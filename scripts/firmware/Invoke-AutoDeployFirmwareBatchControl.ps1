@@ -25,7 +25,24 @@
     and vice versa. The detection table shows which form produced each match.
 
 .NOTES
-    - Version 16.7.1. Set in $ScriptVersion below and stamped onto every row of the run summary
+    REQUIREMENTS - assumed present, NOT verified at run time. Confirm once when building the jump
+    host; probing for them on every run was slow enough to look like a hang.
+
+      * PowerShell 7 (Core). Intersight.PowerShell is a binary module built for it and can appear
+        installed under Windows PowerShell 5.1 while failing at the first signed request.
+      * VMware PowerCLI - VMware.VimAutomation.Core for hosts, clusters, Maintenance mode and host
+        profile compliance.
+      * Intersight.PowerShell - EXACTLY ONE version, matching the appliance's Intersight release.
+        Side-by-side versions, or a build that disagrees with the appliance, produce an error that
+        blames BasePath and the API key while the credentials are in fact correct. Pin the version
+        with config/module-requirements.psd1 and load it with tools\Import-RichoModuleBundle.ps1.
+      * Cisco UCS PowerTool (Cisco.UCSManager) - only if a host in scope is UCS Manager-managed.
+
+    A missing module still fails clearly at the point of use, and the Intersight login diagnostics
+    report installed versions when a login actually fails. Verify the environment out of band with
+    scripts\intersight\Test-IntersightApiKey.ps1.
+
+    - Version 16.8.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -67,7 +84,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "16.7.1"
+$ScriptVersion = "16.8.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -340,61 +357,24 @@ function Get-AvailableModuleVersion {
     return $found
 }
 
-function Get-ModulePresenceReport {
-    <#
-    .SYNOPSIS
-        Reports whether a module is installed, and every version of it that is.
-
-    .DESCRIPTION
-        The version count matters as much as presence: side-by-side versions of
-        Intersight.PowerShell are the documented most-common cause of an authentication failure
-        with an otherwise valid API key, and the failure never points at the real reason.
-    #>
-    param(
-        [Parameter(Mandatory=$true)][string]$Label,
-        [Parameter(Mandatory=$true)][string]$ModuleName,
-        [Parameter(Mandatory=$true)][string]$ProbeCmdlet
-    )
-
-    $versions = @(Get-AvailableModuleVersion -Name $ModuleName | Select-Object -ExpandProperty Version -Unique | Sort-Object -Descending)
-
-    # Some vendor bundles register cmdlets under a differently-named module, so a successful
-    # cmdlet probe still counts as present even when the expected module name returns nothing.
-    #
-    # Only probed when the module was not found by name. Get-Command triggers command discovery
-    # across every module on the box, which for a module exporting thousands of cmdlets is far
-    # slower than the enumeration above - not worth paying when the answer is already known.
-    $cmdletAvailable = $false
-    if ($versions.Count -eq 0) {
-        $cmdletAvailable = ($null -ne (Get-Command -Name $ProbeCmdlet -ErrorAction SilentlyContinue))
-    }
-    $installed = (($versions.Count -gt 0) -or $cmdletAvailable)
-
-    $status = if (-not $installed) { "MISSING" }
-              elseif ($versions.Count -gt 1) { "MULTIPLE" }
-              else { "OK" }
-
-    return [pscustomobject]@{
-        Component = $Label
-        Module    = $ModuleName
-        Status    = $status
-        Versions  = if ($versions.Count -gt 0) { (($versions | ForEach-Object { $_.ToString() }) -join ', ') }
-                    elseif ($cmdletAvailable) { "present (version not reported)" }
-                    else { "-" }
-    }
-}
-
 function Confirm-RunPrerequisites {
     <#
     .SYNOPSIS
-        Pre-flight gate: required PowerShell modules, plus the Intersight API key ID and .pem.
+        Pre-flight gate confirming the Intersight API key ID and .pem private key are in hand.
 
     .DESCRIPTION
-        Checks the modules the run depends on before vCenter is contacted, and confirms the
-        operator holds the Intersight credentials. Both are generated together in Intersight
-        (Settings > API Keys) and cannot be recovered afterwards - the secret key is only
-        downloadable at creation. Finding any of this out partway through a change window is
-        expensive.
+        Deliberately does NOT probe for installed modules or PowerShell versions. Enumerating
+        Intersight.PowerShell, whose manifest exports several thousand cmdlets, took long enough on
+        a domain jump host to read as a hang. The requirements are stated in the script header and
+        printed below instead; the environment is assumed to meet them.
+
+        What is still asked is the thing that cannot be recovered later: the Intersight API Key ID
+        and the matching private key are issued together, and the secret is downloadable only at
+        creation. Finding that out partway through a change window is expensive.
+
+        A missing module still fails clearly - Assert-IntersightPowerShellAvailable and
+        Assert-UcsPowerToolAvailable check for their cmdlets at the point of use, and the Intersight
+        login diagnostics report installed versions when something actually goes wrong.
     #>
     if ($Global:PrerequisitesConfirmed) { return }
 
@@ -402,98 +382,18 @@ function Confirm-RunPrerequisites {
     Write-Host "=====================================================================" -ForegroundColor Cyan
     Write-Host " PRE-FLIGHT CHECK" -ForegroundColor Cyan
     Write-Host "=====================================================================" -ForegroundColor Cyan
+    Write-Host "Assumed present on this host (not verified here - see the script header):" -ForegroundColor Cyan
+    Write-Host "  - PowerShell 7 (Core). Intersight.PowerShell is a binary module built for it." -ForegroundColor Gray
+    Write-Host "  - VMware PowerCLI." -ForegroundColor Gray
+    Write-Host "  - Intersight.PowerShell, ONE version only, matching the appliance release." -ForegroundColor Gray
+    Write-Host "  - Cisco UCS PowerTool, if any host in scope is UCS Manager-managed." -ForegroundColor Gray
+    Write-Host "" -ForegroundColor Cyan
 
-    # ---- Required PowerShell modules -------------------------------------------------------
-    Write-Host "Checking required PowerShell modules..." -ForegroundColor Cyan
-    $moduleReport = @(
-        Get-ModulePresenceReport -Label "VMware PowerCLI"     -ModuleName "VMware.VimAutomation.Core" -ProbeCmdlet "Connect-VIServer"
-        Get-ModulePresenceReport -Label "Cisco Intersight"    -ModuleName "Intersight.PowerShell"     -ProbeCmdlet "Set-IntersightConfiguration"
-        Get-ModulePresenceReport -Label "Cisco UCS PowerTool" -ModuleName "Cisco.UCSManager"          -ProbeCmdlet "Connect-Ucs"
-    )
-    $moduleReport | Format-Table -AutoSize
-    foreach ($row in $moduleReport) {
-        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Check module $($row.Module)" -Result $row.Status -Details "Versions: $($row.Versions)."
-    }
-
-    $powerCli = $moduleReport | Where-Object { $_.Module -eq "VMware.VimAutomation.Core" }
-    if ($powerCli.Status -eq "MISSING") {
-        Stop-WithMessage "VMware PowerCLI is not installed, and every part of this script depends on it. Install it with: Install-Module VMware.PowerCLI -Scope CurrentUser"
-    }
-
-    # Intersight.PowerShell is a binary module built for PowerShell 7 (Core). It can appear
-    # installed under Windows PowerShell 5.1 and then fail at the first signed request, with an
-    # error that blames BasePath and the API key.
-    $edition = if ($PSVersionTable.ContainsKey('PSEdition')) { [string]$PSVersionTable.PSEdition } else { 'Desktop' }
-    if ($edition -ne 'Core') {
-        Write-Host "This is Windows PowerShell ($edition $($PSVersionTable.PSVersion))." -ForegroundColor Red
-        Write-Host "  Intersight.PowerShell is built for PowerShell 7 (Core). If any host in scope is" -ForegroundColor Red
-        Write-Host "  Intersight-managed, re-run this script in pwsh.exe rather than Windows PowerShell." -ForegroundColor Red
-        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Check PowerShell edition" -Result "Warning" -Details "$edition $($PSVersionTable.PSVersion); Intersight.PowerShell expects Core."
-    }
-    else {
-        Write-Host "PowerShell edition: Core $($PSVersionTable.PSVersion) - correct host for Intersight.PowerShell." -ForegroundColor Green
-    }
-
-    # Compare what is loaded against the version pinned in config/module-requirements.psd1. A
-    # module that authenticates but cannot parse the appliance's responses looks like a credential
-    # problem and costs a change window; catching the version here costs seconds.
-    Write-Host "Checking Intersight.PowerShell against the pinned version..." -ForegroundColor Cyan
-    $pinnedIntersight = ""
-    try {
-        $reqPath = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'config/module-requirements.psd1'
-        if (Test-Path $reqPath) {
-            $req = Import-PowerShellDataFile -Path $reqPath
-            $pinnedIntersight = [string](@($req.Modules | Where-Object { $_.Name -eq 'Intersight.PowerShell' }).Version)
-        }
-    } catch {}
-
-    $intersight = $moduleReport | Where-Object { $_.Module -eq "Intersight.PowerShell" }
-
-    if (-not [string]::IsNullOrWhiteSpace($pinnedIntersight) -and $intersight.Status -ne "MISSING") {
-        $loadedIntersight = @(Get-AvailableModuleVersion -Name Intersight.PowerShell | Select-Object -First 1)
-        $loadedVersion = if ($loadedIntersight.Count -gt 0) { $loadedIntersight[0].Version.ToString() } else { "unknown" }
-        if ($loadedVersion -ne $pinnedIntersight) {
-            Write-Host "Intersight.PowerShell version $loadedVersion does not match the pinned $pinnedIntersight." -ForegroundColor Yellow
-            Write-Host "  A mismatched build can authenticate correctly and then fail to read the appliance's" -ForegroundColor Yellow
-            Write-Host "  responses, which reports as a credential error. Load the pinned version with:" -ForegroundColor Yellow
-            Write-Host "    . .\tools\Import-RichoModuleBundle.ps1" -ForegroundColor Yellow
-            Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Check pinned Intersight version" -Result "Mismatch" -Details "Loaded $loadedVersion, pinned $pinnedIntersight."
-        }
-        else {
-            Write-Host "Intersight.PowerShell $loadedVersion matches the pinned version." -ForegroundColor Green
-        }
-    }
-
-    if ($intersight.Status -eq "MISSING") {
-        Write-Host "Intersight.PowerShell is NOT installed." -ForegroundColor Red
-        Write-Host "  Load the pinned copy from the repo bundle: . .\tools\Import-RichoModuleBundle.ps1" -ForegroundColor Red
-        Write-Host "  Or install it with: Install-Module Intersight.PowerShell -Scope CurrentUser" -ForegroundColor Red
-        Write-Host "  Without it, the run will stop as soon as an Intersight-managed host is detected." -ForegroundColor Red
-        Write-Host "  Answer SKIP below only if no host in scope is Intersight-managed." -ForegroundColor Red
-    }
-    elseif ($intersight.Status -eq "MULTIPLE") {
-        Write-Host "MORE THAN ONE version of Intersight.PowerShell is installed: $($intersight.Versions)" -ForegroundColor Red
-        Write-Host "  This is the most common cause of an Intersight authentication failure with a valid" -ForegroundColor Red
-        Write-Host "  API key, and the error it produces never points at the real reason. Remove the older" -ForegroundColor Red
-        Write-Host "  versions and restart PowerShell before running against Intersight-managed hosts." -ForegroundColor Red
-        Write-Host "  Find them with: Get-Module -ListAvailable -Name Intersight.PowerShell | Select Version, ModuleBase" -ForegroundColor Red
-    }
-
-    $ucsPowerTool = $moduleReport | Where-Object { $_.Module -eq "Cisco.UCSManager" }
-    if ($ucsPowerTool.Status -eq "MISSING" -and $Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") {
-        Write-Host "Cisco UCS PowerTool is NOT installed." -ForegroundColor Yellow
-        Write-Host "  Install it with: Install-Module Cisco.UCSManager -Scope CurrentUser" -ForegroundColor Yellow
-        Write-Host "  It is only needed if at least one host in scope is UCS Manager-managed." -ForegroundColor Yellow
-    }
-
-    # ---- Intersight credentials ------------------------------------------------------------
-    Write-Host "" -ForegroundColor Yellow
     Write-Host "If any host in scope is Intersight-managed, this run needs ALL of:" -ForegroundColor Yellow
     Write-Host "  1. An Intersight API Key ID - three segments, e.g. aaaa/bbbb/cccc" -ForegroundColor Yellow
     Write-Host "  2. The matching private key (.pem) file saved to this machine" -ForegroundColor Yellow
     Write-Host "  3. The Intersight address - the PVA appliance FQDN, or intersight.com for SaaS." -ForegroundColor Yellow
     Write-Host "     You will be prompted for this the moment an Intersight fabric is detected." -ForegroundColor Yellow
-    Write-Host "  4. The Intersight.PowerShell module installed, in exactly one version (see above)." -ForegroundColor Yellow
     Write-Host "" -ForegroundColor Yellow
     Write-Host "Both are issued together in Intersight under Settings > API Keys. The" -ForegroundColor Yellow
     Write-Host "secret key can only be downloaded at the moment the key is created - if" -ForegroundColor Yellow
@@ -504,7 +404,6 @@ function Confirm-RunPrerequisites {
     Write-Host "if any host is Intersight-managed." -ForegroundColor Yellow
     Write-Host "=====================================================================" -ForegroundColor Cyan
 
-    Write-Host "Pre-flight checks complete." -ForegroundColor Green
     $answer = Read-ChoiceExit -Message "Do you have the Intersight API Key ID and matching .pem file available? Answer SKIP if no Intersight-managed hosts are in scope." -AllowedChoices @("YES","SKIP") -ExitMessage "Stopped at the pre-flight prerequisites check."
 
     Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Confirm Intersight prerequisites" -Result $answer -Details "Operator confirmation of API Key ID and .pem availability."
@@ -1323,22 +1222,23 @@ function Invoke-UcsPendingAckForBatch {
 # -----------------------------
 
 function Assert-IntersightPowerShellAvailable {
+    <#
+    .SYNOPSIS
+        Confirms the Intersight cmdlets this script calls are actually available.
+
+    .DESCRIPTION
+        A cmdlet-existence check only. No module enumeration and no version comparison - listing
+        versions of a module exporting several thousand cmdlets is slow enough on a domain jump
+        host to look like a hang, and the environment is assumed to meet the requirements stated
+        in the script header.
+
+        Version information is still gathered when it is actually worth the wait: on the failure
+        path, by Write-IntersightLoginDiagnostics.
+    #>
     foreach ($cmdletName in @("Set-IntersightConfiguration","Get-IntersightServerProfile")) {
         if ($null -eq (Get-Command -Name $cmdletName -ErrorAction SilentlyContinue)) {
-            Stop-WithMessage "Intersight.PowerShell module was not found ($cmdletName is missing). Import Intersight.PowerShell before running against hosts mapped to Intersight."
+            Stop-WithMessage "Intersight.PowerShell module was not found ($cmdletName is missing). Import Intersight.PowerShell before running against hosts mapped to Intersight. If more than one version is installed, load the pinned one with: . .\tools\Import-RichoModuleBundle.ps1"
         }
-    }
-
-    # Side-by-side module versions are the most common cause of AuthenticationFailure with
-    # otherwise correct credentials, and the failure message never points at the real cause.
-    $installed = @(Get-AvailableModuleVersion -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique)
-    $versionList = ($installed | ForEach-Object { $_.ToString() }) -join ', '
-    Write-Host "Intersight.PowerShell version(s) available: $versionList" -ForegroundColor Cyan
-
-    if ($installed.Count -gt 1) {
-        Write-Host "WARNING: $($installed.Count) versions of Intersight.PowerShell are installed." -ForegroundColor Yellow
-        Write-Host "Side-by-side versions are the most common cause of an authentication failure with an otherwise valid key. Remove the older versions if the login below fails." -ForegroundColor Yellow
-        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Check module versions" -Result "Warning" -Details "Multiple Intersight.PowerShell versions installed: $versionList."
     }
 }
 

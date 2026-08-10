@@ -12,6 +12,36 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [16.8.0] — 2026-08-10
+
+#### Removed
+
+- **All module and PowerShell version probing from the pre-flight.** Enumerating
+  `Intersight.PowerShell`, whose manifest exports several thousand cmdlets, was
+  slow enough on a domain jump host to read as a hang, and it ran before every
+  single run. The environment is now assumed to meet the requirements.
+- `Get-ModulePresenceReport`, along with the module table, the PowerShell
+  edition check, the pinned-version comparison and the UCS PowerTool check.
+
+#### Changed
+
+- Requirements moved into the script header as a REQUIREMENTS block, and printed
+  as a short notice at the start of a run. They say what must be present and why
+  each matters, without checking anything.
+- `Assert-IntersightPowerShellAvailable` is a cmdlet-existence check only. No
+  enumeration, no version listing.
+
+#### Notes
+
+- Nothing is lost on the failure path. A missing module still fails clearly at
+  the point of use, and the Intersight login diagnostics still report every
+  installed version when a login actually fails — which is when the wait is
+  worth paying for. `scripts/intersight/Test-IntersightApiKey.ps1` remains the
+  way to verify the environment out of band.
+- `tests/Test-ModulePresence.ps1` is now
+  `tests/Test-ModuleEnumerationCache.ps1`, covering the caching that survives on
+  the failure path.
+
 ### [16.7.1] — 2026-08-10
 
 #### Fixed
