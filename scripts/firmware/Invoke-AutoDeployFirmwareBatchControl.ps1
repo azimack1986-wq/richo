@@ -25,7 +25,7 @@
     and vice versa. The detection table shows which form produced each match.
 
 .NOTES
-    - Version 16.7.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 16.7.1. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -67,7 +67,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "16.7.0"
+$ScriptVersion = "16.7.1"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -111,6 +111,8 @@ $Global:IntersightActionableConfigStates = @(
     'Not-deployed'
 )
 $Global:BatchActionsSent = 0
+$Global:ModuleVersionCache = @{}
+$Global:SlowModulePathReported = $false
 $Global:IntersightUnusable = $false
 $Global:IntersightUnusableReason = ""
 $Global:IntersightSkippedHosts = @{}
@@ -284,6 +286,60 @@ function Show-OpenFileDialog {
     }
 }
 
+function Get-AvailableModuleVersion {
+    <#
+    .SYNOPSIS
+        Cached Get-Module -ListAvailable for one module, with progress and slow-path diagnosis.
+
+    .DESCRIPTION
+        Get-Module -ListAvailable walks every entry in $env:PSModulePath and parses each manifest
+        it finds. For Intersight.PowerShell, whose manifest exports several thousand cmdlets, that
+        is slow - and it was being repeated at five separate points in this script, with no output
+        in between, which reads exactly like a hang.
+
+        Each module is enumerated once and the result reused. The first lookup is timed, and if it
+        is slow the likely reason is reported: a network or mapped-drive entry in PSModulePath,
+        where enumeration can take minutes.
+
+    .PARAMETER Name
+        Module name.
+
+    .PARAMETER Refresh
+        Ignore the cache and re-enumerate.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [switch]$Refresh
+    )
+
+    if (-not $Refresh -and $Global:ModuleVersionCache.ContainsKey($Name)) {
+        return $Global:ModuleVersionCache[$Name]
+    }
+
+    Write-Host "  Looking for $Name..." -ForegroundColor DarkGray -NoNewline
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $found = @()
+    try { $found = @(Get-Module -ListAvailable -Name $Name -ErrorAction SilentlyContinue | Sort-Object Version -Descending) } catch {}
+    $sw.Stop()
+
+    $seconds = [Math]::Round($sw.Elapsed.TotalSeconds, 1)
+    Write-Host " $($found.Count) found in ${seconds}s" -ForegroundColor DarkGray
+
+    if ($sw.Elapsed.TotalSeconds -gt 15 -and -not $Global:SlowModulePathReported) {
+        $Global:SlowModulePathReported = $true
+        Write-Host "  NOTE: module discovery is slow (${seconds}s). PSModulePath entries:" -ForegroundColor Yellow
+        foreach ($entry in ($env:PSModulePath -split [IO.Path]::PathSeparator | Where-Object { $_ })) {
+            $remote = ($entry -like '\\\\*') -or ($entry -match '^[A-Za-z]:\\' -and (Test-Path $entry -ErrorAction SilentlyContinue) -eq $false)
+            $marker = if ($remote) { "  <- network or unavailable path, likely the cause" } else { "" }
+            Write-Host "    $entry$marker" -ForegroundColor Yellow
+        }
+        Write-Host "  Removing unreachable or network entries from PSModulePath speeds this up considerably." -ForegroundColor Yellow
+    }
+
+    $Global:ModuleVersionCache[$Name] = $found
+    return $found
+}
+
 function Get-ModulePresenceReport {
     <#
     .SYNOPSIS
@@ -300,12 +356,18 @@ function Get-ModulePresenceReport {
         [Parameter(Mandatory=$true)][string]$ProbeCmdlet
     )
 
-    $versions = @(Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue |
-        Select-Object -ExpandProperty Version -Unique | Sort-Object -Descending)
+    $versions = @(Get-AvailableModuleVersion -Name $ModuleName | Select-Object -ExpandProperty Version -Unique | Sort-Object -Descending)
 
     # Some vendor bundles register cmdlets under a differently-named module, so a successful
     # cmdlet probe still counts as present even when the expected module name returns nothing.
-    $cmdletAvailable = ($null -ne (Get-Command -Name $ProbeCmdlet -ErrorAction SilentlyContinue))
+    #
+    # Only probed when the module was not found by name. Get-Command triggers command discovery
+    # across every module on the box, which for a module exporting thousands of cmdlets is far
+    # slower than the enumeration above - not worth paying when the answer is already known.
+    $cmdletAvailable = $false
+    if ($versions.Count -eq 0) {
+        $cmdletAvailable = ($null -ne (Get-Command -Name $ProbeCmdlet -ErrorAction SilentlyContinue))
+    }
     $installed = (($versions.Count -gt 0) -or $cmdletAvailable)
 
     $status = if (-not $installed) { "MISSING" }
@@ -375,6 +437,7 @@ function Confirm-RunPrerequisites {
     # Compare what is loaded against the version pinned in config/module-requirements.psd1. A
     # module that authenticates but cannot parse the appliance's responses looks like a credential
     # problem and costs a change window; catching the version here costs seconds.
+    Write-Host "Checking Intersight.PowerShell against the pinned version..." -ForegroundColor Cyan
     $pinnedIntersight = ""
     try {
         $reqPath = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'config/module-requirements.psd1'
@@ -387,7 +450,7 @@ function Confirm-RunPrerequisites {
     $intersight = $moduleReport | Where-Object { $_.Module -eq "Intersight.PowerShell" }
 
     if (-not [string]::IsNullOrWhiteSpace($pinnedIntersight) -and $intersight.Status -ne "MISSING") {
-        $loadedIntersight = @(Get-Module -ListAvailable -Name Intersight.PowerShell | Sort-Object Version -Descending | Select-Object -First 1)
+        $loadedIntersight = @(Get-AvailableModuleVersion -Name Intersight.PowerShell | Select-Object -First 1)
         $loadedVersion = if ($loadedIntersight.Count -gt 0) { $loadedIntersight[0].Version.ToString() } else { "unknown" }
         if ($loadedVersion -ne $pinnedIntersight) {
             Write-Host "Intersight.PowerShell version $loadedVersion does not match the pinned $pinnedIntersight." -ForegroundColor Yellow
@@ -441,6 +504,7 @@ function Confirm-RunPrerequisites {
     Write-Host "if any host is Intersight-managed." -ForegroundColor Yellow
     Write-Host "=====================================================================" -ForegroundColor Cyan
 
+    Write-Host "Pre-flight checks complete." -ForegroundColor Green
     $answer = Read-ChoiceExit -Message "Do you have the Intersight API Key ID and matching .pem file available? Answer SKIP if no Intersight-managed hosts are in scope." -AllowedChoices @("YES","SKIP") -ExitMessage "Stopped at the pre-flight prerequisites check."
 
     Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Confirm Intersight prerequisites" -Result $answer -Details "Operator confirmation of API Key ID and .pem availability."
@@ -1267,7 +1331,7 @@ function Assert-IntersightPowerShellAvailable {
 
     # Side-by-side module versions are the most common cause of AuthenticationFailure with
     # otherwise correct credentials, and the failure message never points at the real cause.
-    $installed = @(Get-Module -ListAvailable -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique)
+    $installed = @(Get-AvailableModuleVersion -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique)
     $versionList = ($installed | ForEach-Object { $_.ToString() }) -join ', '
     Write-Host "Intersight.PowerShell version(s) available: $versionList" -ForegroundColor Cyan
 
@@ -1427,7 +1491,7 @@ function Write-IntersightLoginDiagnostics {
     }
 
     Write-Host "Installed module versions:" -ForegroundColor Yellow
-    $installed = @(Get-Module -ListAvailable -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique)
+    $installed = @(Get-AvailableModuleVersion -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique)
     Write-Host "  $((($installed | ForEach-Object { $_.ToString() }) -join ', '))" -ForegroundColor Gray
     if ($installed.Count -gt 1) {
         Write-Host "  MORE THAN ONE VERSION INSTALLED - this is the most common cause of this exact failure." -ForegroundColor Red
@@ -1716,7 +1780,7 @@ function Connect-IntersightTarget {
     # them is about credentials.
     $failureKind = Get-IntersightFailureKind -ErrorRecord $lastError
     if ($failureKind.Kind -eq 'Deserialization') {
-        $installedVersions = (@(Get-Module -ListAvailable -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique | ForEach-Object { $_.ToString() }) -join ', ')
+        $installedVersions = (@(Get-AvailableModuleVersion -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique | ForEach-Object { $_.ToString() }) -join ', ')
         Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "VersionMismatch" -Details "Signed request accepted; response could not be deserialized. Installed: $installedVersions."
         Write-Host "" -ForegroundColor Yellow
         Write-Host "Intersight AUTHENTICATION SUCCEEDED - the appliance accepted the signed request and" -ForegroundColor Green

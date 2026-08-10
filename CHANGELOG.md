@@ -12,6 +12,32 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [16.7.1] — 2026-08-10
+
+#### Fixed
+
+- **The pre-flight appeared to hang after the PowerShell edition check.** The
+  next statement was another `Get-Module -ListAvailable` for
+  `Intersight.PowerShell`, and that module's manifest exports several thousand
+  cmdlets, so each enumeration is slow — and the script was doing it at five
+  separate points with no output in between. Module enumeration is now cached
+  per module and reused, and each lookup prints what it is doing and how long it
+  took, so a slow environment reads as slow rather than as stuck.
+- The `Get-Command` probe in the module check is only used as a fallback when
+  the module is not found by name. It triggers command discovery across every
+  module on the machine, which for a module of this size costs more than the
+  enumeration it was backing up.
+- A first lookup taking over 15 seconds now prints the `PSModulePath` entries
+  and flags network or unreachable paths, which is the usual cause.
+
+#### Added
+
+- Progress output through the pre-flight, including an explicit
+  "Pre-flight checks complete" before the first prompt.
+- Caching assertions in `tests/Test-ModulePresence.ps1`: a module is enumerated
+  at most once per run, distinct modules enumerate independently, and `-Refresh`
+  forces a re-read.
+
 ### [16.7.0] — 2026-08-10
 
 Found on the first successful authenticated run: the blade had a pending profile

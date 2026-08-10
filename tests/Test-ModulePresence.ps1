@@ -20,8 +20,12 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [r
 if ($errors) { throw "parse errors" }
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -eq 'Get-ModulePresenceReport' } |
+    Where-Object { $_.Name -in @('Get-ModulePresenceReport','Get-AvailableModuleVersion') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
+
+# Get-ModulePresenceReport enumerates through the cache, so the cache globals must exist.
+$Global:ModuleVersionCache = @{}
+$Global:SlowModulePathReported = $false
 
 $script:pass = 0; $script:fail = 0
 function Assert-Equal {
@@ -42,6 +46,8 @@ function Invoke-Report {
     param([string[]]$Versions,[bool]$CmdletPresent)
     $script:StubVersions = $Versions
     $script:StubCmdletPresent = $CmdletPresent
+    # Cleared each time so every case re-enumerates rather than reusing the previous stub result.
+    $Global:ModuleVersionCache = @{}
     return Get-ModulePresenceReport -Label "Cisco Intersight" -ModuleName "Intersight.PowerShell" -ProbeCmdlet "Set-IntersightConfiguration"
 }
 
@@ -71,6 +77,32 @@ Assert-Equal "three versions still report MULTIPLE" "MULTIPLE" $r.Status
 $r = Invoke-Report -Versions @('1.0.11.17') -CmdletPresent $true
 Assert-Equal "component label is carried through" "Cisco Intersight" $r.Component
 Assert-Equal "module name is carried through" "Intersight.PowerShell" $r.Module
+
+Write-Host "`n=== Enumeration is cached ===" -ForegroundColor Cyan
+# Repeated Get-Module -ListAvailable on a module exporting thousands of cmdlets is what made the
+# pre-flight look like it had hung. Each module must be enumerated at most once per run.
+$script:EnumerationCount = 0
+function Get-Module { param([switch]$ListAvailable,[string]$Name,$ErrorAction)
+    $script:EnumerationCount++
+    $script:StubVersions | ForEach-Object { [pscustomobject]@{ Version = [version]$_ } } }
+
+$script:StubVersions = @('1.0.11.17')
+$Global:ModuleVersionCache = @{}
+$script:EnumerationCount = 0
+
+[void](Get-AvailableModuleVersion -Name 'Intersight.PowerShell')
+Assert-Equal "first lookup enumerates once" 1 $script:EnumerationCount
+
+[void](Get-AvailableModuleVersion -Name 'Intersight.PowerShell')
+[void](Get-AvailableModuleVersion -Name 'Intersight.PowerShell')
+[void](Get-AvailableModuleVersion -Name 'Intersight.PowerShell')
+Assert-Equal "three further lookups add no enumerations" 1 $script:EnumerationCount
+
+[void](Get-AvailableModuleVersion -Name 'VMware.VimAutomation.Core')
+Assert-Equal "a different module enumerates on its own" 2 $script:EnumerationCount
+
+[void](Get-AvailableModuleVersion -Name 'Intersight.PowerShell' -Refresh)
+Assert-Equal "-Refresh forces a re-enumeration" 3 $script:EnumerationCount
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }
