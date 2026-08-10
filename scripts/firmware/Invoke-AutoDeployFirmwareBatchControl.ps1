@@ -31,6 +31,11 @@
       Authentication is applied with Set-IntersightConfiguration; Intersight.PowerShell has no
       Connect-*/Disconnect-* cmdlet pair. $Global:IntersightBaseUrl is the appliance root only, with
       no /api/v1 suffix and no trailing slash.
+    - The Intersight API endpoint is not fixed in the script. As soon as a host is detected as
+      Intersight-managed, the operator is prompted for the appliance FQDN (or intersight.com for
+      SaaS) and that becomes the BasePath for the run. A bare FQDN, a full URL, a trailing slash or
+      a pasted /api/v1 are all accepted and normalised. Certificate checking follows from the
+      answer: skipped for an on-prem PVA, enforced for intersight.com.
     - DRYRUN is the default.
     - UCSM acknowledgement and Intersight accept/reboot are each scoped to their own batch hosts only.
     - Batch mode is AUTO (sized from live cluster capacity and health, capped at $MaxAbsoluteBatchSize)
@@ -67,10 +72,15 @@ $TargetUcsFirmwarePolicyName = ""
 # Expected CSV columns: Name (the Intersight Fabrics export column matched against CDP/LLDP system
 # name), ServerProfileName (optional - defaults to Name if omitted), Moid (optional, speeds up lookup).
 $IntersightCsvPath = "C:\temp\intersightfabric.csv"
+# Default offered at the Intersight FQDN prompt. When an Intersight-managed fabric is detected the
+# operator is asked for the appliance address, and their answer replaces this for the rest of the
+# run - so this only needs changing if you want a different default in the prompt.
 # BasePath is the appliance root only - no /api/v1 suffix and no trailing slash. The module
 # appends the API path itself, and a trailing slash breaks HTTP signature validation.
 $Global:IntersightBaseUrl = "https://intersight.com"           # PVA example: https://<pva-fqdn>
-$Global:IntersightSkipCertificateCheck = $true                 # required for PVA on-prem; harmless for SaaS
+# Set automatically from the entered address: on for an on-prem PVA, off for intersight.com.
+$Global:IntersightSkipCertificateCheck = $true
+$Global:IntersightBaseUrlConfirmed = $false
 # NOTE: Intersight's API only supports API-key + HTTP-signature auth (key ID + private key file) -
 # there is no username/password endpoint. Get-IntersightCredentialIfNeeded below still prompts
 # interactively and holds the material in memory only, matching the hardened UCSM pattern, but what
@@ -265,9 +275,11 @@ function Confirm-RunPrerequisites {
     Write-Host "=====================================================================" -ForegroundColor Cyan
     Write-Host " PRE-FLIGHT CHECK" -ForegroundColor Cyan
     Write-Host "=====================================================================" -ForegroundColor Cyan
-    Write-Host "If any host in scope is Intersight-managed, this run needs BOTH of:" -ForegroundColor Yellow
+    Write-Host "If any host in scope is Intersight-managed, this run needs ALL of:" -ForegroundColor Yellow
     Write-Host "  1. An Intersight API Key ID - three segments, e.g. aaaa/bbbb/cccc" -ForegroundColor Yellow
     Write-Host "  2. The matching private key (.pem) file saved to this machine" -ForegroundColor Yellow
+    Write-Host "  3. The Intersight address - the PVA appliance FQDN, or intersight.com for SaaS." -ForegroundColor Yellow
+    Write-Host "     You will be prompted for this the moment an Intersight fabric is detected." -ForegroundColor Yellow
     Write-Host "" -ForegroundColor Yellow
     Write-Host "Both are issued together in Intersight under Settings > API Keys. The" -ForegroundColor Yellow
     Write-Host "secret key can only be downloaded at the moment the key is created - if" -ForegroundColor Yellow
@@ -789,6 +801,10 @@ function Build-InfrastructureHostMapping {
         foreach ($row in $intersightRoutedRows) {
             Add-SummaryRecord -Stage "InfrastructureDetection" -Batch "" -HostName $row.Host -Action "Detect infrastructure" -Result "Intersight" -Details "CdpSystemName=$($row.CdpSystemName); MatchedOn=$($row.MatchedOn); CsvName=$($row.IntersightCsvName)."
         }
+
+        # A fabric has been detected, so ask for the appliance address now rather than at first
+        # API call. Getting the endpoint wrong is cheap to fix here and expensive to fix mid-batch.
+        [void](Get-IntersightBaseUrlIfNeeded -DetectedFabricNames @($intersightRoutedRows | Select-Object -ExpandProperty IntersightCsvName))
     }
 
     if ($ucsOnlyHosts.Count -eq 0) {
@@ -1100,6 +1116,104 @@ function Assert-IntersightPowerShellAvailable {
     }
 }
 
+function ConvertTo-IntersightBaseUrl {
+    <#
+    .SYNOPSIS
+        Normalises an operator-entered Intersight address into a usable BasePath, or "" if invalid.
+
+    .DESCRIPTION
+        Accepts what people actually type - a bare FQDN, a full URL, a trailing slash, a pasted
+        /api/v1 suffix, an IP, an optional port - and returns "https://<host>[:port]".
+
+        The suffix and trailing slash matter: the module appends the API path itself, and either
+        one left in place breaks HTTP signature validation with an error that does not mention the
+        URL. Anything with an unexpected path, whitespace or an invalid hostname returns "" so the
+        caller can re-prompt rather than fail later at the signing stage.
+
+    .PARAMETER Value
+        Raw operator input.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
+
+    # Not $host - that is a read-only automatic variable and assigning to it throws.
+    $hostPart = $Value.Trim().Trim('"').Trim("'")
+    $hostPart = $hostPart -replace '^\s*[A-Za-z][A-Za-z0-9+.-]*://', ''   # drop any scheme
+    $hostPart = $hostPart -replace '/+$', ''                              # drop trailing slashes
+    $hostPart = $hostPart -replace '(?i)/api/v\d+$', ''                   # drop a pasted API path
+    $hostPart = $hostPart -replace '/+$', ''
+    $hostPart = $hostPart.Trim()
+
+    if ([string]::IsNullOrWhiteSpace($hostPart)) { return "" }
+
+    # Hostname, FQDN or IPv4, with an optional port. Anything else - a remaining path segment,
+    # embedded whitespace, a stray credential - is rejected rather than guessed at.
+    $pattern = '^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*(:\d{1,5})?$'
+    if ($hostPart -notmatch $pattern) { return "" }
+
+    return "https://$hostPart"
+}
+
+function Test-IntersightSaaSUrl {
+    param([Parameter(Mandatory=$true)][string]$BaseUrl)
+    return ($BaseUrl -match '(?i)^https://([A-Za-z0-9-]+\.)*intersight\.com(:\d+)?$')
+}
+
+function Get-IntersightBaseUrlIfNeeded {
+    <#
+    .SYNOPSIS
+        Prompts once for the Intersight appliance FQDN and sets it as the API BasePath.
+
+    .DESCRIPTION
+        Called as soon as an Intersight-managed fabric is detected, so the operator supplies the
+        appliance address at detection time rather than discovering a wrong endpoint later. The
+        entered value replaces $Global:IntersightBaseUrl for the rest of the run; the value in
+        User Settings is only the default offered at the prompt.
+
+        Certificate checking follows from the address: an on-prem PVA gets -SkipCertificateCheck,
+        intersight.com does not.
+
+    .PARAMETER DetectedFabricNames
+        Fabric names matched from the CSV, shown for context so the operator can tell which
+        appliance is being asked about.
+    #>
+    param([string[]]$DetectedFabricNames = @())
+
+    if ($Global:IntersightBaseUrlConfirmed) { return $Global:IntersightBaseUrl }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Intersight-managed fabric detected." -ForegroundColor Cyan
+    if ($DetectedFabricNames.Count -gt 0) {
+        Write-Host "Matched fabric name(s) from $($IntersightCsvPath): $(($DetectedFabricNames | Select-Object -Unique) -join ', ')" -ForegroundColor Cyan
+    }
+    Write-Host "Enter the Intersight address to authenticate against - the PVA appliance FQDN for" -ForegroundColor Yellow
+    Write-Host "on-prem, or intersight.com for SaaS. A bare FQDN is fine; scheme, trailing slash" -ForegroundColor Yellow
+    Write-Host "and any /api/v1 suffix are handled for you." -ForegroundColor Yellow
+
+    $default = $Global:IntersightBaseUrl
+    do {
+        $entry = (Read-Host "Intersight FQDN (press Enter for $default, or type EXIT)").Trim()
+        if ($entry.ToUpper() -eq "EXIT") { Stop-SafeExit -Message "Stopped at the Intersight FQDN prompt." }
+        if ([string]::IsNullOrWhiteSpace($entry)) { $entry = $default }
+
+        $normalised = ConvertTo-IntersightBaseUrl -Value $entry
+        if ([string]::IsNullOrWhiteSpace($normalised)) {
+            Write-Host "'$entry' is not a valid hostname, FQDN or IP address. Example: siepd24pva0001.dpe.protected.mil.au" -ForegroundColor Yellow
+        }
+    } until (-not [string]::IsNullOrWhiteSpace($normalised))
+
+    $Global:IntersightBaseUrl = $normalised
+    $Global:IntersightSkipCertificateCheck = -not (Test-IntersightSaaSUrl -BaseUrl $normalised)
+    $Global:IntersightBaseUrlConfirmed = $true
+
+    $kind = if (Test-IntersightSaaSUrl -BaseUrl $normalised) { "SaaS" } else { "on-prem PVA" }
+    Write-Host "Intersight API BasePath set to $normalised ($kind; certificate check $(if($Global:IntersightSkipCertificateCheck){'skipped'}else{'enforced'}))." -ForegroundColor Green
+    Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Set API BasePath" -Result "Confirmed" -Details "BasePath=$normalised; Kind=$kind; SkipCertificateCheck=$Global:IntersightSkipCertificateCheck."
+
+    return $Global:IntersightBaseUrl
+}
+
 function Assert-IntersightUpgradeCmdletSurface {
     <#
     .SYNOPSIS
@@ -1175,6 +1289,10 @@ function Get-IntersightCredentialIfNeeded {
 function Connect-IntersightTarget {
     if ($null -ne $Global:IntersightSession) { return $Global:IntersightSession }
     Assert-IntersightPowerShellAvailable
+
+    # Normally already answered during fabric detection; this covers any path that reaches an
+    # Intersight call without having gone through detection.
+    [void](Get-IntersightBaseUrlIfNeeded)
     Get-IntersightCredentialIfNeeded
 
     $basePath = $Global:IntersightBaseUrl.Trim().TrimEnd('/')
