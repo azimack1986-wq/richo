@@ -421,6 +421,53 @@ else {
 }
 
 # ---------------------------------------------------------------------------
+# 9. Which schemas the module can actually read
+# ---------------------------------------------------------------------------
+if ($script:DeserializationProblem) {
+    Write-Section "8. Which endpoints the module can read"
+    Write-Host "  Narrowing the mismatch: if only some schemas fail, a workaround may exist; if" -ForegroundColor Gray
+    Write-Host "  everything fails, only a matching module version will do." -ForegroundColor Gray
+
+    $probes = @(
+        @{ Cmdlet = 'Get-IntersightOrganizationOrganization'; Why = 'organizations - failed above' },
+        @{ Cmdlet = 'Get-IntersightServerProfile';            Why = 'server profiles - needed to find the host' },
+        @{ Cmdlet = 'Get-IntersightFirmwareUpgrade';          Why = 'firmware upgrades - needed to accept and reboot' },
+        @{ Cmdlet = 'Get-IntersightComputeBlade';             Why = 'blades' },
+        @{ Cmdlet = 'Get-IntersightIamAccount';               Why = 'account - simplest possible object' },
+        @{ Cmdlet = 'Get-IntersightNtpPolicy';                Why = 'a simple policy' }
+    )
+
+    foreach ($probe in $probes) {
+        if ($null -eq (Get-Command -Name $probe.Cmdlet -ErrorAction SilentlyContinue)) {
+            Write-Check -Name "$($probe.Cmdlet)" -Result INFO -Detail "Not present in this module version."
+            continue
+        }
+        try {
+            [void](& $probe.Cmdlet -Top 1 -ErrorAction Stop)
+            Write-Check -Name "$($probe.Cmdlet)" -Result PASS -Detail "Readable ($($probe.Why))."
+        }
+        catch {
+            $kind = Get-IntersightFailureKind -ErrorRecord $_
+            if ($kind.Kind -eq 'Deserialization') {
+                # Name the schema that actually failed - it is usually not the one you asked for.
+                $failedType = "unknown"
+                # No ternary - this script declares 5.1 support.
+                $flat = [string]$_.Exception.Message
+                if ($null -ne $_.Exception.InnerException) { $flat = [string]$_.Exception.InnerException.Message }
+                if ($flat -match '"ObjectType"\s*:\s*"([^"]+)"') { $failedType = $Matches[1] }
+                Write-Check -Name "$($probe.Cmdlet)" -Result FAIL -Detail "Cannot deserialize; failing schema: $failedType ($($probe.Why))."
+            }
+            else {
+                Write-Check -Name "$($probe.Cmdlet)" -Result WARN -Detail (Format-Truncated -Text $_.Exception.Message -Max 200)
+            }
+        }
+    }
+
+    Write-Host "  If every endpoint reports the same failing schema, the module resolves that object" -ForegroundColor Gray
+    Write-Host "  internally on each call and no endpoint can be used until the versions match." -ForegroundColor Gray
+}
+
+# ---------------------------------------------------------------------------
 # Verdict
 # ---------------------------------------------------------------------------
 Write-Host "`n=====================================================================" -ForegroundColor Cyan

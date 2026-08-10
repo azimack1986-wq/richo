@@ -12,6 +12,27 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [16.5.0] — 2026-08-10
+
+Follow-up to the PVA diagnosis: no code change can make the module parse a
+schema it does not know, so the controller now fails usefully instead of
+failing totally.
+
+#### Added
+
+- When Intersight authenticates but its responses cannot be read, the run offers
+  to exclude the Intersight-managed hosts and continue with the UCS Manager
+  hosts, rather than abandoning the whole cluster. This is decided during
+  detection, before any host has been touched, so nothing is left half-done.
+  Excluded hosts are removed from batching entirely — they are never treated as
+  UCS Manager-managed, which they are not — and each exclusion is recorded in
+  the run summary.
+- The API key checker probes several endpoints when a deserialization failure is
+  seen, naming the schema that actually failed for each. If every endpoint
+  reports the same failing schema, the module resolves that object internally on
+  every call and no endpoint is usable until the versions match; if only some
+  fail, a workaround may exist.
+
 ### [16.4.0] — 2026-08-10
 
 Diagnosed from a live PVA run: the "authentication failure" was not one. The

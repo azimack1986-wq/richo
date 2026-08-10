@@ -25,7 +25,7 @@
     and vice versa. The detection table shows which form produced each match.
 
 .NOTES
-    - Version 16.4.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 16.5.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -67,7 +67,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "16.4.0"
+$ScriptVersion = "16.5.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -101,6 +101,9 @@ $Global:IntersightServerList = @{}
 $Global:IntersightHostMap = @{}
 $Global:IntersightProfileCache = @{}
 $Global:IntersightUpgradeSurfaceChecked = $false
+$Global:IntersightUnusable = $false
+$Global:IntersightUnusableReason = ""
+$Global:IntersightSkippedHosts = @{}
 $Global:EsxiDiscoveryCache = @{}
 
 $ResourceSafetyBuffer = 0.85
@@ -1685,7 +1688,14 @@ function Connect-IntersightTarget {
         Write-Host "one version, restart PowerShell, and re-run:" -ForegroundColor Yellow
         Write-Host "  Install-Module Intersight.PowerShell -RequiredVersion 1.0.11.17 -Scope CurrentUser -Force" -ForegroundColor Yellow
         Write-Host "Verify in isolation first with scripts/intersight/Test-IntersightApiKey.ps1." -ForegroundColor Yellow
-        Stop-WithMessage "Intersight module cannot parse responses from '$basePath'. Credentials are valid - align the Intersight.PowerShell version with the appliance before re-running."
+
+        # No code change here can make the module parse the response, so the run cannot drive
+        # Intersight. It can still drive the UCS Manager-managed hosts, which are usually the
+        # majority - the caller decides whether losing the change window is worse than deferring
+        # the Intersight subset.
+        $Global:IntersightUnusable = $true
+        $Global:IntersightUnusableReason = "Intersight.PowerShell $installedVersions cannot deserialize responses from $basePath. Credentials are valid."
+        return $null
     }
 
     Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "Failed" -Details $lastError.Exception.Message
@@ -1859,7 +1869,36 @@ function Initialize-IntersightRoutedHosts {
     Write-Host "" -ForegroundColor Cyan
     Write-Host "Validating Intersight access for $($Global:IntersightHostMap.Count) detected host(s) before any host is touched..." -ForegroundColor Cyan
 
-    Connect-IntersightTarget | Out-Null
+    $session = Connect-IntersightTarget
+
+    if ($null -eq $session -and $Global:IntersightUnusable) {
+        # Authentication is fine but the module cannot read the appliance. Nothing in this script
+        # can fix that, and it is caught here - before any host has been touched - so the UCS
+        # Manager side of the cluster can still proceed if the operator wants it to.
+        $affected = @($Global:IntersightHostMap.Keys | Sort-Object)
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Intersight cannot be driven in this session: $Global:IntersightUnusableReason" -ForegroundColor Yellow
+        Write-Host "Affected host(s), all Intersight-managed: $($affected -join ', ')" -ForegroundColor Yellow
+        Write-Host "Nothing has been touched yet. You can either stop and fix the module version, or" -ForegroundColor Yellow
+        Write-Host "exclude these hosts and continue with the UCS Manager-managed hosts only." -ForegroundColor Yellow
+
+        $choice = Read-ChoiceExit `
+            -Message "Choose SKIP to exclude the Intersight-managed hosts and continue with the rest, or STOP" `
+            -AllowedChoices @("SKIP","STOP") `
+            -ExitMessage "Stopped because Intersight is unusable in this session."
+
+        if ($choice -eq "STOP") {
+            Stop-WithMessage "Intersight module cannot parse responses. Credentials are valid - align the Intersight.PowerShell version with the appliance before re-running."
+        }
+
+        foreach ($hostName in $affected) {
+            $Global:IntersightSkippedHosts[$hostName] = $Global:IntersightUnusableReason
+            Add-SummaryRecord -Stage "IntersightMapping" -Batch "" -HostName $hostName -Action "Exclude from run" -Result "Skipped" -Details $Global:IntersightUnusableReason
+        }
+        $Global:IntersightHostMap = @{}
+        Write-Host "Excluded $($affected.Count) Intersight-managed host(s). They will not be batched, entered into Maintenance mode, or rebooted." -ForegroundColor Yellow
+        return
+    }
 
     $rows = New-Object System.Collections.ArrayList
     foreach ($hostName in @($Global:IntersightHostMap.Keys)) {
@@ -2592,6 +2631,17 @@ function Invoke-ClusterUpgradeWorkflow {
     else {
         # ESXi-only mode should skip hosts already on the target ESXi build.
         $patchCandidateHosts = @($allClusterHosts | Where-Object { $_.ConnectionState -eq "Connected" -and ($alreadyTargetHosts.Name -notcontains $_.Name) })
+    }
+
+    # Hosts excluded because Intersight is unusable must not fall through to the UCS Manager path -
+    # they are Intersight-managed and have no service profile in UCSM.
+    if ($Global:IntersightSkippedHosts.Count -gt 0) {
+        $before = $patchCandidateHosts.Count
+        $patchCandidateHosts = @($patchCandidateHosts | Where-Object { -not $Global:IntersightSkippedHosts.ContainsKey($_.Name) })
+        $removed = $before - $patchCandidateHosts.Count
+        if ($removed -gt 0) {
+            Write-Host "Excluded $removed Intersight-managed host(s) from this run: $(($Global:IntersightSkippedHosts.Keys | Sort-Object) -join ', ')" -ForegroundColor Yellow
+        }
     }
 
     if ($patchCandidateHosts.Count -eq 0) {
