@@ -12,6 +12,32 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [16.3.0] — 2026-08-10
+
+#### Added
+
+- `scripts/intersight/Test-IntersightApiKey.ps1` — a standalone, read-only
+  checker for an Intersight API Key ID and `.pem` against an appliance. Works
+  through the causes of the module's catch-all "check that BasePath and API Key
+  identifier are configured correctly" and gives a verdict for each: PowerShell
+  edition, installed module versions, PEM header/footer/BOM/whitespace, key ID
+  segment shape, proxy interception, reachability, clock skew against the
+  appliance's own `Date` header, and finally the authentication itself.
+- PowerShell edition check in the pre-flight. `Intersight.PowerShell` is a
+  binary module built for PowerShell 7 (Core); it can appear installed under
+  Windows PowerShell 5.1 and then fail at the first signed request with an error
+  that blames BasePath and the key.
+- Automatic fallback from `ApiKeyFilePath` to `ApiKeyString`. A byte-order mark
+  or stray leading whitespace in the `.pem` makes the file form fail while the
+  string form succeeds; the run now recovers by itself and says the file needs
+  correcting.
+
+#### Notes
+
+- Clock skew is worth calling out: HTTP signature authentication signs the
+  `Date` header, so a jump host more than a few minutes out of sync is rejected
+  with an error that never mentions time.
+
 ### [16.2.0] — 2026-08-10
 
 #### Added

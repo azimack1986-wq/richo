@@ -25,7 +25,7 @@
     and vice versa. The detection table shows which form produced each match.
 
 .NOTES
-    - Version 16.2.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 16.3.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -67,7 +67,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "16.2.0"
+$ScriptVersion = "16.3.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -343,6 +343,20 @@ function Confirm-RunPrerequisites {
     $powerCli = $moduleReport | Where-Object { $_.Module -eq "VMware.VimAutomation.Core" }
     if ($powerCli.Status -eq "MISSING") {
         Stop-WithMessage "VMware PowerCLI is not installed, and every part of this script depends on it. Install it with: Install-Module VMware.PowerCLI -Scope CurrentUser"
+    }
+
+    # Intersight.PowerShell is a binary module built for PowerShell 7 (Core). It can appear
+    # installed under Windows PowerShell 5.1 and then fail at the first signed request, with an
+    # error that blames BasePath and the API key.
+    $edition = if ($PSVersionTable.ContainsKey('PSEdition')) { [string]$PSVersionTable.PSEdition } else { 'Desktop' }
+    if ($edition -ne 'Core') {
+        Write-Host "This is Windows PowerShell ($edition $($PSVersionTable.PSVersion))." -ForegroundColor Red
+        Write-Host "  Intersight.PowerShell is built for PowerShell 7 (Core). If any host in scope is" -ForegroundColor Red
+        Write-Host "  Intersight-managed, re-run this script in pwsh.exe rather than Windows PowerShell." -ForegroundColor Red
+        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Check PowerShell edition" -Result "Warning" -Details "$edition $($PSVersionTable.PSVersion); Intersight.PowerShell expects Core."
+    }
+    else {
+        Write-Host "PowerShell edition: Core $($PSVersionTable.PSVersion) - correct host for Intersight.PowerShell." -ForegroundColor Green
     }
 
     $intersight = $moduleReport | Where-Object { $_.Module -eq "Intersight.PowerShell" }
@@ -1567,58 +1581,75 @@ function Connect-IntersightTarget {
     $basePath = $Global:IntersightBaseUrl.Trim().TrimEnd('/')
     Write-Host "Configuring Intersight connection: $basePath" -ForegroundColor Cyan
 
-    try {
-        # Intersight.PowerShell has no Connect-* cmdlet - authentication is process-wide
-        # configuration applied by Set-IntersightConfiguration, and every subsequent
-        # Get-Intersight*/Set-Intersight* call signs against it.
-        #
-        # The four signing headers must be exactly these, in this order and capitalisation;
-        # anything else produces "cannot sign http request, request does not contain date header".
-        $signingHeaders = @("(request-target)", "Host", "Date", "Digest")
+    # Intersight.PowerShell has no Connect-* cmdlet - authentication is process-wide configuration
+    # applied by Set-IntersightConfiguration, and every subsequent Get-Intersight*/Set-Intersight*
+    # call signs against it.
+    #
+    # The four signing headers must be exactly these, in this order and capitalisation; anything
+    # else produces "cannot sign http request, request does not contain date header".
+    $signingHeaders = @("(request-target)", "Host", "Date", "Digest")
 
-        $configParams = @{
-            BasePath          = $basePath
-            ApiKeyId          = $Global:IntersightApiKeyId
-            ApiKeyFilePath    = $Global:IntersightApiKeyFilePath
-            HttpSigningHeader = $signingHeaders
-            HashAlgorithm     = "SHA256"
-            ErrorAction       = "Stop"
+    # Two ways of supplying the same key. ApiKeyFilePath is the normal one; passing the contents
+    # as a string bypasses PEM file encoding and whitespace problems - a byte-order mark or stray
+    # leading whitespace makes the file form fail while the string form works.
+    $lastError = $null
+    foreach ($method in @('KeyFile','KeyString')) {
+        try {
+            $configParams = @{
+                BasePath          = $basePath
+                ApiKeyId          = $Global:IntersightApiKeyId
+                HttpSigningHeader = $signingHeaders
+                HashAlgorithm     = "SHA256"
+                ErrorAction       = "Stop"
+            }
+            if ($method -eq 'KeyFile') { $configParams["ApiKeyFilePath"] = $Global:IntersightApiKeyFilePath }
+            else { $configParams["ApiKeyString"] = (Get-Content -Path $Global:IntersightApiKeyFilePath -Raw -ErrorAction Stop) }
+            if ($Global:IntersightSkipCertificateCheck) { $configParams["SkipCertificateCheck"] = $true }
+
+            Set-IntersightConfiguration @configParams | Out-Null
+
+            # Prove the configuration took and that the key actually authenticates, before any
+            # host is routed down the Intersight path.
+            $activeConfig = Get-IntersightConfiguration -ErrorAction Stop
+            if ($null -eq $activeConfig -or [string]::IsNullOrWhiteSpace([string]$activeConfig.BasePath)) {
+                throw "Set-IntersightConfiguration did not take effect - Get-IntersightConfiguration returned no BasePath."
+            }
+
+            [void](Get-IntersightServerProfile -Top 1 -Skip 0 -ErrorAction Stop)
+
+            $Global:IntersightSession = $activeConfig
+            Write-Host "Intersight authenticated against $basePath (key supplied as $method)." -ForegroundColor Green
+            if ($method -eq 'KeyString') {
+                Write-Host "The key file itself was rejected but its contents were accepted - the .pem has an encoding or whitespace problem worth correcting." -ForegroundColor Yellow
+            }
+            Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "Connected" -Details "BasePath=$basePath; Method=$method."
+            return $Global:IntersightSession
         }
-        if ($Global:IntersightSkipCertificateCheck) { $configParams["SkipCertificateCheck"] = $true }
-
-        Set-IntersightConfiguration @configParams | Out-Null
-
-        # Prove the configuration took and that the key actually authenticates, before any
-        # host is routed down the Intersight path.
-        $activeConfig = Get-IntersightConfiguration -ErrorAction Stop
-        if ($null -eq $activeConfig -or [string]::IsNullOrWhiteSpace([string]$activeConfig.BasePath)) {
-            Stop-WithMessage "Set-IntersightConfiguration did not take effect - Get-IntersightConfiguration returned no BasePath."
+        catch {
+            $lastError = $_
+            if ($method -eq 'KeyFile') {
+                Write-Host "Key-file authentication failed. Retrying with the key passed as a string..." -ForegroundColor Yellow
+            }
         }
+    }
 
-        [void](Get-IntersightServerProfile -Top 1 -Skip 0 -ErrorAction Stop)
+    # Both methods failed - report against the last error.
+    Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "Failed" -Details $lastError.Exception.Message
+    Write-Host "`nIntersight login failed against '$basePath': $($lastError.Exception.Message)" -ForegroundColor Red
+    Write-IntersightLoginDiagnostics -BasePath $basePath -ErrorRecord $lastError
 
-        $Global:IntersightSession = $activeConfig
-        Write-Host "Intersight authenticated against $basePath." -ForegroundColor Green
-        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "Connected" -Details "BasePath=$basePath."
-        return $Global:IntersightSession
-    } catch {
-        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "Failed" -Details $_.Exception.Message
-        Write-Host "`nIntersight login failed against '$basePath': $($_.Exception.Message)" -ForegroundColor Red
-        Write-IntersightLoginDiagnostics -BasePath $basePath -ErrorRecord $_
+    if ($Attempt -ge $MaxAttempts) {
+        Stop-WithMessage "Intersight login failed $MaxAttempts times against '$basePath'. Resolve the cause above before re-running."
+    }
 
-        if ($Attempt -ge $MaxAttempts) {
-            Stop-WithMessage "Intersight login failed $MaxAttempts times against '$basePath'. Resolve the cause above before re-running."
-        }
-
-        # Let the operator correct the endpoint or key material and retry without losing the run.
-        $choice = Read-ChoiceExit -Message "Choose RETRY to re-enter the Intersight FQDN, key ID and private key (attempt $Attempt of $MaxAttempts), or EXIT" -AllowedChoices @("RETRY") -ExitMessage "Stopped after Intersight login failure."
-        if ($choice -eq "RETRY") {
-            $Global:IntersightBaseUrlConfirmed = $false
-            $Global:IntersightApiKeyId = ""
-            $Global:IntersightApiKeyFilePath = ""
-            $Global:IntersightSession = $null
-            return (Connect-IntersightTarget -Attempt ($Attempt + 1) -MaxAttempts $MaxAttempts)
-        }
+    # Let the operator correct the endpoint or key material and retry without losing the run.
+    $choice = Read-ChoiceExit -Message "Choose RETRY to re-enter the Intersight FQDN, key ID and private key (attempt $Attempt of $MaxAttempts), or EXIT" -AllowedChoices @("RETRY") -ExitMessage "Stopped after Intersight login failure."
+    if ($choice -eq "RETRY") {
+        $Global:IntersightBaseUrlConfirmed = $false
+        $Global:IntersightApiKeyId = ""
+        $Global:IntersightApiKeyFilePath = ""
+        $Global:IntersightSession = $null
+        return (Connect-IntersightTarget -Attempt ($Attempt + 1) -MaxAttempts $MaxAttempts)
     }
 }
 
