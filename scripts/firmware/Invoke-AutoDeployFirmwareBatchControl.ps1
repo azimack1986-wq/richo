@@ -25,7 +25,7 @@
     and vice versa. The detection table shows which form produced each match.
 
 .NOTES
-    - Version 16.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 16.1.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -67,7 +67,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "16.0.0"
+$ScriptVersion = "16.1.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -162,6 +162,9 @@ function Stop-SafeExit {
 function Stop-WithMessage {
     param([Parameter(Mandatory=$true)][string]$Message)
     Write-Host "`n$Message" -ForegroundColor Red
+    # Same warning Stop-SafeExit gives. A stop can land mid-batch with hosts already evacuated,
+    # and leaving them in Maintenance mode without saying so costs cluster capacity silently.
+    Write-Host "If any host is already in Maintenance mode, exit Maintenance mode in vCenter before leaving the change window." -ForegroundColor Yellow
     Add-SummaryRecord -Stage "Stop" -Batch "" -HostName "" -Action "Stop workflow" -Result "Stopped" -Details $Message
     Export-RunSummary
     throw "STOP_WORKFLOW"
@@ -814,6 +817,12 @@ function Build-InfrastructureHostMapping {
         # A fabric has been detected, so ask for the appliance address now rather than at first
         # API call. Getting the endpoint wrong is cheap to fix here and expensive to fix mid-batch.
         [void](Get-IntersightBaseUrlIfNeeded -DetectedFabricNames @($intersightRoutedRows | Select-Object -ExpandProperty IntersightCsvName))
+
+        # Authenticate and resolve every server profile NOW, while no host has been touched.
+        # Leaving this until the accept/reboot step meant the first Intersight credential prompt
+        # appeared after the batch was already in Maintenance mode and past the safety window, so
+        # a bad key stranded the batch instead of stopping the run harmlessly.
+        Initialize-IntersightRoutedHosts
     }
 
     if ($ucsOnlyHosts.Count -eq 0) {
@@ -1119,11 +1128,175 @@ function Assert-IntersightPowerShellAvailable {
     # Side-by-side module versions are the most common cause of AuthenticationFailure with
     # otherwise correct credentials, and the failure message never points at the real cause.
     $installed = @(Get-Module -ListAvailable -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique)
+    $versionList = ($installed | ForEach-Object { $_.ToString() }) -join ', '
+    Write-Host "Intersight.PowerShell version(s) available: $versionList" -ForegroundColor Cyan
+
     if ($installed.Count -gt 1) {
-        Write-Host "WARNING: $($installed.Count) versions of Intersight.PowerShell are installed: $(($installed | ForEach-Object { $_.ToString() }) -join ', ')." -ForegroundColor Yellow
-        Write-Host "Side-by-side versions are a known cause of AuthenticationFailure even with a valid key. Remove the older versions if the login below fails." -ForegroundColor Yellow
-        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Check module versions" -Result "Warning" -Details "Multiple Intersight.PowerShell versions installed: $(($installed | ForEach-Object { $_.ToString() }) -join ', ')."
+        Write-Host "WARNING: $($installed.Count) versions of Intersight.PowerShell are installed." -ForegroundColor Yellow
+        Write-Host "Side-by-side versions are the most common cause of an authentication failure with an otherwise valid key. Remove the older versions if the login below fails." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Check module versions" -Result "Warning" -Details "Multiple Intersight.PowerShell versions installed: $versionList."
     }
+}
+
+function Get-ExceptionDetail {
+    <#
+    .SYNOPSIS
+        Flattens an exception chain, surfacing any HTTP status and response body.
+
+    .DESCRIPTION
+        Intersight.PowerShell wraps API failures in a generic "check that BasePath and API Key
+        identifier are configured correctly" message. The useful part - the HTTP status code and
+        the response body, which distinguish a signature rejection from a wrong endpoint - is in
+        the inner exception. Reporting only $_.Exception.Message throws that away.
+    #>
+    param([Parameter(Mandatory=$true)]$ErrorRecord)
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $ex = $ErrorRecord.Exception
+    $depth = 0
+
+    while ($null -ne $ex -and $depth -lt 6) {
+        [void]$lines.Add("  [$($ex.GetType().Name)] $($ex.Message)")
+        foreach ($prop in @("StatusCode","ErrorCode","ResponseBody","ErrorContent","Response")) {
+            try {
+                if ($ex.PSObject.Properties.Name -contains $prop -and $null -ne $ex.$prop) {
+                    $value = [string]$ex.$prop
+                    if (-not [string]::IsNullOrWhiteSpace($value) -and $value.Length -lt 2000) {
+                        [void]$lines.Add("      ${prop}: $value")
+                    }
+                }
+            } catch {}
+        }
+        $ex = $ex.InnerException
+        $depth++
+    }
+
+    return ($lines -join [Environment]::NewLine)
+}
+
+function Test-IntersightEndpointReachable {
+    <#
+    .SYNOPSIS
+        Checks the appliance answers HTTPS at all, separately from whether the key is accepted.
+
+    .DESCRIPTION
+        Distinguishes "wrong or unreachable FQDN" from "endpoint fine, key rejected" - the module's
+        error message covers both and names neither. Any HTTP response, including 401/403, proves
+        reachability. Only DNS failure, TLS failure or timeout mean unreachable.
+    #>
+    param([Parameter(Mandatory=$true)][string]$BaseUrl)
+
+    $params = @{
+        Uri             = "$BaseUrl/"
+        Method          = 'Get'
+        TimeoutSec      = 20
+        UseBasicParsing = $true
+        ErrorAction     = 'Stop'
+    }
+
+    $supportsSkip = (Get-Command Invoke-WebRequest).Parameters.ContainsKey('SkipCertificateCheck')
+    if ($supportsSkip -and $Global:IntersightSkipCertificateCheck) { $params['SkipCertificateCheck'] = $true }
+
+    # Windows PowerShell 5.1 has no -SkipCertificateCheck, so the validation callback is relaxed
+    # for this one probe and restored immediately afterwards.
+    $previousCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    try {
+        if (-not $supportsSkip -and $Global:IntersightSkipCertificateCheck) {
+            [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        }
+        $response = Invoke-WebRequest @params
+        return [pscustomobject]@{ Reachable=$true; StatusCode=[int]$response.StatusCode; Detail="HTTP $([int]$response.StatusCode) from $BaseUrl/" }
+    }
+    catch [System.Net.WebException] {
+        $status = $null
+        try { if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode } } catch {}
+        if ($status) { return [pscustomobject]@{ Reachable=$true; StatusCode=$status; Detail="HTTP $status from $BaseUrl/ - endpoint answered." } }
+        return [pscustomobject]@{ Reachable=$false; StatusCode=$null; Detail=$_.Exception.Message }
+    }
+    catch {
+        $status = $null
+        try { if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode } } catch {}
+        if ($status) { return [pscustomobject]@{ Reachable=$true; StatusCode=$status; Detail="HTTP $status from $BaseUrl/ - endpoint answered." } }
+        return [pscustomobject]@{ Reachable=$false; StatusCode=$null; Detail=$_.Exception.Message }
+    }
+    finally {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $previousCallback
+    }
+}
+
+function Write-IntersightLoginDiagnostics {
+    <#
+    .SYNOPSIS
+        Prints everything needed to tell apart the causes of an Intersight login failure.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$BasePath,
+        [Parameter(Mandatory=$true)]$ErrorRecord
+    )
+
+    Write-Host "" -ForegroundColor Yellow
+    Write-Host "--------------------- Intersight login diagnostics ---------------------" -ForegroundColor Yellow
+
+    Write-Host "Full error chain:" -ForegroundColor Yellow
+    Write-Host (Get-ExceptionDetail -ErrorRecord $ErrorRecord) -ForegroundColor Gray
+
+    Write-Host "Endpoint reachability:" -ForegroundColor Yellow
+    $reach = Test-IntersightEndpointReachable -BaseUrl $BasePath
+    if ($reach.Reachable) {
+        Write-Host "  $($reach.Detail)" -ForegroundColor Gray
+        Write-Host "  The appliance is answering, so this is about the key or the signature, not the address." -ForegroundColor Gray
+    }
+    else {
+        Write-Host "  UNREACHABLE: $($reach.Detail)" -ForegroundColor Red
+        Write-Host "  Fix name resolution, routing or the certificate before looking at the API key." -ForegroundColor Red
+    }
+
+    Write-Host "Installed module versions:" -ForegroundColor Yellow
+    $installed = @(Get-Module -ListAvailable -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique)
+    Write-Host "  $((($installed | ForEach-Object { $_.ToString() }) -join ', '))" -ForegroundColor Gray
+    if ($installed.Count -gt 1) {
+        Write-Host "  MORE THAN ONE VERSION INSTALLED - this is the most common cause of this exact failure." -ForegroundColor Red
+        Write-Host "  Remove the older versions, restart PowerShell, and retry." -ForegroundColor Red
+    }
+
+    Write-Host "Active configuration:" -ForegroundColor Yellow
+    try {
+        $cfg = Get-IntersightConfiguration -ErrorAction Stop
+        Write-Host "  BasePath          : $($cfg.BasePath)" -ForegroundColor Gray
+        Write-Host "  ApiKeyId          : $($cfg.ApiKeyId)" -ForegroundColor Gray
+        Write-Host "  ApiKeyFilePath    : $($cfg.ApiKeyFilePath)" -ForegroundColor Gray
+        Write-Host "  HttpSigningHeader : $(($cfg.HttpSigningHeader) -join ', ')" -ForegroundColor Gray
+        Write-Host "  HashAlgorithm     : $($cfg.HashAlgorithm)" -ForegroundColor Gray
+    }
+    catch { Write-Host "  Get-IntersightConfiguration failed: $($_.Exception.Message)" -ForegroundColor Gray }
+
+    Write-Host "API key material:" -ForegroundColor Yellow
+    $segments = @($Global:IntersightApiKeyId -split '/')
+    Write-Host "  Key ID segments   : $($segments.Count) (must be 3)" -ForegroundColor Gray
+    try {
+        $firstLine = (Get-Content -Path $Global:IntersightApiKeyFilePath -TotalCount 1 -ErrorAction Stop)
+        Write-Host "  Private key header: $firstLine" -ForegroundColor Gray
+        if ($firstLine -match 'EC PRIVATE KEY') {
+            Write-Host "  This is an EC key, which Intersight issues for API key v3." -ForegroundColor Gray
+        }
+        elseif ($firstLine -match 'RSA PRIVATE KEY') {
+            Write-Host "  This is an RSA key, which Intersight issues for API key v2." -ForegroundColor Gray
+        }
+        elseif ($firstLine -match 'BEGIN PRIVATE KEY') {
+            Write-Host "  PKCS#8 wrapper. Intersight expects a PEM in EC or RSA form - if the login keeps failing, re-download the secret key rather than converting it." -ForegroundColor Yellow
+        }
+    }
+    catch { Write-Host "  Could not read the private key file: $($_.Exception.Message)" -ForegroundColor Gray }
+
+    Write-Host "" -ForegroundColor Yellow
+    Write-Host "Most likely causes, in order:" -ForegroundColor Yellow
+    Write-Host "  1. More than one Intersight.PowerShell version installed." -ForegroundColor Yellow
+    Write-Host "  2. Key ID and .pem are not a matched pair - they are only valid together, and the" -ForegroundColor Yellow
+    Write-Host "     secret is downloadable only at creation. Generate a fresh key pair and retry." -ForegroundColor Yellow
+    Write-Host "  3. The API key was created on a different appliance or account than $BasePath." -ForegroundColor Yellow
+    Write-Host "  4. The key has been deleted or disabled in Settings > API Keys." -ForegroundColor Yellow
+    Write-Host "  5. $BasePath is reachable but is not an Intersight PVA appliance." -ForegroundColor Yellow
+    Write-Host "------------------------------------------------------------------------" -ForegroundColor Yellow
 }
 
 function ConvertTo-IntersightBaseUrl {
@@ -1297,6 +1470,9 @@ function Get-IntersightCredentialIfNeeded {
 }
 
 function Connect-IntersightTarget {
+    # RETRY re-enters this function; bounded so repeated failures end in a clean stop.
+    param([int]$Attempt = 1, [int]$MaxAttempts = 3)
+
     if ($null -ne $Global:IntersightSession) { return $Global:IntersightSession }
     Assert-IntersightPowerShellAvailable
 
@@ -1344,7 +1520,22 @@ function Connect-IntersightTarget {
         return $Global:IntersightSession
     } catch {
         Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "Failed" -Details $_.Exception.Message
-        Stop-WithMessage "Intersight login failed against '$basePath': $($_.Exception.Message)`nCheck: single Intersight.PowerShell version installed, three-segment API Key ID, matching .pem secret key, BasePath without /api/v1 or trailing slash."
+        Write-Host "`nIntersight login failed against '$basePath': $($_.Exception.Message)" -ForegroundColor Red
+        Write-IntersightLoginDiagnostics -BasePath $basePath -ErrorRecord $_
+
+        if ($Attempt -ge $MaxAttempts) {
+            Stop-WithMessage "Intersight login failed $MaxAttempts times against '$basePath'. Resolve the cause above before re-running."
+        }
+
+        # Let the operator correct the endpoint or key material and retry without losing the run.
+        $choice = Read-ChoiceExit -Message "Choose RETRY to re-enter the Intersight FQDN, key ID and private key (attempt $Attempt of $MaxAttempts), or EXIT" -AllowedChoices @("RETRY") -ExitMessage "Stopped after Intersight login failure."
+        if ($choice -eq "RETRY") {
+            $Global:IntersightBaseUrlConfirmed = $false
+            $Global:IntersightApiKeyId = ""
+            $Global:IntersightApiKeyFilePath = ""
+            $Global:IntersightSession = $null
+            return (Connect-IntersightTarget -Attempt ($Attempt + 1) -MaxAttempts $MaxAttempts)
+        }
     }
 }
 
@@ -1478,6 +1669,50 @@ function Get-IntersightCsvRowIdentity {
         }
     }
     return ""
+}
+
+function Initialize-IntersightRoutedHosts {
+    <#
+    .SYNOPSIS
+        Proves Intersight authentication and server profile resolution before any host is touched.
+
+    .DESCRIPTION
+        Runs during infrastructure detection, alongside the UCS Manager login that already happens
+        there. Authenticates once, resolves the server profile for every Intersight-routed host,
+        and prints the mapping.
+
+        This is deliberately eager. Resolving lazily at the accept/reboot step put the first
+        credential prompt after the batch had entered Maintenance mode and passed the pre-reboot
+        safety window - so a wrong key or unreachable appliance left hosts stranded in Maintenance
+        mode rather than failing before any disruption.
+    #>
+    if ($Global:IntersightHostMap.Count -eq 0) { return }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Validating Intersight access for $($Global:IntersightHostMap.Count) detected host(s) before any host is touched..." -ForegroundColor Cyan
+
+    Connect-IntersightTarget | Out-Null
+
+    $rows = New-Object System.Collections.ArrayList
+    foreach ($hostName in @($Global:IntersightHostMap.Keys)) {
+        $map = $Global:IntersightHostMap[$hostName]
+        $sp = Resolve-IntersightServerProfileForHost -HostName $hostName -IntersightCsvRow $map.IntersightCsvRow
+        [void]$rows.Add([pscustomobject]@{
+            Host          = $hostName
+            ServerProfile = $sp.Name
+            ProfileMoid   = $sp.Moid
+            ConfigState   = (Get-IntersightProfileComplianceStateSafe -ServerProfile $sp)
+        })
+    }
+
+    Write-Host "Intersight server profile mapping:" -ForegroundColor Cyan
+    $rows | Format-Table -AutoSize
+    Add-SummaryRecord -Stage "IntersightMapping" -Batch "" -HostName "" -Action "Resolve server profiles" -Result "Completed" -Details "$($rows.Count) host(s) resolved and Intersight authenticated before any batch work."
+}
+
+function Get-IntersightProfileComplianceStateSafe {
+    param([Parameter(Mandatory=$true)]$ServerProfile)
+    try { return (Get-IntersightProfileInconsistencyState -ServerProfile $ServerProfile).ConfigState } catch { return "UNKNOWN" }
 }
 
 function Resolve-IntersightCsvMatch {

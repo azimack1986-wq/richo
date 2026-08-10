@@ -12,6 +12,38 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [16.1.0] — 2026-08-10
+
+Found during the first live run against a PVA appliance.
+
+#### Fixed
+
+- **Intersight credentials were requested too late.** The API Key ID and `.pem`
+  prompt lived in `Get-IntersightCredentialIfNeeded`, reached only from the
+  accept/reboot step *inside* a batch. In practice the first prompt appeared
+  after the batch had entered Maintenance mode and passed the pre-reboot safety
+  window, so a wrong key or unreachable appliance stranded the batch with hosts
+  evacuated instead of stopping the run before any disruption. Authentication
+  and server profile resolution for every Intersight-routed host now happen
+  during infrastructure detection, alongside the UCS Manager login that was
+  already there.
+- **`Stop-WithMessage` did not warn about Maintenance mode.** `Stop-SafeExit`
+  did. A stop landing mid-batch left hosts evacuated without saying so.
+
+#### Added
+
+- Intersight login failure diagnostics. The module reports every API failure as
+  a generic "check that BasePath and API Key identifier are configured
+  correctly", which names neither the real cause nor the useful detail. On
+  failure the script now reports: the full inner exception chain including HTTP
+  status and response body; whether the appliance answers HTTPS at all
+  (separating a wrong or unreachable FQDN from a rejected key); all installed
+  `Intersight.PowerShell` versions; the active `Get-IntersightConfiguration`;
+  the key ID segment count; and the private key type from its PEM header.
+- RETRY on Intersight login failure, re-prompting for FQDN, key ID and private
+  key without losing the run. Bounded to three attempts.
+- Installed module versions are always printed, not only when several are found.
+
 ### [16.0.0] — 2026-08-10
 
 Reviewed and reworked from the supplied v15. Breaking changes to the operator
