@@ -10,7 +10,7 @@
 
     No management platform is assumed up front. CDP/LLDP is the single identity source for every host,
     and supporting infrastructure is detected per host, before any UCSM or Intersight login: each host's
-    normalised CDP/LLDP system name is checked against the Name column in $IntersightCsvPath (default
+    CDP/LLDP system name is checked against the Name column in $IntersightCsvPath (default
     C:\temp\intersightfabric.csv). A match detects that host as Intersight-managed: the script finds the
     server profile, checks for the "Inconsistent" state caused by a firmware policy update, accepts it
     (including the compulsory disruption tick box), and reboots the blade immediately - scoped to the
@@ -18,17 +18,29 @@
     as UCS Manager-managed and falls through to the existing UCS Manager (classic) logic unchanged. UCS
     PowerTool is only required/loaded if at least one host in the cluster is detected as UCS-managed.
 
+    CSV name matching is form-independent. The Fabrics export and the CDP/LLDP system name may each
+    carry a -A or -B fabric suffix or none at all, and may each be an FQDN or a short name. Every CSV
+    row is indexed under all eight equivalent forms of its Name, and each CDP name is tested against the
+    same set, so a row named PD24000001SS101-A matches a host reporting PD24000001SS101-B.dpe.example
+    and vice versa. The detection table shows which form produced each match.
+
 .NOTES
     - Credentials/API keys are kept in memory only.
     - Intersight only supports API-key + HTTP-signature auth, not username/password - see the
       $Global:IntersightApiKeyId / $Global:IntersightApiKeyFilePath notes in User Settings.
+      Authentication is applied with Set-IntersightConfiguration; Intersight.PowerShell has no
+      Connect-*/Disconnect-* cmdlet pair. $Global:IntersightBaseUrl is the appliance root only, with
+      no /api/v1 suffix and no trailing slash.
     - DRYRUN is the default.
     - UCSM acknowledgement and Intersight accept/reboot are each scoped to their own batch hosts only.
     - The Intersight accept + reboot-immediately step has no interactive confirmation gate by design
       (it runs whenever DRYRUN/STAGE_NO_ACK are not active) - the pre-reboot safety window still covers
       the whole batch. Consider that against the typed ACK-BATCH-N gate still used on the UCSM side.
-    - Validate Cisco UCS PowerTool cmdlet names, and Intersight.PowerShell cmdlet/parameter names
-      (marked TODO-VALIDATE), in your installed module versions before LIVE RUN.
+    - Batch sizing is by host count only. The CPU, memory and datastore headroom settings in User
+      Settings are NOT enforced - see Get-ClusterSafeBatchSizeStrict.
+    - Validate Cisco UCS PowerTool cmdlet names in your installed module version before LIVE RUN. The
+      Intersight accept/reboot parameter surface is checked at run time by
+      Assert-IntersightUpgradeCmdletSurface, which stops the run rather than guessing if it differs.
 #>
 
 # -----------------------------
@@ -47,7 +59,10 @@ $TargetUcsFirmwarePolicyName = ""
 # Expected CSV columns: Name (the Intersight Fabrics export column matched against CDP/LLDP system
 # name), ServerProfileName (optional - defaults to Name if omitted), Moid (optional, speeds up lookup).
 $IntersightCsvPath = "C:\temp\intersightfabric.csv"
-$Global:IntersightBaseUrl = "https://intersight.com/api/v1"   # override for a PVA appliance, e.g. https://<pva-fqdn>/api/v1
+# BasePath is the appliance root only - no /api/v1 suffix and no trailing slash. The module
+# appends the API path itself, and a trailing slash breaks HTTP signature validation.
+$Global:IntersightBaseUrl = "https://intersight.com"           # PVA example: https://<pva-fqdn>
+$Global:IntersightSkipCertificateCheck = $true                 # required for PVA on-prem; harmless for SaaS
 # NOTE: Intersight's API only supports API-key + HTTP-signature auth (key ID + private key file) -
 # there is no username/password endpoint. Get-IntersightCredentialIfNeeded below still prompts
 # interactively and holds the material in memory only, matching the hardened UCSM pattern, but what
@@ -57,6 +72,9 @@ $Global:IntersightApiKeyFilePath = ""
 $Global:IntersightSession = $null
 $Global:IntersightServerList = @{}
 $Global:IntersightHostMap = @{}
+$Global:IntersightProfileCache = @{}
+$Global:IntersightUpgradeSurfaceChecked = $false
+$Global:EsxiDiscoveryCache = @{}
 
 $ResourceSafetyBuffer = 0.85
 $MinimumCpuHeadroomPercentAfterBatch = 10
@@ -80,6 +98,7 @@ $Global:UcsCredential = $null
 $Global:UcsSessions = @{}
 $Global:UcsHostMap = @{}
 $Global:UcsCandidateCache = @{}
+$Global:UcsServiceProfileCache = @{}
 $Global:ReconnectCredential = $null
 $Global:PromptForReconnectPasswordWhenNeeded = $false
 $Global:AutoExitMaintenanceMode = $true
@@ -144,6 +163,25 @@ function Read-YesNoExit {
 function Test-DryRun { return ($Global:RunMode -eq "DRYRUN") }
 function Test-StageNoAck { return ($Global:RunMode -eq "STAGE_NO_ACK") }
 
+function Read-PendingConsoleKey {
+    <#
+    .SYNOPSIS
+        Returns the pending keypress as an upper-case string, or "" if none is waiting.
+
+    .DESCRIPTION
+        [Console]::KeyAvailable throws when the host has no interactive console - a redirected
+        stdin, the ISE, or a scheduled task. Left unguarded that turns a timed wait into an
+        unhandled error mid-change. Here it degrades to "no key pressed", so the wait simply
+        runs to its timeout.
+    #>
+    try {
+        if ([Console]::KeyAvailable) {
+            return [Console]::ReadKey($true).KeyChar.ToString().ToUpper()
+        }
+    } catch {}
+    return ""
+}
+
 # -----------------------------
 # Hardened UCSM login and discovery
 # -----------------------------
@@ -180,9 +218,11 @@ function Clear-ExistingUcsSessions {
     }
     catch {}
 
-    # Reset script-local UCS session caches after UCS cleanup.
+    # Reset script-local UCS session caches after UCS cleanup. The service profile cache is keyed
+    # by UCSM target and is only valid for a live session, so it goes with them.
     $Global:UcsSessions = @{}
     $Global:UcsCandidateCache = @{}
+    $Global:UcsServiceProfileCache = @{}
 
     try {
         $remainingSessions = @(Get-UcsPSSession -ErrorAction SilentlyContinue)
@@ -306,7 +346,17 @@ function Connect-UcsCached {
         Write-Host "Connected to UCSM: $target" -ForegroundColor Green
         return $session
     } catch {
-        Write-Host "Credential-based UCSM login failed for '$target': $($_.Exception.Message)" -ForegroundColor Yellow
+        $failureMessage = $_.Exception.Message
+        Write-Host "Credential-based UCSM login failed for '$target': $failureMessage" -ForegroundColor Yellow
+
+        # A wrong password would otherwise stay cached for the rest of the run and fail every
+        # remaining UCSM domain in turn. Drop it so the next attempt prompts again. Connectivity
+        # and name-resolution failures leave the credential alone.
+        if ($failureMessage -match 'auth|credential|password|denied|unauthori[sz]ed|login') {
+            $Global:UcsCredential = $null
+            Write-Host "Cached UCSM credential discarded - you will be prompted again on the next attempt." -ForegroundColor Yellow
+        }
+
         Write-Host "Because manual 'Connect-Ucs '$target'' works in your environment, you can try an interactive UCS login now." -ForegroundColor Yellow
         $choice = Read-ChoiceExit -Message "Try interactive Connect-Ucs '$target'?" -AllowedChoices @("YES","NO") -ExitMessage "Stopped during UCSM login."
         if ($choice -eq "YES") {
@@ -355,12 +405,37 @@ function Get-EsxiDiscoveryProtocolInfo {
     return @($results)
 }
 
-function Resolve-UcsTargetForHost {
+function Get-EsxiPreferredDiscovery {
+    <#
+    .SYNOPSIS
+        Returns the preferred CDP/LLDP row for a host, querying vCenter at most once per host.
+
+    .DESCRIPTION
+        QueryNetworkHint is issued per physical NIC and is the slowest step in the whole
+        discovery phase. The infrastructure detection pass and the UCSM mapping pass both
+        need the same answer, so the result is cached per host for the life of the run.
+        Returns $null when the host reports no usable CDP/LLDP neighbour.
+    #>
     param([Parameter(Mandatory=$true)]$VMHostObject)
+
+    if ($Global:EsxiDiscoveryCache.ContainsKey($VMHostObject.Name)) {
+        return $Global:EsxiDiscoveryCache[$VMHostObject.Name]
+    }
 
     $discovery = @(Get-EsxiDiscoveryProtocolInfo -VMHostObject $VMHostObject)
     $preferred = @($discovery | Where-Object { $_.Vmnic -in @("vmnic0","vmnic1","vmnic2","vmnic3") } | Sort-Object Vmnic | Select-Object -First 1)
     if ($preferred.Count -eq 0 -and $discovery.Count -gt 0) { $preferred = @($discovery | Select-Object -First 1) }
+
+    $result = if ($preferred.Count -gt 0) { $preferred[0] } else { $null }
+    $Global:EsxiDiscoveryCache[$VMHostObject.Name] = $result
+    return $result
+}
+
+function Resolve-UcsTargetForHost {
+    param([Parameter(Mandatory=$true)]$VMHostObject)
+
+    $preferredRow = Get-EsxiPreferredDiscovery -VMHostObject $VMHostObject
+    $preferred = @($preferredRow | Where-Object { $null -ne $_ })
 
     if ($preferred.Count -gt 0) {
         $systemName = $preferred[0].SystemName
@@ -396,7 +471,14 @@ function Resolve-UcsServiceProfileForHost {
     try {
         $sp = Get-UcsServiceProfile -Ucs $ucsSession -Name $short -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -ne $sp) { return $sp }
-        $sp = Get-UcsServiceProfile -Ucs $ucsSession -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $short -or $_.Dn -like "*/ls-$short" -or $_.Dn -like "*/$short" } | Select-Object -First 1
+
+        # Fallback scan over every service profile in the domain. Enumerated once per UCSM target
+        # and reused, rather than re-fetched for each host in the cluster.
+        if (-not $Global:UcsServiceProfileCache.ContainsKey($UcsTarget)) {
+            Write-Host "Enumerating all service profiles in '$UcsTarget' for fallback matching..." -ForegroundColor Cyan
+            $Global:UcsServiceProfileCache[$UcsTarget] = @(Get-UcsServiceProfile -Ucs $ucsSession -ErrorAction SilentlyContinue)
+        }
+        $sp = $Global:UcsServiceProfileCache[$UcsTarget] | Where-Object { $_.Name -eq $short -or $_.Dn -like "*/ls-$short" -or $_.Dn -like "*/$short" } | Select-Object -First 1
         if ($null -ne $sp) { return $sp }
     } catch { Write-Host "Service profile lookup failed for '$HostName': $($_.Exception.Message)" -ForegroundColor Yellow }
     $manualSp = Read-Host "Enter UCS service profile name or DN manually for host $HostName, or type EXIT"
@@ -556,22 +638,21 @@ function Build-InfrastructureHostMapping {
 
     $intersightRoutedRows = New-Object System.Collections.ArrayList
     foreach ($hostObj in $Hosts) {
-        $discovery = @(Get-EsxiDiscoveryProtocolInfo -VMHostObject $hostObj)
-        $preferred = @($discovery | Where-Object { $_.Vmnic -in @("vmnic0","vmnic1","vmnic2","vmnic3") } | Sort-Object Vmnic | Select-Object -First 1)
-        if ($preferred.Count -eq 0 -and $discovery.Count -gt 0) { $preferred = @($discovery | Select-Object -First 1) }
-        $systemName = if ($preferred.Count -gt 0) { $preferred[0].SystemName } else { "" }
+        $preferred = Get-EsxiPreferredDiscovery -VMHostObject $hostObj
+        $systemName = if ($null -ne $preferred) { $preferred.SystemName } else { "" }
+        $match = Resolve-IntersightCsvMatch -CdpSystemName $systemName
 
-        if (-not [string]::IsNullOrWhiteSpace($systemName) -and (Test-HostInIntersightList -CdpSystemName $systemName)) {
-            $key = Convert-FiSystemNameToUcsCandidate -SystemName $systemName
-            $csvRow = $Global:IntersightServerList[$key]
+        if ($null -ne $match) {
+            $csvRow = $match.Row
             $Global:IntersightHostMap[$hostObj.Name] = [pscustomobject]@{
                 Host            = $hostObj.Name
-                Vmnic           = $preferred[0].Vmnic
+                Vmnic           = $preferred.Vmnic
                 CdpSystemName   = $systemName
                 IntersightCsvRow = $csvRow
+                MatchedKey      = $match.MatchedKey
                 HostObject      = $hostObj
             }
-            [void]$intersightRoutedRows.Add([pscustomobject]@{ Host=$hostObj.Name; CdpSystemName=$systemName; IntersightCsvName=$csvRow.Name; Infrastructure="Intersight" })
+            [void]$intersightRoutedRows.Add([pscustomobject]@{ Host=$hostObj.Name; CdpSystemName=$systemName; MatchedOn=$match.MatchedKey; IntersightCsvName=$csvRow.Name; Infrastructure="Intersight" })
         }
         else {
             [void]$ucsOnlyHosts.Add($hostObj)
@@ -579,10 +660,10 @@ function Build-InfrastructureHostMapping {
     }
 
     if ($intersightRoutedRows.Count -gt 0) {
-        Write-Host "Detected as Intersight-managed (CDP/LLDP name matched the Name column in $IntersightCsvPath):" -ForegroundColor Green
+        Write-Host "Detected as Intersight-managed (CDP/LLDP name matched the Name column in $IntersightCsvPath, allowing for -A, -B and suffix-less forms):" -ForegroundColor Green
         $intersightRoutedRows | Format-Table -AutoSize
         foreach ($row in $intersightRoutedRows) {
-            Add-SummaryRecord -Stage "InfrastructureDetection" -Batch "" -HostName $row.Host -Action "Detect infrastructure" -Result "Intersight" -Details "CdpSystemName=$($row.CdpSystemName)."
+            Add-SummaryRecord -Stage "InfrastructureDetection" -Batch "" -HostName $row.Host -Action "Detect infrastructure" -Result "Intersight" -Details "CdpSystemName=$($row.CdpSystemName); MatchedOn=$($row.MatchedOn); CsvName=$($row.IntersightCsvName)."
         }
     }
 
@@ -605,16 +686,15 @@ function Build-InfrastructureHostMapping {
     $discoveryRows = New-Object System.Collections.ArrayList
 
     foreach ($hostObj in $ucsOnlyHosts) {
-        $discovery = @(Get-EsxiDiscoveryProtocolInfo -VMHostObject $hostObj)
-        $preferred = @($discovery | Where-Object { $_.Vmnic -in @("vmnic0","vmnic1","vmnic2","vmnic3") } | Sort-Object Vmnic | Select-Object -First 1)
-        if ($preferred.Count -eq 0 -and $discovery.Count -gt 0) { $preferred = @($discovery | Select-Object -First 1) }
+        # Cached from the detection pass above - no second QueryNetworkHint round trip.
+        $preferred = Get-EsxiPreferredDiscovery -VMHostObject $hostObj
 
-        if ($preferred.Count -gt 0) {
-            $systemName = $preferred[0].SystemName
+        if ($null -ne $preferred) {
+            $systemName = $preferred.SystemName
             $candidate = (Get-UcsCandidateListFromSystemName -SystemName $systemName | Select-Object -First 1)
             [void]$discoveryRows.Add([pscustomobject]@{
                 Host          = $hostObj.Name
-                Vmnic         = $preferred[0].Vmnic
+                Vmnic         = $preferred.Vmnic
                 CdpSystemName = $systemName
                 UcsTarget     = $candidate
                 Discovery     = "AUTO_DISCOVERED"
@@ -730,7 +810,14 @@ function Build-InfrastructureHostMapping {
 }
 
 function Set-UcsFirmwarePolicyForBatch {
-    param([Parameter(Mandatory=$true)][array]$HostNames,[Parameter(Mandatory=$true)][string]$BatchNumber)
+    param(
+        [Parameter(Mandatory=$true)][array]$HostNames,
+        [Parameter(Mandatory=$true)][string]$BatchNumber,
+        # RECHECK re-enters this function. Bounded so a policy that never converges ends in a
+        # clean stop instead of recursing until the call stack gives out.
+        [int]$Attempt = 1,
+        [int]$MaxAttempts = 5
+    )
 
     $rows = foreach ($hostName in $HostNames) { $Global:UcsHostMap[$hostName] }
 
@@ -807,9 +894,12 @@ function Set-UcsFirmwarePolicyForBatch {
         Write-Host "WARNING: One or more service profiles did not verify with the requested target policy after the set command." -ForegroundColor Yellow
         $failedVerification | Select-Object Host,ServiceProfileDn,BeforePolicy,RequestedPolicy,AfterPolicy,Result | Format-Table -AutoSize
         if (-not (Test-StageNoAck)) {
-            $choice = Read-ChoiceExit -Message "Firmware policy verification failed for one or more hosts. Choose RECHECK or STOP" -AllowedChoices @("RECHECK","STOP")
+            if ($Attempt -ge $MaxAttempts) {
+                Stop-WithMessage "Firmware policy verification still failing after $MaxAttempts attempts for Batch $BatchNumber. Resolve in UCSM before continuing."
+            }
+            $choice = Read-ChoiceExit -Message "Firmware policy verification failed for one or more hosts (attempt $Attempt of $MaxAttempts). Choose RECHECK or STOP" -AllowedChoices @("RECHECK","STOP")
             if ($choice -eq "STOP") { Stop-WithMessage "Firmware policy verification failed after set command." }
-            if ($choice -eq "RECHECK") { return Set-UcsFirmwarePolicyForBatch -HostNames $HostNames -BatchNumber $BatchNumber }
+            if ($choice -eq "RECHECK") { return Set-UcsFirmwarePolicyForBatch -HostNames $HostNames -BatchNumber $BatchNumber -Attempt ($Attempt + 1) -MaxAttempts $MaxAttempts }
         }
     }
 }
@@ -817,11 +907,24 @@ function Set-UcsFirmwarePolicyForBatch {
 function Get-UcsPendingRebootObjectsForBatch {
     param([Parameter(Mandatory=$true)][array]$HostNames)
     $pendingRows = New-Object System.Collections.ArrayList
+
+    # Pending-ack objects are fetched once per UCSM domain for the whole batch instead of once per
+    # host. The cache is local to this call so each batch still reads current state.
+    $ackCache = @{}
+
     foreach ($hostName in $HostNames) {
         $map = $Global:UcsHostMap[$hostName]
         $ucsSession = Get-UcsSessionForTarget -UcsTarget $map.UcsTarget
-        $ackObject = $null
-        try { $ackObject = Get-UcsLsmaintAck -Ucs $ucsSession -ErrorAction SilentlyContinue | Where-Object { $_.Dn -like "$($map.ServiceProfileDn)/*" -or $_.Dn -eq "$($map.ServiceProfileDn)/ack" } | Select-Object -First 1 } catch {}
+
+        if (-not $ackCache.ContainsKey($map.UcsTarget)) {
+            $ackCache[$map.UcsTarget] = @()
+            try { $ackCache[$map.UcsTarget] = @(Get-UcsLsmaintAck -Ucs $ucsSession -ErrorAction SilentlyContinue) } catch {}
+        }
+
+        $ackObject = $ackCache[$map.UcsTarget] |
+            Where-Object { $_.Dn -like "$($map.ServiceProfileDn)/*" -or $_.Dn -eq "$($map.ServiceProfileDn)/ack" } |
+            Select-Object -First 1
+
         [void]$pendingRows.Add([pscustomobject]@{ Host=$hostName; UcsTarget=$map.UcsTarget; ServiceProfileDn=$map.ServiceProfileDn; PendingAckFound=($null -ne $ackObject); AckDn=if($ackObject){$ackObject.Dn}else{""}; AckObject=$ackObject })
     }
     return @($pendingRows)
@@ -856,10 +959,55 @@ function Invoke-UcsPendingAckForBatch {
 # -----------------------------
 
 function Assert-IntersightPowerShellAvailable {
-    if ($null -eq (Get-Command -Name Connect-IntersightApi -ErrorAction SilentlyContinue) -and
-        $null -eq (Get-Command -Name Get-IntersightServerProfile -ErrorAction SilentlyContinue)) {
-        Stop-WithMessage "Intersight.PowerShell module was not found (Connect-IntersightApi / Get-IntersightServerProfile). Import Intersight.PowerShell before running against hosts mapped to Intersight."
+    foreach ($cmdletName in @("Set-IntersightConfiguration","Get-IntersightServerProfile")) {
+        if ($null -eq (Get-Command -Name $cmdletName -ErrorAction SilentlyContinue)) {
+            Stop-WithMessage "Intersight.PowerShell module was not found ($cmdletName is missing). Import Intersight.PowerShell before running against hosts mapped to Intersight."
+        }
     }
+
+    # Side-by-side module versions are the most common cause of AuthenticationFailure with
+    # otherwise correct credentials, and the failure message never points at the real cause.
+    $installed = @(Get-Module -ListAvailable -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique)
+    if ($installed.Count -gt 1) {
+        Write-Host "WARNING: $($installed.Count) versions of Intersight.PowerShell are installed: $(($installed | ForEach-Object { $_.ToString() }) -join ', ')." -ForegroundColor Yellow
+        Write-Host "Side-by-side versions are a known cause of AuthenticationFailure even with a valid key. Remove the older versions if the login below fails." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Check module versions" -Result "Warning" -Details "Multiple Intersight.PowerShell versions installed: $(($installed | ForEach-Object { $_.ToString() }) -join ', ')."
+    }
+}
+
+function Assert-IntersightUpgradeCmdletSurface {
+    <#
+    .SYNOPSIS
+        Confirms the accept + reboot-immediately call exists with the parameters this script passes.
+
+    .DESCRIPTION
+        The firmware upgrade parameter surface moves between Intersight.PowerShell releases. This
+        checks it once, before the first blade in the run is touched, so a mismatch surfaces as a
+        clean stop rather than as a half-completed batch.
+
+        Deliberately does not fall back to Set-IntersightServerProfile -Action Deploy. Deploy pushes
+        the pending profile configuration but is not the same operation as accepting the disruption
+        and rebooting immediately, and silently substituting one disruptive action for another is
+        not a decision this script should make on its own.
+    #>
+    if ($Global:IntersightUpgradeSurfaceChecked) { return }
+
+    $missing = New-Object System.Collections.Generic.List[string]
+    foreach ($cmdletName in @("New-IntersightFirmwareUpgrade","Initialize-IntersightMoMoRef")) {
+        if ($null -eq (Get-Command -Name $cmdletName -ErrorAction SilentlyContinue)) { [void]$missing.Add($cmdletName) }
+    }
+    if ($missing.Count -gt 0) {
+        Stop-WithMessage "Intersight accept/reboot requires $($missing -join ' and '), which the installed Intersight.PowerShell version does not provide. Confirm the correct call for your version with 'Get-Command -Module Intersight.PowerShell -Noun Intersight*Upgrade*' and update this script before a LIVE RUN."
+    }
+
+    $upgradeCmd = Get-Command -Name New-IntersightFirmwareUpgrade
+    $missingParams = @("Server","RebootImmediately","DisruptionAcknowledged") | Where-Object { -not $upgradeCmd.Parameters.ContainsKey($_) }
+    if ($missingParams.Count -gt 0) {
+        Stop-WithMessage "New-IntersightFirmwareUpgrade in the installed Intersight.PowerShell version does not accept: $($missingParams -join ', '). Run 'Get-Help New-IntersightFirmwareUpgrade -Full' and update this script's accept/reboot call before a LIVE RUN."
+    }
+
+    $Global:IntersightUpgradeSurfaceChecked = $true
+    Write-Host "Intersight accept/reboot cmdlet surface validated (New-IntersightFirmwareUpgrade)." -ForegroundColor Green
 }
 
 function Get-IntersightCredentialIfNeeded {
@@ -873,21 +1021,127 @@ function Get-IntersightCredentialIfNeeded {
     if (-not (Test-Path -Path $Global:IntersightApiKeyFilePath)) {
         Stop-WithMessage "Intersight private key file not found at '$Global:IntersightApiKeyFilePath'."
     }
+
+    # Catch the two malformed-credential cases here rather than as an opaque
+    # iam_api_key_is_invalid several calls later.
+    if (($Global:IntersightApiKeyId -split '/').Count -ne 3) {
+        Stop-WithMessage "Intersight API Key ID must be three segments separated by '/' (aaa/bbb/ccc). Got '$Global:IntersightApiKeyId'."
+    }
+    $firstKeyLine = (Get-Content -Path $Global:IntersightApiKeyFilePath -TotalCount 1 -ErrorAction SilentlyContinue)
+    if ($firstKeyLine -notmatch '^-----BEGIN .*PRIVATE KEY-----') {
+        Stop-WithMessage "Intersight private key file '$Global:IntersightApiKeyFilePath' does not start with a PEM private key header. Re-download the secret key that was generated with this Key ID."
+    }
 }
 
 function Connect-IntersightTarget {
     if ($null -ne $Global:IntersightSession) { return $Global:IntersightSession }
     Assert-IntersightPowerShellAvailable
     Get-IntersightCredentialIfNeeded
-    Write-Host "Connecting to Intersight: $Global:IntersightBaseUrl" -ForegroundColor Cyan
+
+    $basePath = $Global:IntersightBaseUrl.Trim().TrimEnd('/')
+    Write-Host "Configuring Intersight connection: $basePath" -ForegroundColor Cyan
+
     try {
-        # TODO-VALIDATE: confirm exact parameter names for your installed Intersight.PowerShell version.
-        $Global:IntersightSession = Connect-IntersightApi -BasePath $Global:IntersightBaseUrl -ApiKeyId $Global:IntersightApiKeyId -ApiKeyFilePath $Global:IntersightApiKeyFilePath -ErrorAction Stop
-        Write-Host "Connected to Intersight." -ForegroundColor Green
+        # Intersight.PowerShell has no Connect-* cmdlet - authentication is process-wide
+        # configuration applied by Set-IntersightConfiguration, and every subsequent
+        # Get-Intersight*/Set-Intersight* call signs against it.
+        #
+        # The four signing headers must be exactly these, in this order and capitalisation;
+        # anything else produces "cannot sign http request, request does not contain date header".
+        $signingHeaders = @("(request-target)", "Host", "Date", "Digest")
+
+        $configParams = @{
+            BasePath          = $basePath
+            ApiKeyId          = $Global:IntersightApiKeyId
+            ApiKeyFilePath    = $Global:IntersightApiKeyFilePath
+            HttpSigningHeader = $signingHeaders
+            HashAlgorithm     = "SHA256"
+            ErrorAction       = "Stop"
+        }
+        if ($Global:IntersightSkipCertificateCheck) { $configParams["SkipCertificateCheck"] = $true }
+
+        Set-IntersightConfiguration @configParams | Out-Null
+
+        # Prove the configuration took and that the key actually authenticates, before any
+        # host is routed down the Intersight path.
+        $activeConfig = Get-IntersightConfiguration -ErrorAction Stop
+        if ($null -eq $activeConfig -or [string]::IsNullOrWhiteSpace([string]$activeConfig.BasePath)) {
+            Stop-WithMessage "Set-IntersightConfiguration did not take effect - Get-IntersightConfiguration returned no BasePath."
+        }
+
+        [void](Get-IntersightServerProfile -Top 1 -Skip 0 -ErrorAction Stop)
+
+        $Global:IntersightSession = $activeConfig
+        Write-Host "Intersight authenticated against $basePath." -ForegroundColor Green
+        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "Connected" -Details "BasePath=$basePath."
         return $Global:IntersightSession
     } catch {
-        Stop-WithMessage "Intersight login failed: $($_.Exception.Message)"
+        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "Failed" -Details $_.Exception.Message
+        Stop-WithMessage "Intersight login failed against '$basePath': $($_.Exception.Message)`nCheck: single Intersight.PowerShell version installed, three-segment API Key ID, matching .pem secret key, BasePath without /api/v1 or trailing slash."
     }
+}
+
+function Get-IntersightMatchKeyList {
+    <#
+    .SYNOPSIS
+        Expands a fabric/system name into every equivalent form used for CSV matching.
+
+    .DESCRIPTION
+        The Intersight Fabrics export and the ESXi CDP/LLDP system name do not agree on
+        shape. Either side may carry a fabric suffix or not, and either side may be an
+        FQDN or a short name. A row named "PD24000001SS101-A" and a CDP name of
+        "PD24000001SS101-B.dpe.protected.mil.au" describe the same UCS domain, and both
+        must match.
+
+        The previous implementation collapsed each name to a single suffix-stripped key,
+        so it only matched when both sides happened to share the same FQDN/short shape.
+        This returns the full equivalence set instead, most specific first:
+
+            PD24000001SS101-A.dpe.protected.mil.au   (as supplied, FQDN)
+            PD24000001SS101-A                        (as supplied, short)
+            PD24000001SS101.dpe.protected.mil.au     (fabric suffix removed, FQDN)
+            PD24000001SS101                          (fabric suffix removed, short)
+            PD24000001SS101-A.dpe.protected.mil.au   (fabric A, FQDN)
+            PD24000001SS101-A                        (fabric A, short)
+            PD24000001SS101-B.dpe.protected.mil.au   (fabric B, FQDN)
+            PD24000001SS101-B                        (fabric B, short)
+
+        Indexing every CSV row under all of these, and testing a CDP name against all of
+        these, means the two sides match whichever form each one happens to use.
+
+    .PARAMETER Value
+        A fabric interconnect name, CDP/LLDP system name, or CSV Name value.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Value)
+
+    $clean = (Remove-UcsTargetDecoration -Value $Value).Trim().TrimEnd('.')
+    if ([string]::IsNullOrWhiteSpace($clean)) { return @() }
+
+    # Split off the DNS domain so the fabric suffix is handled identically for short
+    # names and FQDNs. $domainPart keeps its leading dot, or is empty for a short name.
+    $firstLabel = $clean
+    $domainPart = ""
+    $dotIndex = $clean.IndexOf('.')
+    if ($dotIndex -gt 0) {
+        $firstLabel = $clean.Substring(0, $dotIndex)
+        $domainPart = $clean.Substring($dotIndex)
+    }
+
+    # Remove a trailing -A/-B fabric suffix from the first label only, so a domain
+    # component that happens to end in -a or -b is never touched.
+    $core = $firstLabel
+    if ($firstLabel -match '^(.*[^-])-[AaBb]$') { $core = $Matches[1] }
+
+    $keys = New-Object System.Collections.Generic.List[string]
+    foreach ($label in @($firstLabel, $core, "$core-A", "$core-B")) {
+        if ([string]::IsNullOrWhiteSpace($label)) { continue }
+        if (-not [string]::IsNullOrWhiteSpace($domainPart)) { [void]$keys.Add("$label$domainPart") }
+        [void]$keys.Add($label)
+    }
+
+    # Select-Object -Unique is case-insensitive and keeps first occurrence, which
+    # preserves the most-specific-first ordering above.
+    return @($keys | Select-Object -Unique)
 }
 
 function Import-IntersightServerCsv {
@@ -900,38 +1154,116 @@ function Import-IntersightServerCsv {
     Write-Host "Raw CSV rows read from file: $($rows.Count)" -ForegroundColor Cyan
 
     $skippedBlankName = 0
-    $duplicateKeys = New-Object System.Collections.Generic.List[string]
+    $loadedRows = 0
 
+    # Each row is indexed under every equivalent form of its Name, so a -A row, a -B row
+    # and a suffix-less row all resolve for any host in that domain. One key can therefore
+    # legitimately hold several rows (the A and B sides of the same fabric pair) - that is
+    # expected and is not reported as a duplicate. Only rows that disagree about which
+    # server profile to act on are a real ambiguity, and those are reported below.
     foreach ($row in $rows) {
         if (-not ($row.PSObject.Properties.Name -contains "Name") -or [string]::IsNullOrWhiteSpace($row.Name)) { $skippedBlankName++; continue }
-        # Same normalisation as the UCSM CDP/LLDP path, so both routes key off the same identity.
-        # The Intersight Fabrics export uses "Name" for the discovered/CDP-LLDP-matching system name.
-        $key = Convert-FiSystemNameToUcsCandidate -SystemName $row.Name
-        if ([string]::IsNullOrWhiteSpace($key)) { $skippedBlankName++; continue }
-        if ($Global:IntersightServerList.ContainsKey($key)) { $duplicateKeys.Add($row.Name) }
-        $Global:IntersightServerList[$key] = $row
+        $keys = @(Get-IntersightMatchKeyList -Value $row.Name)
+        if ($keys.Count -eq 0) { $skippedBlankName++; continue }
+
+        $loadedRows++
+        foreach ($key in $keys) {
+            if (-not $Global:IntersightServerList.ContainsKey($key)) {
+                $Global:IntersightServerList[$key] = New-Object System.Collections.Generic.List[object]
+            }
+            [void]$Global:IntersightServerList[$key].Add($row)
+        }
     }
 
-    Write-Host "Intersight server list loaded: $($Global:IntersightServerList.Count) unique row(s) out of $($rows.Count) raw CSV row(s)." -ForegroundColor Green
+    Write-Host "Intersight server list loaded: $loadedRows row(s) indexed under $($Global:IntersightServerList.Count) match key(s), from $($rows.Count) raw CSV row(s)." -ForegroundColor Green
     if ($skippedBlankName -gt 0) {
         Write-Host "WARNING: $skippedBlankName row(s) were skipped because the Name column was blank or normalised to an empty value." -ForegroundColor Yellow
     }
-    if ($duplicateKeys.Count -gt 0) {
-        Write-Host "WARNING: $($duplicateKeys.Count) row(s) normalised to a Name already seen earlier in the CSV - the later row overwrote the earlier one for that key:" -ForegroundColor Yellow
-        $duplicateKeys | ForEach-Object { Write-Host " - $_" -ForegroundColor Yellow }
+
+    $ambiguousKeys = @(
+        $Global:IntersightServerList.Keys | Where-Object {
+            $identities = @(
+                $Global:IntersightServerList[$_] |
+                    ForEach-Object { "$(Get-IntersightCsvRowIdentity -CsvRow $_)" } |
+                    Select-Object -Unique
+            )
+            $identities.Count -gt 1
+        }
+    )
+    if ($ambiguousKeys.Count -gt 0) {
+        Write-Host "WARNING: $($ambiguousKeys.Count) match key(s) resolve to CSV rows that name different server profiles. The first matching row wins - confirm these are correct before a LIVE RUN:" -ForegroundColor Yellow
+        foreach ($key in $ambiguousKeys) {
+            $names = @($Global:IntersightServerList[$key] | ForEach-Object { Get-IntersightCsvRowIdentity -CsvRow $_ }) -join ' | '
+            Write-Host " - $key => $names" -ForegroundColor Yellow
+        }
     }
-    if ($rows.Count -gt 0 -and $Global:IntersightServerList.Count -lt $rows.Count -and $skippedBlankName -eq 0 -and $duplicateKeys.Count -eq 0) {
-        Write-Host "NOTE: loaded row count is lower than raw row count with no blank/duplicate rows detected - re-check the CSV encoding/delimiter if this looks wrong." -ForegroundColor Yellow
-    }
-    Add-SummaryRecord -Stage "IntersightCsvImport" -Batch "" -HostName "" -Action "Import CSV" -Result "Completed" -Details "RawRows=$($rows.Count); Loaded=$($Global:IntersightServerList.Count); SkippedBlank=$skippedBlankName; Duplicates=$($duplicateKeys.Count)."
+
+    Add-SummaryRecord -Stage "IntersightCsvImport" -Batch "" -HostName "" -Action "Import CSV" -Result "Completed" -Details "RawRows=$($rows.Count); IndexedRows=$loadedRows; MatchKeys=$($Global:IntersightServerList.Count); SkippedBlank=$skippedBlankName; AmbiguousKeys=$($ambiguousKeys.Count)."
 }
 
-function Test-HostInIntersightList {
-    param([Parameter(Mandatory=$true)][string]$CdpSystemName)
-    if ($Global:IntersightServerList.Count -eq 0) { return $false }
-    if ([string]::IsNullOrWhiteSpace($CdpSystemName)) { return $false }
-    $key = Convert-FiSystemNameToUcsCandidate -SystemName $CdpSystemName
-    return $Global:IntersightServerList.ContainsKey($key)
+function Get-IntersightCsvRowIdentity {
+    # Which server profile a row points at. Rows that agree on this are interchangeable
+    # for routing purposes even when their Name values differ by fabric suffix.
+    param([Parameter(Mandatory=$true)]$CsvRow)
+    foreach ($prop in @("Moid","ServerProfileName")) {
+        if ($CsvRow.PSObject.Properties.Name -contains $prop -and -not [string]::IsNullOrWhiteSpace($CsvRow.$prop)) {
+            return [string]$CsvRow.$prop
+        }
+    }
+    return ""
+}
+
+function Resolve-IntersightCsvMatch {
+    <#
+    .SYNOPSIS
+        Finds the Intersight CSV row for a CDP/LLDP system name, trying every name form.
+
+    .DESCRIPTION
+        Returns $null when the host is not Intersight-managed. On a match, returns the
+        winning CSV row plus the key that matched, so the detection table can show which
+        form of the name was responsible.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$CdpSystemName)
+
+    if ($Global:IntersightServerList.Count -eq 0) { return $null }
+    if ([string]::IsNullOrWhiteSpace($CdpSystemName)) { return $null }
+
+    foreach ($key in (Get-IntersightMatchKeyList -Value $CdpSystemName)) {
+        if ($Global:IntersightServerList.ContainsKey($key)) {
+            $candidates = @($Global:IntersightServerList[$key])
+            return [pscustomobject]@{
+                Row        = $candidates[0]
+                MatchedKey = $key
+                Candidates = $candidates
+            }
+        }
+    }
+    return $null
+}
+
+function Get-IntersightResultList {
+    <#
+    .SYNOPSIS
+        Unwraps an Intersight paged response into a plain array of managed objects.
+
+    .DESCRIPTION
+        Get-Intersight* returns a page object carrying a Results collection, not the objects
+        themselves. Piping the page straight into Select-Object -First 1 yields the page,
+        whose Moid is $null - which then silently targets nothing downstream. Everything
+        that consumes a query result goes through here.
+    #>
+    param($Response)
+    if ($null -eq $Response) { return @() }
+    if ($Response.PSObject.Properties.Name -contains "Results") { return @($Response.Results | Where-Object { $null -ne $_ }) }
+    return @($Response)
+}
+
+function Get-IntersightServerProfileByName {
+    param([Parameter(Mandatory=$true)][string]$Name)
+    # OData string literals escape a single quote by doubling it.
+    $escaped = $Name -replace "'", "''"
+    $page = Get-IntersightServerProfile -Filter "Name eq '$escaped'" -ErrorAction Stop
+    return (Get-IntersightResultList -Response $page | Select-Object -First 1)
 }
 
 function Resolve-IntersightServerProfileForHost {
@@ -939,39 +1271,83 @@ function Resolve-IntersightServerProfileForHost {
 
     Connect-IntersightTarget | Out-Null
     $short = Get-ShortHostName -HostName $HostName
-    # ServerProfileName is optional in the CSV - if the export only has the Name column, the same
-    # value is used as both the match key and the Intersight server profile name to look up.
-    $profileName = if (-not [string]::IsNullOrWhiteSpace($IntersightCsvRow.ServerProfileName)) { $IntersightCsvRow.ServerProfileName }
-                   elseif (-not [string]::IsNullOrWhiteSpace($IntersightCsvRow.Name)) { $IntersightCsvRow.Name }
-                   else { $short }
+
+    # Only the resolved Moid is cached, never the profile object. ConfigState is read again on
+    # every call, because the accept/reboot decision must act on live state rather than on
+    # whatever the profile looked like during the discovery pass.
+    if ($Global:IntersightProfileCache.ContainsKey($HostName)) {
+        $cachedMoid = $Global:IntersightProfileCache[$HostName]
+        try {
+            $fresh = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $cachedMoid -ErrorAction Stop) | Select-Object -First 1
+            if ($null -ne $fresh) { return $fresh }
+        } catch {
+            Write-Host "Could not refresh cached Intersight profile for '$HostName' (Moid $cachedMoid): $($_.Exception.Message). Re-resolving." -ForegroundColor Yellow
+        }
+        [void]$Global:IntersightProfileCache.Remove($HostName)
+    }
+
+    $sp = $null
+    $resolvedBy = ""
 
     try {
         if ($IntersightCsvRow.PSObject.Properties.Name -contains "Moid" -and -not [string]::IsNullOrWhiteSpace($IntersightCsvRow.Moid)) {
-            $sp = Get-IntersightServerProfile -Moid $IntersightCsvRow.Moid -ErrorAction Stop
-        } else {
-            $sp = Get-IntersightServerProfile -Filter "Name eq '$profileName'" -ErrorAction Stop | Select-Object -First 1
+            $sp = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $IntersightCsvRow.Moid -ErrorAction Stop) | Select-Object -First 1
+            if ($null -ne $sp) { $resolvedBy = "CSV Moid '$($IntersightCsvRow.Moid)'" }
+        }
+
+        if ($null -eq $sp) {
+            # Ordered candidates. An explicit ServerProfileName always wins. Otherwise the ESXi
+            # short hostname is tried before the CSV Name, because in a Fabrics export the Name
+            # column holds the fabric interconnect name, which is never a server profile name.
+            # Falling back to Name still covers a CSV that is genuinely a per-server list.
+            $candidates = New-Object System.Collections.Generic.List[object]
+            foreach ($candidate in @(
+                @{ Value = $IntersightCsvRow.ServerProfileName; Source = "CSV ServerProfileName" },
+                @{ Value = $short;                              Source = "ESXi short hostname" },
+                @{ Value = $IntersightCsvRow.Name;              Source = "CSV Name" }
+            )) {
+                $value = [string]$candidate.Value
+                if ([string]::IsNullOrWhiteSpace($value)) { continue }
+                if ($candidates.Value -contains $value) { continue }
+                [void]$candidates.Add([pscustomobject]@{ Value = $value; Source = $candidate.Source })
+            }
+
+            foreach ($candidate in $candidates) {
+                $sp = Get-IntersightServerProfileByName -Name $candidate.Value
+                if ($null -ne $sp) { $resolvedBy = "$($candidate.Source) '$($candidate.Value)'"; break }
+            }
         }
     } catch {
-        Stop-WithMessage "Intersight server profile lookup failed for host '$HostName' (profile '$profileName'): $($_.Exception.Message)"
+        Stop-WithMessage "Intersight server profile lookup failed for host '$HostName': $($_.Exception.Message)"
     }
 
-    if ($null -eq $sp) { Stop-WithMessage "No Intersight server profile found for host '$HostName' (profile '$profileName')." }
+    if ($null -eq $sp) {
+        Stop-WithMessage "No Intersight server profile found for host '$HostName'. Tried: CSV Moid, CSV ServerProfileName, short hostname '$short', CSV Name '$($IntersightCsvRow.Name)'. Add a ServerProfileName or Moid column to $IntersightCsvPath for this row."
+    }
+
+    Write-Host "Host '$HostName' resolved to Intersight server profile '$($sp.Name)' via $resolvedBy." -ForegroundColor Cyan
+    $Global:IntersightProfileCache[$HostName] = $sp.Moid
     return $sp
 }
 
 function Get-IntersightProfileInconsistencyState {
     param([Parameter(Mandatory=$true)]$ServerProfile)
 
-    # PolicyConfigContext.ConfigState surfaces "Inconsistent" when the deployed config (including a
+    # ConfigContext.ConfigState surfaces "Inconsistent" when the deployed config (including a
     # firmware/host-firmware-package policy) no longer matches what is actually running on the server.
     $configState = $null
     if ($ServerProfile.PSObject.Properties.Name -contains "ConfigContext" -and $null -ne $ServerProfile.ConfigContext) {
         $configState = $ServerProfile.ConfigContext.ConfigState
     }
-    $isInconsistent = ($configState -eq "Inconsistent")
+
+    # An absent or blank ConfigState is not the same as "consistent, nothing to do". Treating the
+    # two alike silently skips a host that may still need the firmware change, so the caller is
+    # given enough to tell them apart and stop.
+    $stateKnown = -not [string]::IsNullOrWhiteSpace([string]$configState)
     return [pscustomobject]@{
-        ConfigState    = $configState
-        IsInconsistent = $isInconsistent
+        ConfigState    = if ($stateKnown) { [string]$configState } else { "UNKNOWN" }
+        StateKnown     = $stateKnown
+        IsInconsistent = ($configState -eq "Inconsistent")
     }
 }
 
@@ -987,6 +1363,7 @@ function Get-IntersightPendingInconsistencyForBatch {
             ServerProfile   = $sp.Name
             ProfileMoid     = $sp.Moid
             ConfigState     = $state.ConfigState
+            StateKnown      = $state.StateKnown
             IsInconsistent  = $state.IsInconsistent
             ServerProfileObj = $sp
         })
@@ -1004,6 +1381,21 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
     Write-Host "Intersight server profile inconsistency check for Batch ${BatchNumber}:" -ForegroundColor Cyan
     $pendingRows | Select-Object Host,ServerProfile,ConfigState,IsInconsistent | Format-Table -AutoSize
 
+    # A profile whose ConfigState could not be read is not evidence that there is nothing to do.
+    # Continuing past it would quietly leave the host un-upgraded while the batch reports success.
+    $unknownStateRows = @($pendingRows | Where-Object { -not $_.StateKnown })
+    if ($unknownStateRows.Count -gt 0) {
+        Write-Host "WARNING: ConfigState could not be read for $($unknownStateRows.Count) Intersight profile(s) in this batch: $(($unknownStateRows | Select-Object -ExpandProperty Host) -join ', ')" -ForegroundColor Yellow
+        Write-Host "These hosts cannot be confirmed as either already-consistent or pending, so skipping them silently is not safe." -ForegroundColor Yellow
+        foreach ($row in $unknownStateRows) {
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Warning" -Details "ConfigState unreadable on profile '$($row.ServerProfile)'."
+        }
+        if (-not (Test-DryRun)) {
+            $choice = Read-ChoiceExit -Message "Intersight ConfigState unreadable for one or more hosts. Choose SKIP to leave them untouched and continue, or STOP" -AllowedChoices @("SKIP","STOP") -ExitMessage "Stopped on unreadable Intersight ConfigState."
+            if ($choice -eq "STOP") { Stop-WithMessage "Intersight ConfigState could not be read for: $(($unknownStateRows | Select-Object -ExpandProperty Host) -join ', ')." }
+        }
+    }
+
     if (Test-DryRun) {
         foreach ($row in $pendingRows) {
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "DryRun" -Details "ConfigState=$($row.ConfigState)."
@@ -1020,6 +1412,10 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
         return
     }
 
+    if (@($pendingRows | Where-Object { $_.IsInconsistent }).Count -gt 0) {
+        Assert-IntersightUpgradeCmdletSurface
+    }
+
     foreach ($row in $pendingRows) {
         if (-not $row.IsInconsistent) {
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Skipped" -Details "ConfigState=$($row.ConfigState) - not Inconsistent, nothing to accept."
@@ -1028,9 +1424,8 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
 
         Write-Host "Intersight: accepting inconsistency and rebooting immediately for '$($row.Host)' (profile '$($row.ServerProfile)')." -ForegroundColor Yellow
         try {
-            # TODO-VALIDATE against your Intersight.PowerShell version:
-            #   - New-IntersightFirmwareUpgrade (or Set-IntersightServerProfile -Action Deploy) is the
-            #     call that actually triggers the upgrade/deploy.
+            # Parameter surface confirmed once per run by Assert-IntersightUpgradeCmdletSurface before
+            # anything is sent, rather than discovered mid-batch on the first blade.
             #   - RebootImmediately corresponds to choosing "Reboot Immediately" instead of scheduling.
             #   - DisruptionAcknowledged corresponds to the UI's compulsory "I understand this will be
             #     disruptive" tick box - there is no separate confirmation step once this is set, so
@@ -1082,13 +1477,31 @@ function Select-UpgradeMode {
 function Test-VMHostOnTargetBuild { param([Parameter(Mandatory=$true)]$VMHostObject) if ([string]::IsNullOrWhiteSpace($TargetEsxiBuild)) { return $false } return ([string]$VMHostObject.Build -eq $TargetEsxiBuild) }
 
 function Get-ClusterSafeBatchSizeStrict {
+    <#
+    .SYNOPSIS
+        Returns the batch size cap based on host count only.
+
+    .DESCRIPTION
+        LIMITATION - this does NOT evaluate resource headroom. The batch size is
+        min(connected hosts - 1, $MaxAbsoluteBatchSize) and nothing more. The
+        $ResourceSafetyBuffer, $MinimumCpuHeadroomPercentAfterBatch,
+        $MinimumMemoryHeadroomPercentAfterBatch and $MinimumDatastoreFreePercent settings are
+        accepted but never applied, so a batch that would leave the cluster short of CPU, memory
+        or datastore capacity is not detected here.
+
+        Confirm headroom in the manual health checks until this is implemented.
+    #>
     param([Parameter(Mandatory=$true)][array]$Hosts,[Parameter(Mandatory=$true)]$Cluster,[double]$SafetyBuffer=0.85)
     $connectedHosts = @($Hosts | Where-Object { $_.ConnectionState -eq "Connected" })
+
+    Write-Host "NOTE: batch sizing is by host count only. CPU, memory and datastore headroom thresholds in User Settings are not enforced - confirm headroom manually." -ForegroundColor Yellow
+    Add-SummaryRecord -Stage "BatchSizing" -Batch "" -HostName "" -Action "Calculate safe batch size" -Result "HostCountOnly" -Details "Resource headroom thresholds are not evaluated by this build."
+
     if ($connectedHosts.Count -le 1) { return [pscustomobject]@{ SafeBatchSize=1; Reason="Only one connected candidate host available."; Diagnostics=@() } }
     $maxByRemainingHosts = [int]($connectedHosts.Count - 1)
     $safeBatch = [int](@($maxByRemainingHosts,[int]$MaxAbsoluteBatchSize) | Measure-Object -Minimum | Select-Object -ExpandProperty Minimum)
     if ($safeBatch -lt 1) { $safeBatch = 1 }
-    return [pscustomobject]@{ SafeBatchSize=$safeBatch; Reason="Conservative maximum based on connected hosts and max batch cap."; Diagnostics=@() }
+    return [pscustomobject]@{ SafeBatchSize=$safeBatch; Reason="Host-count cap only (connected hosts minus one, capped at $MaxAbsoluteBatchSize). Resource headroom not evaluated."; Diagnostics=@() }
 }
 
 function Confirm-BatchSize {
@@ -1108,11 +1521,9 @@ function Invoke-RebootSafetyWindow {
     Write-Host "Press C to continue immediately, E to exit safely, or wait for auto-continue." -ForegroundColor Cyan
     $endTime = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $endTime) {
-        if ([Console]::KeyAvailable) {
-            $key = [Console]::ReadKey($true).KeyChar.ToString().ToUpper()
-            if ($key -eq "C") { return $true }
-            if ($key -eq "E") { Stop-SafeExit -Message "Exited during pre-reboot safety window." }
-        }
+        $key = Read-PendingConsoleKey
+        if ($key -eq "C") { return $true }
+        if ($key -eq "E") { Stop-SafeExit -Message "Exited during pre-reboot safety window." }
         Start-Sleep -Milliseconds 250
     }
     return $true
@@ -1120,7 +1531,7 @@ function Invoke-RebootSafetyWindow {
 
 function Move-PoweredOffAndSuspendedVMsForBatch {
     param([Parameter(Mandatory=$true)][array]$CurrentBatchNames,[Parameter(Mandatory=$true)]$Cluster)
-    if (Test-DryRun -or Test-StageNoAck) { Write-Host "DRY/STAGE: Would move powered-off/suspended VMs from batch hosts where applicable." -ForegroundColor Green; return $true }
+    if ((Test-DryRun) -or (Test-StageNoAck)) { Write-Host "DRY/STAGE: Would move powered-off/suspended VMs from batch hosts where applicable." -ForegroundColor Green; return $true }
     $destinationHosts = @(Get-VMHost -Location $Cluster | Where-Object { $_.ConnectionState -eq "Connected" -and ($CurrentBatchNames -notcontains $_.Name) })
     if ($destinationHosts.Count -eq 0) { Stop-WithMessage "No connected non-batch destination hosts available for powered-off/suspended VM movement." }
     foreach ($hostName in $CurrentBatchNames) {
@@ -1135,7 +1546,7 @@ function Move-PoweredOffAndSuspendedVMsForBatch {
 
 function Request-MaintenanceModeForBatch {
     param([Parameter(Mandatory=$true)][array]$HostNames,[Parameter(Mandatory=$true)][string]$Mode)
-    if (Test-DryRun -or Test-StageNoAck) { Write-Host "DRY/STAGE: Would request Maintenance mode for $($HostNames -join ', ')." -ForegroundColor Green; return }
+    if ((Test-DryRun) -or (Test-StageNoAck)) { Write-Host "DRY/STAGE: Would request Maintenance mode for $($HostNames -join ', ')." -ForegroundColor Green; return }
     foreach ($hostName in $HostNames) {
         $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
         if ($hostObj.ConnectionState -eq "Connected") {
@@ -1147,7 +1558,7 @@ function Request-MaintenanceModeForBatch {
 
 function Wait-BatchMaintenanceMode {
     param([Parameter(Mandatory=$true)][array]$HostNames,[int]$TimeoutMinutes=60)
-    if (Test-DryRun -or Test-StageNoAck) { return @(foreach ($name in $HostNames) { Get-VMHost -Name $name -ErrorAction SilentlyContinue }) }
+    if ((Test-DryRun) -or (Test-StageNoAck)) { return @(foreach ($name in $HostNames) { Get-VMHost -Name $name -ErrorAction SilentlyContinue }) }
     $timeout = (Get-Date).AddMinutes($TimeoutMinutes)
     do {
         $notReady = @($HostNames | Where-Object { (Get-VMHost -Name $_ -ErrorAction SilentlyContinue).ConnectionState -ne "Maintenance" })
@@ -1165,15 +1576,13 @@ function Get-BatchConnectionStateSummary {
 
 function Wait-BatchReconnectAfterReboot {
     param([Parameter(Mandatory=$true)][array]$HostNames,[int]$InitialWaitMinutes,[string]$ModeLabel)
-    if (Test-DryRun -or Test-StageNoAck) { return (Get-BatchConnectionStateSummary -HostNames $HostNames) }
+    if ((Test-DryRun) -or (Test-StageNoAck)) { return (Get-BatchConnectionStateSummary -HostNames $HostNames) }
     Write-Host "$ModeLabel initial wait: $InitialWaitMinutes minutes. Press R to recheck early, E to exit." -ForegroundColor Yellow
     $endTime = (Get-Date).AddMinutes($InitialWaitMinutes)
     while ((Get-Date) -lt $endTime) {
-        if ([Console]::KeyAvailable) {
-            $key = [Console]::ReadKey($true).KeyChar.ToString().ToUpper()
-            if ($key -eq "E") { Stop-SafeExit -Message "Stopped during post-reboot wait." }
-            if ($key -eq "R") { break }
-        }
+        $key = Read-PendingConsoleKey
+        if ($key -eq "E") { Stop-SafeExit -Message "Stopped during post-reboot wait." }
+        if ($key -eq "R") { break }
         Start-Sleep -Seconds 1
     }
     do {
@@ -1342,6 +1751,10 @@ try {
 } finally {
     Export-RunSummary
     try { foreach ($key in @($Global:UcsSessions.Keys)) { try { Disconnect-Ucs -Ucs $Global:UcsSessions[$key] -ErrorAction SilentlyContinue | Out-Null } catch {} } } catch {}
-    try { if ($Global:IntersightSession) { Disconnect-IntersightApi -ErrorAction SilentlyContinue | Out-Null } } catch {}
+    # Intersight.PowerShell holds process-wide configuration rather than a session object, so there
+    # is nothing to disconnect. Clear the in-memory key material instead.
+    $Global:IntersightSession = $null
+    $Global:IntersightApiKeyId = ""
+    $Global:IntersightApiKeyFilePath = ""
     try { if ($global:vCenter) { Disconnect-VIServer -Server $global:vCenter -Confirm:$false | Out-Null; Write-Host "Disconnected from vCenter." -ForegroundColor Green } } catch { Write-Host "Could not disconnect cleanly from vCenter." -ForegroundColor Yellow }
 }
