@@ -33,11 +33,19 @@
       no /api/v1 suffix and no trailing slash.
     - DRYRUN is the default.
     - UCSM acknowledgement and Intersight accept/reboot are each scoped to their own batch hosts only.
-    - The Intersight accept + reboot-immediately step has no interactive confirmation gate by design
-      (it runs whenever DRYRUN/STAGE_NO_ACK are not active) - the pre-reboot safety window still covers
-      the whole batch. Consider that against the typed ACK-BATCH-N gate still used on the UCSM side.
-    - Batch sizing is by host count only. The CPU, memory and datastore headroom settings in User
-      Settings are NOT enforced - see Get-ClusterSafeBatchSizeStrict.
+    - Batch mode is AUTO (sized from live cluster capacity and health, capped at $MaxAbsoluteBatchSize)
+      or SINGLE (one host at a time). There is no free-text batch size.
+    - The run advances through the cluster automatically. The per-batch typed gates (ACK-BATCH-N and
+      SAVE-BATCH-N) have been REMOVED in favour of automatic progression. What now gates each batch is:
+      a pre-batch cluster health check, the timed pre-reboot safety window (press E to abort), a host
+      profile compliance check on every rebooted host, and a post-batch cluster health check. Any of
+      those failing stops the run.
+    - After each reboot, every host is tested against its attached host profile while still in
+      Maintenance mode. Compliant hosts are taken out of Maintenance mode and the run continues;
+      non-compliant hosts stay in Maintenance mode and the operator is prompted to remediate and
+      re-check. The run does not advance until the host passes.
+    - Batch sizing now enforces $ResourceSafetyBuffer, $MinimumCpuHeadroomPercentAfterBatch,
+      $MinimumMemoryHeadroomPercentAfterBatch and $MinimumDatastoreFreePercent.
     - Validate Cisco UCS PowerTool cmdlet names in your installed module version before LIVE RUN. The
       Intersight accept/reboot parameter surface is checked at run time by
       Assert-IntersightUpgradeCmdletSurface, which stops the run rather than guessing if it differs.
@@ -102,6 +110,7 @@ $Global:UcsServiceProfileCache = @{}
 $Global:ReconnectCredential = $null
 $Global:PromptForReconnectPasswordWhenNeeded = $false
 $Global:AutoExitMaintenanceMode = $true
+$Global:PrerequisitesConfirmed = $false
 
 # -----------------------------
 # Generic helpers
@@ -162,6 +171,121 @@ function Read-YesNoExit {
 
 function Test-DryRun { return ($Global:RunMode -eq "DRYRUN") }
 function Test-StageNoAck { return ($Global:RunMode -eq "STAGE_NO_ACK") }
+
+function Show-OpenFileDialog {
+    <#
+    .SYNOPSIS
+        Opens a Windows file picker and returns the selected path, or "" if unavailable/cancelled.
+
+    .DESCRIPTION
+        OpenFileDialog requires an STA thread. The Windows PowerShell 5.1 console is STA, but
+        PowerShell 7 runs MTA, so on 7 the dialog is marshalled onto a dedicated STA runspace.
+        Any failure - no GUI, no Windows Forms, remote session - returns "" so the caller can
+        fall back to a typed path rather than breaking an otherwise headless run.
+
+    .PARAMETER Title
+        Dialog window title.
+
+    .PARAMETER Filter
+        Win32 filter string, e.g. "PEM files (*.pem)|*.pem|All files (*.*)|*.*".
+
+    .PARAMETER InitialDirectory
+        Folder to open at, when it exists.
+    #>
+    param(
+        [string]$Title = "Select a file",
+        [string]$Filter = "All files (*.*)|*.*",
+        [string]$InitialDirectory = ""
+    )
+
+    $dialogScript = {
+        param($Title, $Filter, $InitialDirectory)
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+            $dialog = New-Object System.Windows.Forms.OpenFileDialog
+            $dialog.Title = $Title
+            $dialog.Filter = $Filter
+            $dialog.Multiselect = $false
+            $dialog.CheckFileExists = $true
+            if (-not [string]::IsNullOrWhiteSpace($InitialDirectory) -and (Test-Path -Path $InitialDirectory)) {
+                $dialog.InitialDirectory = $InitialDirectory
+            }
+            # Parent the dialog to a topmost form, otherwise it can open behind the console.
+            $anchor = New-Object System.Windows.Forms.Form
+            $anchor.TopMost = $true
+            $anchor.ShowInTaskbar = $false
+            if ($dialog.ShowDialog($anchor) -eq [System.Windows.Forms.DialogResult]::OK) {
+                $anchor.Dispose()
+                return $dialog.FileName
+            }
+            $anchor.Dispose()
+            return ""
+        }
+        catch { return "" }
+    }
+
+    if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -eq [System.Threading.ApartmentState]::STA) {
+        return [string](& $dialogScript $Title $Filter $InitialDirectory)
+    }
+
+    $ps = $null
+    $runspace = $null
+    try {
+        $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $runspace.ApartmentState = [System.Threading.ApartmentState]::STA
+        $runspace.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::ReuseThread
+        $runspace.Open()
+
+        $ps = [PowerShell]::Create()
+        $ps.Runspace = $runspace
+        [void]$ps.AddScript($dialogScript.ToString()).AddArgument($Title).AddArgument($Filter).AddArgument($InitialDirectory)
+        $output = $ps.Invoke()
+        return [string](@($output) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)
+    }
+    catch { return "" }
+    finally {
+        if ($ps) { $ps.Dispose() }
+        if ($runspace) { $runspace.Close(); $runspace.Dispose() }
+    }
+}
+
+function Confirm-RunPrerequisites {
+    <#
+    .SYNOPSIS
+        Pre-flight gate confirming the Intersight API key ID and .pem private key are in hand.
+
+    .DESCRIPTION
+        Both are generated together in Intersight (Settings > API Keys) and cannot be recovered
+        afterwards - the secret key is only downloadable at creation. Finding that out partway
+        through a change window is expensive, so it is asked before vCenter is even contacted.
+    #>
+    if ($Global:PrerequisitesConfirmed) { return }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "=====================================================================" -ForegroundColor Cyan
+    Write-Host " PRE-FLIGHT CHECK" -ForegroundColor Cyan
+    Write-Host "=====================================================================" -ForegroundColor Cyan
+    Write-Host "If any host in scope is Intersight-managed, this run needs BOTH of:" -ForegroundColor Yellow
+    Write-Host "  1. An Intersight API Key ID - three segments, e.g. aaaa/bbbb/cccc" -ForegroundColor Yellow
+    Write-Host "  2. The matching private key (.pem) file saved to this machine" -ForegroundColor Yellow
+    Write-Host "" -ForegroundColor Yellow
+    Write-Host "Both are issued together in Intersight under Settings > API Keys. The" -ForegroundColor Yellow
+    Write-Host "secret key can only be downloaded at the moment the key is created - if" -ForegroundColor Yellow
+    Write-Host "you no longer have that file, generate a new API key before continuing." -ForegroundColor Yellow
+    Write-Host "You will be asked to browse to the .pem file when it is first needed." -ForegroundColor Yellow
+    Write-Host "" -ForegroundColor Yellow
+    Write-Host "Also confirm: UCSM credentials to hand, and $IntersightCsvPath present" -ForegroundColor Yellow
+    Write-Host "if any host is Intersight-managed." -ForegroundColor Yellow
+    Write-Host "=====================================================================" -ForegroundColor Cyan
+
+    $answer = Read-ChoiceExit -Message "Do you have the Intersight API Key ID and matching .pem file available? Answer SKIP if no Intersight-managed hosts are in scope." -AllowedChoices @("YES","SKIP") -ExitMessage "Stopped at the pre-flight prerequisites check."
+
+    Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Confirm Intersight prerequisites" -Result $answer -Details "Operator confirmation of API Key ID and .pem availability."
+    if ($answer -eq "SKIP") {
+        Write-Host "Continuing without confirmed Intersight credentials. If an Intersight-managed host is detected, you will still be prompted for the key ID and .pem file at that point." -ForegroundColor Yellow
+    }
+    $Global:PrerequisitesConfirmed = $true
+}
 
 function Read-PendingConsoleKey {
     <#
@@ -935,10 +1059,11 @@ function Invoke-UcsPendingAckForBatch {
     $pendingRows = @(Get-UcsPendingRebootObjectsForBatch -HostNames $HostNames)
     $pendingRows | Select-Object Host,UcsTarget,ServiceProfileDn,PendingAckFound,AckDn | Format-Table -AutoSize
     if (Test-DryRun) { Write-Host "DRY RUN: Would acknowledge only listed current-batch UCSM pending objects." -ForegroundColor Green; return }
-    $requiredText = "ACK-BATCH-$BatchNumber"
-    $confirm = (Read-Host "Type $requiredText to acknowledge UCSM reboot for Batch $BatchNumber only, or type EXIT").Trim().ToUpper()
-    if ($confirm -eq "EXIT") { Stop-SafeExit -Message "Exited before UCSM pending reboot acknowledgement." }
-    if ($confirm -ne $requiredText) { Stop-WithMessage "UCSM acknowledgement was not confirmed. Expected '$requiredText'." }
+
+    # The typed ACK-BATCH-N gate that used to sit here has been removed so the run advances
+    # through the cluster on its own. The abort point is now the pre-reboot safety window
+    # immediately before this call, which covers the whole batch and accepts E to exit.
+    Write-Host "Acknowledging UCSM pending reboot for Batch $BatchNumber ($(@($pendingRows | Where-Object { $_.PendingAckFound }).Count) host(s) with a pending activity)." -ForegroundColor Yellow
     foreach ($row in $pendingRows) {
         if (-not $row.PendingAckFound) { continue }
         $ucsSession = Get-UcsSessionForTarget -UcsTarget $row.UcsTarget
@@ -1016,7 +1141,21 @@ function Get-IntersightCredentialIfNeeded {
         $Global:IntersightApiKeyId = (Read-Host "Enter Intersight API Key ID").Trim()
     }
     if ([string]::IsNullOrWhiteSpace($Global:IntersightApiKeyFilePath)) {
-        $Global:IntersightApiKeyFilePath = (Read-Host "Enter path to the Intersight API private key (.pem) file").Trim()
+        Write-Host "Opening a file browser to select the Intersight API private key (.pem)..." -ForegroundColor Cyan
+        $picked = Show-OpenFileDialog `
+            -Title "Select the Intersight API private key (.pem)" `
+            -Filter "Intersight private key (*.pem;*.key;*.txt)|*.pem;*.key;*.txt|All files (*.*)|*.*" `
+            -InitialDirectory ([Environment]::GetFolderPath('UserProfile'))
+
+        if (-not [string]::IsNullOrWhiteSpace($picked)) {
+            $Global:IntersightApiKeyFilePath = $picked.Trim()
+            Write-Host "Selected private key: $Global:IntersightApiKeyFilePath" -ForegroundColor Green
+        }
+        else {
+            # Cancelled, or no GUI available (remote session, headless host).
+            Write-Host "No file selected from the browser. Enter the path manually instead." -ForegroundColor Yellow
+            $Global:IntersightApiKeyFilePath = (Read-Host "Enter path to the Intersight API private key (.pem) file").Trim().Trim('"')
+        }
     }
     if (-not (Test-Path -Path $Global:IntersightApiKeyFilePath)) {
         Stop-WithMessage "Intersight private key file not found at '$Global:IntersightApiKeyFilePath'."
@@ -1476,43 +1615,320 @@ function Select-UpgradeMode {
 
 function Test-VMHostOnTargetBuild { param([Parameter(Mandatory=$true)]$VMHostObject) if ([string]::IsNullOrWhiteSpace($TargetEsxiBuild)) { return $false } return ([string]$VMHostObject.Build -eq $TargetEsxiBuild) }
 
-function Get-ClusterSafeBatchSizeStrict {
+function Get-ClusterHealthReport {
     <#
     .SYNOPSIS
-        Returns the batch size cap based on host count only.
+        Evaluates whether the cluster is healthy enough to start or continue batching.
 
     .DESCRIPTION
-        LIMITATION - this does NOT evaluate resource headroom. The batch size is
-        min(connected hosts - 1, $MaxAbsoluteBatchSize) and nothing more. The
-        $ResourceSafetyBuffer, $MinimumCpuHeadroomPercentAfterBatch,
-        $MinimumMemoryHeadroomPercentAfterBatch and $MinimumDatastoreFreePercent settings are
-        accepted but never applied, so a batch that would leave the cluster short of CPU, memory
-        or datastore capacity is not detected here.
+        Checked before every batch and again after each batch completes, so the run only
+        advances through the cluster while the cluster is actually well. Covers host
+        connection state, hosts unexpectedly in Maintenance mode, datastore free space
+        against $MinimumDatastoreFreePercent, and red alarms triggered on the cluster.
 
-        Confirm headroom in the manual health checks until this is implemented.
+    .PARAMETER Cluster
+        The cluster being worked on.
+
+    .PARAMETER IgnoreHostNames
+        Hosts excluded from the assessment - the current batch, which is expected to be
+        in Maintenance mode or rebooting.
     #>
-    param([Parameter(Mandatory=$true)][array]$Hosts,[Parameter(Mandatory=$true)]$Cluster,[double]$SafetyBuffer=0.85)
-    $connectedHosts = @($Hosts | Where-Object { $_.ConnectionState -eq "Connected" })
+    param(
+        [Parameter(Mandatory=$true)]$Cluster,
+        [array]$IgnoreHostNames = @()
+    )
 
-    Write-Host "NOTE: batch sizing is by host count only. CPU, memory and datastore headroom thresholds in User Settings are not enforced - confirm headroom manually." -ForegroundColor Yellow
-    Add-SummaryRecord -Stage "BatchSizing" -Batch "" -HostName "" -Action "Calculate safe batch size" -Result "HostCountOnly" -Details "Resource headroom thresholds are not evaluated by this build."
+    $reasons = New-Object System.Collections.Generic.List[string]
 
-    if ($connectedHosts.Count -le 1) { return [pscustomobject]@{ SafeBatchSize=1; Reason="Only one connected candidate host available."; Diagnostics=@() } }
-    $maxByRemainingHosts = [int]($connectedHosts.Count - 1)
-    $safeBatch = [int](@($maxByRemainingHosts,[int]$MaxAbsoluteBatchSize) | Measure-Object -Minimum | Select-Object -ExpandProperty Minimum)
-    if ($safeBatch -lt 1) { $safeBatch = 1 }
-    return [pscustomobject]@{ SafeBatchSize=$safeBatch; Reason="Host-count cap only (connected hosts minus one, capped at $MaxAbsoluteBatchSize). Resource headroom not evaluated."; Diagnostics=@() }
+    $allHosts = @(Get-VMHost -Location $Cluster -ErrorAction Stop)
+    $relevant = @($allHosts | Where-Object { $IgnoreHostNames -notcontains $_.Name })
+
+    $badState = @($relevant | Where-Object { $_.ConnectionState -eq "NotResponding" -or $_.ConnectionState -eq "Disconnected" })
+    if ($badState.Count -gt 0) {
+        [void]$reasons.Add("Host(s) not responding or disconnected: $(($badState | Select-Object -ExpandProperty Name) -join ', ')")
+    }
+
+    $inMaintenance = @($relevant | Where-Object { $_.ConnectionState -eq "Maintenance" })
+    if ($inMaintenance.Count -gt 0) {
+        [void]$reasons.Add("Host(s) in Maintenance mode outside the current batch: $(($inMaintenance | Select-Object -ExpandProperty Name) -join ', ')")
+    }
+
+    try {
+        $lowDatastores = @(
+            Get-Datastore -Location $Cluster -ErrorAction Stop |
+                Where-Object { $_.CapacityGB -gt 0 -and ((($_.FreeSpaceGB / $_.CapacityGB) * 100) -lt $MinimumDatastoreFreePercent) }
+        )
+        if ($lowDatastores.Count -gt 0) {
+            $names = @($lowDatastores | ForEach-Object { "{0} ({1:N1}% free)" -f $_.Name, (($_.FreeSpaceGB / $_.CapacityGB) * 100) })
+            [void]$reasons.Add("Datastore(s) below $MinimumDatastoreFreePercent% free: $($names -join ', ')")
+        }
+    }
+    catch {
+        [void]$reasons.Add("Datastore free space could not be evaluated: $($_.Exception.Message)")
+    }
+
+    try {
+        $freshCluster = Get-Cluster -Name $Cluster.Name -ErrorAction Stop
+        $redAlarms = @($freshCluster.ExtensionData.TriggeredAlarmState | Where-Object { $_.OverallStatus -eq 'red' })
+        if ($redAlarms.Count -gt 0) {
+            [void]$reasons.Add("$($redAlarms.Count) red alarm(s) triggered on cluster '$($Cluster.Name)'")
+        }
+    }
+    catch {}
+
+    return [pscustomobject]@{
+        IsHealthy      = ($reasons.Count -eq 0)
+        Reasons        = @($reasons)
+        ConnectedHosts = @($relevant | Where-Object { $_.ConnectionState -eq "Connected" })
+    }
 }
 
-function Confirm-BatchSize {
-    param([Parameter(Mandatory=$true)][int]$CalculatedSize,[Parameter(Mandatory=$true)][int]$CandidateCount)
-    do {
-        $manualBatch = (Read-Host "Press Enter to accept $CalculatedSize, enter LOWER batch size, or EXIT").Trim().ToUpper()
-        if ($manualBatch -eq "EXIT") { Stop-SafeExit -Message "Stopped before accepting batch size." }
-        if ($manualBatch -eq "") { return $CalculatedSize }
-        if ($manualBatch -match '^\d+$' -and [int]$manualBatch -ge 1 -and [int]$manualBatch -le $CalculatedSize) { return [int]$manualBatch }
-        Write-Host "Invalid value." -ForegroundColor Yellow
-    } while ($true)
+function Get-CapacityBasedBatchSize {
+    <#
+    .SYNOPSIS
+        Largest batch that still leaves the required CPU and memory headroom.
+
+    .DESCRIPTION
+        Models the worst case: the batch removes the highest-capacity hosts, and every VM they
+        were running has to fit on what remains. Starting from the host-count cap it walks down
+        until both of these hold, where remaining capacity is first discounted by
+        $ResourceSafetyBuffer:
+
+            current cluster CPU usage    <= remaining CPU * (1 - $MinimumCpuHeadroomPercentAfterBatch/100)
+            current cluster memory usage <= remaining RAM * (1 - $MinimumMemoryHeadroomPercentAfterBatch/100)
+
+        Returns SafeBatchSize 0 when even a single host cannot be removed within those limits,
+        which the caller treats as a stop rather than as a batch of one.
+    #>
+    param(
+        # AllowEmptyCollection so an empty candidate list returns a clean "no capacity" result
+        # instead of failing parameter binding partway through the run.
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$CandidateHosts,
+        [Parameter(Mandatory=$true)]$Cluster
+    )
+
+    $connected = @($CandidateHosts | Where-Object { $_.ConnectionState -eq "Connected" })
+    $diagnostics = New-Object System.Collections.Generic.List[string]
+
+    if ($connected.Count -eq 0) {
+        return [pscustomobject]@{ SafeBatchSize=0; Reason="No connected candidate hosts."; Diagnostics=@($diagnostics) }
+    }
+    if ($connected.Count -eq 1) {
+        return [pscustomobject]@{ SafeBatchSize=1; Reason="Only one connected candidate host - batch of one."; Diagnostics=@($diagnostics) }
+    }
+
+    $totalCpuMhz = [double](($connected | Measure-Object -Property CpuTotalMhz -Sum).Sum)
+    $usedCpuMhz  = [double](($connected | Measure-Object -Property CpuUsageMhz -Sum).Sum)
+    $totalMemGB  = [double](($connected | Measure-Object -Property MemoryTotalGB -Sum).Sum)
+    $usedMemGB   = [double](($connected | Measure-Object -Property MemoryUsageGB -Sum).Sum)
+
+    [void]$diagnostics.Add(("Cluster candidates: {0} connected host(s), CPU {1:N0}/{2:N0} MHz used, memory {3:N1}/{4:N1} GB used." -f $connected.Count, $usedCpuMhz, $totalCpuMhz, $usedMemGB, $totalMemGB))
+
+    $cpuByCapacity = @($connected | Sort-Object CpuTotalMhz -Descending)
+    $memByCapacity = @($connected | Sort-Object MemoryTotalGB -Descending)
+
+    $maxByHostCount = [Math]::Min($connected.Count - 1, [int]$MaxAbsoluteBatchSize)
+
+    for ($n = $maxByHostCount; $n -ge 1; $n--) {
+        $removedCpu = [double](($cpuByCapacity | Select-Object -First $n | Measure-Object -Property CpuTotalMhz -Sum).Sum)
+        $removedMem = [double](($memByCapacity | Select-Object -First $n | Measure-Object -Property MemoryTotalGB -Sum).Sum)
+
+        $remainingCpu = ($totalCpuMhz - $removedCpu) * $ResourceSafetyBuffer
+        $remainingMem = ($totalMemGB - $removedMem) * $ResourceSafetyBuffer
+
+        $cpuLimit = $remainingCpu * (1 - ([double]$MinimumCpuHeadroomPercentAfterBatch / 100))
+        $memLimit = $remainingMem * (1 - ([double]$MinimumMemoryHeadroomPercentAfterBatch / 100))
+
+        $cpuOk = ($usedCpuMhz -le $cpuLimit)
+        $memOk = ($usedMemGB -le $memLimit)
+
+        [void]$diagnostics.Add(("Batch of {0}: CPU need {1:N0} vs allowed {2:N0} MHz [{3}]; memory need {4:N1} vs allowed {5:N1} GB [{6}]." -f $n, $usedCpuMhz, $cpuLimit, $(if($cpuOk){"OK"}else{"FAIL"}), $usedMemGB, $memLimit, $(if($memOk){"OK"}else{"FAIL"})))
+
+        if ($cpuOk -and $memOk) {
+            return [pscustomobject]@{
+                SafeBatchSize = $n
+                Reason        = "Largest batch leaving $MinimumCpuHeadroomPercentAfterBatch% CPU and $MinimumMemoryHeadroomPercentAfterBatch% memory headroom after a $ResourceSafetyBuffer safety buffer, capped at $MaxAbsoluteBatchSize."
+                Diagnostics   = @($diagnostics)
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        SafeBatchSize = 0
+        Reason        = "Even removing one host breaches the configured CPU or memory headroom."
+        Diagnostics   = @($diagnostics)
+    }
+}
+
+function Select-BatchMode {
+    <#
+    .SYNOPSIS
+        Chooses between capacity-sized batches and one host at a time.
+
+    .DESCRIPTION
+        These are the only two options. In both, the run advances through the cluster
+        automatically once a batch completes and the cluster reports healthy - there is no
+        per-batch typed confirmation. The pre-reboot safety window remains the abort point.
+    #>
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Select batch mode:" -ForegroundColor Cyan
+    Write-Host "  1. AUTO   - size each batch from live cluster capacity and health (never more than $MaxAbsoluteBatchSize hosts)" -ForegroundColor Cyan
+    Write-Host "  2. SINGLE - one host at a time" -ForegroundColor Cyan
+    Write-Host "  3. Exit" -ForegroundColor Cyan
+    Write-Host "Both modes then run through the whole cluster automatically, batch after batch," -ForegroundColor Yellow
+    Write-Host "pausing only for the pre-reboot safety window, a host profile that is not" -ForegroundColor Yellow
+    Write-Host "compliant, or a failed cluster health check." -ForegroundColor Yellow
+
+    $choice = Read-ChoiceExit -Message "Select batch mode" -AllowedChoices @("1","2","3") -ExitMessage "Stopped during batch mode selection."
+    if ($choice -eq "3") { Stop-SafeExit -Message "Stopped during batch mode selection." }
+
+    $mode = if ($choice -eq "2") { "SINGLE" } else { "AUTO" }
+    Add-SummaryRecord -Stage "BatchMode" -Batch "" -HostName "" -Action "Select batch mode" -Result $mode -Details "Automatic progression through cluster after each healthy batch."
+    return $mode
+}
+
+function Get-VMHostProfileComplianceState {
+    <#
+    .SYNOPSIS
+        Tests a host against its attached host profile.
+
+    .DESCRIPTION
+        Status is one of Compliant, NonCompliant, NoProfile or Unknown. The compliance result
+        property name differs across PowerCLI versions, so both ComplianceStatus and Status are
+        read before giving up.
+    #>
+    param([Parameter(Mandatory=$true)]$VMHostObject)
+
+    $profileObj = $null
+    try { $profileObj = Get-VMHostProfile -Entity $VMHostObject -ErrorAction SilentlyContinue | Select-Object -First 1 } catch {}
+
+    if ($null -eq $profileObj) {
+        return [pscustomobject]@{ Status="NoProfile"; ProfileName=""; Details="No host profile is attached to this host." }
+    }
+
+    try {
+        $result = @(Test-VMHostProfileCompliance -VMHost $VMHostObject -ErrorAction Stop) | Select-Object -First 1
+    }
+    catch {
+        return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test failed: $($_.Exception.Message)" }
+    }
+
+    if ($null -eq $result) {
+        return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test returned no result." }
+    }
+
+    $statusRaw = ""
+    foreach ($prop in @("ComplianceStatus","Status")) {
+        if ($result.PSObject.Properties.Name -contains $prop -and -not [string]::IsNullOrWhiteSpace([string]$result.$prop)) {
+            $statusRaw = [string]$result.$prop
+            break
+        }
+    }
+
+    $details = ""
+    foreach ($prop in @("IncomplianceElementList","ExtensionData")) {
+        if ($result.PSObject.Properties.Name -contains $prop -and $null -ne $result.$prop) {
+            try {
+                $elements = @($result.IncomplianceElementList)
+                if ($elements.Count -gt 0) {
+                    $details = ($elements | ForEach-Object { [string]$_ } | Select-Object -First 5) -join ' | '
+                }
+            } catch {}
+            break
+        }
+    }
+
+    $status = switch -Regex ($statusRaw) {
+        '^(?i)compliant$'    { "Compliant";    break }
+        '^(?i)nonCompliant$' { "NonCompliant"; break }
+        default              { if ([string]::IsNullOrWhiteSpace($statusRaw)) { "Unknown" } else { $statusRaw } }
+    }
+
+    return [pscustomobject]@{ Status=$status; ProfileName=$profileObj.Name; Details=$details }
+}
+
+function Confirm-HostProfileComplianceAndExitMaintenance {
+    <#
+    .SYNOPSIS
+        Per host: verify host profile compliance, then take the host out of Maintenance mode.
+
+    .DESCRIPTION
+        Runs once the batch is confirmed back in vCenter. For each host in turn, while it is
+        still in Maintenance mode, the attached host profile is tested:
+
+          Compliant    - the host is taken out of Maintenance mode and the run moves on.
+          NonCompliant - the operator is told to remediate (Auto Deploy or vCenter host profile
+                         remediation) and presses CONTINUE to re-test. The host is never taken
+                         out of Maintenance mode, and the run never advances, until it passes.
+          NoProfile    - nothing to test; the operator chooses SKIP or exits.
+          Unknown      - treated like NonCompliant, because an unreadable result is not a pass.
+
+        Applies to every reboot path - UCS Manager, Intersight, and ESXi-only - since all three
+        return the host through the same Maintenance mode cycle.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][array]$HostNames,
+        [Parameter(Mandatory=$true)][string]$BatchNumber
+    )
+
+    if ((Test-DryRun) -or (Test-StageNoAck)) {
+        Write-Host "DRY/STAGE: Would check host profile compliance for $($HostNames -join ', '), then exit Maintenance mode for each compliant host." -ForegroundColor Green
+        foreach ($hostName in $HostNames) {
+            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "DryRun" -Details "No compliance test issued."
+        }
+        return
+    }
+
+    foreach ($hostName in $HostNames) {
+        Write-Host "" -ForegroundColor Cyan
+        Write-Host "Host profile compliance check for '$hostName' (Batch $BatchNumber)..." -ForegroundColor Cyan
+
+        $attempt = 0
+        while ($true) {
+            $attempt++
+            $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
+            $state = Get-VMHostProfileComplianceState -VMHostObject $hostObj
+
+            Write-Host ("  Host: {0}  ConnectionState: {1}  Profile: {2}  Compliance: {3}" -f $hostObj.Name, $hostObj.ConnectionState, $(if($state.ProfileName){$state.ProfileName}else{"<none>"}), $state.Status) -ForegroundColor Cyan
+            if (-not [string]::IsNullOrWhiteSpace($state.Details)) {
+                Write-Host "  Detail: $($state.Details)" -ForegroundColor Yellow
+            }
+
+            if ($state.Status -eq "Compliant") {
+                Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Compliant" -Details "Profile '$($state.ProfileName)' compliant after $attempt check(s)."
+                break
+            }
+
+            if ($state.Status -eq "NoProfile") {
+                Write-Host "  No host profile is attached, so compliance cannot be confirmed for this host." -ForegroundColor Yellow
+                $choice = Read-ChoiceExit -Message "No host profile attached to '$hostName'. Choose SKIP to accept and continue, or EXIT" -AllowedChoices @("SKIP") -ExitMessage "Stopped at host profile compliance - no profile attached to '$hostName'."
+                if ($choice -eq "SKIP") {
+                    Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Skipped" -Details "No host profile attached; operator chose to continue."
+                    break
+                }
+            }
+
+            Write-Host "  '$hostName' is NOT compliant with host profile '$($state.ProfileName)'." -ForegroundColor Yellow
+            Write-Host "  Remediate the host now (vCenter host profile remediation, or re-provision via Auto Deploy)." -ForegroundColor Yellow
+            Write-Host "  The host stays in Maintenance mode and this batch will not advance until it passes." -ForegroundColor Yellow
+            [void](Read-ChoiceExit -Message "Type CONTINUE once '$hostName' has been remediated to re-check compliance, or EXIT" -AllowedChoices @("CONTINUE") -ExitMessage "Stopped at host profile compliance for '$hostName'.")
+            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result $state.Status -Details "Attempt $attempt not compliant; operator requested re-check."
+        }
+
+        # Only reached once the host is compliant, or explicitly accepted with no profile attached.
+        $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
+        if ($hostObj.ConnectionState -eq "Maintenance") {
+            if ($Global:AutoExitMaintenanceMode) {
+                Write-Host "  Taking '$hostName' out of Maintenance mode." -ForegroundColor Green
+                Set-VMHost -VMHost $hostObj -State Connected -Confirm:$false -ErrorAction Stop | Out-Null
+                Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Sent" -Details "Exited after host profile compliance passed."
+            }
+            else {
+                Write-Host "  AutoExitMaintenanceMode is disabled - leaving '$hostName' in Maintenance mode." -ForegroundColor Yellow
+                Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Skipped" -Details "AutoExitMaintenanceMode disabled."
+            }
+        }
+    }
 }
 
 function Invoke-RebootSafetyWindow {
@@ -1631,8 +2047,7 @@ function Invoke-ClusterUpgradeWorkflow {
         }
     }
 
-    $safeInfo = Get-ClusterSafeBatchSizeStrict -Hosts $patchCandidateHosts -Cluster $Cluster -SafetyBuffer $ResourceSafetyBuffer
-    $safeBatchSize = Confirm-BatchSize -CalculatedSize ([int]$safeInfo.SafeBatchSize) -CandidateCount $patchCandidateHosts.Count
+    $batchMode = Select-BatchMode
 
     if (Test-StageNoAck) {
         # Save-only mode does not enter Maintenance mode, does not move VMs, does not acknowledge UCSM reboot, and does not reboot hosts.
@@ -1651,14 +2066,40 @@ function Invoke-ClusterUpgradeWorkflow {
 
     while ($pendingHosts.Count -gt 0) {
         $batchNumber++
-        $currentBatchNames = @($pendingHosts | Select-Object -First $safeBatchSize)
-        Write-Host "`nBATCH ${batchNumber}: $($currentBatchNames -join ', ')" -ForegroundColor Cyan
+
+        # Health and capacity are re-evaluated for every batch, not once up front, so hosts
+        # returning to service and any drift in cluster state are both reflected.
+        $batchSize = 1
+        if ($batchMode -eq "AUTO" -and -not (Test-StageNoAck)) {
+            $healthBefore = Get-ClusterHealthReport -Cluster $Cluster
+            if (-not $healthBefore.IsHealthy) {
+                Write-Host "`nCluster health check failed before Batch ${batchNumber}:" -ForegroundColor Yellow
+                $healthBefore.Reasons | ForEach-Object { Write-Host " - $_" -ForegroundColor Yellow }
+                Add-SummaryRecord -Stage "ClusterHealth" -Batch $batchNumber -HostName "" -Action "Pre-batch health check" -Result "Failed" -Details ($healthBefore.Reasons -join ' | ')
+                Stop-WithMessage "Cluster '$($Cluster.Name)' is not healthy enough to start Batch $batchNumber."
+            }
+
+            $remainingCandidates = @($pendingHosts | ForEach-Object { Get-VMHost -Name $_ -ErrorAction SilentlyContinue } | Where-Object { $null -ne $_ })
+            $sizing = Get-CapacityBasedBatchSize -CandidateHosts $remainingCandidates -Cluster $Cluster
+            $sizing.Diagnostics | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+
+            if ($sizing.SafeBatchSize -lt 1) {
+                Add-SummaryRecord -Stage "ClusterHealth" -Batch $batchNumber -HostName "" -Action "Capacity sizing" -Result "Failed" -Details $sizing.Reason
+                Stop-WithMessage "Cluster '$($Cluster.Name)' has insufficient capacity to remove even one host: $($sizing.Reason)"
+            }
+            $batchSize = [int]$sizing.SafeBatchSize
+            Write-Host "Batch ${batchNumber} sized at $batchSize host(s) from live capacity. $($sizing.Reason)" -ForegroundColor Green
+            Add-SummaryRecord -Stage "BatchSizing" -Batch $batchNumber -HostName "" -Action "Calculate batch size" -Result "$batchSize" -Details $sizing.Reason
+        }
+        elseif ($batchMode -eq "AUTO") {
+            # STAGE_NO_ACK never reboots, so capacity is not a constraint there.
+            $batchSize = [Math]::Min($pendingHosts.Count, [int]$MaxAbsoluteBatchSize)
+        }
+
+        $currentBatchNames = @($pendingHosts | Select-Object -First $batchSize)
+        Write-Host "`nBATCH ${batchNumber} ($batchMode, $($currentBatchNames.Count) host(s)): $($currentBatchNames -join ', ')" -ForegroundColor Cyan
 
         if (Test-StageNoAck) {
-            $requiredText = "SAVE-BATCH-$batchNumber"
-            $confirm = (Read-Host "Type $requiredText to save UCSM firmware policy for this batch only without acknowledgement, or type EXIT").Trim().ToUpper()
-            if ($confirm -eq "EXIT") { Stop-SafeExit -Message "Exited before UCSM save-only change." }
-            if ($confirm -ne $requiredText) { Stop-WithMessage "Save-only confirmation failed." }
             $currentBatchUcsNames = @($currentBatchNames | Where-Object { -not $Global:IntersightHostMap.ContainsKey($_) })
             $currentBatchIntersightNames = @($currentBatchNames | Where-Object { $Global:IntersightHostMap.ContainsKey($_) })
             if ($currentBatchUcsNames.Count -gt 0) {
@@ -1705,15 +2146,37 @@ function Invoke-ClusterUpgradeWorkflow {
         $connectedBatchHosts = Wait-BatchReconnectAfterReboot -HostNames $currentBatchNames -InitialWaitMinutes $initialWait -ModeLabel $modeLabel
         if ($null -eq $connectedBatchHosts) { Stop-WithMessage "Batch is not confirmed back in vCenter. Stopping before next batch." }
 
-        if ($Global:AutoExitMaintenanceMode -and -not (Test-DryRun) -and -not (Test-StageNoAck)) {
-            foreach ($hostName in $currentBatchNames) {
-                $hostObj = Get-VMHost -Name $hostName -ErrorAction SilentlyContinue
-                if ($null -ne $hostObj -and $hostObj.ConnectionState -eq "Maintenance") { Set-VMHost -VMHost $hostObj -State Connected -Confirm:$false -ErrorAction Stop | Out-Null }
+        # The host is back in vCenter and still in Maintenance mode. Check it against its host
+        # profile before it is allowed to take load again, and do not advance while any host in
+        # the batch is non-compliant.
+        Confirm-HostProfileComplianceAndExitMaintenance -HostNames $currentBatchNames -BatchNumber $batchNumber
+
+        foreach ($hostName in $currentBatchNames) { [void]$pendingHosts.Remove($hostName) }
+
+        # Post-batch health gate. Passing it is what allows the run to move to the next batch
+        # on its own; failing it stops the run rather than compounding a problem.
+        if (-not (Test-DryRun) -and -not (Test-StageNoAck)) {
+            # Every host should now be back in service, so nothing is excluded - unless the
+            # operator has turned off automatic Maintenance mode exit, in which case the hosts
+            # just completed are expected to still be in Maintenance and are not a fault.
+            $ignoreForHealth = if ($Global:AutoExitMaintenanceMode) { @() } else { @($currentBatchNames) }
+            $healthAfter = Get-ClusterHealthReport -Cluster $Cluster -IgnoreHostNames $ignoreForHealth
+            if ($healthAfter.IsHealthy) {
+                Write-Host "Cluster health confirmed after Batch $batchNumber." -ForegroundColor Green
+                Add-SummaryRecord -Stage "ClusterHealth" -Batch $batchNumber -HostName "" -Action "Post-batch health check" -Result "Healthy" -Details "Continuing automatically to the next batch."
+            }
+            else {
+                Write-Host "`nCluster health check failed after Batch ${batchNumber}:" -ForegroundColor Yellow
+                $healthAfter.Reasons | ForEach-Object { Write-Host " - $_" -ForegroundColor Yellow }
+                Add-SummaryRecord -Stage "ClusterHealth" -Batch $batchNumber -HostName "" -Action "Post-batch health check" -Result "Failed" -Details ($healthAfter.Reasons -join ' | ')
+                Stop-WithMessage "Cluster '$($Cluster.Name)' is not healthy after Batch $batchNumber. Resolve before continuing."
             }
         }
 
-        foreach ($hostName in $currentBatchNames) { [void]$pendingHosts.Remove($hostName) }
         Write-Host "Batch $batchNumber completed. Remaining hosts: $($pendingHosts.Count)" -ForegroundColor Green
+        if ($pendingHosts.Count -gt 0) {
+            Write-Host "Continuing automatically to Batch $($batchNumber + 1)." -ForegroundColor Green
+        }
     }
     Add-SummaryRecord -Stage "ClusterComplete" -Batch "" -HostName "" -Action "Complete cluster" -Result "Completed" -Details $Cluster.Name
 }
@@ -1725,6 +2188,8 @@ function Invoke-ClusterUpgradeWorkflow {
 $global:vCenter = $null
 $continueScript = $true
 try {
+    Confirm-RunPrerequisites
+
     while ($continueScript) {
         if (-not $global:vCenter) {
             $vCenterInput = Read-Host "Enter vCenter FQDN or IP, or press Enter to use $DefaultVCenter"
