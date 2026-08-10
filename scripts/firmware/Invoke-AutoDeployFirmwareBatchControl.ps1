@@ -25,6 +25,9 @@
     and vice versa. The detection table shows which form produced each match.
 
 .NOTES
+    - Version 16.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+      and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
+      filename.
     - Credentials/API keys are kept in memory only.
     - Intersight only supports API-key + HTTP-signature auth, not username/password - see the
       $Global:IntersightApiKeyId / $Global:IntersightApiKeyFilePath notes in User Settings.
@@ -59,6 +62,12 @@
 # -----------------------------
 # User Settings
 # -----------------------------
+
+# Script version. Recorded in the console banner and stamped onto every row of the run summary
+# and firmware verification CSVs, so any change record can be traced back to the exact revision
+# that produced it. Bump this in the same commit as the change, and tag the commit to match
+# (see CHANGELOG.md). Do not version by filename - git holds the history.
+$ScriptVersion = "16.0.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -128,7 +137,7 @@ $Global:PrerequisitesConfirmed = $false
 
 function Add-SummaryRecord {
     param([string]$Stage,[string]$Batch,[string]$HostName,[string]$Action,[string]$Result,[string]$Details="")
-    $Global:RunSummary.Add([pscustomobject]@{ TimeStamp=Get-Date; Stage=$Stage; Batch=$Batch; Host=$HostName; Action=$Action; Result=$Result; Details=$Details })
+    $Global:RunSummary.Add([pscustomobject]@{ TimeStamp=Get-Date; ScriptVersion=$ScriptVersion; Stage=$Stage; Batch=$Batch; Host=$HostName; Action=$Action; Result=$Result; Details=$Details })
 }
 
 function Export-RunSummary {
@@ -1001,6 +1010,7 @@ function Set-UcsFirmwarePolicyForBatch {
         $Global:UcsHostMap[$row.Host] = $row
 
         [void]$verificationRows.Add([pscustomobject]@{
+            ScriptVersion    = $ScriptVersion
             Batch            = $BatchNumber
             Host             = $row.Host
             UcsTarget        = $row.UcsTarget
@@ -2320,6 +2330,11 @@ function Invoke-ClusterUpgradeWorkflow {
 $global:vCenter = $null
 $continueScript = $true
 try {
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "AutoDeploy UCSM/Intersight firmware batch controller - version $ScriptVersion" -ForegroundColor Cyan
+    Write-Host "Run started $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') on $env:COMPUTERNAME by $env:USERNAME" -ForegroundColor Cyan
+    Add-SummaryRecord -Stage "RunStart" -Batch "" -HostName "" -Action "Start run" -Result "Started" -Details "Version $ScriptVersion; host $env:COMPUTERNAME; user $env:USERNAME."
+
     Confirm-RunPrerequisites
 
     while ($continueScript) {

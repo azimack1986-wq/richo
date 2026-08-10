@@ -1,0 +1,26 @@
+# Normalise to LF in the repository so diffs stay reviewable regardless of who edits.
+* text=auto eol=lf
+
+# PowerShell is checked out CRLF on Windows (matching .editorconfig) but stored LF, so a Windows
+# edit does not show the whole file as changed. That matters here: these scripts change production
+# infrastructure, and a review needs to show only what actually changed.
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+*.cmd  text eol=crlf
+*.bat  text eol=crlf
+
+*.md   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Never touched by normalisation.
+*.pem  binary
+*.key  binary
+*.pfx  binary
+*.p12  binary
+*.png  binary
+*.jpg  binary
+*.xlsx binary
+*.docx binary

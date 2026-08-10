@@ -70,9 +70,39 @@ up the conventions below.
 - **Check dependencies up front** with `Assert-RichoModule` so a missing module
   fails immediately with the install command.
 
+## Versioning
+
+Git holds the history — **do not version by filename** (no `-v15`, `-final`,
+`-new` suffixes). Instead:
+
+- Each script carries a `$ScriptVersion` near the top, semantic per script.
+- That version is stamped onto every row of the run summary and verification
+  CSVs, so any change record traces back to the exact revision that produced it.
+- Bump `$ScriptVersion` in the same commit as the change, record it in
+  [CHANGELOG.md](CHANGELOG.md), and tag the commit to match:
+
+```powershell
+git tag -a firmware-batch-v16.0.0 -m "Firmware batch controller 16.0.0"
+git push origin firmware-batch-v16.0.0
+```
+
+Tags are prefixed with the script name because scripts version independently.
+
+Before a live run, check the banner the script prints against the tag you
+intended to run — that is the cheapest way to catch a stale copy on a jump host.
+
 ## Before committing
 
 ```powershell
 Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
 Invoke-Pester -Path ./tests
+```
+
+The firmware controller also ships standalone suites that need no Pester and no
+vendor modules, so they run anywhere including a locked-down jump host:
+
+```powershell
+pwsh -File ./tests/Test-IntersightNameMatching.ps1
+pwsh -File ./tests/Test-BatchSizingAndCompliance.ps1
+pwsh -File ./tests/Test-IntersightBaseUrl.ps1
 ```
