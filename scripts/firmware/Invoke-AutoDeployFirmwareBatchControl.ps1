@@ -1961,12 +1961,37 @@ function Move-PoweredOffAndSuspendedVMsForBatch {
 }
 
 function Request-MaintenanceModeForBatch {
-    param([Parameter(Mandatory=$true)][array]$HostNames,[Parameter(Mandatory=$true)][string]$Mode)
+    <#
+    .SYNOPSIS
+        Puts every host in the batch into Maintenance mode with evacuation.
+
+    .DESCRIPTION
+        How the request is issued follows from the batch size, so there is nothing to choose:
+
+          One host   - a single blocking call. There is no second host to overlap with.
+          Many hosts - all requested with -RunAsync, then Wait-BatchMaintenanceMode polls until
+                       the whole batch has arrived.
+
+        Issuing a multi-host batch asynchronously is not only faster, it is more correct. A
+        blocking call per host evacuates them one at a time, and DRS is free to place VMs onto a
+        host later in the same batch - which then has to evacuate them again. Requesting the whole
+        batch up front puts every one of them into "entering maintenance" together, so DRS
+        excludes all of them from placement and each VM moves once.
+
+    .PARAMETER HostNames
+        The hosts making up the current batch.
+    #>
+    param([Parameter(Mandatory=$true)][array]$HostNames)
+
     if ((Test-DryRun) -or (Test-StageNoAck)) { Write-Host "DRY/STAGE: Would request Maintenance mode for $($HostNames -join ', ')." -ForegroundColor Green; return }
+
+    $useAsync = ($HostNames.Count -gt 1)
+    Write-Host "Requesting Maintenance mode with evacuation for $($HostNames.Count) host(s)$(if($useAsync){' concurrently'}else{''})." -ForegroundColor Cyan
+
     foreach ($hostName in $HostNames) {
         $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
         if ($hostObj.ConnectionState -eq "Connected") {
-            if ($Mode -eq "PARALLEL") { Set-VMHost -VMHost $hostObj -State Maintenance -Evacuate -RunAsync -Confirm:$false -ErrorAction Stop | Out-Null }
+            if ($useAsync) { Set-VMHost -VMHost $hostObj -State Maintenance -Evacuate -RunAsync -Confirm:$false -ErrorAction Stop | Out-Null }
             else { Set-VMHost -VMHost $hostObj -State Maintenance -Evacuate -Confirm:$false -ErrorAction Stop | Out-Null }
         }
     }
@@ -2049,17 +2074,6 @@ function Invoke-ClusterUpgradeWorkflow {
 
     $batchMode = Select-BatchMode
 
-    if (Test-StageNoAck) {
-        # Save-only mode does not enter Maintenance mode, does not move VMs, does not acknowledge UCSM reboot, and does not reboot hosts.
-        # Skip the maintenance method prompt to keep the flow simple and avoid confusion.
-        $maintenanceModeMethod = "NOT_USED_STAGE_NO_ACK"
-        Write-Host "SAVE ONLY / NO ACKNOWLEDGEMENT selected: skipping Maintenance mode method selection." -ForegroundColor Green
-    }
-    else {
-        $maintenanceModeChoice = Read-ChoiceExit -Message "Select Maintenance mode execution method" -AllowedChoices @("SEQUENTIAL","PARALLEL","1","2")
-        $maintenanceModeMethod = if ($maintenanceModeChoice -eq "1") { "SEQUENTIAL" } elseif ($maintenanceModeChoice -eq "2") { "PARALLEL" } else { $maintenanceModeChoice }
-    }
-
     $pendingHosts = New-Object System.Collections.ArrayList
     foreach ($hostObj in $patchCandidateHosts) { [void]$pendingHosts.Add($hostObj.Name) }
     $batchNumber = 0
@@ -2116,7 +2130,7 @@ function Invoke-ClusterUpgradeWorkflow {
         }
 
         Move-PoweredOffAndSuspendedVMsForBatch -CurrentBatchNames $currentBatchNames -Cluster $Cluster | Out-Null
-        Request-MaintenanceModeForBatch -HostNames $currentBatchNames -Mode $maintenanceModeMethod
+        Request-MaintenanceModeForBatch -HostNames $currentBatchNames
         $batchMaintenanceHosts = Wait-BatchMaintenanceMode -HostNames $currentBatchNames -TimeoutMinutes $MaintenanceValidationTimeoutMinutes
         if ($null -eq $batchMaintenanceHosts) { Stop-WithMessage "Batch is not fully in Maintenance mode within timeout." }
 
