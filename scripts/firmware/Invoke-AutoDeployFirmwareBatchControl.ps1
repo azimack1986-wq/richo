@@ -12,7 +12,7 @@
     and supporting infrastructure is detected per host, before any UCSM or Intersight login: each host's
     CDP/LLDP system name is checked against the Name column in $IntersightCsvPath (default
     C:\temp\intersightfabric.csv). A match detects that host as Intersight-managed: the script finds the
-    server profile, checks for the "Inconsistent" state caused by a firmware policy update, accepts it
+    server profile, checks for staged changes (normally "Pending-changes") caused by a firmware policy update, accepts them
     (including the compulsory disruption tick box), and reboots the blade immediately - scoped to the
     current batch only, same as the existing UCSM acknowledgement. Any host with no CSV match is detected
     as UCS Manager-managed and falls through to the existing UCS Manager (classic) logic unchanged. UCS
@@ -25,7 +25,7 @@
     and vice versa. The detection table shows which form produced each match.
 
 .NOTES
-    - Version 16.6.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 16.7.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -67,7 +67,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "16.6.0"
+$ScriptVersion = "16.7.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -101,6 +101,16 @@ $Global:IntersightServerList = @{}
 $Global:IntersightHostMap = @{}
 $Global:IntersightProfileCache = @{}
 $Global:IntersightUpgradeSurfaceChecked = $false
+# ConfigState values that mean the profile has staged changes not yet on the server, and so needs
+# a deploy. A firmware policy update normally lands in Pending-changes, NOT Inconsistent.
+# Matching ignores case, spaces, hyphens and underscores.
+$Global:IntersightActionableConfigStates = @(
+    'Pending-changes',
+    'Inconsistent',
+    'Out-of-sync',
+    'Not-deployed'
+)
+$Global:BatchActionsSent = 0
 $Global:IntersightUnusable = $false
 $Global:IntersightUnusableReason = ""
 $Global:IntersightSkippedHosts = @{}
@@ -1232,6 +1242,7 @@ function Invoke-UcsPendingAckForBatch {
         if (-not $row.PendingAckFound) { continue }
         $ucsSession = Get-UcsSessionForTarget -UcsTarget $row.UcsTarget
         Set-UcsLsmaintAck -Ucs $ucsSession -LsmaintAck $row.AckObject -AdminState "trigger-immediate" -Force -ErrorAction Stop | Out-Null
+        $Global:BatchActionsSent++
         Add-SummaryRecord -Stage "UCSMAcknowledge" -Batch $BatchNumber -HostName $row.Host -Action "Acknowledge pending activity" -Result "Sent" -Details $row.AckDn
     }
 }
@@ -1948,7 +1959,7 @@ function Initialize-IntersightRoutedHosts {
 
 function Get-IntersightProfileComplianceStateSafe {
     param([Parameter(Mandatory=$true)]$ServerProfile)
-    try { return (Get-IntersightProfileInconsistencyState -ServerProfile $ServerProfile).ConfigState } catch { return "UNKNOWN" }
+    try { return (Get-IntersightProfileDeployState -ServerProfile $ServerProfile).ConfigState } catch { return "UNKNOWN" }
 }
 
 function Resolve-IntersightCsvMatch {
@@ -2068,24 +2079,44 @@ function Resolve-IntersightServerProfileForHost {
     return $sp
 }
 
-function Get-IntersightProfileInconsistencyState {
+function Get-IntersightProfileDeployState {
+    <#
+    .SYNOPSIS
+        Reads a server profile's ConfigState and decides whether it has changes to deploy.
+
+    .DESCRIPTION
+        A firmware policy change does NOT usually leave the profile "Inconsistent". In practice it
+        lands in "Pending-changes" - the policy has been edited but not pushed to the server. An
+        earlier version of this script matched only "Inconsistent", so a profile sitting in
+        Pending-changes was reported as nothing to do, no deploy was sent, and the run then waited
+        out the full post-reboot window for a reboot that was never triggered.
+
+        Every state that means "there is something staged that has not reached the server" is now
+        actionable - see $Global:IntersightActionableConfigStates. Matching is case-insensitive
+        and tolerates the hyphenated and unhyphenated spellings the API has used.
+    #>
     param([Parameter(Mandatory=$true)]$ServerProfile)
 
-    # ConfigContext.ConfigState surfaces "Inconsistent" when the deployed config (including a
-    # firmware/host-firmware-package policy) no longer matches what is actually running on the server.
     $configState = $null
     if ($ServerProfile.PSObject.Properties.Name -contains "ConfigContext" -and $null -ne $ServerProfile.ConfigContext) {
         $configState = $ServerProfile.ConfigContext.ConfigState
     }
 
-    # An absent or blank ConfigState is not the same as "consistent, nothing to do". Treating the
-    # two alike silently skips a host that may still need the firmware change, so the caller is
-    # given enough to tell them apart and stop.
+    # An absent or blank ConfigState is not the same as "nothing to do". Treating the two alike
+    # silently skips a host that may still need the firmware change, so the caller is given
+    # enough to tell them apart and stop.
     $stateKnown = -not [string]::IsNullOrWhiteSpace([string]$configState)
+
+    $normalised = ([string]$configState) -replace '[\s_-]', ''
+    $requiresDeploy = $false
+    foreach ($actionable in $Global:IntersightActionableConfigStates) {
+        if ($normalised -eq (($actionable -replace '[\s_-]', ''))) { $requiresDeploy = $true; break }
+    }
+
     return [pscustomobject]@{
         ConfigState    = if ($stateKnown) { [string]$configState } else { "UNKNOWN" }
         StateKnown     = $stateKnown
-        IsInconsistent = ($configState -eq "Inconsistent")
+        RequiresDeploy = $requiresDeploy
     }
 }
 
@@ -2095,14 +2126,14 @@ function Get-IntersightPendingInconsistencyForBatch {
     foreach ($hostName in $HostNames) {
         $map = $Global:IntersightHostMap[$hostName]
         $sp = Resolve-IntersightServerProfileForHost -HostName $hostName -IntersightCsvRow $map.IntersightCsvRow
-        $state = Get-IntersightProfileInconsistencyState -ServerProfile $sp
+        $state = Get-IntersightProfileDeployState -ServerProfile $sp
         [void]$rows.Add([pscustomobject]@{
             Host            = $hostName
             ServerProfile   = $sp.Name
             ProfileMoid     = $sp.Moid
             ConfigState     = $state.ConfigState
             StateKnown      = $state.StateKnown
-            IsInconsistent  = $state.IsInconsistent
+            RequiresDeploy  = $state.RequiresDeploy
             ServerProfileObj = $sp
         })
     }
@@ -2117,7 +2148,7 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
     $pendingRows = @(Get-IntersightPendingInconsistencyForBatch -HostNames $HostNames)
     Write-Host "" -ForegroundColor Cyan
     Write-Host "Intersight server profile inconsistency check for Batch ${BatchNumber}:" -ForegroundColor Cyan
-    $pendingRows | Select-Object Host,ServerProfile,ConfigState,IsInconsistent | Format-Table -AutoSize
+    $pendingRows | Select-Object Host,ServerProfile,ConfigState,RequiresDeploy | Format-Table -AutoSize | Out-Host
 
     # A profile whose ConfigState could not be read is not evidence that there is nothing to do.
     # Continuing past it would quietly leave the host un-upgraded while the batch reports success.
@@ -2150,13 +2181,13 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
         return
     }
 
-    if (@($pendingRows | Where-Object { $_.IsInconsistent }).Count -gt 0) {
+    if (@($pendingRows | Where-Object { $_.RequiresDeploy }).Count -gt 0) {
         Assert-IntersightUpgradeCmdletSurface
     }
 
     foreach ($row in $pendingRows) {
-        if (-not $row.IsInconsistent) {
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Skipped" -Details "ConfigState=$($row.ConfigState) - not Inconsistent, nothing to accept."
+        if (-not $row.RequiresDeploy) {
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Skipped" -Details "ConfigState=$($row.ConfigState) - no staged changes to deploy."
             continue
         }
 
@@ -2174,7 +2205,8 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
                 -DisruptionAcknowledged $true `
                 -ErrorAction Stop | Out-Null
 
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Sent" -Details "ServerProfile=$($row.ServerProfile); ConfigState was Inconsistent; disruption tick box accepted."
+            $Global:BatchActionsSent++
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Sent" -Details "ServerProfile=$($row.ServerProfile); ConfigState was $($row.ConfigState); disruption tick box accepted."
         } catch {
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Failed" -Details $_.Exception.Message
             Stop-WithMessage "Intersight accept/reboot failed for '$($row.Host)': $($_.Exception.Message)"
@@ -2721,6 +2753,7 @@ function Invoke-ClusterUpgradeWorkflow {
         }
 
         $currentBatchNames = @($pendingHosts | Select-Object -First $batchSize)
+        $Global:BatchActionsSent = 0
         Write-Host "`nBATCH ${batchNumber} ($batchMode, $($currentBatchNames.Count) host(s)): $($currentBatchNames -join ', ')" -ForegroundColor Cyan
 
         if (Test-StageNoAck) {
@@ -2760,6 +2793,43 @@ function Invoke-ClusterUpgradeWorkflow {
 
             $initialWait = $FirmwareReconnectInitialWaitMinutes
             $modeLabel = "Firmware mode"
+
+            # Nothing was actually sent, so nothing is rebooting. Waiting out the post-reboot
+            # window here would burn the change window and then check compliance on a host that
+            # never restarted. Surface it and let the operator decide instead.
+            if ($Global:BatchActionsSent -eq 0 -and -not (Test-DryRun)) {
+                Write-Host "" -ForegroundColor Yellow
+                Write-Host "No firmware action was sent for Batch ${batchNumber}. Nothing is rebooting." -ForegroundColor Yellow
+                Write-Host "Every host in this batch reported no staged changes to deploy:" -ForegroundColor Yellow
+                foreach ($hostName in $currentBatchNames) {
+                    $stateText = "unknown"
+                    if ($Global:IntersightHostMap.ContainsKey($hostName)) {
+                        try {
+                            $sp = Resolve-IntersightServerProfileForHost -HostName $hostName -IntersightCsvRow $Global:IntersightHostMap[$hostName].IntersightCsvRow
+                            $stateText = "Intersight ConfigState=$((Get-IntersightProfileDeployState -ServerProfile $sp).ConfigState)"
+                        } catch { $stateText = "Intersight state unreadable" }
+                    }
+                    else {
+                        $stateText = "UCSM - no pending activity found on the service profile"
+                    }
+                    Write-Host "  $hostName - $stateText" -ForegroundColor Yellow
+                }
+                Write-Host "That is expected if these hosts already run the target firmware. If it is not" -ForegroundColor Yellow
+                Write-Host "expected, the policy change may not have been staged against these profiles." -ForegroundColor Yellow
+                Add-SummaryRecord -Stage "BatchAction" -Batch $batchNumber -HostName "" -Action "Send firmware action" -Result "None" -Details "No host in the batch had staged changes to deploy; post-reboot wait skipped."
+
+                $choice = Read-ChoiceExit `
+                    -Message "Nothing to reboot for Batch $batchNumber. Choose CONTINUE to treat these hosts as already current and move on, or STOP" `
+                    -AllowedChoices @("CONTINUE","STOP") `
+                    -ExitMessage "Stopped because Batch $batchNumber had no firmware action to send."
+                if ($choice -eq "STOP") {
+                    Stop-WithMessage "Batch $batchNumber had no firmware action to send. Confirm the firmware policy is staged against these profiles before re-running."
+                }
+
+                # Skip the reboot wait entirely, then let the normal compliance and health path run.
+                $initialWait = 0
+                $modeLabel = "Firmware mode (no reboot triggered)"
+            }
         } else {
             Invoke-RebootSafetyWindow -TimeoutSeconds 90 -HostNames $currentBatchNames -BatchNumber $batchNumber | Out-Null
             foreach ($hostObj in $batchMaintenanceHosts) { if (-not (Test-DryRun)) { Restart-VMHost -VMHost $hostObj -Confirm:$false -ErrorAction Stop | Out-Null } }

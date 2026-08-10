@@ -12,6 +12,44 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [16.7.0] — 2026-08-10
+
+Found on the first successful authenticated run: the blade had a pending profile
+update and the deploy was never sent.
+
+#### Fixed
+
+- **A firmware policy change leaves the profile in `Pending-changes`, not
+  `Inconsistent`.** Only `Inconsistent` was matched, so a profile sitting in
+  `Pending-changes` was reported as `IsInconsistent False`, no deploy was sent,
+  and the host never rebooted. Every state meaning "changes are staged but not
+  on the server" is now actionable — `Pending-changes`, `Inconsistent`,
+  `Out-of-sync`, `Not-deployed` — listed in
+  `$Global:IntersightActionableConfigStates` and matched ignoring case, spaces,
+  hyphens and underscores.
+- **The batch then waited out the full 25-minute post-reboot window for a reboot
+  that was never triggered**, and would have run the host profile compliance
+  check against a host that never restarted. Each batch now counts the
+  disruptive actions it actually sends. If that count is zero, the reboot wait is
+  skipped and the operator is shown each host with its current ConfigState, then
+  chooses CONTINUE (these hosts already run the target firmware) or STOP (the
+  policy was not staged against these profiles).
+- `Format-Table` inside the inconsistency check wrote to the success stream,
+  which would have leaked rendering records into any caller's pipeline.
+
+#### Changed
+
+- `Get-IntersightProfileInconsistencyState` is now
+  `Get-IntersightProfileDeployState`, returning `RequiresDeploy` in place of
+  `IsInconsistent`. The batch table column changes to match.
+
+#### Added
+
+- `tests/Test-IntersightDeployState.ps1` — 26 assertions covering the state from
+  the live run, the other actionable states, seven spelling and casing variants,
+  six states that must never trigger a reboot, and the unreadable cases that
+  must not be silently treated as "nothing to do".
+
 ### [16.6.0] — 2026-08-10
 
 #### Added
