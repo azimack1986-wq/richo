@@ -1,0 +1,48 @@
+{
+  "$comment": "Copy to config/environments.json (gitignored) and fill in. Endpoints and key IDs only -- no passwords, no private keys. Point apiKeyFile at a .pem stored OUTSIDE this repo.",
+  "default": "lab",
+  "environments": {
+    "lab": {
+      "description": "Non-production lab",
+      "vcenter": {
+        "server": "vcenter-lab.example.com",
+        "credentialName": "vcenter-lab"
+      },
+      "intersight": {
+        "apiKeyId": "REPLACE_ME/REPLACE_ME/REPLACE_ME",
+        "apiKeyFile": "C:\\keys\\intersight-lab.pem",
+        "basePath": "https://intersight.com"
+      },
+      "ucsm": {
+        "server": "ucsm-lab.example.com",
+        "credentialName": "ucsm-lab"
+      },
+      "srm": {
+        "server": "srm-lab.example.com",
+        "port": 443,
+        "credentialName": "srm-lab"
+      }
+    },
+    "prod": {
+      "description": "Production",
+      "vcenter": {
+        "server": "vcenter01.example.com",
+        "credentialName": "vcenter-prod"
+      },
+      "intersight": {
+        "apiKeyId": "REPLACE_ME/REPLACE_ME/REPLACE_ME",
+        "apiKeyFile": "C:\\keys\\intersight-prod.pem",
+        "basePath": "https://intersight.example.com"
+      },
+      "ucsm": {
+        "server": "ucsm01.example.com",
+        "credentialName": "ucsm-prod"
+      },
+      "srm": {
+        "server": "srm01.example.com",
+        "port": 443,
+        "credentialName": "srm-prod"
+      }
+    }
+  }
+}

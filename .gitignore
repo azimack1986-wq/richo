@@ -1,0 +1,50 @@
+# ---------------------------------------------------------------------------
+# Secrets and credentials -- NEVER commit these.
+# ---------------------------------------------------------------------------
+*.pem
+*.key
+*.pfx
+*.p12
+*.cer
+*.crt
+secrets.json
+secrets.*.json
+credentials.json
+*.cred
+*.clixml
+config/environments.json
+config/*.local.json
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Script output
+# ---------------------------------------------------------------------------
+output/
+logs/
+*.log
+*.transcript
+reports/
+*.csv.bak
+
+# ---------------------------------------------------------------------------
+# PowerShell
+# ---------------------------------------------------------------------------
+*.ps1xml.bak
+PSScriptAnalyzer-results.*
+TestResults.xml
+coverage.xml
+.pester/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
