@@ -12,6 +12,29 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [16.6.0] — 2026-08-10
+
+#### Added
+
+- Pinned module versions in `config/module-requirements.psd1`, plus
+  `tools/Save-RichoModuleBundle.ps1` to fetch them into `modules/vendor/` on a
+  machine with gallery access and `tools/Import-RichoModuleBundle.ps1` to load
+  them on a jump host. `Save-Module` is used, so nothing is installed and no
+  admin rights are needed; the import prepends the bundle to `$env:PSModulePath`
+  for the current session only, so pinned versions shadow machine-wide installs
+  without changing anything on the machine.
+- The pre-flight compares the loaded `Intersight.PowerShell` against the pinned
+  version and points at the bundle when they differ. A mismatched build
+  authenticates correctly and then fails to read the appliance's responses, so
+  catching it here saves a change window.
+
+#### Notes
+
+- `modules/vendor/README.md` covers the size question before committing
+  binaries: GitHub rejects files over 100 MB, git keeps every version forever,
+  and the recommendation is to vendor only `Intersight.PowerShell` — the
+  version-sensitive one — and install PowerCLI and UCS PowerTool normally.
+
 ### [16.5.0] — 2026-08-10
 
 Follow-up to the PVA diagnosis: no code change can make the module parse a

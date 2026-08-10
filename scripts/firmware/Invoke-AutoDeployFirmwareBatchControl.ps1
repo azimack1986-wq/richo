@@ -25,7 +25,7 @@
     and vice versa. The detection table shows which form produced each match.
 
 .NOTES
-    - Version 16.5.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 16.6.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -67,7 +67,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "16.5.0"
+$ScriptVersion = "16.6.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -362,10 +362,39 @@ function Confirm-RunPrerequisites {
         Write-Host "PowerShell edition: Core $($PSVersionTable.PSVersion) - correct host for Intersight.PowerShell." -ForegroundColor Green
     }
 
+    # Compare what is loaded against the version pinned in config/module-requirements.psd1. A
+    # module that authenticates but cannot parse the appliance's responses looks like a credential
+    # problem and costs a change window; catching the version here costs seconds.
+    $pinnedIntersight = ""
+    try {
+        $reqPath = Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'config/module-requirements.psd1'
+        if (Test-Path $reqPath) {
+            $req = Import-PowerShellDataFile -Path $reqPath
+            $pinnedIntersight = [string](@($req.Modules | Where-Object { $_.Name -eq 'Intersight.PowerShell' }).Version)
+        }
+    } catch {}
+
     $intersight = $moduleReport | Where-Object { $_.Module -eq "Intersight.PowerShell" }
+
+    if (-not [string]::IsNullOrWhiteSpace($pinnedIntersight) -and $intersight.Status -ne "MISSING") {
+        $loadedIntersight = @(Get-Module -ListAvailable -Name Intersight.PowerShell | Sort-Object Version -Descending | Select-Object -First 1)
+        $loadedVersion = if ($loadedIntersight.Count -gt 0) { $loadedIntersight[0].Version.ToString() } else { "unknown" }
+        if ($loadedVersion -ne $pinnedIntersight) {
+            Write-Host "Intersight.PowerShell version $loadedVersion does not match the pinned $pinnedIntersight." -ForegroundColor Yellow
+            Write-Host "  A mismatched build can authenticate correctly and then fail to read the appliance's" -ForegroundColor Yellow
+            Write-Host "  responses, which reports as a credential error. Load the pinned version with:" -ForegroundColor Yellow
+            Write-Host "    . .\tools\Import-RichoModuleBundle.ps1" -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Check pinned Intersight version" -Result "Mismatch" -Details "Loaded $loadedVersion, pinned $pinnedIntersight."
+        }
+        else {
+            Write-Host "Intersight.PowerShell $loadedVersion matches the pinned version." -ForegroundColor Green
+        }
+    }
+
     if ($intersight.Status -eq "MISSING") {
         Write-Host "Intersight.PowerShell is NOT installed." -ForegroundColor Red
-        Write-Host "  Install it with: Install-Module Intersight.PowerShell -Scope CurrentUser" -ForegroundColor Red
+        Write-Host "  Load the pinned copy from the repo bundle: . .\tools\Import-RichoModuleBundle.ps1" -ForegroundColor Red
+        Write-Host "  Or install it with: Install-Module Intersight.PowerShell -Scope CurrentUser" -ForegroundColor Red
         Write-Host "  Without it, the run will stop as soon as an Intersight-managed host is detected." -ForegroundColor Red
         Write-Host "  Answer SKIP below only if no host in scope is Intersight-managed." -ForegroundColor Red
     }

@@ -70,6 +70,35 @@ up the conventions below.
 - **Check dependencies up front** with `Assert-RichoModule` so a missing module
   fails immediately with the install command.
 
+## Vendored modules (offline / pinned)
+
+Third-party module versions are pinned in
+[`config/module-requirements.psd1`](config/module-requirements.psd1) and can be
+vendored into `modules/vendor/` so a jump host runs end-to-end without gallery
+access — and so every jump host runs the same version.
+
+```powershell
+# Once, on a machine with PowerShell Gallery access:
+.\tools\Save-RichoModuleBundle.ps1
+
+# On the jump host, in the session you will run the automation from:
+. .\tools\Import-RichoModuleBundle.ps1
+```
+
+`Save-Module` is used, so nothing is installed and no admin rights are needed.
+The import puts the bundle at the front of `$env:PSModulePath` for the current
+session only, so pinned versions win over machine-wide installs without changing
+or removing anything on the machine.
+
+This is not cosmetic. `Intersight.PowerShell` 1.0.11.2025021903 authenticates
+correctly against a PVA and then cannot deserialize its responses — a schema
+mismatch the module reports as a credential error. Pinning removes that class of
+failure.
+
+See [`modules/vendor/README.md`](modules/vendor/README.md) before committing the
+binaries — they are large, GitHub rejects files over 100 MB, and git keeps every
+version forever.
+
 ## Versioning
 
 Git holds the history — **do not version by filename** (no `-v15`, `-final`,
