@@ -12,6 +12,28 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [16.2.0] — 2026-08-10
+
+#### Added
+
+- The pre-flight check now verifies the required PowerShell modules before
+  vCenter is contacted, reporting each as OK, MISSING or MULTIPLE with the
+  versions found:
+  - **VMware PowerCLI** — missing stops the run, since everything depends on it.
+  - **Intersight.PowerShell** — missing warns with the install command and notes
+    the run will stop at Intersight fabric detection. More than one version
+    installed warns loudly, because that is the most common cause of an
+    authentication failure with a valid API key.
+  - **Cisco UCS PowerTool** — missing warns when running in firmware mode.
+- A module registering its cmdlets under a different module name still counts as
+  present, so a working install is never reported as missing.
+
+#### Fixed
+
+- A controlled stop (`SAFE_EXIT` / `STOP_WORKFLOW`) reaching the outer handler
+  printed "Unhandled script error: STOP_WORKFLOW". It now reports a controlled
+  checkpoint, and no longer records a duplicate error row in the summary.
+
 ### [16.1.0] — 2026-08-10
 
 Found during the first live run against a PVA appliance.

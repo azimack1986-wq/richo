@@ -25,7 +25,7 @@
     and vice versa. The detection table shows which form produced each match.
 
 .NOTES
-    - Version 16.1.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 16.2.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -67,7 +67,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "16.1.0"
+$ScriptVersion = "16.2.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -271,15 +271,55 @@ function Show-OpenFileDialog {
     }
 }
 
+function Get-ModulePresenceReport {
+    <#
+    .SYNOPSIS
+        Reports whether a module is installed, and every version of it that is.
+
+    .DESCRIPTION
+        The version count matters as much as presence: side-by-side versions of
+        Intersight.PowerShell are the documented most-common cause of an authentication failure
+        with an otherwise valid API key, and the failure never points at the real reason.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Label,
+        [Parameter(Mandatory=$true)][string]$ModuleName,
+        [Parameter(Mandatory=$true)][string]$ProbeCmdlet
+    )
+
+    $versions = @(Get-Module -ListAvailable -Name $ModuleName -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty Version -Unique | Sort-Object -Descending)
+
+    # Some vendor bundles register cmdlets under a differently-named module, so a successful
+    # cmdlet probe still counts as present even when the expected module name returns nothing.
+    $cmdletAvailable = ($null -ne (Get-Command -Name $ProbeCmdlet -ErrorAction SilentlyContinue))
+    $installed = (($versions.Count -gt 0) -or $cmdletAvailable)
+
+    $status = if (-not $installed) { "MISSING" }
+              elseif ($versions.Count -gt 1) { "MULTIPLE" }
+              else { "OK" }
+
+    return [pscustomobject]@{
+        Component = $Label
+        Module    = $ModuleName
+        Status    = $status
+        Versions  = if ($versions.Count -gt 0) { (($versions | ForEach-Object { $_.ToString() }) -join ', ') }
+                    elseif ($cmdletAvailable) { "present (version not reported)" }
+                    else { "-" }
+    }
+}
+
 function Confirm-RunPrerequisites {
     <#
     .SYNOPSIS
-        Pre-flight gate confirming the Intersight API key ID and .pem private key are in hand.
+        Pre-flight gate: required PowerShell modules, plus the Intersight API key ID and .pem.
 
     .DESCRIPTION
-        Both are generated together in Intersight (Settings > API Keys) and cannot be recovered
-        afterwards - the secret key is only downloadable at creation. Finding that out partway
-        through a change window is expensive, so it is asked before vCenter is even contacted.
+        Checks the modules the run depends on before vCenter is contacted, and confirms the
+        operator holds the Intersight credentials. Both are generated together in Intersight
+        (Settings > API Keys) and cannot be recovered afterwards - the secret key is only
+        downloadable at creation. Finding any of this out partway through a change window is
+        expensive.
     #>
     if ($Global:PrerequisitesConfirmed) { return }
 
@@ -287,11 +327,54 @@ function Confirm-RunPrerequisites {
     Write-Host "=====================================================================" -ForegroundColor Cyan
     Write-Host " PRE-FLIGHT CHECK" -ForegroundColor Cyan
     Write-Host "=====================================================================" -ForegroundColor Cyan
+
+    # ---- Required PowerShell modules -------------------------------------------------------
+    Write-Host "Checking required PowerShell modules..." -ForegroundColor Cyan
+    $moduleReport = @(
+        Get-ModulePresenceReport -Label "VMware PowerCLI"     -ModuleName "VMware.VimAutomation.Core" -ProbeCmdlet "Connect-VIServer"
+        Get-ModulePresenceReport -Label "Cisco Intersight"    -ModuleName "Intersight.PowerShell"     -ProbeCmdlet "Set-IntersightConfiguration"
+        Get-ModulePresenceReport -Label "Cisco UCS PowerTool" -ModuleName "Cisco.UCSManager"          -ProbeCmdlet "Connect-Ucs"
+    )
+    $moduleReport | Format-Table -AutoSize
+    foreach ($row in $moduleReport) {
+        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Check module $($row.Module)" -Result $row.Status -Details "Versions: $($row.Versions)."
+    }
+
+    $powerCli = $moduleReport | Where-Object { $_.Module -eq "VMware.VimAutomation.Core" }
+    if ($powerCli.Status -eq "MISSING") {
+        Stop-WithMessage "VMware PowerCLI is not installed, and every part of this script depends on it. Install it with: Install-Module VMware.PowerCLI -Scope CurrentUser"
+    }
+
+    $intersight = $moduleReport | Where-Object { $_.Module -eq "Intersight.PowerShell" }
+    if ($intersight.Status -eq "MISSING") {
+        Write-Host "Intersight.PowerShell is NOT installed." -ForegroundColor Red
+        Write-Host "  Install it with: Install-Module Intersight.PowerShell -Scope CurrentUser" -ForegroundColor Red
+        Write-Host "  Without it, the run will stop as soon as an Intersight-managed host is detected." -ForegroundColor Red
+        Write-Host "  Answer SKIP below only if no host in scope is Intersight-managed." -ForegroundColor Red
+    }
+    elseif ($intersight.Status -eq "MULTIPLE") {
+        Write-Host "MORE THAN ONE version of Intersight.PowerShell is installed: $($intersight.Versions)" -ForegroundColor Red
+        Write-Host "  This is the most common cause of an Intersight authentication failure with a valid" -ForegroundColor Red
+        Write-Host "  API key, and the error it produces never points at the real reason. Remove the older" -ForegroundColor Red
+        Write-Host "  versions and restart PowerShell before running against Intersight-managed hosts." -ForegroundColor Red
+        Write-Host "  Find them with: Get-Module -ListAvailable -Name Intersight.PowerShell | Select Version, ModuleBase" -ForegroundColor Red
+    }
+
+    $ucsPowerTool = $moduleReport | Where-Object { $_.Module -eq "Cisco.UCSManager" }
+    if ($ucsPowerTool.Status -eq "MISSING" -and $Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") {
+        Write-Host "Cisco UCS PowerTool is NOT installed." -ForegroundColor Yellow
+        Write-Host "  Install it with: Install-Module Cisco.UCSManager -Scope CurrentUser" -ForegroundColor Yellow
+        Write-Host "  It is only needed if at least one host in scope is UCS Manager-managed." -ForegroundColor Yellow
+    }
+
+    # ---- Intersight credentials ------------------------------------------------------------
+    Write-Host "" -ForegroundColor Yellow
     Write-Host "If any host in scope is Intersight-managed, this run needs ALL of:" -ForegroundColor Yellow
     Write-Host "  1. An Intersight API Key ID - three segments, e.g. aaaa/bbbb/cccc" -ForegroundColor Yellow
     Write-Host "  2. The matching private key (.pem) file saved to this machine" -ForegroundColor Yellow
     Write-Host "  3. The Intersight address - the PVA appliance FQDN, or intersight.com for SaaS." -ForegroundColor Yellow
     Write-Host "     You will be prompted for this the moment an Intersight fabric is detected." -ForegroundColor Yellow
+    Write-Host "  4. The Intersight.PowerShell module installed, in exactly one version (see above)." -ForegroundColor Yellow
     Write-Host "" -ForegroundColor Yellow
     Write-Host "Both are issued together in Intersight under Settings > API Keys. The" -ForegroundColor Yellow
     Write-Host "secret key can only be downloaded at the moment the key is created - if" -ForegroundColor Yellow
@@ -2593,8 +2676,14 @@ try {
         if ($next -eq "3") { $continueScript = $false }
     }
 } catch {
-    Write-Host "`nUnhandled script error: $($_.Exception.Message)" -ForegroundColor Red
-    Add-SummaryRecord -Stage "UnhandledError" -Batch "" -HostName "" -Action "Script error" -Result "Failed" -Details $_.Exception.Message
+    if ($_.Exception.Message -in @("SAFE_EXIT","STOP_WORKFLOW")) {
+        # Already reported and recorded by Stop-SafeExit / Stop-WithMessage.
+        Write-Host "`nScript stopped at a controlled checkpoint. See the messages above and the run summary." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "`nUnhandled script error: $($_.Exception.Message)" -ForegroundColor Red
+        Add-SummaryRecord -Stage "UnhandledError" -Batch "" -HostName "" -Action "Script error" -Result "Failed" -Details $_.Exception.Message
+    }
 } finally {
     Export-RunSummary
     try { foreach ($key in @($Global:UcsSessions.Keys)) { try { Disconnect-Ucs -Ucs $Global:UcsSessions[$key] -ErrorAction SilentlyContinue | Out-Null } catch {} } } catch {}
