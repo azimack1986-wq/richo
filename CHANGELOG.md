@@ -12,6 +12,38 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [16.9.0] — 2026-08-10
+
+Aligned with a minimal `Set-IntersightConfiguration` call the operator confirmed
+works against this PVA, where the script's richer call kept faulting. Three
+differences, each now removed or defaulted off.
+
+#### Fixed
+
+- **Only one `Set-IntersightConfiguration` call per session.** The key-file then
+  key-string fallback issued a second call after a failure.
+  `Set-IntersightConfiguration` is process-wide state that does not reliably
+  reset, so the second call tested a poisoned client rather than the
+  credentials — which is exactly why the same inputs succeed first time in a
+  fresh session. The failure path now says to start a fresh PowerShell session
+  rather than quietly retrying in a session that has already failed.
+- **`-SkipCertificateCheck` is off by default**, including for on-prem
+  appliances, and is no longer derived from the address. It swaps the module's
+  HTTP handler, which is a credible cause of the corrupted response bodies —
+  JSON turning to percent-encoded JSON partway through — that surface as
+  "cannot be deserialized into any schema defined".
+- **`-HashAlgorithm` is omitted** unless `$Global:IntersightHashAlgorithm` is
+  set, leaving the module default rather than forcing SHA256.
+
+#### Changed
+
+- The exact `Set-IntersightConfiguration` call is echoed before it runs, with
+  the key ID and PEM path elided, so what the script sends can be compared
+  against a known-good call at a glance.
+- Remedies for an unreadable response are reordered to match likelihood: fresh
+  session first, certificate handler second, module version last. Previously it
+  led with the module version, which is the most disruptive and least likely.
+
 ### [16.8.0] — 2026-08-10
 
 #### Removed

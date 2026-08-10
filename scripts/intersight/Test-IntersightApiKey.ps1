@@ -20,10 +20,15 @@
       6. Reachability, separating a wrong or unreachable FQDN from a rejected key.
       7. Clock skew against the appliance's own Date header. HTTP signature auth signs the
          Date header, so a jump host more than a few minutes out is rejected with no clue why.
-      8. The authentication itself, tried first with the key file and then with the key passed
-         as a string, which works around PEM encoding and whitespace problems.
+      8. The authentication itself - ONE Set-IntersightConfiguration call, matching the minimal
+         form proven to work against this appliance.
 
     Changes nothing. Touches no host, no profile, no policy.
+
+    RUN THIS FROM A FRESH POWERSHELL SESSION. Set-IntersightConfiguration is process-wide state
+    that does not reliably reset after a failed attempt, so a session that has already tried and
+    failed will keep failing with credentials that are perfectly good. That is why the same inputs
+    succeed immediately in a new session.
 
 .PARAMETER BaseUrl
     Appliance address. Bare FQDN or full URL; scheme, trailing slash and any /api/v1 suffix are
@@ -36,8 +41,10 @@
     Path to the .pem private key issued with that Key ID. Prompted for when omitted.
 
 .PARAMETER SkipCertificateCheck
-    Relax certificate validation, as an on-prem PVA with a private CA normally requires.
-    Defaults to on for anything that is not intersight.com.
+    Relax certificate validation. OFF by default, including for on-prem appliances: it swaps the
+    module's HTTP handler and is a credible cause of the corrupted response bodies that surface as
+    "cannot be deserialized into any schema defined". Pass it only if the appliance certificate
+    genuinely cannot be validated, and expect it to be a suspect if responses then fail to parse.
 
 .EXAMPLE
     .\Test-IntersightApiKey.ps1
@@ -172,7 +179,9 @@ if ([string]::IsNullOrWhiteSpace($normalisedBase)) {
 $ApiKeyId = $ApiKeyId.Trim()
 
 $isSaaS = ($normalisedBase -match '(?i)^https://([A-Za-z0-9-]+\.)*intersight\.com(:\d+)?$')
-if (-not $PSBoundParameters.ContainsKey('SkipCertificateCheck')) { $SkipCertificateCheck = (-not $isSaaS) }
+# Default OFF. -SkipCertificateCheck swaps the module's HTTP handler and is a credible cause of
+# the corrupted response bodies that present as "cannot be deserialized". Pass it explicitly only
+# if the appliance certificate genuinely cannot be validated.
 
 Write-Host "`nTarget    : $normalisedBase"
 Write-Host "Kind      : $(if ($isSaaS) { 'SaaS' } else { 'on-prem PVA' })"
@@ -371,20 +380,23 @@ else {
     $signingHeaders = @("(request-target)", "Host", "Date", "Digest")
     $authenticated = $false
 
-    foreach ($method in @('KeyFile','KeyString')) {
+    # ONE attempt. Set-IntersightConfiguration is process-wide state that does not reliably reset
+    # after a failure, so a second call in the same session tests a poisoned client rather than the
+    # credentials. Run this checker from a fresh session each time.
+    foreach ($method in @('KeyFile')) {
         if ($authenticated) { break }
-        if ($method -eq 'KeyString' -and -not (Test-Path -Path $ApiKeyFilePath)) { continue }
 
         try {
+            # Matches the minimal call proven to work against this appliance: no HashAlgorithm
+            # (module default) and no SkipCertificateCheck unless explicitly requested, since it
+            # swaps the HTTP handler and can corrupt response bodies.
             $cfg = @{
                 BasePath          = $normalisedBase
                 ApiKeyId          = $ApiKeyId
+                ApiKeyFilePath    = $ApiKeyFilePath
                 HttpSigningHeader = $signingHeaders
-                HashAlgorithm     = "SHA256"
                 ErrorAction       = "Stop"
             }
-            if ($method -eq 'KeyFile') { $cfg['ApiKeyFilePath'] = $ApiKeyFilePath }
-            else { $cfg['ApiKeyString'] = (Get-Content -Path $ApiKeyFilePath -Raw) }
             if ($SkipCertificateCheck) { $cfg['SkipCertificateCheck'] = $true }
 
             Set-IntersightConfiguration @cfg | Out-Null
@@ -402,10 +414,12 @@ else {
                 Write-Check -Name "Authentication ($method)" -Result PASS -Detail "The appliance accepted the signed request and returned data. The API Key ID and .pem are correct."
                 Write-Check -Name "Module can read appliance responses" -Result FAIL -Detail "Intersight.PowerShell could not deserialize the reply into any schema it knows. This is a client/appliance version mismatch, not a credential problem - do NOT regenerate the API key."
                 Write-Host "         Installed module: $(if ($available.Count -gt 0) { $available[0].Version } else { 'unknown' })" -ForegroundColor Gray
-                Write-Host "         Install the module build that matches this appliance's Intersight release:" -ForegroundColor Yellow
-                Write-Host "           Install-Module Intersight.PowerShell -RequiredVersion 1.0.11.17 -Scope CurrentUser -Force" -ForegroundColor Yellow
-                Write-Host "           Uninstall-Module Intersight.PowerShell -RequiredVersion <newer version> -AllVersions:`$false" -ForegroundColor Yellow
-                Write-Host "         Then close PowerShell, reopen, and re-run this checker." -ForegroundColor Yellow
+                Write-Host "         Try in this order:" -ForegroundColor Yellow
+                Write-Host "           1. Close PowerShell, open a FRESH session, run this checker again. This is" -ForegroundColor Yellow
+                Write-Host "              the most common fix - the module keeps process-wide state." -ForegroundColor Yellow
+                Write-Host "           2. Do not pass -SkipCertificateCheck." -ForegroundColor Yellow
+                Write-Host "           3. Only then align the module version:" -ForegroundColor Yellow
+                Write-Host "              Install-Module Intersight.PowerShell -RequiredVersion 1.0.11.17 -Scope CurrentUser -Force" -ForegroundColor Yellow
                 Write-Host "         Abridged error:" -ForegroundColor DarkGray
                 Write-Host (Get-ExceptionChain -ErrorRecord $_) -ForegroundColor DarkGray
                 $authenticated = $true
@@ -415,7 +429,8 @@ else {
 
             Write-Check -Name "Authentication ($method)" -Result FAIL -Detail (Format-Truncated -Text $_.Exception.Message -Max 300)
             Write-Host (Get-ExceptionChain -ErrorRecord $_) -ForegroundColor DarkGray
-            if ($method -eq 'KeyFile') { Write-Host "         Retrying with the key passed as a string, which bypasses file encoding problems..." -ForegroundColor Yellow }
+            Write-Host "         Run this again from a FRESH PowerShell session before drawing conclusions -" -ForegroundColor Yellow
+            Write-Host "         Set-IntersightConfiguration does not reliably reset after a failed attempt." -ForegroundColor Yellow
         }
     }
 }

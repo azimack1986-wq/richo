@@ -42,7 +42,7 @@
     report installed versions when a login actually fails. Verify the environment out of band with
     scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 16.8.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 16.9.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -84,7 +84,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "16.8.0"
+$ScriptVersion = "16.9.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -105,7 +105,13 @@ $IntersightCsvPath = "C:\temp\intersightfabric.csv"
 # appends the API path itself, and a trailing slash breaks HTTP signature validation.
 $Global:IntersightBaseUrl = "https://intersight.com"           # PVA example: https://<pva-fqdn>
 # Set automatically from the entered address: on for an on-prem PVA, off for intersight.com.
-$Global:IntersightSkipCertificateCheck = $true
+# Both default OFF, to match the minimal Set-IntersightConfiguration call proven to work against
+# this PVA. -SkipCertificateCheck in particular changes the HTTP handler the module uses, and is a
+# credible cause of the mangled response bodies that surface as "cannot be deserialized into any
+# schema defined" - so it is no longer switched on automatically for on-prem appliances.
+# Turn either on only if your appliance actually needs it.
+$Global:IntersightSkipCertificateCheck = $false
+$Global:IntersightHashAlgorithm = ""            # blank = omit the parameter, use the module default
 $Global:IntersightBaseUrlConfirmed = $false
 # NOTE: Intersight's API only supports API-key + HTTP-signature auth (key ID + private key file) -
 # there is no username/password endpoint. Get-IntersightCredentialIfNeeded below still prompts
@@ -1526,9 +1532,11 @@ function Get-IntersightBaseUrlIfNeeded {
     } until (-not [string]::IsNullOrWhiteSpace($normalised))
 
     $Global:IntersightBaseUrl = $normalised
-    $Global:IntersightSkipCertificateCheck = -not (Test-IntersightSaaSUrl -BaseUrl $normalised)
     $Global:IntersightBaseUrlConfirmed = $true
 
+    # Certificate checking is NOT derived from the address any more. -SkipCertificateCheck swaps
+    # the module's HTTP handler, which is a credible cause of the corrupted response bodies seen
+    # against this PVA, and the minimal call that works there omits it entirely.
     $kind = if (Test-IntersightSaaSUrl -BaseUrl $normalised) { "SaaS" } else { "on-prem PVA" }
     Write-Host "Intersight API BasePath set to $normalised ($kind; certificate check $(if($Global:IntersightSkipCertificateCheck){'skipped'}else{'enforced'}))." -ForegroundColor Green
     Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Set API BasePath" -Result "Confirmed" -Details "BasePath=$normalised; Kind=$kind; SkipCertificateCheck=$Global:IntersightSkipCertificateCheck."
@@ -1631,22 +1639,34 @@ function Connect-IntersightTarget {
     # else produces "cannot sign http request, request does not contain date header".
     $signingHeaders = @("(request-target)", "Host", "Date", "Digest")
 
-    # Two ways of supplying the same key. ApiKeyFilePath is the normal one; passing the contents
-    # as a string bypasses PEM file encoding and whitespace problems - a byte-order mark or stray
-    # leading whitespace makes the file form fail while the string form works.
+    # ONE Set-IntersightConfiguration call per session, and nothing in the splat that is not
+    # required.
+    #
+    # Set-IntersightConfiguration is process-wide state, and calling it repeatedly in a session
+    # after a failure does not reliably reset the module - which is why the same credentials fail
+    # in a session that has already attempted a connection, and succeed immediately in a fresh
+    # one. The previous key-file-then-key-string fallback issued a second call and made that worse.
+    # The failure path below therefore asks for a fresh session rather than retrying in place.
+    #
+    # The splat below matches the minimal call proven to work against this appliance. Anything
+    # optional is omitted unless explicitly switched on in User Settings: HashAlgorithm is left to
+    # the module default, and SkipCertificateCheck is off, since it changes the HTTP handler and is
+    # a credible cause of corrupted response bodies.
     $lastError = $null
-    foreach ($method in @('KeyFile','KeyString')) {
+    $singleAttempt = @('KeyFile')
+    foreach ($method in $singleAttempt) {
         try {
             $configParams = @{
                 BasePath          = $basePath
                 ApiKeyId          = $Global:IntersightApiKeyId
+                ApiKeyFilePath    = $Global:IntersightApiKeyFilePath
                 HttpSigningHeader = $signingHeaders
-                HashAlgorithm     = "SHA256"
                 ErrorAction       = "Stop"
             }
-            if ($method -eq 'KeyFile') { $configParams["ApiKeyFilePath"] = $Global:IntersightApiKeyFilePath }
-            else { $configParams["ApiKeyString"] = (Get-Content -Path $Global:IntersightApiKeyFilePath -Raw -ErrorAction Stop) }
+            if (-not [string]::IsNullOrWhiteSpace($Global:IntersightHashAlgorithm)) { $configParams["HashAlgorithm"] = $Global:IntersightHashAlgorithm }
             if ($Global:IntersightSkipCertificateCheck) { $configParams["SkipCertificateCheck"] = $true }
+
+            Write-Host "  Set-IntersightConfiguration -BasePath $basePath -ApiKeyId <id> -ApiKeyFilePath <pem> -HttpSigningHeader (4 headers)$(if($Global:IntersightHashAlgorithm){" -HashAlgorithm $Global:IntersightHashAlgorithm"})$(if($Global:IntersightSkipCertificateCheck){' -SkipCertificateCheck'})" -ForegroundColor DarkGray
 
             Set-IntersightConfiguration @configParams | Out-Null
 
@@ -1660,38 +1680,34 @@ function Connect-IntersightTarget {
             [void](Get-IntersightServerProfile -Top 1 -Skip 0 -ErrorAction Stop)
 
             $Global:IntersightSession = $activeConfig
-            Write-Host "Intersight authenticated against $basePath (key supplied as $method)." -ForegroundColor Green
-            if ($method -eq 'KeyString') {
-                Write-Host "The key file itself was rejected but its contents were accepted - the .pem has an encoding or whitespace problem worth correcting." -ForegroundColor Yellow
-            }
+            Write-Host "Intersight authenticated against $basePath." -ForegroundColor Green
             Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "Connected" -Details "BasePath=$basePath; Method=$method."
             return $Global:IntersightSession
         }
         catch {
             $lastError = $_
-            if ($method -eq 'KeyFile') {
-                Write-Host "Key-file authentication failed. Retrying with the key passed as a string..." -ForegroundColor Yellow
-            }
         }
     }
 
-    # Both methods failed. Distinguish a rejected key from a key that was accepted but whose
-    # response the module could not parse - the module reports both identically, and only one of
-    # them is about credentials.
+    # Distinguish a rejected key from a key that was accepted but whose response the module could
+    # not parse - the module reports both identically, and only one of them is about credentials.
     $failureKind = Get-IntersightFailureKind -ErrorRecord $lastError
     if ($failureKind.Kind -eq 'Deserialization') {
         $installedVersions = (@(Get-AvailableModuleVersion -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique | ForEach-Object { $_.ToString() }) -join ', ')
-        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "VersionMismatch" -Details "Signed request accepted; response could not be deserialized. Installed: $installedVersions."
+        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "ResponseUnreadable" -Details "Signed request accepted; response could not be deserialized. Installed: $installedVersions."
         Write-Host "" -ForegroundColor Yellow
         Write-Host "Intersight AUTHENTICATION SUCCEEDED - the appliance accepted the signed request and" -ForegroundColor Green
         Write-Host "returned data. The API Key ID and .pem are correct; do NOT regenerate them." -ForegroundColor Green
         Write-Host "" -ForegroundColor Yellow
-        Write-Host "Intersight.PowerShell could not deserialize the reply into any schema it knows. That" -ForegroundColor Yellow
-        Write-Host "is a client/appliance version mismatch. Installed version(s): $installedVersions" -ForegroundColor Yellow
-        Write-Host "Install the module build matching this appliance's Intersight release, keep exactly" -ForegroundColor Yellow
-        Write-Host "one version, restart PowerShell, and re-run:" -ForegroundColor Yellow
-        Write-Host "  Install-Module Intersight.PowerShell -RequiredVersion 1.0.11.17 -Scope CurrentUser -Force" -ForegroundColor Yellow
-        Write-Host "Verify in isolation first with scripts/intersight/Test-IntersightApiKey.ps1." -ForegroundColor Yellow
+        Write-Host "Intersight.PowerShell could not deserialize the reply. Try these in order:" -ForegroundColor Yellow
+        Write-Host "  1. START A FRESH POWERSHELL SESSION and run again. Set-IntersightConfiguration is" -ForegroundColor Yellow
+        Write-Host "     process-wide state that does not reliably reset after a failed attempt, so the" -ForegroundColor Yellow
+        Write-Host "     same credentials often work first time in a clean session and never in this one." -ForegroundColor Yellow
+        Write-Host "  2. Leave `$Global:IntersightSkipCertificateCheck = `$false (the default). It swaps" -ForegroundColor Yellow
+        Write-Host "     the module's HTTP handler and can corrupt response bodies." -ForegroundColor Yellow
+        Write-Host "  3. Only then consider the module version. Installed: $installedVersions" -ForegroundColor Yellow
+        Write-Host "     Install-Module Intersight.PowerShell -RequiredVersion 1.0.11.17 -Scope CurrentUser -Force" -ForegroundColor Yellow
+        Write-Host "Verify in isolation with scripts/intersight/Test-IntersightApiKey.ps1 from a fresh session." -ForegroundColor Yellow
 
         # No code change here can make the module parse the response, so the run cannot drive
         # Intersight. It can still drive the UCS Manager-managed hosts, which are usually the
@@ -1706,12 +1722,17 @@ function Connect-IntersightTarget {
     Write-Host "`nIntersight login failed against '$basePath'." -ForegroundColor Red
     Write-IntersightLoginDiagnostics -BasePath $basePath -ErrorRecord $lastError
 
+    Write-Host "" -ForegroundColor Yellow
+    Write-Host "NOTE: Set-IntersightConfiguration is process-wide state, and this session has now made" -ForegroundColor Yellow
+    Write-Host "a failed attempt against it. Retrying in the same session is unreliable - the same" -ForegroundColor Yellow
+    Write-Host "credentials frequently succeed first time in a fresh PowerShell session. RETRY below" -ForegroundColor Yellow
+    Write-Host "is worth one go if you mistyped something; otherwise close PowerShell and start again." -ForegroundColor Yellow
+
     if ($Attempt -ge $MaxAttempts) {
-        Stop-WithMessage "Intersight login failed $MaxAttempts times against '$basePath'. Resolve the cause above before re-running."
+        Stop-WithMessage "Intersight login failed $MaxAttempts times against '$basePath'. Close PowerShell, open a fresh session, and re-run - Set-IntersightConfiguration does not reliably reset within a session."
     }
 
-    # Let the operator correct the endpoint or key material and retry without losing the run.
-    $choice = Read-ChoiceExit -Message "Choose RETRY to re-enter the Intersight FQDN, key ID and private key (attempt $Attempt of $MaxAttempts), or EXIT" -AllowedChoices @("RETRY") -ExitMessage "Stopped after Intersight login failure."
+    $choice = Read-ChoiceExit -Message "Choose RETRY to re-enter the Intersight FQDN, key ID and private key in THIS session (attempt $Attempt of $MaxAttempts), or EXIT and start a fresh session" -AllowedChoices @("RETRY") -ExitMessage "Stopped after Intersight login failure - start a fresh PowerShell session before trying again."
     if ($choice -eq "RETRY") {
         $Global:IntersightBaseUrlConfirmed = $false
         $Global:IntersightApiKeyId = ""
