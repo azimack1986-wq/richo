@@ -25,7 +25,7 @@
     and vice versa. The detection table shows which form produced each match.
 
 .NOTES
-    - Version 16.3.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 16.4.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -67,7 +67,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "16.3.0"
+$ScriptVersion = "16.4.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -1235,6 +1235,38 @@ function Assert-IntersightPowerShellAvailable {
     }
 }
 
+function Get-IntersightFailureKind {
+    <#
+    .SYNOPSIS
+        Separates a rejected key from a key that worked but whose reply could not be parsed.
+
+    .DESCRIPTION
+        Intersight.PowerShell reports both as "Error performing this operation. Check that
+        BasePath and API Key identifier are configured correctly", which points at credentials
+        in both cases. Only one of them is about credentials.
+
+        A deserialization failure is proof of success at the protocol level: the appliance only
+        returns a populated Results payload to a request whose HTTP signature it has already
+        verified. Reaching the deserializer means authentication passed and the module version
+        does not match the appliance's API schema.
+    #>
+    param([Parameter(Mandatory=$true)]$ErrorRecord)
+
+    $ex = $ErrorRecord.Exception
+    $depth = 0
+    while ($null -ne $ex -and $depth -lt 6) {
+        if ($ex.Message -match 'cannot be deserialized into any schema') {
+            return [pscustomobject]@{ Kind='Deserialization'; Authenticated=$true }
+        }
+        if ($ex.Message -match 'iam_api_key_is_invalid|AuthenticationFailure|401|Unauthorized|signature|cannot sign http request|invalid.{0,20}key') {
+            return [pscustomobject]@{ Kind='Authentication'; Authenticated=$false }
+        }
+        $ex = $ex.InnerException
+        $depth++
+    }
+    return [pscustomobject]@{ Kind='Unknown'; Authenticated=$false }
+}
+
 function Get-ExceptionDetail {
     <#
     .SYNOPSIS
@@ -1253,14 +1285,17 @@ function Get-ExceptionDetail {
     $depth = 0
 
     while ($null -ne $ex -and $depth -lt 6) {
-        [void]$lines.Add("  [$($ex.GetType().Name)] $($ex.Message)")
-        foreach ($prop in @("StatusCode","ErrorCode","ResponseBody","ErrorContent","Response")) {
+        # Truncated: a deserialization failure embeds the whole API response in its message,
+        # which runs to thousands of lines and buries every other clue.
+        $flat = ($ex.Message -replace '\s+', ' ').Trim()
+        if ($flat.Length -gt 400) { $flat = $flat.Substring(0, 400) + "... [truncated, $($flat.Length) chars total]" }
+        [void]$lines.Add("  [$($ex.GetType().Name)] $flat")
+
+        foreach ($prop in @("StatusCode","ErrorCode")) {
             try {
                 if ($ex.PSObject.Properties.Name -contains $prop -and $null -ne $ex.$prop) {
                     $value = [string]$ex.$prop
-                    if (-not [string]::IsNullOrWhiteSpace($value) -and $value.Length -lt 2000) {
-                        [void]$lines.Add("      ${prop}: $value")
-                    }
+                    if (-not [string]::IsNullOrWhiteSpace($value)) { [void]$lines.Add("      ${prop}: $value") }
                 }
             } catch {}
         }
@@ -1633,9 +1668,28 @@ function Connect-IntersightTarget {
         }
     }
 
-    # Both methods failed - report against the last error.
+    # Both methods failed. Distinguish a rejected key from a key that was accepted but whose
+    # response the module could not parse - the module reports both identically, and only one of
+    # them is about credentials.
+    $failureKind = Get-IntersightFailureKind -ErrorRecord $lastError
+    if ($failureKind.Kind -eq 'Deserialization') {
+        $installedVersions = (@(Get-Module -ListAvailable -Name Intersight.PowerShell | Select-Object -ExpandProperty Version -Unique | ForEach-Object { $_.ToString() }) -join ', ')
+        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "VersionMismatch" -Details "Signed request accepted; response could not be deserialized. Installed: $installedVersions."
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Intersight AUTHENTICATION SUCCEEDED - the appliance accepted the signed request and" -ForegroundColor Green
+        Write-Host "returned data. The API Key ID and .pem are correct; do NOT regenerate them." -ForegroundColor Green
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Intersight.PowerShell could not deserialize the reply into any schema it knows. That" -ForegroundColor Yellow
+        Write-Host "is a client/appliance version mismatch. Installed version(s): $installedVersions" -ForegroundColor Yellow
+        Write-Host "Install the module build matching this appliance's Intersight release, keep exactly" -ForegroundColor Yellow
+        Write-Host "one version, restart PowerShell, and re-run:" -ForegroundColor Yellow
+        Write-Host "  Install-Module Intersight.PowerShell -RequiredVersion 1.0.11.17 -Scope CurrentUser -Force" -ForegroundColor Yellow
+        Write-Host "Verify in isolation first with scripts/intersight/Test-IntersightApiKey.ps1." -ForegroundColor Yellow
+        Stop-WithMessage "Intersight module cannot parse responses from '$basePath'. Credentials are valid - align the Intersight.PowerShell version with the appliance before re-running."
+    }
+
     Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "Failed" -Details $lastError.Exception.Message
-    Write-Host "`nIntersight login failed against '$basePath': $($lastError.Exception.Message)" -ForegroundColor Red
+    Write-Host "`nIntersight login failed against '$basePath'." -ForegroundColor Red
     Write-IntersightLoginDiagnostics -BasePath $basePath -ErrorRecord $lastError
 
     if ($Attempt -ge $MaxAttempts) {

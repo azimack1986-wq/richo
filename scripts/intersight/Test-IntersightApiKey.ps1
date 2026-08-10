@@ -58,6 +58,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $script:Findings = New-Object System.Collections.Generic.List[object]
+$script:DeserializationProblem = $false
 
 function Write-Check {
     param(
@@ -85,18 +86,28 @@ function ConvertTo-BaseUrl {
     return "https://$h"
 }
 
+function Format-Truncated {
+    param([string]$Text,[int]$Max = 400)
+    if ([string]::IsNullOrEmpty($Text)) { return "" }
+    $flat = ($Text -replace '\s+', ' ').Trim()
+    if ($flat.Length -le $Max) { return $flat }
+    return $flat.Substring(0, $Max) + "... [truncated, $($flat.Length) chars total]"
+}
+
 function Get-ExceptionChain {
     param($ErrorRecord)
     $lines = New-Object System.Collections.Generic.List[string]
     $ex = $ErrorRecord.Exception
     $depth = 0
     while ($null -ne $ex -and $depth -lt 6) {
-        $lines.Add("    [$($ex.GetType().Name)] $($ex.Message)")
-        foreach ($prop in @("StatusCode","ErrorCode","ResponseBody","ErrorContent")) {
+        # Truncated: a deserialization failure embeds the entire API response in its message,
+        # which is thousands of lines and buries everything else.
+        $lines.Add("    [$($ex.GetType().Name)] $(Format-Truncated -Text $ex.Message)")
+        foreach ($prop in @("StatusCode","ErrorCode")) {
             try {
                 if ($ex.PSObject.Properties.Name -contains $prop -and $null -ne $ex.$prop) {
                     $v = [string]$ex.$prop
-                    if (-not [string]::IsNullOrWhiteSpace($v) -and $v.Length -lt 2000) { $lines.Add("        ${prop}: $v") }
+                    if (-not [string]::IsNullOrWhiteSpace($v)) { $lines.Add("        ${prop}: $v") }
                 }
             } catch {}
         }
@@ -104,6 +115,42 @@ function Get-ExceptionChain {
         $depth++
     }
     return ($lines -join [Environment]::NewLine)
+}
+
+function Get-IntersightFailureKind {
+    <#
+    .SYNOPSIS
+        Separates "the key was rejected" from "the key worked but the client could not read the reply".
+
+    .DESCRIPTION
+        The module reports both as the same catch-all message. They could not be more different:
+        one means regenerate your credentials, the other means the credentials are correct and the
+        module version does not match the appliance's API schema.
+
+        A deserialization failure is proof of success at the protocol level. The appliance only
+        returns a populated Results payload to a request whose HTTP signature it has already
+        verified, so reaching the deserializer means authentication passed.
+    #>
+    param($ErrorRecord)
+
+    $ex = $ErrorRecord.Exception
+    $depth = 0
+    while ($null -ne $ex -and $depth -lt 6) {
+        if ($ex.Message -match 'cannot be deserialized into any schema') {
+            $carriedData = ($ex.Message -match '"Results"\s*:' -or $ex.Message -match '%22Results%22')
+            return [pscustomobject]@{
+                Kind        = 'Deserialization'
+                Authenticated = $true
+                CarriedData = $carriedData
+            }
+        }
+        if ($ex.Message -match 'iam_api_key_is_invalid|AuthenticationFailure|401|Unauthorized|signature|cannot sign http request|invalid.{0,20}key') {
+            return [pscustomobject]@{ Kind='Authentication'; Authenticated=$false; CarriedData=$false }
+        }
+        $ex = $ex.InnerException
+        $depth++
+    }
+    return [pscustomobject]@{ Kind='Unknown'; Authenticated=$false; CarriedData=$false }
 }
 
 Write-Host "`n=====================================================================" -ForegroundColor Cyan
@@ -347,14 +394,29 @@ else {
             $authenticated = $true
         }
         catch {
-            Write-Check -Name "Authentication ($method)" -Result FAIL -Detail $_.Exception.Message
+            $kind = Get-IntersightFailureKind -ErrorRecord $_
+
+            if ($kind.Kind -eq 'Deserialization') {
+                # The appliance returned a populated payload, which it only does for a request
+                # whose signature it already verified. The credentials are correct.
+                Write-Check -Name "Authentication ($method)" -Result PASS -Detail "The appliance accepted the signed request and returned data. The API Key ID and .pem are correct."
+                Write-Check -Name "Module can read appliance responses" -Result FAIL -Detail "Intersight.PowerShell could not deserialize the reply into any schema it knows. This is a client/appliance version mismatch, not a credential problem - do NOT regenerate the API key."
+                Write-Host "         Installed module: $(if ($available.Count -gt 0) { $available[0].Version } else { 'unknown' })" -ForegroundColor Gray
+                Write-Host "         Install the module build that matches this appliance's Intersight release:" -ForegroundColor Yellow
+                Write-Host "           Install-Module Intersight.PowerShell -RequiredVersion 1.0.11.17 -Scope CurrentUser -Force" -ForegroundColor Yellow
+                Write-Host "           Uninstall-Module Intersight.PowerShell -RequiredVersion <newer version> -AllVersions:`$false" -ForegroundColor Yellow
+                Write-Host "         Then close PowerShell, reopen, and re-run this checker." -ForegroundColor Yellow
+                Write-Host "         Abridged error:" -ForegroundColor DarkGray
+                Write-Host (Get-ExceptionChain -ErrorRecord $_) -ForegroundColor DarkGray
+                $authenticated = $true
+                $script:DeserializationProblem = $true
+                break
+            }
+
+            Write-Check -Name "Authentication ($method)" -Result FAIL -Detail (Format-Truncated -Text $_.Exception.Message -Max 300)
             Write-Host (Get-ExceptionChain -ErrorRecord $_) -ForegroundColor DarkGray
             if ($method -eq 'KeyFile') { Write-Host "         Retrying with the key passed as a string, which bypasses file encoding problems..." -ForegroundColor Yellow }
         }
-    }
-
-    if ($authenticated -and $method -eq 'KeyString') {
-        Write-Host "         The key file failed but its contents succeeded - this points at file encoding or whitespace." -ForegroundColor Yellow
     }
 }
 
@@ -379,9 +441,17 @@ else {
         foreach ($w in $warnings) { Write-Host "   - $($w.Check): $($w.Detail)" -ForegroundColor Yellow }
     }
     Write-Host ""
-    Write-Host " If everything above passes but authentication still fails, the Key ID and .pem" -ForegroundColor Yellow
-    Write-Host " are almost certainly not a matched pair, or the key was created on a different" -ForegroundColor Yellow
-    Write-Host " appliance. They are only ever valid together and the secret is downloadable only" -ForegroundColor Yellow
-    Write-Host " at creation. Generate a fresh API key in Settings > API Keys and retry." -ForegroundColor Yellow
+    if ($script:DeserializationProblem) {
+        Write-Host " YOUR CREDENTIALS ARE CORRECT. Do not regenerate the API key." -ForegroundColor Green
+        Write-Host " The appliance accepted the signed request and returned data; the module could not" -ForegroundColor Yellow
+        Write-Host " parse it. Align the Intersight.PowerShell version with the appliance release and" -ForegroundColor Yellow
+        Write-Host " re-run. Keep exactly one version installed." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host " If everything above passes but authentication still fails, the Key ID and .pem" -ForegroundColor Yellow
+        Write-Host " are almost certainly not a matched pair, or the key was created on a different" -ForegroundColor Yellow
+        Write-Host " appliance. They are only ever valid together and the secret is downloadable only" -ForegroundColor Yellow
+        Write-Host " at creation. Generate a fresh API key in Settings > API Keys and retry." -ForegroundColor Yellow
+    }
 }
 Write-Host "=====================================================================" -ForegroundColor Cyan

@@ -12,6 +12,33 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [16.4.0] — 2026-08-10
+
+Diagnosed from a live PVA run: the "authentication failure" was not one. The
+appliance accepted the signed request and returned a populated payload; the
+module then failed to deserialize it. Reporting that as a credential problem
+would have sent an operator to regenerate a perfectly good API key mid-change.
+
+#### Fixed
+
+- A response the module cannot deserialize is no longer reported as a login
+  failure. `Get-IntersightFailureKind` separates a rejected key from a key that
+  worked but whose reply could not be parsed — the module reports both with the
+  same catch-all message, and only one is about credentials. The deserialization
+  case now states plainly that authentication succeeded, that the credentials
+  are correct, and that the fix is to align the `Intersight.PowerShell` version
+  with the appliance release.
+- Exception messages are truncated to 400 characters in diagnostics. A
+  deserialization failure embeds the entire API response in its message, which
+  ran to thousands of lines and buried every other clue on screen.
+
+#### Added
+
+- `tests/Test-IntersightFailureKind.ps1` — classification tested against the
+  real error shapes, including the abridged payload from the live run, four
+  genuine credential rejections, and cases that must stay Unknown rather than
+  being guessed at. 16 assertions.
+
 ### [16.3.0] — 2026-08-10
 
 #### Added
