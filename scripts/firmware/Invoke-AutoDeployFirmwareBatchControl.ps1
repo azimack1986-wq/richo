@@ -42,7 +42,7 @@
     report installed versions when a login actually fails. Verify the environment out of band with
     scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 16.9.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 17.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -84,7 +84,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "16.9.0"
+$ScriptVersion = "17.0.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -111,7 +111,16 @@ $Global:IntersightBaseUrl = "https://intersight.com"           # PVA example: ht
 # schema defined" - so it is no longer switched on automatically for on-prem appliances.
 # Turn either on only if your appliance actually needs it.
 $Global:IntersightSkipCertificateCheck = $false
-$Global:IntersightHashAlgorithm = ""            # blank = omit the parameter, use the module default
+$Global:IntersightHashAlgorithm = ""            # blank = omit; the module already defaults to SHA256
+$Global:IntersightApiKeyPassPhrase = ""         # only for an encrypted key; the SDK errors without it
+$Global:IntersightConfigurationApplied = $false # one-shot guard - see Connect-IntersightTarget
+
+# Extra PolicyActionParam name/value pairs sent with the server profile Deploy, as
+# @{ Name = '...'; Value = '...' } entries. Empty by default: the parameter names that carry a
+# reboot acknowledgement are not published in the SDK reference, and guessing at the name of a
+# parameter whose job is to authorise a disruptive reboot is not a safe default. Populate this
+# once confirmed against your appliance rather than editing the deploy call.
+$Global:IntersightDeployActionParams = @()
 $Global:IntersightBaseUrlConfirmed = $false
 # NOTE: Intersight's API only supports API-key + HTTP-signature auth (key ID + private key file) -
 # there is no username/password endpoint. Get-IntersightCredentialIfNeeded below still prompts
@@ -1561,22 +1570,27 @@ function Assert-IntersightUpgradeCmdletSurface {
     #>
     if ($Global:IntersightUpgradeSurfaceChecked) { return }
 
-    $missing = New-Object System.Collections.Generic.List[string]
-    foreach ($cmdletName in @("New-IntersightFirmwareUpgrade","Initialize-IntersightMoMoRef")) {
-        if ($null -eq (Get-Command -Name $cmdletName -ErrorAction SilentlyContinue)) { [void]$missing.Add($cmdletName) }
-    }
-    if ($missing.Count -gt 0) {
-        Stop-WithMessage "Intersight accept/reboot requires $($missing -join ' and '), which the installed Intersight.PowerShell version does not provide. Confirm the correct call for your version with 'Get-Command -Module Intersight.PowerShell -Noun Intersight*Upgrade*' and update this script before a LIVE RUN."
+    if ($null -eq (Get-Command -Name Set-IntersightServerProfile -ErrorAction SilentlyContinue)) {
+        Stop-WithMessage "Set-IntersightServerProfile is not available in the installed Intersight.PowerShell version, so a server profile cannot be deployed. Check the module install before a LIVE RUN."
     }
 
-    $upgradeCmd = Get-Command -Name New-IntersightFirmwareUpgrade
-    $missingParams = @("Server","RebootImmediately","DisruptionAcknowledged") | Where-Object { -not $upgradeCmd.Parameters.ContainsKey($_) }
+    $deployCmd = Get-Command -Name Set-IntersightServerProfile
+    $missingParams = @("Moid","Action") | Where-Object { -not $deployCmd.Parameters.ContainsKey($_) }
     if ($missingParams.Count -gt 0) {
-        Stop-WithMessage "New-IntersightFirmwareUpgrade in the installed Intersight.PowerShell version does not accept: $($missingParams -join ', '). Run 'Get-Help New-IntersightFirmwareUpgrade -Full' and update this script's accept/reboot call before a LIVE RUN."
+        Stop-WithMessage "Set-IntersightServerProfile in the installed Intersight.PowerShell version does not accept: $($missingParams -join ', '). Run 'Get-Help Set-IntersightServerProfile -Full' and update this script's deploy call before a LIVE RUN."
+    }
+
+    if ($Global:IntersightDeployActionParams.Count -gt 0) {
+        if ($null -eq (Get-Command -Name Initialize-IntersightPolicyActionParam -ErrorAction SilentlyContinue)) {
+            Stop-WithMessage "IntersightDeployActionParams is populated but Initialize-IntersightPolicyActionParam is not available in this module version. Clear the setting or install a module version that provides it."
+        }
+        if (-not $deployCmd.Parameters.ContainsKey("ActionParams")) {
+            Stop-WithMessage "IntersightDeployActionParams is populated but Set-IntersightServerProfile does not accept -ActionParams in this module version. Clear the setting before a LIVE RUN."
+        }
     }
 
     $Global:IntersightUpgradeSurfaceChecked = $true
-    Write-Host "Intersight accept/reboot cmdlet surface validated (New-IntersightFirmwareUpgrade)." -ForegroundColor Green
+    Write-Host "Intersight deploy cmdlet surface validated (Set-IntersightServerProfile -Action Deploy)." -ForegroundColor Green
 }
 
 function Get-IntersightCredentialIfNeeded {
@@ -1617,10 +1631,29 @@ function Get-IntersightCredentialIfNeeded {
 }
 
 function Connect-IntersightTarget {
-    # RETRY re-enters this function; bounded so repeated failures end in a clean stop.
-    param([int]$Attempt = 1, [int]$MaxAttempts = 3)
 
+    # ---- One configuration call per PowerShell session, full stop -------------------------------
+    # Cisco's own getting-started guidance is that Set-IntersightConfiguration is called once per
+    # session. It is process-wide state, and a second call after a failure does not reliably reset
+    # the client - which is why the same credentials fail repeatedly in a session that has already
+    # tried, and succeed immediately in a fresh one.
+    #
+    # So: succeeded once -> reuse it for the rest of the run, across every cluster.
+    #     failed once    -> never call again in this session; a fresh session is the only fix.
     if ($null -ne $Global:IntersightSession) { return $Global:IntersightSession }
+
+    if ($Global:IntersightConfigurationApplied) {
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Intersight was already configured in this PowerShell session and the attempt failed." -ForegroundColor Yellow
+        Write-Host "Set-IntersightConfiguration is process-wide state that does not reliably reset, so" -ForegroundColor Yellow
+        Write-Host "trying again in this session would test a stale client rather than your credentials." -ForegroundColor Yellow
+        Write-Host "Close PowerShell, open a fresh session, and run again." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "IntersightLogin" -Batch "" -HostName "" -Action "Authenticate" -Result "Skipped" -Details "Configuration already applied and failed in this session; a fresh session is required."
+        $Global:IntersightUnusable = $true
+        $Global:IntersightUnusableReason = "Intersight configuration already attempted and failed in this PowerShell session. A fresh session is required."
+        return $null
+    }
+
     Assert-IntersightPowerShellAvailable
 
     # Normally already answered during fabric detection; this covers any path that reaches an
@@ -1664,7 +1697,12 @@ function Connect-IntersightTarget {
                 ErrorAction       = "Stop"
             }
             if (-not [string]::IsNullOrWhiteSpace($Global:IntersightHashAlgorithm)) { $configParams["HashAlgorithm"] = $Global:IntersightHashAlgorithm }
+            if (-not [string]::IsNullOrWhiteSpace($Global:IntersightApiKeyPassPhrase)) { $configParams["ApiKeyPassPhrase"] = $Global:IntersightApiKeyPassPhrase }
             if ($Global:IntersightSkipCertificateCheck) { $configParams["SkipCertificateCheck"] = $true }
+
+            # Set before the call, not after: once it has been issued the session is committed,
+            # whether it succeeds or throws.
+            $Global:IntersightConfigurationApplied = $true
 
             Write-Host "  Set-IntersightConfiguration -BasePath $basePath -ApiKeyId <id> -ApiKeyFilePath <pem> -HttpSigningHeader (4 headers)$(if($Global:IntersightHashAlgorithm){" -HashAlgorithm $Global:IntersightHashAlgorithm"})$(if($Global:IntersightSkipCertificateCheck){' -SkipCertificateCheck'})" -ForegroundColor DarkGray
 
@@ -1722,24 +1760,17 @@ function Connect-IntersightTarget {
     Write-Host "`nIntersight login failed against '$basePath'." -ForegroundColor Red
     Write-IntersightLoginDiagnostics -BasePath $basePath -ErrorRecord $lastError
 
+    # No in-session retry. Re-issuing Set-IntersightConfiguration after a failure tests a stale
+    # client, not the credentials, and was itself a source of "mismatch" confusion.
     Write-Host "" -ForegroundColor Yellow
-    Write-Host "NOTE: Set-IntersightConfiguration is process-wide state, and this session has now made" -ForegroundColor Yellow
-    Write-Host "a failed attempt against it. Retrying in the same session is unreliable - the same" -ForegroundColor Yellow
-    Write-Host "credentials frequently succeed first time in a fresh PowerShell session. RETRY below" -ForegroundColor Yellow
-    Write-Host "is worth one go if you mistyped something; otherwise close PowerShell and start again." -ForegroundColor Yellow
+    Write-Host "Not retrying in this session. Set-IntersightConfiguration is process-wide state and" -ForegroundColor Yellow
+    Write-Host "has already been applied here, so a second attempt would test a stale client rather" -ForegroundColor Yellow
+    Write-Host "than your credentials. Correct whatever the diagnostics above point at, then close" -ForegroundColor Yellow
+    Write-Host "PowerShell and run again from a fresh session." -ForegroundColor Yellow
 
-    if ($Attempt -ge $MaxAttempts) {
-        Stop-WithMessage "Intersight login failed $MaxAttempts times against '$basePath'. Close PowerShell, open a fresh session, and re-run - Set-IntersightConfiguration does not reliably reset within a session."
-    }
-
-    $choice = Read-ChoiceExit -Message "Choose RETRY to re-enter the Intersight FQDN, key ID and private key in THIS session (attempt $Attempt of $MaxAttempts), or EXIT and start a fresh session" -AllowedChoices @("RETRY") -ExitMessage "Stopped after Intersight login failure - start a fresh PowerShell session before trying again."
-    if ($choice -eq "RETRY") {
-        $Global:IntersightBaseUrlConfirmed = $false
-        $Global:IntersightApiKeyId = ""
-        $Global:IntersightApiKeyFilePath = ""
-        $Global:IntersightSession = $null
-        return (Connect-IntersightTarget -Attempt ($Attempt + 1) -MaxAttempts $MaxAttempts)
-    }
+    $Global:IntersightUnusable = $true
+    $Global:IntersightUnusableReason = "Intersight login failed against $basePath. A fresh PowerShell session is required before another attempt."
+    return $null
 }
 
 function Get-IntersightMatchKeyList {
@@ -2142,7 +2173,7 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
         Write-Host "WARNING: ConfigState could not be read for $($unknownStateRows.Count) Intersight profile(s) in this batch: $(($unknownStateRows | Select-Object -ExpandProperty Host) -join ', ')" -ForegroundColor Yellow
         Write-Host "These hosts cannot be confirmed as either already-consistent or pending, so skipping them silently is not safe." -ForegroundColor Yellow
         foreach ($row in $unknownStateRows) {
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Warning" -Details "ConfigState unreadable on profile '$($row.ServerProfile)'."
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Warning" -Details "ConfigState unreadable on profile '$($row.ServerProfile)'."
         }
         if (-not (Test-DryRun)) {
             $choice = Read-ChoiceExit -Message "Intersight ConfigState unreadable for one or more hosts. Choose SKIP to leave them untouched and continue, or STOP" -AllowedChoices @("SKIP","STOP") -ExitMessage "Stopped on unreadable Intersight ConfigState."
@@ -2152,7 +2183,7 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
 
     if (Test-DryRun) {
         foreach ($row in $pendingRows) {
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "DryRun" -Details "ConfigState=$($row.ConfigState)."
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "DryRun" -Details "ConfigState=$($row.ConfigState)."
         }
         Write-Host "DRY RUN: Would accept the firmware-policy inconsistency and reboot immediately for this batch's Intersight-routed hosts only." -ForegroundColor Green
         return
@@ -2160,7 +2191,7 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
 
     if (Test-StageNoAck) {
         foreach ($row in $pendingRows) {
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Skipped" -Details "STAGE_NO_ACK mode - no acknowledgement sent."
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Skipped" -Details "STAGE_NO_ACK mode - no acknowledgement sent."
         }
         Write-Host "SAVE ONLY / NO ACKNOWLEDGEMENT mode selected: skipping Intersight accept/reboot for this batch." -ForegroundColor Green
         return
@@ -2172,29 +2203,47 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
 
     foreach ($row in $pendingRows) {
         if (-not $row.RequiresDeploy) {
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Skipped" -Details "ConfigState=$($row.ConfigState) - no staged changes to deploy."
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Skipped" -Details "ConfigState=$($row.ConfigState) - no staged changes to deploy."
             continue
         }
 
-        Write-Host "Intersight: accepting inconsistency and rebooting immediately for '$($row.Host)' (profile '$($row.ServerProfile)')." -ForegroundColor Yellow
+        Write-Host "Intersight: deploying server profile for '$($row.Host)' (profile '$($row.ServerProfile)', ConfigState $($row.ConfigState))." -ForegroundColor Yellow
         try {
-            # Parameter surface confirmed once per run by Assert-IntersightUpgradeCmdletSurface before
-            # anything is sent, rather than discovered mid-batch on the first blade.
-            #   - RebootImmediately corresponds to choosing "Reboot Immediately" instead of scheduling.
-            #   - DisruptionAcknowledged corresponds to the UI's compulsory "I understand this will be
-            #     disruptive" tick box - there is no separate confirmation step once this is set, so
-            #     the script itself is the record of acceptance (captured in the summary CSV below).
-            New-IntersightFirmwareUpgrade `
-                -Server (Initialize-IntersightMoMoRef -Moid $row.ServerProfileObj.Moid -ObjectType "server.Profile") `
-                -RebootImmediately $true `
-                -DisruptionAcknowledged $true `
-                -ErrorAction Stop | Out-Null
+            # Deploying the server profile is what pushes a staged firmware policy change to the
+            # server - the API equivalent of Deploy in the UI, and the action that clears
+            # Pending-changes.
+            #
+            # This replaces an earlier call to New-IntersightFirmwareUpgrade with -RebootImmediately
+            # and -DisruptionAcknowledged. Per the SDK reference, that cmdlet has neither parameter,
+            # and its -Server takes a ComputePhysicalRelationship (compute.Blade / compute.RackUnit),
+            # not the server.Profile that was being passed. It would never have worked as written.
+            #
+            # Set-IntersightServerProfile -Action accepts only Deploy and Unassign; Activate was
+            # withdrawn from the SDK. Any extra acknowledgement travels as ActionParams, which stay
+            # empty unless configured - see $Global:IntersightDeployActionParams.
+            $deployParams = @{
+                Moid        = $row.ProfileMoid
+                Action      = 'Deploy'
+                ErrorAction = 'Stop'
+            }
+
+            if ($Global:IntersightDeployActionParams.Count -gt 0) {
+                $actionParams = @(
+                    $Global:IntersightDeployActionParams | ForEach-Object {
+                        Initialize-IntersightPolicyActionParam -Name $_.Name -Value $_.Value
+                    }
+                )
+                $deployParams['ActionParams'] = $actionParams
+                Write-Host "  With ActionParams: $((($Global:IntersightDeployActionParams | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '))" -ForegroundColor DarkGray
+            }
+
+            Set-IntersightServerProfile @deployParams | Out-Null
 
             $Global:BatchActionsSent++
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Sent" -Details "ServerProfile=$($row.ServerProfile); ConfigState was $($row.ConfigState); disruption tick box accepted."
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Sent" -Details "ServerProfile=$($row.ServerProfile); ConfigState was $($row.ConfigState); Set-IntersightServerProfile -Action Deploy sent."
         } catch {
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Accept + reboot immediately" -Result "Failed" -Details $_.Exception.Message
-            Stop-WithMessage "Intersight accept/reboot failed for '$($row.Host)': $($_.Exception.Message)"
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Failed" -Details $_.Exception.Message
+            Stop-WithMessage "Intersight server profile deploy failed for '$($row.Host)': $($_.Exception.Message)"
         }
     }
 }
@@ -2653,9 +2702,45 @@ function Wait-BatchReconnectAfterReboot {
     } while ($true)
 }
 
+function Reset-ClusterScopedState {
+    <#
+    .SYNOPSIS
+        Clears per-cluster state before starting a cluster, keeping session-level logins.
+
+    .DESCRIPTION
+        The Step 27 menu allows a second cluster in the same run. Everything keyed to hosts,
+        service profiles or firmware policy belongs to the cluster just finished and must not carry
+        over - a stale UcsHostMap or profile cache would map the new cluster's hosts to the previous
+        cluster's service profiles.
+
+        Deliberately NOT cleared, because they are session-level and re-establishing them is either
+        impossible or the thing that breaks:
+
+          - Intersight configuration and session. Set-IntersightConfiguration is once per process;
+            re-running it for a second cluster is exactly the fault this script now avoids.
+          - The Intersight BasePath, API key ID and private key path.
+          - UCSM credentials and open UCSM sessions.
+          - The operator's pre-flight confirmation.
+    #>
+    Write-Host "Clearing per-cluster state (Intersight and UCSM logins are kept for the session)." -ForegroundColor DarkGray
+
+    $Global:UcsHostMap = @{}
+    $Global:UcsServiceProfileCache = @{}
+    $Global:UcsCandidateCache = @{}
+    $Global:IntersightHostMap = @{}
+    $Global:IntersightProfileCache = @{}
+    $Global:IntersightSkippedHosts = @{}
+    $Global:EsxiDiscoveryCache = @{}
+    $Global:BatchActionsSent = 0
+
+    # Firmware policy is chosen per cluster from that cluster's UCSM domain.
+    Set-Variable -Name TargetUcsFirmwarePolicyName -Scope Script -Value ""
+}
+
 function Invoke-ClusterUpgradeWorkflow {
     param([Parameter(Mandatory=$true)]$Cluster)
     Write-Host "Selected cluster: $($Cluster.Name)" -ForegroundColor Green
+    Reset-ClusterScopedState
     Select-RunMode
     Select-UpgradeMode
     if ((Test-StageNoAck) -and $Global:UpgradeMode -ne "ESXI_UCS_FIRMWARE") { Stop-WithMessage "STAGE_NO_ACK is only valid with UCSM firmware mode." }

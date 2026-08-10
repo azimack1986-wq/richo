@@ -12,6 +12,60 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [17.0.0] — 2026-08-10
+
+Checked against Cisco's published SDK reference and issue tracker. One finding
+is a genuine defect that would never have worked, hence the major bump.
+
+#### Fixed
+
+- **The Intersight deploy call was wrong.** It called
+  `New-IntersightFirmwareUpgrade -Server <server.Profile> -RebootImmediately
+  -DisruptionAcknowledged`. Per the SDK reference that cmdlet has neither
+  `-RebootImmediately` nor `-DisruptionAcknowledged`, and its `-Server` takes a
+  `ComputePhysicalRelationship` (`compute.Blade` / `compute.RackUnit`), not a
+  server profile. Deploying a staged firmware policy is
+  `Set-IntersightServerProfile -Moid <profile> -Action Deploy`, which is what the
+  script now sends. `-Action` accepts only `Deploy` and `Unassign`; `Activate`
+  was withdrawn from the SDK.
+- **Intersight authenticates once per PowerShell session and never again.**
+  Cisco's getting-started guidance is explicit that
+  `Set-IntersightConfiguration` is called once per session. The one-shot guard is
+  set the moment the call is issued, whether it succeeds or throws, so a failed
+  attempt can no longer be followed by another in the same session — that tested
+  a stale client rather than the credentials and produced the repeated
+  mismatches. A successful login is reused for every cluster in the run.
+- **In-session retry removed.** RETRY re-issued `Set-IntersightConfiguration`,
+  which is the thing that does not work. The failure path now says plainly that a
+  fresh session is required.
+- **Per-cluster state is cleared** when a new cluster is selected from the Step 27
+  menu: host maps, service profile caches, discovery cache, skipped hosts, batch
+  action count and the target firmware policy. Previously a second cluster
+  inherited the first cluster's `UcsHostMap` and profile caches, which could map
+  its hosts onto the wrong service profiles. Session logins are deliberately
+  kept.
+
+#### Added
+
+- `$Global:IntersightApiKeyPassPhrase` for encrypted private keys — the SDK
+  errors without it when the key is encrypted.
+- `$Global:IntersightDeployActionParams`, sent as `PolicyActionParam` objects
+  with the deploy. Empty by default: the parameter names carrying a reboot
+  acknowledgement are not published in the SDK reference, and guessing at the
+  name of a parameter whose job is to authorise a disruptive reboot is not a safe
+  default.
+
+#### Notes
+
+- The error "Error performing this operation. Check that BasePath and API Key
+  identifier are configured correctly" is a known module regression, not
+  necessarily a configuration fault — reported broken in 1.0.11.13236 and working
+  in 1.0.11.12738 (CiscoDevNet/intersight-powershell issue #106).
+- `HashAlgorithm` already defaults to SHA256 and `HttpSigningHeader` already
+  defaults to the four signing headers, so passing them was redundant rather than
+  harmful.
+- Get cmdlets return at most 10,000 objects per invocation.
+
 ### [16.9.0] — 2026-08-10
 
 Aligned with a minimal `Set-IntersightConfiguration` call the operator confirmed
