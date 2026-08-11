@@ -12,6 +12,46 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [17.2.0] — 2026-08-11
+
+`Set-VMHost` failed a live run with "An error occurred while sending the
+request". That is a transport timeout, and it was caused by a change I made in
+16.x.
+
+#### Fixed
+
+- **Entering Maintenance mode always uses `-RunAsync`, including for a single
+  host.** Deriving async from batch size meant a SINGLE-mode batch used the
+  blocking form, which holds one HTTP request open for the entire evacuation.
+  PowerCLI's `WebOperationTimeoutSeconds` defaults to 300, and evacuating a
+  production host takes longer than five minutes, so the request was torn down
+  mid-evacuation — leaving the host partway into maintenance with only "An error
+  occurred while sending the request" to show for it. Issuing the task and
+  polling has no such ceiling, and `Wait-BatchMaintenanceMode` already did
+  exactly that.
+- The PowerCLI web operation timeout is raised to
+  `$PowerCliWebOperationTimeoutSeconds` (3600) for the session at vCenter connect
+  time, as defence for every other long-running task.
+
+#### Added
+
+- `tests/Test-WorkflowSimulation.ps1` — runs the entire cluster workflow against
+  stubbed vCenter, UCS Manager and Intersight cmdlets, in both DRY RUN and LIVE
+  modes, with a scripted operator answering prompts. 30 assertions covering
+  platform routing, every host batched exactly once, firmware actions firing,
+  hosts returned to service, and DRY RUN mutating nothing.
+  - The `Set-VMHost` stub **refuses a blocking evacuate**, so the defect fixed
+    above cannot return silently.
+  - A prompt the scripted operator cannot answer throws rather than hanging, so a
+    `Read-ChoiceExit` loop fails fast.
+
+#### Notes
+
+- The simulation proves control flow, not vendor behaviour. Stubs return
+  instantly and always succeed, so nothing in it speaks to real timeouts,
+  appliance schemas or evacuation duration. A live DRY RUN is still the only
+  thing that tests those.
+
 ### [17.1.0] — 2026-08-11
 
 Triggered by a live run failing at PowerCLI load, then reviewed with a static

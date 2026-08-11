@@ -42,7 +42,7 @@
     report installed versions when a login actually fails. Verify the environment out of band with
     scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 17.1.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 17.2.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -84,7 +84,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "17.1.0"
+$ScriptVersion = "17.2.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -160,6 +160,10 @@ $EsxiOnlyReconnectInitialWaitMinutes = 15
 $FirmwareReconnectInitialWaitMinutes = 25
 $ReconnectRetryWindowMinutes = 5
 $ReconnectCheckIntervalSeconds = 60
+
+# PowerCLI holds one HTTP request open per blocking task and defaults to a 300-second ceiling,
+# which is shorter than a host evacuation. Raised for the session at vCenter connect time.
+$PowerCliWebOperationTimeoutSeconds = 3600
 
 $RunDirectory = (Get-Location).Path
 $RunTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
@@ -2297,6 +2301,17 @@ function Connect-VCenterServer {
         Stop-WithMessage "VMware PowerCLI could not be loaded, so vCenter cannot be contacted."
     }
 
+    # Long-running vSphere tasks outlive the 300-second default and are torn down mid-flight with
+    # "An error occurred while sending the request". Session scope only - nothing persists.
+    try {
+        Set-PowerCLIConfiguration -Scope Session -WebOperationTimeoutSeconds $PowerCliWebOperationTimeoutSeconds -Confirm:$false -ErrorAction Stop | Out-Null
+        Write-Host "PowerCLI web operation timeout set to $PowerCliWebOperationTimeoutSeconds seconds for this session." -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Host "Could not raise the PowerCLI web operation timeout: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "Long operations may fail with 'An error occurred while sending the request'." -ForegroundColor Yellow
+    }
+
     Write-Host "Connecting to vCenter: $Server" -ForegroundColor Cyan
     try {
         Connect-VIServer -Server $Server -ErrorAction Stop | Out-Null
@@ -2710,16 +2725,24 @@ function Request-MaintenanceModeForBatch {
 
     if ((Test-DryRun) -or (Test-StageNoAck)) { Write-Host "DRY/STAGE: Would request Maintenance mode for $($HostNames -join ', ')." -ForegroundColor Green; return }
 
-    $useAsync = ($HostNames.Count -gt 1)
-    Write-Host "Requesting Maintenance mode with evacuation for $($HostNames.Count) host(s)$(if($useAsync){' concurrently'}else{''})." -ForegroundColor Cyan
+    Write-Host "Requesting Maintenance mode with evacuation for $($HostNames.Count) host(s)." -ForegroundColor Cyan
 
     foreach ($hostName in $HostNames) {
         $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
         if ($hostObj.ConnectionState -eq "Connected") {
-            if ($useAsync) { Set-VMHost -VMHost $hostObj -State Maintenance -Evacuate -RunAsync -Confirm:$false -ErrorAction Stop | Out-Null }
-            else { Set-VMHost -VMHost $hostObj -State Maintenance -Evacuate -Confirm:$false -ErrorAction Stop | Out-Null }
+            # ALWAYS -RunAsync, including for a single host.
+            #
+            # A blocking Set-VMHost holds one HTTP request open for the whole evacuation. PowerCLI's
+            # WebOperationTimeoutSeconds defaults to 300, and evacuating a production host takes
+            # longer than five minutes, so the request is torn down mid-evacuation and surfaces as
+            # "An error occurred while sending the request" - with the host left partway into
+            # maintenance. Issuing the task and polling for the result has no such ceiling, and
+            # Wait-BatchMaintenanceMode already does exactly that.
+            Set-VMHost -VMHost $hostObj -State Maintenance -Evacuate -RunAsync -Confirm:$false -ErrorAction Stop | Out-Null
         }
     }
+
+    Write-Host "Maintenance mode requested. Waiting for evacuation to complete - this is polled, not held open." -ForegroundColor Cyan
 }
 
 function Wait-BatchMaintenanceMode {
