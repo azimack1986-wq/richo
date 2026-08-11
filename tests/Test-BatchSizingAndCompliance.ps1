@@ -17,7 +17,8 @@ $errors = $null; $tokens = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
 if ($errors) { throw "parse errors" }
 
-$wanted = @('Get-CapacityBasedBatchSize','Get-VMHostProfileComplianceState')
+$wanted = @('Get-CapacityBasedBatchSize','Get-VMHostProfileComplianceState',
+            'Get-ComplianceCheckTime','Wait-VMHostProfileComplianceTask')
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $wanted -contains $_.Name } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
@@ -27,6 +28,14 @@ $MaxAbsoluteBatchSize = 6
 $ResourceSafetyBuffer = 0.85
 $MinimumCpuHeadroomPercentAfterBatch = 10
 $MinimumMemoryHeadroomPercentAfterBatch = 10
+
+# The settings the compliance scan reads. Retries are 1 here because these cases are about parsing
+# what vCenter returned, not about re-scanning; the retry behaviour is covered in Test-ComplianceGate.
+$HostProfileComplianceScanRetries = 1
+$HostProfileComplianceScanTimeoutMinutes = 1
+
+function Get-Task { param($Status,$Id,$ErrorAction) return @() }
+function Start-Sleep { param($Seconds,$Milliseconds) }
 
 $script:pass = 0; $script:fail = 0
 function Assert-Equal {
@@ -93,26 +102,26 @@ $testHost = New-TestHost -Name "esx1" -CpuTotal 1 -CpuUsed 0 -MemTotal 1 -MemUse
 
 function Get-VMHostProfile { param($Entity) return $null }
 function Test-VMHostProfileCompliance { param($VMHost) return $null }
-Assert-Equal "no attached profile reports NoProfile" "NoProfile" (Get-VMHostProfileComplianceState -VMHostObject $testHost).Status
+Assert-Equal "no attached profile reports NoProfile" "NoProfile" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
 
 function Get-VMHostProfile { param($Entity) [pscustomobject]@{ Name = 'HP-Prod' } }
 function Test-VMHostProfileCompliance { param($VMHost) [pscustomobject]@{ ComplianceStatus = 'Compliant' } }
-$s = Get-VMHostProfileComplianceState -VMHostObject $testHost
+$s = Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null
 Assert-Equal "ComplianceStatus Compliant is recognised" "Compliant" $s.Status
 Assert-Equal "profile name is carried through" "HP-Prod" $s.ProfileName
 
 function Test-VMHostProfileCompliance { param($VMHost) [pscustomobject]@{ ComplianceStatus = 'NonCompliant' } }
-Assert-Equal "ComplianceStatus NonCompliant is recognised" "NonCompliant" (Get-VMHostProfileComplianceState -VMHostObject $testHost).Status
+Assert-Equal "ComplianceStatus NonCompliant is recognised" "NonCompliant" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
 
 # Older PowerCLI surfaces the value as Status rather than ComplianceStatus.
 function Test-VMHostProfileCompliance { param($VMHost) [pscustomobject]@{ Status = 'compliant' } }
-Assert-Equal "legacy Status property is read, case-insensitively" "Compliant" (Get-VMHostProfileComplianceState -VMHostObject $testHost).Status
+Assert-Equal "legacy Status property is read, case-insensitively" "Compliant" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
 
 function Test-VMHostProfileCompliance { param($VMHost) throw "vCenter unavailable" }
-Assert-Equal "a failed compliance test is Unknown, never a pass" "Unknown" (Get-VMHostProfileComplianceState -VMHostObject $testHost).Status
+Assert-Equal "a failed compliance test is Unknown, never a pass" "Unknown" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
 
 function Test-VMHostProfileCompliance { param($VMHost) return $null }
-Assert-Equal "an empty compliance result is Unknown, never a pass" "Unknown" (Get-VMHostProfileComplianceState -VMHostObject $testHost).Status
+Assert-Equal "an empty compliance result is Unknown, never a pass" "Unknown" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

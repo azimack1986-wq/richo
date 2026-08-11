@@ -61,6 +61,12 @@ $MaintenanceValidationTimeoutMinutes    = 60
 $EsxiOnlyReconnectInitialWaitMinutes    = 1
 $FirmwareReconnectInitialWaitMinutes    = 1
 $PowerCliWebOperationTimeoutSeconds     = 3600
+# 0.01 minutes rather than 0: the settle wait must actually run so its summary row is produced and
+# the batch loop is proven to go through it, but Start-Sleep is stubbed here, so the real two
+# minutes would be two minutes of busy-waiting per batch.
+$HostProfileComplianceSettleMinutes     = 0.01
+$HostProfileComplianceScanTimeoutMinutes = 1
+$HostProfileComplianceScanRetries       = 3
 $RunDirectory                           = [IO.Path]::GetTempPath()
 $SummaryPath                            = Join-Path $RunDirectory "simulation-summary.csv"
 
@@ -91,8 +97,8 @@ $Global:EsxiDiscoveryCache              = @{}
 $Global:UcsFirmwarePolicyByTarget       = @{}
 $Global:AllowUcsFirmwarePolicyCreation  = $true
 $Global:UcsFirmwarePolicyByFabricFamily = @{
-    '6400' = @{ PolicyName = 'global-602d'; BladeBundleVersion = '6.0(2d)B'; RackBundleVersion = '6.0(2d)C' }
-    '6300' = @{ PolicyName = 'global-436h'; BladeBundleVersion = '4.3(6h)B'; RackBundleVersion = '4.3(6h)C' }
+    '6400' = 'global-602d'
+    '6300' = 'global-436h'
 }
 
 # Intersight CSV: esx01/esx02 belong to fabric SS101, esx03/esx04 do not appear at all.
@@ -145,7 +151,16 @@ function Get-VM { param($ErrorAction) return @() }
 function Move-VM { param($VM,$Destination,$Confirm,$ErrorAction) Note-Call 'Move-VM' }
 function Restart-VMHost { param($VMHost,$Confirm,$ErrorAction) Note-Call 'Restart-VMHost' }
 function Get-VMHostProfile { param($Entity,$ErrorAction) return [pscustomobject]@{ Name = 'HP-Prod' } }
-function Test-VMHostProfileCompliance { param($VMHost,$ErrorAction) return [pscustomobject]@{ ComplianceStatus = 'Compliant' } }
+function Get-Task { param($Status,$Id,$ErrorAction) return @() }
+# CheckTime is stamped at call time, so the freshness comparison in Get-VMHostProfileComplianceState
+# is exercised on the happy path. -UseCache is declared but must never be bound: binding it would
+# mean the script asked vCenter for a stored result instead of a scan.
+function Test-VMHostProfileCompliance {
+    param($VMHost,[switch]$UseCache,$ErrorAction)
+    Note-Call 'Test-VMHostProfileCompliance'
+    if ($UseCache) { throw "-UseCache returns the previous stored result, not a completed scan" }
+    return [pscustomobject]@{ ComplianceStatus = 'Compliant'; CheckTime = (Get-Date) }
+}
 
 function Connect-Ucs { param($Name,$Credential,$ErrorAction) Note-Call 'Connect-Ucs'; return [pscustomobject]@{ Ucs = $Name } }
 function Disconnect-Ucs { param($Ucs,$ErrorAction) }
@@ -179,9 +194,9 @@ function Get-UcsNetworkElement { param($Ucs,$ErrorAction)
 function Get-UcsFirmwareComputeHostPack { param($Ucs,$ErrorAction)
     return @($script:HostPacks | ForEach-Object { [pscustomobject]@{ Name=$_; Dn="org-root/fw-host-pack-$_"; Descr='' } })
 }
-function Get-UcsFirmwareDistributable { param($Ucs,$ErrorAction) return @([pscustomobject]@{ Name='ucs-6400'; Version='6.0(2d)' }) }
 function Add-UcsFirmwareComputeHostPack { param($Ucs,$Org,$Name,$BladeBundleVersion,$RackBundleVersion,$Descr,$ErrorAction)
     Note-Call 'Add-UcsFirmwareComputeHostPack'
+    if ($BladeBundleVersion -or $RackBundleVersion) { throw "bundle versions must come from the global setting, not from the script" }
     $script:HostPacks += $Name
 }
 function Get-UcsLsmaintAck { param($Ucs,$ErrorAction) return @() }
@@ -233,7 +248,7 @@ function Read-Host {
         'Create host firmware package' { return 'CREATE' }
         'Intersight FQDN'            { return 'pva.example.com' }
         'Nothing to reboot'          { return 'CONTINUE' }
-        'remediated to re-check'     { return 'CONTINUE' }
+        'O to override'              { return 'C' }
         'No host profile attached'   { return 'SKIP' }
         'Choose SKIP'                { return 'SKIP' }
         'Reconnect incomplete'       { return 'OVERRIDE' }
@@ -331,7 +346,7 @@ function Read-Host { param([string]$Prompt)
         'manual health checks'     { return 'YES' }
         'Create host firmware package' { return 'CREATE' }
         'Nothing to reboot'        { return 'CONTINUE' }
-        'remediated to re-check'   { return 'CONTINUE' }
+        'O to override'            { return 'C' }
         'No host profile attached' { return 'SKIP' }
         'Choose SKIP'              { return 'SKIP' }
         'Reconnect incomplete'     { return 'OVERRIDE' }
@@ -361,6 +376,17 @@ Assert-True "compliance was checked for all four hosts" (@($Global:RunSummary | 
 Assert-True "maintenance mode was exited for all four hosts" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ExitMaintenance' -and $_.Result -eq 'Sent' }).Count -eq 4)
 Assert-True "the cluster completed" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
 Assert-True "post-batch health was confirmed each batch" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterHealth' -and $_.Result -eq 'Healthy' }).Count -ge 1)
+
+Write-Host "`n=== Compliance was scanned, not read from cache ===" -ForegroundColor Cyan
+# The settle wait sits between the reconnect gate and the first scan of each batch. If it stops
+# running, a batch scans a host that is still starting up and reports differences that are not real.
+$settleRows = @($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileComplianceSettle' })
+$batchesWithCompliance = @($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' } | Select-Object -ExpandProperty Batch -Unique)
+Assert-True "the settle wait ran before every batch's compliance scan" ($settleRows.Count -eq $batchesWithCompliance.Count) "settles: $($settleRows.Count), batches: $($batchesWithCompliance.Count)"
+Assert-True "every settle ran to completion" (@($settleRows | Where-Object { $_.Result -eq 'Completed' }).Count -eq $settleRows.Count)
+# The stub throws on -UseCache, so reaching here at all proves a real scan was requested each time.
+Assert-True "a compliance scan was issued for every host" ($script:Calls['Test-VMHostProfileCompliance'] -ge 4) "got $($script:Calls['Test-VMHostProfileCompliance'])"
+Assert-True "the settle wait does not add per-host compliance rows" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' }).Count -eq 4)
 
 Remove-Item -Path $csvDir -Recurse -Force -ErrorAction SilentlyContinue
 

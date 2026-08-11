@@ -8,8 +8,12 @@
     load-bearing: get the family wrong and a 6300 domain is pointed at 6400 firmware.
 
     Covers the model strings Cisco actually ships, the mapping to a host firmware package, reuse of
-    an existing package, creation of a missing one with the right bundle versions, and the cases
-    that must stop the run rather than guess.
+    an existing package, creation of a missing one by name alone, and the cases that must stop the
+    run rather than guess.
+
+    Creation by name alone is the point of the last group: no blade or rack bundle version may be
+    written by this script. The package takes its versions from the global firmware setting its name
+    refers to, and a bundle string sent from here would override that setting silently.
 
     Standalone - no Pester, no vendor modules, no infrastructure.
 
@@ -32,8 +36,8 @@ $ScriptVersion = 'test'
 $Global:UcsFirmwarePolicyByTarget = @{}
 $Global:AllowUcsFirmwarePolicyCreation = $true
 $Global:UcsFirmwarePolicyByFabricFamily = @{
-    '6400' = @{ PolicyName = 'global-602d'; BladeBundleVersion = '6.0(2d)B'; RackBundleVersion = '6.0(2d)C' }
-    '6300' = @{ PolicyName = 'global-436h'; BladeBundleVersion = '4.3(6h)B'; RackBundleVersion = '4.3(6h)C' }
+    '6400' = 'global-602d'
+    '6300' = 'global-436h'
 }
 
 function Add-SummaryRecord { param($Stage,$Batch,$HostName,$Action,$Result,$Details)
@@ -58,9 +62,10 @@ function Get-UcsNetworkElement { param($Ucs,$ErrorAction)
     return @($script:Models | ForEach-Object { [pscustomobject]@{ Dn='sys/switch'; Model=$_ } }) }
 function Get-UcsFirmwareComputeHostPack { param($Ucs,$ErrorAction)
     return @($script:Packs | ForEach-Object { [pscustomobject]@{ Name=$_; Dn="org-root/fw-host-pack-$_"; Descr='' } }) }
-function Get-UcsFirmwareDistributable { param($Ucs,$ErrorAction) return @([pscustomobject]@{ Version='6.0(2d)' }) }
+# Bundle parameters are still declared, so that passing one is recorded rather than silently
+# swallowed by parameter binding - the assertions below require that they arrive empty.
 function Add-UcsFirmwareComputeHostPack { param($Ucs,$Org,$Name,$BladeBundleVersion,$RackBundleVersion,$Descr,$ErrorAction)
-    $script:Created += [pscustomobject]@{ Org=$Org; Name=$Name; Blade=$BladeBundleVersion; Rack=$RackBundleVersion }
+    $script:Created += [pscustomobject]@{ Org=$Org; Name=$Name; Blade=$BladeBundleVersion; Rack=$RackBundleVersion; Descr=$Descr }
     $script:Packs += $Name }
 function Read-ChoiceExit { param($Message,$AllowedChoices,$ExitMessage) return $script:Answer }
 
@@ -93,15 +98,16 @@ $Global:UcsFirmwarePolicyByTarget = @{}
 Assert-Equal "6400 domain resolves to global-602d" "global-602d" (Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null)
 Assert-Equal "nothing was created" 0 $script:Created.Count
 
-Write-Host "`n=== A missing package is created with the mapped bundles ===" -ForegroundColor Cyan
+Write-Host "`n=== A missing package is created by name only ===" -ForegroundColor Cyan
 $script:Models = @('UCS-FI-6332'); $script:Packs = @(); $script:Created = @()
 $Global:UcsFirmwarePolicyByTarget = @{}
 Assert-Equal "6300 domain resolves to global-436h" "global-436h" (Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-b' -UcsSession 'x' 6>$null)
 Assert-Equal "exactly one package was created" 1 $script:Created.Count
 Assert-Equal "created at org-root so any org can reference it" "org-root" $script:Created[0].Org
 Assert-Equal "created with the mapped name" "global-436h" $script:Created[0].Name
-Assert-Equal "created with the mapped blade bundle" "4.3(6h)B" $script:Created[0].Blade
-Assert-Equal "created with the mapped rack bundle" "4.3(6h)C" $script:Created[0].Rack
+Assert-Equal "no blade bundle version was written - it comes from the global setting" $true ([string]::IsNullOrEmpty($script:Created[0].Blade))
+Assert-Equal "no rack bundle version was written - it comes from the global setting" $true ([string]::IsNullOrEmpty($script:Created[0].Rack))
+Assert-Equal "the package is attributed to this script" $true ($script:Created[0].Descr -match 'firmware batch controller')
 
 Write-Host "`n=== The resolution is cached per domain ===" -ForegroundColor Cyan
 $script:Created = @()
@@ -129,6 +135,14 @@ $script:Models = @('UCS-FI-6332'); $script:Packs = @(); $script:Created = @(); $
 Assert-Equal "DRY RUN still reports the policy it would use" "global-436h" (Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-e' -UcsSession 'x' 6>$null)
 Assert-Equal "DRY RUN created nothing" 0 $script:Created.Count
 $Global:RunMode = 'LIVE'
+
+Write-Host "`n=== The script contains no hard-coded bundle versions ===" -ForegroundColor Cyan
+# A stub can only prove what was passed on the paths the test walks. This proves it for the whole
+# file: the moment someone reintroduces -BladeBundleVersion, the policy stops following the global
+# setting, and no runtime assertion would necessarily walk that line.
+$scriptText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "no -BladeBundleVersion anywhere in the script" $true (-not ($scriptText -match '-BladeBundleVersion'))
+Assert-Equal "no -RackBundleVersion anywhere in the script"  $true (-not ($scriptText -match '-RackBundleVersion'))
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

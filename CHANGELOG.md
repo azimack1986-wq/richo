@@ -12,6 +12,82 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [19.0.0] — 2026-08-11
+
+Two changes to what returns a host to production, plus the firmware package is
+no longer created with versions this script invents. Both change behaviour an
+operator relies on, hence the major bump.
+
+#### Added
+
+- **A settle wait before the first compliance scan of each batch.**
+  `$HostProfileComplianceSettleMinutes` (default 2) is waited once per batch,
+  after the reconnect gate confirms every host is back. A host that has just
+  re-registered is still starting — hostd, the profile engine, and on a
+  stateless host the Auto Deploy answer file — and a scan run through that
+  window reports differences that clear themselves a minute later. Press `C` to
+  scan immediately or `E` to exit. Recorded under its own
+  `HostProfileComplianceSettle` stage, so it never inflates the per-host
+  compliance rows.
+- **An override at the compliance prompt.** A non-compliant host now offers
+  `C` to re-scan after remediating, `O` to accept the host as it is and return
+  it to service, or `E` to exit. `O` is announced on screen and recorded in the
+  run summary as `Overridden`, naming the status that was accepted — it is a
+  decision with a record, not a silent pass.
+- `Wait-VMHostProfileComplianceTask` drains a compliance check vCenter or Auto
+  Deploy started itself before this run starts its own, so the scan that answers
+  is the one whose result is acted on. Best effort; the freshness check below is
+  the actual guarantee.
+- `Get-ComplianceCheckTime` reads the result's check time from the object or
+  from `ExtensionData`, and reports `$null` rather than guessing where the
+  PowerCLI build exposes neither.
+
+#### Changed
+
+- **The compliance scan must complete, and must be fresh.** `-UseCache` is never
+  passed — that switch is what makes `Test-VMHostProfileCompliance` return the
+  stored result instead of checking. The result's check time is then compared
+  against the moment the scan was requested; a result older than the request is
+  re-scanned up to `$HostProfileComplianceScanRetries` (default 3) times and, if
+  it stays stale, reported as `Unknown`. A pre-reboot `Compliant` would release
+  a host on the strength of its old configuration, so it is never accepted.
+- **A missing host firmware package is created by name only.**
+  `$Global:UcsFirmwarePolicyByFabricFamily` is now family → package name, with no
+  bundle versions, and `Add-UcsFirmwareComputeHostPack` is called without
+  `-BladeBundleVersion` or `-RackBundleVersion`. The package takes its versions
+  from the global firmware setting its name refers to; versions written from here
+  would pin it to whatever was current when this script was last edited and then
+  disagree with that setting silently. The `Get-UcsFirmwareDistributable`
+  bundle-availability warning goes with them — there is no longer a bundle string
+  to check.
+- `Read-ChoiceExit` accepts `E` as `EXIT`, so the single-letter prompts read the
+  same way as the timed waits. No prompt offers `E` as a choice of its own, so
+  the alias cannot shadow a real answer.
+- The compliance status object now carries `CheckTime`, and the per-host line
+  shows when the result was actually produced.
+
+#### Added — tests
+
+- `tests/Test-ComplianceGate.ps1` — 36 assertions: `-UseCache` is never passed,
+  in-flight checks are drained, a stale `Compliant` becomes `Unknown` after
+  retrying, a stale result that goes fresh is accepted, a build reporting no
+  check time is taken at face value, `C` keeps the host in Maintenance mode
+  until it passes, `O` releases it and records `Overridden`, `E` exits leaving it
+  in Maintenance mode, and DRY RUN neither waits nor scans.
+- `tests/Test-UcsFabricFamily.ps1` asserts creation writes no bundle version, and
+  greps the whole script for `-BladeBundleVersion`/`-RackBundleVersion` so a
+  reintroduction fails even on a path no test walks.
+- `tests/Test-WorkflowSimulation.ps1` throws if `-UseCache` is bound or if a
+  bundle version reaches `Add-UcsFirmwareComputeHostPack`, and asserts the settle
+  ran before every batch's scan.
+
+#### Notes
+
+- 302 assertions across 12 standalone suites, all passing. PowerShell is not
+  installed in the Claude Code web sandbox where the edits were made, so the
+  suites were run under `pwsh` 7.4.6 there but nothing was linted with
+  `Invoke-ScriptAnalyzer` and nothing ran against live infrastructure.
+
 ### [18.0.0] — 2026-08-11
 
 The UCS firmware policy is no longer chosen by the operator. It is derived from
@@ -644,6 +720,18 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [19.0.0-preauth] — 2026-08-11
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 19.0.0 — the compliance
+settle wait, the completed-and-fresh scan guarantee, the `C`/`O`/`E` prompt, and
+host firmware packages created by name only. The two builds differ only in the
+five functions listed in `tests/Test-PreAuthVariantParity.ps1`, which is
+enforced on every run of that suite.
+
+This is still the build to run. It does not authenticate to Intersight; it
+assumes `Set-IntersightConfiguration` has already been applied in the session,
+and verifies the resulting connection before any host is touched.
 
 ### [17.0.1-preauth] — 2026-08-10
 

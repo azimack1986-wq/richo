@@ -131,7 +131,22 @@ The firmware controller also ships standalone suites that need no Pester and no
 vendor modules, so they run anywhere including a locked-down jump host:
 
 ```powershell
-pwsh -File ./tests/Test-IntersightNameMatching.ps1
-pwsh -File ./tests/Test-BatchSizingAndCompliance.ps1
-pwsh -File ./tests/Test-IntersightBaseUrl.ps1
+Get-ChildItem ./tests/Test-*.ps1 | ForEach-Object { pwsh -File $_.FullName }
 ```
+
+They are independent, so any one can be run on its own:
+
+| Suite | Covers |
+| --- | --- |
+| `Test-ScriptLint.ps1` | Static rules for bug classes these scripts have actually shipped |
+| `Test-WorkflowSimulation.ps1` | The whole cluster workflow, DRY RUN and LIVE, against stubs |
+| `Test-PreAuthVariantParity.ps1` | The two builds have not drifted apart |
+| `Test-PreAuthSessionGuard.ps1` | Intersight is configured exactly once per session |
+| `Test-ComplianceGate.ps1` | The host profile gate: settle, scan freshness, C/O/E |
+| `Test-UcsFabricFamily.ps1` | FI family detection and the firmware package it selects |
+| `Test-BatchSizingAndCompliance.ps1` | Capacity-based batch sizing, compliance result parsing |
+| `Test-IntersightNameMatching.ps1` | CSV name matching across -A/-B, FQDN and short forms |
+| `Test-IntersightBaseUrl.ps1` | Appliance URL normalisation and SaaS classification |
+| `Test-IntersightDeployState.ps1` | Which `ConfigState` values mean a deploy is needed |
+| `Test-IntersightFailureKind.ps1` | Auth failure vs. a response the client cannot parse |
+| `Test-ModuleEnumerationCache.ps1` | Module enumeration happens once, not per lookup |

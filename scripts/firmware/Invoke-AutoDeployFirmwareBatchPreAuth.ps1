@@ -71,7 +71,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 18.0.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 18.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 19.0.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 19.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -94,10 +94,25 @@
       a pre-batch cluster health check, the timed pre-reboot safety window (press E to abort), a host
       profile compliance check on every rebooted host, and a post-batch cluster health check. Any of
       those failing stops the run.
-    - After each reboot, every host is tested against its attached host profile while still in
-      Maintenance mode. Compliant hosts are taken out of Maintenance mode and the run continues;
-      non-compliant hosts stay in Maintenance mode and the operator is prompted to remediate and
-      re-check. The run does not advance until the host passes.
+    - After each reboot, once the batch is confirmed back in vCenter, the run waits
+      $HostProfileComplianceSettleMinutes (default 2) and then scans every host against its attached
+      host profile while it is still in Maintenance mode. The wait is there because a host that has
+      just re-registered reports differences that clear themselves; scanning through that window
+      produces failures that are not real.
+      The scan is a real check, never vCenter's cached answer: -UseCache is not passed, any
+      compliance check already running is drained first, and the result's check time is compared
+      against the moment the scan was requested. A result older than the request is re-scanned and,
+      if it stays stale, reported as Unknown - a pre-reboot "Compliant" must never release a host.
+      Compliant hosts are taken out of Maintenance mode and the run continues. For anything else the
+      operator chooses C to re-scan after remediating, O to override and return the host to service
+      as it is, or E to exit. On C the host stays in Maintenance mode and the batch does not advance.
+      An override is announced on screen and recorded in the run summary as Overridden, naming the
+      status that was accepted.
+    - The UCSM host firmware package is derived from the fabric interconnect family, not chosen by
+      an operator: 6400 -> global-602d, 6300 -> global-436h. An existing package is used as-is. A
+      missing one is created, after an explicit confirmation, by NAME ONLY - no blade or rack bundle
+      version is written from this script, so the package follows the global firmware setting its
+      name refers to. DRY RUN never creates anything.
     - Batch sizing now enforces $ResourceSafetyBuffer, $MinimumCpuHeadroomPercentAfterBatch,
       $MinimumMemoryHeadroomPercentAfterBatch and $MinimumDatastoreFreePercent.
     - Validate Cisco UCS PowerTool cmdlet names in your installed module version before LIVE RUN. The
@@ -171,7 +186,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "18.0.0-preauth"
+$ScriptVersion = "19.0.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -181,13 +196,14 @@ $TargetUcsFirmwarePolicyName = ""
 # Fabric-derived firmware policy. The FI family is read from the connected UCSM domain and mapped
 # straight to a host firmware package, replacing the interactive policy picker.
 #
-# PolicyName is what the service profiles are pointed at. BladeBundleVersion/RackBundleVersion are
-# used ONLY when the policy does not already exist and has to be created - they must match a
-# bundle already downloaded to the fabric interconnect, or the policy will reference firmware that
-# is not there. Verify with: Get-UcsFirmwareDistributable -Ucs <session> | Select-Object Name,Version
+# The value is the host firmware package name the service profiles are pointed at. Bundle versions
+# are deliberately NOT held here. Where the package is missing it is created by NAME ONLY and left
+# to use the global firmware setting that name refers to - the blade and rack bundles come from
+# that setting, not from anything hard-coded in this script. Pinning versions here would let the
+# script and the global setting disagree silently, and the script would win.
 $Global:UcsFirmwarePolicyByFabricFamily = @{
-    '6400' = @{ PolicyName = 'global-602d'; BladeBundleVersion = '6.0(2d)B'; RackBundleVersion = '6.0(2d)C' }
-    '6300' = @{ PolicyName = 'global-436h'; BladeBundleVersion = '4.3(6h)B'; RackBundleVersion = '4.3(6h)C' }
+    '6400' = 'global-602d'
+    '6300' = 'global-436h'
 }
 
 # Resolved policy per UCSM domain, so a cluster spanning a 6300 and a 6400 domain gets the right
@@ -250,6 +266,18 @@ $FirmwareReconnectInitialWaitMinutes = 40
 $ReconnectRetryWindowMinutes = 5
 $ReconnectCheckIntervalSeconds = 60
 
+# A host that has just re-registered with vCenter is not settled. hostd and the profile engine are
+# still starting and Auto Deploy may still be applying the answer file, so a compliance scan run in
+# that window reports differences that clear themselves a minute later. Read as real they stop the
+# batch and send an operator hunting a fault that is not there. Waited once per batch, after the
+# reconnect gate confirms every host is back, before the first scan.
+$HostProfileComplianceSettleMinutes = 2
+# Bound on waiting for a compliance check vCenter or Auto Deploy started itself to finish before
+# this run starts its own, so the scan that answers is the one whose result is acted on.
+$HostProfileComplianceScanTimeoutMinutes = 10
+# How many times to re-scan when vCenter answers from a check taken before the scan was requested.
+$HostProfileComplianceScanRetries = 3
+
 # PowerCLI holds one HTTP request open per blocking task and defaults to a 300-second ceiling,
 # which is shorter than a host evacuation. Raised for the session at vCenter connect time.
 $PowerCliWebOperationTimeoutSeconds = 3600
@@ -311,10 +339,20 @@ function Stop-WithMessage {
 }
 
 function Read-ChoiceExit {
+    <#
+    .SYNOPSIS
+        Asks for one of a fixed set of answers, with EXIT always available.
+
+    .DESCRIPTION
+        E is accepted as EXIT so that the single-letter prompts read the same way as the timed
+        waits, where E has always meant exit. No prompt in this script offers E as a choice of its
+        own, so the alias cannot shadow a real answer.
+    #>
     param([Parameter(Mandatory=$true)][string]$Message,[Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$AllowedChoices,[string]$ExitMessage="Script stopped at a safe checkpoint by implementor.")
     $normalizedAllowed = @($AllowedChoices | ForEach-Object { $_.ToString().ToUpper() })
     do {
         $answer = (Read-Host "$Message Type one of: $($AllowedChoices -join ', '), or EXIT").Trim().ToUpper()
+        if ($answer -eq "E" -and $normalizedAllowed -notcontains "E") { $answer = "EXIT" }
         if ($answer -eq "EXIT") { Stop-SafeExit -Message $ExitMessage }
     } until ($normalizedAllowed -contains $answer)
     return $answer
@@ -810,10 +848,11 @@ function Resolve-UcsFirmwarePolicyForTarget {
         the package is then created at org-root so service profiles in any organisation can
         reference it. DRY RUN never creates anything.
 
-        A created package points at BladeBundleVersion/RackBundleVersion from the settings table.
-        Those bundles must already be downloaded to the fabric interconnect - the run warns loudly
-        if it cannot see them, because a policy referencing absent firmware applies cleanly and then
-        does nothing.
+        A created package is created by NAME ONLY. No blade or rack bundle version is set on it, so
+        it takes its versions from the global firmware setting the name refers to - which is where
+        they are managed. Writing bundle strings from this script would pin the package to whatever
+        was current when the script was last edited, and it would then quietly disagree with that
+        setting rather than follow it.
 
     .PARAMETER UcsTarget
         UCSM name, for messages and caching.
@@ -840,8 +879,7 @@ function Resolve-UcsFirmwarePolicyForTarget {
         Stop-WithMessage "No firmware policy is mapped for fabric family '$($fabric.Family)' on $UcsTarget ($($fabric.Detail)). Mapped families: $known. Add an entry to `$Global:UcsFirmwarePolicyByFabricFamily before running against this domain."
     }
 
-    $mapping = $Global:UcsFirmwarePolicyByFabricFamily[$fabric.Family]
-    $policyName = [string]$mapping.PolicyName
+    $policyName = [string]$Global:UcsFirmwarePolicyByFabricFamily[$fabric.Family]
     Write-Host "  Target host firmware package: $policyName" -ForegroundColor Green
 
     $existing = @(Get-UcsFirmwarePolicyRows -UcsSession $UcsSession | Where-Object { $_.Name -eq $policyName })
@@ -855,8 +893,8 @@ function Resolve-UcsFirmwarePolicyForTarget {
     Write-Host "  '$policyName' does NOT exist in $UcsTarget." -ForegroundColor Yellow
 
     if (Test-DryRun) {
-        Write-Host "  DRY RUN: would create it as a host firmware package at org-root with blade bundle $($mapping.BladeBundleVersion) and rack bundle $($mapping.RackBundleVersion)." -ForegroundColor Green
-        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "DryRun" -Details "$UcsTarget - would create $policyName ($($mapping.BladeBundleVersion) / $($mapping.RackBundleVersion))."
+        Write-Host "  DRY RUN: would create it as a host firmware package at org-root, by name only, using the global firmware setting for its bundle versions." -ForegroundColor Green
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "DryRun" -Details "$UcsTarget - would create $policyName by name only; bundle versions come from the global setting."
         $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
         return $policyName
     }
@@ -865,22 +903,11 @@ function Resolve-UcsFirmwarePolicyForTarget {
         Stop-WithMessage "Host firmware package '$policyName' is missing from $UcsTarget and policy creation is disabled. Create it in UCSM, or set `$Global:AllowUcsFirmwarePolicyCreation to `$true."
     }
 
-    # A policy pointing at firmware the fabric interconnect has never been given applies cleanly
-    # and then does nothing, so say so before creating rather than after the batch fails to move.
-    $available = @()
-    try { $available = @(Get-UcsFirmwareDistributable -Ucs $UcsSession -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Version -Unique) } catch {}
-    $bundleShort = ($mapping.BladeBundleVersion -replace '[A-Z]$', '')
-    if ($available.Count -gt 0 -and ($available -notcontains $bundleShort)) {
-        Write-Host "  WARNING: bundle '$bundleShort' was not found among the firmware downloaded to $UcsTarget." -ForegroundColor Yellow
-        Write-Host "  Available: $(($available | Sort-Object) -join ', ')" -ForegroundColor Yellow
-        Write-Host "  A policy referencing firmware the fabric does not hold will apply but never upgrade anything." -ForegroundColor Yellow
-    }
-
     Write-Host "  About to CREATE a host firmware package in ${UcsTarget}:" -ForegroundColor Yellow
-    Write-Host "    Name                : $policyName" -ForegroundColor Yellow
-    Write-Host "    Organisation        : org-root (global, referencable from any org)" -ForegroundColor Yellow
-    Write-Host "    Blade bundle version: $($mapping.BladeBundleVersion)" -ForegroundColor Yellow
-    Write-Host "    Rack bundle version : $($mapping.RackBundleVersion)" -ForegroundColor Yellow
+    Write-Host "    Name          : $policyName" -ForegroundColor Yellow
+    Write-Host "    Organisation  : org-root (global, referencable from any org)" -ForegroundColor Yellow
+    Write-Host "    Bundle version: not set here - taken from the global firmware setting '$policyName'." -ForegroundColor Yellow
+    Write-Host "  The service profiles are then pointed at this package, and everything else follows from that setting." -ForegroundColor Yellow
 
     $choice = Read-ChoiceExit `
         -Message "Create host firmware package '$policyName' in $UcsTarget?" `
@@ -891,9 +918,9 @@ function Resolve-UcsFirmwarePolicyForTarget {
     }
 
     try {
+        # Name and description only. Bundle versions are left unset so the package uses the global
+        # firmware setting rather than a version pinned by this script.
         Add-UcsFirmwareComputeHostPack -Ucs $UcsSession -Org "org-root" -Name $policyName `
-            -BladeBundleVersion $mapping.BladeBundleVersion `
-            -RackBundleVersion $mapping.RackBundleVersion `
             -Descr "Created by the firmware batch controller for fabric family $($fabric.Family)." `
             -ErrorAction Stop | Out-Null
     }
@@ -908,7 +935,7 @@ function Resolve-UcsFirmwarePolicyForTarget {
     }
 
     Write-Host "  Created and verified '$policyName' in $UcsTarget." -ForegroundColor Green
-    Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "Created" -Details "$UcsTarget - $policyName ($($mapping.BladeBundleVersion) / $($mapping.RackBundleVersion)) for fabric family $($fabric.Family)."
+    Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "Created" -Details "$UcsTarget - $policyName created by name only for fabric family $($fabric.Family); bundle versions come from the global setting."
     $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
     return $policyName
 }
@@ -2275,15 +2302,154 @@ function Select-BatchMode {
     return $mode
 }
 
+function Wait-HostProfileComplianceSettle {
+    <#
+    .SYNOPSIS
+        Pauses after a batch is confirmed back in vCenter, before the first host profile compliance scan.
+
+    .DESCRIPTION
+        A host that has just re-registered is not settled. hostd and the profile engine are still
+        starting, and on a stateless host Auto Deploy may still be applying the answer file. A scan
+        run in that window reports differences that resolve themselves shortly after; taken as real
+        they stop the batch and send an operator looking for a fault that is not there.
+
+        Waited once per batch rather than once per host - every host in the batch came back through
+        the same reconnect gate, so one settle covers all of them and a per-host wait would add
+        dead time per host for nothing. Press C to scan now, E to exit.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,
+        [Parameter(Mandatory=$true)][string]$BatchNumber
+    )
+
+    $minutes = $HostProfileComplianceSettleMinutes
+    if ($minutes -le 0) { return }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Batch $BatchNumber is back in vCenter. Waiting $minutes minute(s) for the host(s) to settle before the compliance scan." -ForegroundColor Cyan
+    Write-Host "  Hosts: $($HostNames -join ', ')" -ForegroundColor Gray
+    Write-Host "  Press C to scan now, E to exit." -ForegroundColor Cyan
+
+    $endTime = (Get-Date).AddMinutes($minutes)
+    $lastAnnounced = -1
+    while ((Get-Date) -lt $endTime) {
+        $key = Read-PendingConsoleKey
+        if ($key -eq "E") { Stop-SafeExit -Message "Stopped during the host profile compliance settle wait." }
+        if ($key -eq "C") {
+            Write-Host "  Settle wait ended early by the operator." -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "HostProfileComplianceSettle" -Batch $BatchNumber -HostName "" -Action "Settle wait" -Result "Skipped" -Details "Operator scanned before the $minutes minute settle elapsed."
+            return
+        }
+        $remaining = [int][math]::Ceiling(($endTime - (Get-Date)).TotalSeconds)
+        if ($remaining -ne $lastAnnounced -and ($remaining % 30) -eq 0) {
+            Write-Host "  $remaining second(s) remaining..." -ForegroundColor Gray
+            $lastAnnounced = $remaining
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    Add-SummaryRecord -Stage "HostProfileComplianceSettle" -Batch $BatchNumber -HostName "" -Action "Settle wait" -Result "Completed" -Details "Waited $minutes minute(s) after reconnect before scanning compliance."
+}
+
+function Wait-VMHostProfileComplianceTask {
+    <#
+    .SYNOPSIS
+        Waits for a host profile compliance check already running in vCenter to finish.
+
+    .DESCRIPTION
+        vCenter starts its own compliance check when a host reconnects, and Auto Deploy triggers one
+        after a stateless boot. Starting a scan on top of one of those is how a pre-reboot answer
+        gets read as the post-reboot one, so any in-flight check is drained first.
+
+        Best effort by design. Get-Task is not available in every configuration and the task name
+        differs across vCenter versions, so a failure here returns quietly and the run continues -
+        the check-time comparison in Get-VMHostProfileComplianceState is the actual guarantee that
+        the scan completed, and this only removes the most common way of provoking it.
+    #>
+    param([int]$TimeoutMinutes = 10)
+
+    $endTime = (Get-Date).AddMinutes($TimeoutMinutes)
+    while ((Get-Date) -lt $endTime) {
+        $running = @()
+        try {
+            $running = @(Get-Task -Status Running -ErrorAction SilentlyContinue |
+                Where-Object { "$($_.Name)$($_.Description)" -match '(?i)compliance' })
+        }
+        catch { return }
+
+        if ($running.Count -eq 0) { return }
+        Write-Host "  Waiting for a compliance check already running in vCenter to finish ($($running.Count) task(s))..." -ForegroundColor Gray
+        Start-Sleep -Seconds 10
+    }
+
+    Write-Host "  A compliance check was still running after $TimeoutMinutes minute(s) - scanning anyway." -ForegroundColor Yellow
+}
+
+function Get-ComplianceCheckTime {
+    <#
+    .SYNOPSIS
+        Returns when a compliance result was produced, or $null when the build does not say.
+
+    .DESCRIPTION
+        The vSphere API's ComplianceResult carries checkTime, but PowerCLI surfaces it
+        inconsistently: some builds project it onto the result object, some leave it on
+        ExtensionData only, and older ones do not expose it at all.
+
+        Both are read, and "not exposed" is reported as $null rather than guessed. Inventing a
+        timestamp would make a stale result look fresh, which is the exact failure the caller uses
+        this to catch.
+    #>
+    param([Parameter(Mandatory=$true)]$ComplianceResult)
+
+    # Built defensively rather than as a literal list: Set-StrictMode -Version Latest turns a
+    # reference to an absent ExtensionData property into a terminating error, and PowerCLI builds
+    # that do not project it are exactly the case this function exists to handle.
+    $candidates = @($ComplianceResult)
+    try {
+        if ($ComplianceResult.PSObject.Properties.Name -contains 'ExtensionData' -and $null -ne $ComplianceResult.ExtensionData) {
+            $candidates += $ComplianceResult.ExtensionData
+        }
+    }
+    catch {}
+
+    foreach ($candidate in $candidates) {
+        if ($null -eq $candidate) { continue }
+        foreach ($prop in @('CheckTime','checkTime')) {
+            try {
+                if ($candidate.PSObject.Properties.Name -contains $prop -and $null -ne $candidate.$prop) {
+                    return [datetime]$candidate.$prop
+                }
+            }
+            catch {}
+        }
+    }
+    return $null
+}
+
 function Get-VMHostProfileComplianceState {
     <#
     .SYNOPSIS
-        Tests a host against its attached host profile.
+        Runs a host profile compliance scan to completion and returns its result.
 
     .DESCRIPTION
         Status is one of Compliant, NonCompliant, NoProfile or Unknown. The compliance result
         property name differs across PowerCLI versions, so both ComplianceStatus and Status are
         read before giving up.
+
+        Two things make the answer worth acting on rather than merely present:
+
+          - -UseCache is never passed. That switch is what makes Test-VMHostProfileCompliance return
+            the last stored result instead of checking. Without it the cmdlet issues a compliance
+            check and blocks until vCenter finishes it, so the scan has completed by the time it
+            returns.
+          - The result's check time is compared against the moment the scan was requested. vCenter
+            can still answer from a check that ran before the reboot, and a pre-reboot "Compliant"
+            is the worst possible answer to act on - it takes the host out of Maintenance mode on
+            the strength of its old configuration. A result older than the request is re-scanned,
+            and if it stays stale it is reported as Unknown, never as Compliant.
+
+        Where the PowerCLI build exposes no check time at all, the synchronous scan is taken at face
+        value; that is its documented behaviour and there is nothing further to verify against.
     #>
     param([Parameter(Mandatory=$true)]$VMHostObject)
 
@@ -2291,18 +2457,55 @@ function Get-VMHostProfileComplianceState {
     try { $profileObj = Get-VMHostProfile -Entity $VMHostObject -ErrorAction SilentlyContinue | Select-Object -First 1 } catch {}
 
     if ($null -eq $profileObj) {
-        return [pscustomobject]@{ Status="NoProfile"; ProfileName=""; Details="No host profile is attached to this host." }
+        return [pscustomobject]@{ Status="NoProfile"; ProfileName=""; Details="No host profile is attached to this host."; CheckTime=$null }
     }
 
-    try {
-        $result = @(Test-VMHostProfileCompliance -VMHost $VMHostObject -ErrorAction Stop) | Select-Object -First 1
-    }
-    catch {
-        return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test failed: $($_.Exception.Message)" }
+    $attempts = [math]::Max(1, [int]$HostProfileComplianceScanRetries)
+    $result = $null
+    $checkTime = $null
+    $stale = $false
+
+    for ($scan = 1; $scan -le $attempts; $scan++) {
+        # Drain anything vCenter or Auto Deploy started, so the scan below is the one that answers.
+        Wait-VMHostProfileComplianceTask -TimeoutMinutes $HostProfileComplianceScanTimeoutMinutes
+
+        $requestedAt = (Get-Date).ToUniversalTime()
+        Write-Host "  Running host profile compliance scan (attempt $scan of $attempts)..." -ForegroundColor Gray
+
+        try {
+            # No -UseCache: this has to be a real check, not the previously stored answer.
+            $result = @(Test-VMHostProfileCompliance -VMHost $VMHostObject -ErrorAction Stop) | Select-Object -First 1
+        }
+        catch {
+            return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test failed: $($_.Exception.Message)"; CheckTime=$null }
+        }
+
+        if ($null -eq $result) {
+            return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test returned no result."; CheckTime=$null }
+        }
+
+        $checkTime = Get-ComplianceCheckTime -ComplianceResult $result
+        $stale = $false
+        if ($null -eq $checkTime) { break }
+
+        # Two minutes of slack, because the jump host's clock and vCenter's are not the same clock.
+        if ($checkTime.ToUniversalTime() -ge $requestedAt.AddMinutes(-2)) { break }
+
+        $stale = $true
+        Write-Host "  vCenter answered from a check taken at $($checkTime.ToUniversalTime().ToString('u')), before this scan was requested." -ForegroundColor Yellow
+        if ($scan -lt $attempts) {
+            Write-Host "  Re-scanning rather than trusting a pre-reboot result." -ForegroundColor Yellow
+            Start-Sleep -Seconds 15
+        }
     }
 
-    if ($null -eq $result) {
-        return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test returned no result." }
+    if ($stale) {
+        return [pscustomobject]@{
+            Status      = "Unknown"
+            ProfileName = $profileObj.Name
+            Details     = "vCenter kept returning a compliance result older than the scan request after $attempts attempt(s); last check time $($checkTime.ToUniversalTime().ToString('u'))."
+            CheckTime   = $checkTime
+        }
     }
 
     $statusRaw = ""
@@ -2332,7 +2535,7 @@ function Get-VMHostProfileComplianceState {
         default              { if ([string]::IsNullOrWhiteSpace($statusRaw)) { "Unknown" } else { $statusRaw } }
     }
 
-    return [pscustomobject]@{ Status=$status; ProfileName=$profileObj.Name; Details=$details }
+    return [pscustomobject]@{ Status=$status; ProfileName=$profileObj.Name; Details=$details; CheckTime=$checkTime }
 }
 
 function Confirm-HostProfileComplianceAndExitMaintenance {
@@ -2341,15 +2544,26 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
         Per host: verify host profile compliance, then take the host out of Maintenance mode.
 
     .DESCRIPTION
-        Runs once the batch is confirmed back in vCenter. For each host in turn, while it is
-        still in Maintenance mode, the attached host profile is tested:
+        Runs once the batch is confirmed back in vCenter, and waits
+        $HostProfileComplianceSettleMinutes first so the hosts are past the noisy window straight
+        after re-registration. Then, for each host in turn while it is still in Maintenance mode, a
+        compliance scan is run to completion - not read from vCenter's cache - and the resulting
+        status decides what happens:
 
           Compliant    - the host is taken out of Maintenance mode and the run moves on.
           NonCompliant - the operator is told to remediate (Auto Deploy or vCenter host profile
-                         remediation) and presses CONTINUE to re-test. The host is never taken
-                         out of Maintenance mode, and the run never advances, until it passes.
+                         remediation) and chooses C to re-scan, O to override, or E to exit.
+                         On C the host stays in Maintenance mode and the batch does not advance.
           NoProfile    - nothing to test; the operator chooses SKIP or exits.
           Unknown      - treated like NonCompliant, because an unreadable result is not a pass.
+                         A scan that could not be completed lands here too, so it can never be
+                         mistaken for a pass.
+
+        The override exists because a host can be held back by a difference the operator has already
+        assessed and accepted, and stalling a change window on it helps nobody. It is a deliberate
+        decision, not a shortcut: the host is returned to service against a profile it does not
+        match, so it is announced on screen and recorded in the run summary as Overridden, naming
+        the status that was accepted.
 
         Applies to every reboot path - UCS Manager, Intersight, and ESXi-only - since all three
         return the host through the same Maintenance mode cycle.
@@ -2360,12 +2574,14 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
     )
 
     if ((Test-DryRun) -or (Test-StageNoAck)) {
-        Write-Host "DRY/STAGE: Would check host profile compliance for $($HostNames -join ', '), then exit Maintenance mode for each compliant host." -ForegroundColor Green
+        Write-Host "DRY/STAGE: Would wait $HostProfileComplianceSettleMinutes minute(s), scan host profile compliance for $($HostNames -join ', '), then exit Maintenance mode for each compliant host." -ForegroundColor Green
         foreach ($hostName in $HostNames) {
-            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "DryRun" -Details "No compliance test issued."
+            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "DryRun" -Details "No settle wait and no compliance scan issued."
         }
         return
     }
+
+    Wait-HostProfileComplianceSettle -HostNames $HostNames -BatchNumber $BatchNumber
 
     foreach ($hostName in $HostNames) {
         Write-Host "" -ForegroundColor Cyan
@@ -2377,13 +2593,14 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
             $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
             $state = Get-VMHostProfileComplianceState -VMHostObject $hostObj
 
-            Write-Host ("  Host: {0}  ConnectionState: {1}  Profile: {2}  Compliance: {3}" -f $hostObj.Name, $hostObj.ConnectionState, $(if($state.ProfileName){$state.ProfileName}else{"<none>"}), $state.Status) -ForegroundColor Cyan
+            $checkedAt = if ($state.CheckTime) { $state.CheckTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "<not reported>" }
+            Write-Host ("  Host: {0}  ConnectionState: {1}  Profile: {2}  Compliance: {3}  Checked: {4}" -f $hostObj.Name, $hostObj.ConnectionState, $(if($state.ProfileName){$state.ProfileName}else{"<none>"}), $state.Status, $checkedAt) -ForegroundColor Cyan
             if (-not [string]::IsNullOrWhiteSpace($state.Details)) {
                 Write-Host "  Detail: $($state.Details)" -ForegroundColor Yellow
             }
 
             if ($state.Status -eq "Compliant") {
-                Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Compliant" -Details "Profile '$($state.ProfileName)' compliant after $attempt check(s)."
+                Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Compliant" -Details "Profile '$($state.ProfileName)' compliant after $attempt scan(s); checked $checkedAt."
                 break
             }
 
@@ -2398,12 +2615,24 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
 
             Write-Host "  '$hostName' is NOT compliant with host profile '$($state.ProfileName)'." -ForegroundColor Yellow
             Write-Host "  Remediate the host now (vCenter host profile remediation, or re-provision via Auto Deploy)." -ForegroundColor Yellow
-            Write-Host "  The host stays in Maintenance mode and this batch will not advance until it passes." -ForegroundColor Yellow
-            [void](Read-ChoiceExit -Message "Type CONTINUE once '$hostName' has been remediated to re-check compliance, or EXIT" -AllowedChoices @("CONTINUE") -ExitMessage "Stopped at host profile compliance for '$hostName'.")
-            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result $state.Status -Details "Attempt $attempt not compliant; operator requested re-check."
+            Write-Host "    C - re-scan compliance once the host has been remediated. It stays in Maintenance" -ForegroundColor Yellow
+            Write-Host "        mode and this batch does not advance." -ForegroundColor Yellow
+            Write-Host "    O - override: accept the host as it is, take it out of Maintenance mode and carry" -ForegroundColor Yellow
+            Write-Host "        on. Recorded in the run summary as an override." -ForegroundColor Yellow
+            Write-Host "    E - exit the run safely, leaving the host in Maintenance mode." -ForegroundColor Yellow
+            $complianceChoice = Read-ChoiceExit -Message "'$hostName' is not compliant. C to re-check, O to override and continue, E to exit" -AllowedChoices @("C","O") -ExitMessage "Stopped at host profile compliance for '$hostName'."
+
+            if ($complianceChoice -eq "O") {
+                Write-Host "  OVERRIDE: '$hostName' is being returned to service without passing its host profile check." -ForegroundColor Red
+                Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Overridden" -Details "Operator accepted '$($state.Status)' against profile '$($state.ProfileName)' after $attempt scan(s) and continued. Checked $checkedAt. $($state.Details)"
+                break
+            }
+
+            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result $state.Status -Details "Attempt $attempt not compliant; operator chose to re-check."
         }
 
-        # Only reached once the host is compliant, or explicitly accepted with no profile attached.
+        # Only reached once the host is compliant, explicitly accepted with no profile attached, or
+        # explicitly overridden by the operator.
         $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
         if ($hostObj.ConnectionState -eq "Maintenance") {
             if ($Global:AutoExitMaintenanceMode) {
