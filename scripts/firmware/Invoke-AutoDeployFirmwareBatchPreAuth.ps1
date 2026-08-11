@@ -71,7 +71,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 17.4.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 17.4.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 18.0.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 18.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -171,12 +171,32 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "17.4.0-preauth"
+$ScriptVersion = "18.0.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
 $TargetEsxiBuild = if ($TargetEsxiVersion -match "(\d{7,})$") { $Matches[1] } else { "" }
 $TargetUcsFirmwarePolicyName = ""
+
+# Fabric-derived firmware policy. The FI family is read from the connected UCSM domain and mapped
+# straight to a host firmware package, replacing the interactive policy picker.
+#
+# PolicyName is what the service profiles are pointed at. BladeBundleVersion/RackBundleVersion are
+# used ONLY when the policy does not already exist and has to be created - they must match a
+# bundle already downloaded to the fabric interconnect, or the policy will reference firmware that
+# is not there. Verify with: Get-UcsFirmwareDistributable -Ucs <session> | Select-Object Name,Version
+$Global:UcsFirmwarePolicyByFabricFamily = @{
+    '6400' = @{ PolicyName = 'global-602d'; BladeBundleVersion = '6.0(2d)B'; RackBundleVersion = '6.0(2d)C' }
+    '6300' = @{ PolicyName = 'global-436h'; BladeBundleVersion = '4.3(6h)B'; RackBundleVersion = '4.3(6h)C' }
+}
+
+# Resolved policy per UCSM domain, so a cluster spanning a 6300 and a 6400 domain gets the right
+# one in each rather than a single cluster-wide choice.
+$Global:UcsFirmwarePolicyByTarget = @{}
+
+# Whether the run may CREATE a missing host firmware package. When false, a missing policy stops
+# the run instead. Creation is always gated by an explicit confirmation and never happens in DRY RUN.
+$Global:AllowUcsFirmwarePolicyCreation = $true
 
 # Intersight PVA routing.
 # CDP/LLDP remains the identity source for every host (same as the UCSM path below). A host whose
@@ -226,7 +246,7 @@ $MinimumDatastoreFreePercent = 10
 $MaxAbsoluteBatchSize = 6
 $MaintenanceValidationTimeoutMinutes = 60
 $EsxiOnlyReconnectInitialWaitMinutes = 15
-$FirmwareReconnectInitialWaitMinutes = 25
+$FirmwareReconnectInitialWaitMinutes = 40
 $ReconnectRetryWindowMinutes = 5
 $ReconnectCheckIntervalSeconds = 60
 
@@ -729,95 +749,168 @@ function Get-UcsFirmwarePolicyRows {
     return @($rows | Sort-Object Name -Unique)
 }
 
-function Select-UcsFirmwarePolicyFromUcs {
+function Get-UcsFabricFamily {
+    <#
+    .SYNOPSIS
+        Reads the fabric interconnect model from a connected UCSM domain and returns its family.
+
+    .DESCRIPTION
+        Get-UcsNetworkElement returns one object per fabric interconnect, whose Model looks like
+        UCS-FI-6332, UCS-FI-6454 or UCS-FI-64108. The first two digits of the model number give the
+        family - 6200, 6300, 6400, 6500 - which is what selects the firmware policy.
+
+        Both fabric interconnects in a domain are read. They should always match; if they do not,
+        the family is reported as Mixed and the caller stops rather than guessing which firmware
+        policy applies.
+
+    .PARAMETER UcsSession
+        A connected UCSM session.
+    #>
+    param([Parameter(Mandatory=$true)]$UcsSession)
+
+    $elements = @()
+    try { $elements = @(Get-UcsNetworkElement -Ucs $UcsSession -ErrorAction Stop) }
+    catch {
+        return [pscustomobject]@{ Family='Unknown'; Models=@(); Detail="Get-UcsNetworkElement failed: $($_.Exception.Message)" }
+    }
+
+    if ($elements.Count -eq 0) {
+        return [pscustomobject]@{ Family='Unknown'; Models=@(); Detail='Get-UcsNetworkElement returned no fabric interconnects.' }
+    }
+
+    $models = @($elements | ForEach-Object { [string]$_.Model } | Where-Object { $_ })
+    $families = @(
+        $models | ForEach-Object {
+            if ($_ -match '(?i)FI-?(\d{2})\d') { "$($Matches[1])00" } else { $null }
+        } | Where-Object { $_ } | Select-Object -Unique
+    )
+
+    if ($families.Count -eq 0) {
+        return [pscustomobject]@{ Family='Unknown'; Models=$models; Detail="No family could be derived from model(s): $($models -join ', ')" }
+    }
+    if ($families.Count -gt 1) {
+        return [pscustomobject]@{ Family='Mixed'; Models=$models; Detail="Fabric interconnects report different families: $($models -join ', ')" }
+    }
+
+    return [pscustomobject]@{ Family=$families[0]; Models=$models; Detail="Model(s): $($models -join ', ')" }
+}
+
+function Resolve-UcsFirmwarePolicyForTarget {
+    <#
+    .SYNOPSIS
+        Returns the host firmware package for a UCSM domain, derived from its fabric family.
+
+    .DESCRIPTION
+        Replaces the interactive firmware policy picker. The fabric interconnect family decides the
+        policy, per $Global:UcsFirmwarePolicyByFabricFamily - so a 6400 domain gets one policy and a
+        6300 domain another, with no operator choice to get wrong.
+
+        If the policy is already present in the domain it is used as-is. If it is missing and
+        creation is permitted, the operator is shown exactly what would be created and must confirm;
+        the package is then created at org-root so service profiles in any organisation can
+        reference it. DRY RUN never creates anything.
+
+        A created package points at BladeBundleVersion/RackBundleVersion from the settings table.
+        Those bundles must already be downloaded to the fabric interconnect - the run warns loudly
+        if it cannot see them, because a policy referencing absent firmware applies cleanly and then
+        does nothing.
+
+    .PARAMETER UcsTarget
+        UCSM name, for messages and caching.
+
+    .PARAMETER UcsSession
+        A connected UCSM session for that domain.
+    #>
     param(
         [Parameter(Mandatory=$true)][string]$UcsTarget,
         [Parameter(Mandatory=$true)]$UcsSession
     )
 
+    if ($Global:UcsFirmwarePolicyByTarget.ContainsKey($UcsTarget)) { return $Global:UcsFirmwarePolicyByTarget[$UcsTarget] }
+
     Write-Host "" -ForegroundColor Cyan
-    Write-Host "Retrieving available UCSM host firmware packages from $UcsTarget..." -ForegroundColor Cyan
+    Write-Host "Determining the fabric interconnect family for $UcsTarget..." -ForegroundColor Cyan
+    $fabric = Get-UcsFabricFamily -UcsSession $UcsSession
+    Write-Host "  $($fabric.Detail)" -ForegroundColor Gray
+    Write-Host "  Fabric family: $($fabric.Family)" -ForegroundColor Cyan
+    Add-SummaryRecord -Stage "UCSMFabricDetection" -Batch "" -HostName "" -Action "Detect fabric family" -Result $fabric.Family -Details "$UcsTarget - $($fabric.Detail)"
 
-    $policyRows = @(Get-UcsFirmwarePolicyRows -UcsSession $UcsSession)
-    if ($policyRows.Count -eq 0) {
-        Stop-WithMessage "No UCSM host firmware packages were returned from $UcsTarget. Check UCS PowerTool access and permissions."
+    if (-not $Global:UcsFirmwarePolicyByFabricFamily.ContainsKey($fabric.Family)) {
+        $known = ($Global:UcsFirmwarePolicyByFabricFamily.Keys | Sort-Object) -join ', '
+        Stop-WithMessage "No firmware policy is mapped for fabric family '$($fabric.Family)' on $UcsTarget ($($fabric.Detail)). Mapped families: $known. Add an entry to `$Global:UcsFirmwarePolicyByFabricFamily before running against this domain."
     }
 
-    Write-Host "Available UCSM host firmware packages returned by UCS PowerTool for this UCSM target:" -ForegroundColor Cyan
-    $policyRows | Select-Object Name,Dn | Format-Table -AutoSize | Out-Host
+    $mapping = $Global:UcsFirmwarePolicyByFabricFamily[$fabric.Family]
+    $policyName = [string]$mapping.PolicyName
+    Write-Host "  Target host firmware package: $policyName" -ForegroundColor Green
 
-    $manualSelectionName = "<MANUAL - enter firmware policy name>"
-    $selectionRows = @($policyRows | Select-Object Name,Dn,Description)
-    $selectionRows += [pscustomobject]@{
-        Name        = $manualSelectionName
-        Dn          = "Manual entry. Use only if the policy is visible in UCSM GUI but not returned by PowerTool."
-        Description = "Manual override"
+    $existing = @(Get-UcsFirmwarePolicyRows -UcsSession $UcsSession | Where-Object { $_.Name -eq $policyName })
+    if ($existing.Count -gt 0) {
+        Write-Host "  '$policyName' already exists in $UcsTarget - using it as-is." -ForegroundColor Green
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Resolve firmware policy" -Result "Existing" -Details "$UcsTarget - $policyName for fabric family $($fabric.Family)."
+        $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
+        return $policyName
     }
 
-    $selectedPolicy = $null
+    Write-Host "  '$policyName' does NOT exist in $UcsTarget." -ForegroundColor Yellow
+
+    if (Test-DryRun) {
+        Write-Host "  DRY RUN: would create it as a host firmware package at org-root with blade bundle $($mapping.BladeBundleVersion) and rack bundle $($mapping.RackBundleVersion)." -ForegroundColor Green
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "DryRun" -Details "$UcsTarget - would create $policyName ($($mapping.BladeBundleVersion) / $($mapping.RackBundleVersion))."
+        $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
+        return $policyName
+    }
+
+    if (-not $Global:AllowUcsFirmwarePolicyCreation) {
+        Stop-WithMessage "Host firmware package '$policyName' is missing from $UcsTarget and policy creation is disabled. Create it in UCSM, or set `$Global:AllowUcsFirmwarePolicyCreation to `$true."
+    }
+
+    # A policy pointing at firmware the fabric interconnect has never been given applies cleanly
+    # and then does nothing, so say so before creating rather than after the batch fails to move.
+    $available = @()
+    try { $available = @(Get-UcsFirmwareDistributable -Ucs $UcsSession -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Version -Unique) } catch {}
+    $bundleShort = ($mapping.BladeBundleVersion -replace '[A-Z]$', '')
+    if ($available.Count -gt 0 -and ($available -notcontains $bundleShort)) {
+        Write-Host "  WARNING: bundle '$bundleShort' was not found among the firmware downloaded to $UcsTarget." -ForegroundColor Yellow
+        Write-Host "  Available: $(($available | Sort-Object) -join ', ')" -ForegroundColor Yellow
+        Write-Host "  A policy referencing firmware the fabric does not hold will apply but never upgrade anything." -ForegroundColor Yellow
+    }
+
+    Write-Host "  About to CREATE a host firmware package in ${UcsTarget}:" -ForegroundColor Yellow
+    Write-Host "    Name                : $policyName" -ForegroundColor Yellow
+    Write-Host "    Organisation        : org-root (global, referencable from any org)" -ForegroundColor Yellow
+    Write-Host "    Blade bundle version: $($mapping.BladeBundleVersion)" -ForegroundColor Yellow
+    Write-Host "    Rack bundle version : $($mapping.RackBundleVersion)" -ForegroundColor Yellow
+
+    $choice = Read-ChoiceExit `
+        -Message "Create host firmware package '$policyName' in $UcsTarget?" `
+        -AllowedChoices @("CREATE","STOP") `
+        -ExitMessage "Stopped before creating a UCS host firmware package."
+    if ($choice -eq "STOP") {
+        Stop-WithMessage "Host firmware package '$policyName' is missing from $UcsTarget and creation was declined."
+    }
 
     try {
-        $selectedPolicy = $selectionRows |
-            Out-GridView -Title "Select target UCS Host Firmware Package for UCSM $UcsTarget" -PassThru
+        Add-UcsFirmwareComputeHostPack -Ucs $UcsSession -Org "org-root" -Name $policyName `
+            -BladeBundleVersion $mapping.BladeBundleVersion `
+            -RackBundleVersion $mapping.RackBundleVersion `
+            -Descr "Created by the firmware batch controller for fabric family $($fabric.Family)." `
+            -ErrorAction Stop | Out-Null
     }
     catch {
-        $selectedPolicy = $null
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "Failed" -Details "$UcsTarget - $policyName - $($_.Exception.Message)"
+        Stop-WithMessage "Could not create host firmware package '$policyName' in ${UcsTarget}: $($_.Exception.Message)"
     }
 
-    if ($null -eq $selectedPolicy) {
-        Write-Host "" -ForegroundColor Cyan
-        Write-Host "GUI drop-down/list selection was not available or no item was selected. Using numbered console selection." -ForegroundColor Yellow
-        for ($i = 0; $i -lt $selectionRows.Count; $i++) {
-            Write-Host ("  {0}. {1}" -f ($i + 1), $selectionRows[$i].Name) -ForegroundColor Cyan
-        }
-        do {
-            $choice = (Read-Host "Enter target firmware policy number, type policy name manually, or type EXIT").Trim()
-            if ($choice.ToUpper() -eq "EXIT") { Stop-SafeExit -Message "Stopped during UCS firmware policy selection." }
-            if ($choice -match '^\d+$') {
-                $index = [int]$choice - 1
-                if ($index -ge 0 -and $index -lt $selectionRows.Count) {
-                    $selectedPolicy = $selectionRows[$index]
-                    break
-                }
-            }
-            else {
-                $matched = @($policyRows | Where-Object { $_.Name -eq $choice })
-                if ($matched.Count -eq 1) {
-                    $selectedPolicy = $matched[0]
-                    break
-                }
-                if (-not [string]::IsNullOrWhiteSpace($choice)) {
-                    $selectedPolicy = [pscustomobject]@{ Name=$choice; Dn="Manual entry"; Description="Manual override" }
-                    break
-                }
-            }
-            Write-Host "Invalid firmware policy selection." -ForegroundColor Yellow
-        } while ($true)
+    # Read it back rather than trusting the create call.
+    if (-not (Test-UcsFirmwarePolicyExists -PolicyName $policyName -UcsSession $UcsSession)) {
+        Stop-WithMessage "Host firmware package '$policyName' was created in $UcsTarget but cannot be read back. Check it in UCSM before continuing."
     }
 
-    if ($selectedPolicy.Name -eq $manualSelectionName) {
-        $manualPolicy = (Read-Host "Enter target UCS Host Firmware Package name exactly as shown in UCSM GUI, or type EXIT").Trim()
-        if ($manualPolicy.ToUpper() -eq "EXIT") { Stop-SafeExit -Message "Stopped during manual UCS firmware policy selection." }
-        if ([string]::IsNullOrWhiteSpace($manualPolicy)) { Stop-WithMessage "Manual UCS firmware policy name cannot be blank." }
-        $selectedPolicy = [pscustomobject]@{ Name=$manualPolicy; Dn="Manual entry"; Description="Manual override" }
-    }
-
-    if ($null -eq $selectedPolicy -or [string]::IsNullOrWhiteSpace($selectedPolicy.Name)) {
-        Stop-WithMessage "No UCS firmware policy was selected."
-    }
-
-    $selectedPolicyFound = (($policyRows | Where-Object { $_.Name -eq $selectedPolicy.Name }).Count -gt 0)
-    if (-not $selectedPolicyFound) {
-        Write-Host "WARNING: Firmware policy '$($selectedPolicy.Name)' was entered manually and was not returned by Get-UcsFirmwareComputeHostPack for UCSM $UcsTarget." -ForegroundColor Yellow
-        Write-Host "Only continue if the policy is visible in the UCSM GUI for this same UCSM domain and you have confirmed the exact spelling." -ForegroundColor Yellow
-        $confirmManual = Read-ChoiceExit -Message "Continue with manually entered firmware policy '$($selectedPolicy.Name)'?" -AllowedChoices @("YES","NO") -ExitMessage "Stopped during manual firmware policy confirmation."
-        if ($confirmManual -ne "YES") { Stop-SafeExit -Message "Manual UCS firmware policy was not accepted." }
-    }
-
-    Set-Variable -Name TargetUcsFirmwarePolicyName -Scope Script -Value ([string]$selectedPolicy.Name)
-    Write-Host "Selected target UCS firmware policy: $TargetUcsFirmwarePolicyName" -ForegroundColor Green
-    Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Select target firmware policy" -Result "Selected" -Details $TargetUcsFirmwarePolicyName
-    return [string]$selectedPolicy.Name
+    Write-Host "  Created and verified '$policyName' in $UcsTarget." -ForegroundColor Green
+    Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "Created" -Details "$UcsTarget - $policyName ($($mapping.BladeBundleVersion) / $($mapping.RackBundleVersion)) for fabric family $($fabric.Family)."
+    $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
+    return $policyName
 }
 
 function Test-UcsFirmwarePolicyExists {
@@ -986,7 +1079,7 @@ function Build-InfrastructureHostMapping {
             ServiceProfileDn   = $sp.Dn
             ServiceProfileName = $sp.Name
             CurrentPolicy      = $currentPolicy
-            TargetPolicy       = $TargetUcsFirmwarePolicyName
+            TargetPolicy       = ""
         }
         $Global:UcsHostMap[$row.Host] = $mapRow
         [void]$mappingRows.Add($mapRow)
@@ -999,12 +1092,15 @@ function Build-InfrastructureHostMapping {
     $uniqueTargets = @($mappingRows | Select-Object -ExpandProperty UcsTarget -Unique)
     if ($uniqueTargets.Count -eq 0) { Stop-WithMessage "No UCSM targets were discovered for firmware policy selection." }
 
-    $firstTarget = $uniqueTargets[0]
-    $firstSession = Get-UcsSessionForTarget -UcsTarget $firstTarget
-    [void](Select-UcsFirmwarePolicyFromUcs -UcsTarget $firstTarget -UcsSession $firstSession)
+    # Derived per UCSM domain from its fabric interconnect family, not chosen once for the whole
+    # cluster - a cluster spanning a 6300 and a 6400 domain needs a different package in each.
+    foreach ($targetName in $uniqueTargets) {
+        $targetSession = Get-UcsSessionForTarget -UcsTarget $targetName
+        [void](Resolve-UcsFirmwarePolicyForTarget -UcsTarget $targetName -UcsSession $targetSession)
+    }
 
     foreach ($row in $mappingRows) {
-        $row.TargetPolicy = $TargetUcsFirmwarePolicyName
+        $row.TargetPolicy = $Global:UcsFirmwarePolicyByTarget[$row.UcsTarget]
         $Global:UcsHostMap[$row.Host] = $row
     }
 
@@ -1014,14 +1110,15 @@ function Build-InfrastructureHostMapping {
 
     foreach ($targetName in $uniqueTargets) {
         $ucsSession = Get-UcsSessionForTarget -UcsTarget $targetName
-        if (-not (Test-UcsFirmwarePolicyExists -PolicyName $TargetUcsFirmwarePolicyName -UcsSession $ucsSession)) {
-            Write-Host "WARNING: Target UCS firmware policy '$TargetUcsFirmwarePolicyName' was not returned by PowerTool from UCSM $targetName after selection." -ForegroundColor Yellow
+        $targetPolicy = $Global:UcsFirmwarePolicyByTarget[$targetName]
+        if (-not (Test-UcsFirmwarePolicyExists -PolicyName $targetPolicy -UcsSession $ucsSession)) {
+            Write-Host "WARNING: Target UCS firmware policy '$targetPolicy' was not returned by PowerTool from UCSM $targetName after resolution." -ForegroundColor Yellow
             Write-Host "If this was a manual policy selection, the later Set-UcsServiceProfile step will still attempt to apply it directly." -ForegroundColor Yellow
-            Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Validate selected policy" -Result "Warning" -Details "Policy not returned by PowerTool on $targetName."
+            Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Validate selected policy" -Result "Warning" -Details "Policy $targetPolicy not returned by PowerTool on $targetName."
         }
     }
 
-    Add-SummaryRecord -Stage "UCSMMapping" -Batch "" -HostName "" -Action "Map hosts" -Result "Completed" -Details "$($mappingRows.Count) hosts mapped. Target policy: $TargetUcsFirmwarePolicyName."
+    Add-SummaryRecord -Stage "UCSMMapping" -Batch "" -HostName "" -Action "Map hosts" -Result "Completed" -Details "$($mappingRows.Count) hosts mapped. Policies by domain: $((($Global:UcsFirmwarePolicyByTarget.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '; '))."
 }
 
 function Set-UcsFirmwarePolicyForBatch {
@@ -1043,7 +1140,7 @@ function Set-UcsFirmwarePolicyForBatch {
     if (Test-DryRun) {
         Write-Host "DRY RUN: Would apply target UCS firmware policy to current batch service profiles only." -ForegroundColor Green
         foreach ($row in $rows) {
-            Add-SummaryRecord -Stage "UCSMFirmwarePolicy" -Batch $BatchNumber -HostName $row.Host -Action "Apply firmware policy" -Result "DryRun" -Details "Would set $($row.ServiceProfileDn) to $TargetUcsFirmwarePolicyName."
+            Add-SummaryRecord -Stage "UCSMFirmwarePolicy" -Batch $BatchNumber -HostName $row.Host -Action "Apply firmware policy" -Result "DryRun" -Details "Would set $($row.ServiceProfileDn) to $($row.TargetPolicy)."
         }
         return
     }
@@ -1058,21 +1155,26 @@ function Set-UcsFirmwarePolicyForBatch {
         $setResult = "Skipped"
         $setDetails = "Already target policy before change."
 
-        if ($beforePolicy -ne $TargetUcsFirmwarePolicyName) {
-            Set-UcsServiceProfile -Ucs $ucsSession -ServiceProfile $spBefore -HostFwPolicyName $TargetUcsFirmwarePolicyName -Force -ErrorAction Stop | Out-Null
+        # Each host's policy comes from its own UCSM domain's fabric family.
+        $wantedPolicy = [string]$row.TargetPolicy
+        if ([string]::IsNullOrWhiteSpace($wantedPolicy)) {
+            Stop-WithMessage "No firmware policy was resolved for host $($row.Host) in domain $($row.UcsTarget)."
+        }
+        if ($beforePolicy -ne $wantedPolicy) {
+            Set-UcsServiceProfile -Ucs $ucsSession -ServiceProfile $spBefore -HostFwPolicyName $wantedPolicy -Force -ErrorAction Stop | Out-Null
             $setResult = "SetSent"
-            $setDetails = "Set command sent from $beforePolicy to $TargetUcsFirmwarePolicyName."
+            $setDetails = "Set command sent from $beforePolicy to $wantedPolicy."
         }
 
         Start-Sleep -Seconds 2
 
         $spAfter = Get-UcsServiceProfile -Ucs $ucsSession -Dn $row.ServiceProfileDn -ErrorAction Stop
         $afterPolicy = Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $spAfter
-        $verified = ($afterPolicy -eq $TargetUcsFirmwarePolicyName)
+        $verified = ($afterPolicy -eq $wantedPolicy)
         $verifyResult = if ($verified) { "Verified" } else { "NotVerified" }
 
         $row.CurrentPolicy = $afterPolicy
-        $row.TargetPolicy = $TargetUcsFirmwarePolicyName
+        $row.TargetPolicy = $wantedPolicy
         $Global:UcsHostMap[$row.Host] = $row
 
         [void]$verificationRows.Add([pscustomobject]@{
@@ -1082,7 +1184,7 @@ function Set-UcsFirmwarePolicyForBatch {
             UcsTarget        = $row.UcsTarget
             ServiceProfileDn = $row.ServiceProfileDn
             BeforePolicy     = $beforePolicy
-            RequestedPolicy  = $TargetUcsFirmwarePolicyName
+            RequestedPolicy  = $wantedPolicy
             AfterPolicy      = $afterPolicy
             Result           = $verifyResult
             Action           = $setResult
@@ -2462,7 +2564,8 @@ function Reset-ClusterScopedState {
     $Global:EsxiDiscoveryCache = @{}
     $Global:BatchActionsSent = 0
 
-    # Firmware policy is chosen per cluster from that cluster's UCSM domain.
+    # Firmware policy is derived per UCSM domain, so the resolved map is cluster-scoped.
+    $Global:UcsFirmwarePolicyByTarget = @{}
     Set-Variable -Name TargetUcsFirmwarePolicyName -Scope Script -Value ""
 }
 

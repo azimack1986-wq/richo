@@ -88,6 +88,12 @@ $Global:IntersightUpgradeSurfaceChecked = $false
 $Global:IntersightDeployActionParams    = @()
 $Global:IntersightActionableConfigStates = @('Pending-changes','Inconsistent','Out-of-sync','Not-deployed')
 $Global:EsxiDiscoveryCache              = @{}
+$Global:UcsFirmwarePolicyByTarget       = @{}
+$Global:AllowUcsFirmwarePolicyCreation  = $true
+$Global:UcsFirmwarePolicyByFabricFamily = @{
+    '6400' = @{ PolicyName = 'global-602d'; BladeBundleVersion = '6.0(2d)B'; RackBundleVersion = '6.0(2d)C' }
+    '6300' = @{ PolicyName = 'global-436h'; BladeBundleVersion = '4.3(6h)B'; RackBundleVersion = '4.3(6h)C' }
+}
 
 # Intersight CSV: esx01/esx02 belong to fabric SS101, esx03/esx04 do not appear at all.
 $csvDir = Join-Path ([IO.Path]::GetTempPath()) ("wfsim-" + [Guid]::NewGuid().ToString('N'))
@@ -160,7 +166,24 @@ function Set-UcsServiceProfile {
     Note-Call 'Set-UcsServiceProfile'
     $script:UcsPolicyState[$ServiceProfile.Name] = $HostFwPolicyName
 }
-function Get-UcsFirmwareComputeHostPack { param($Ucs,$ErrorAction) return @([pscustomobject]@{ Name='fw-new'; Dn='org-root/fw-host-pack-fw-new'; Descr='' }) }
+# Fabric family drives the firmware policy, so the simulated domain reports a 6400-series FI and
+# the run must land on global-602d without asking anyone.
+$script:FabricModel = 'UCS-FI-6454'
+$script:HostPacks = @('global-602d')
+function Get-UcsNetworkElement { param($Ucs,$ErrorAction)
+    return @(
+        [pscustomobject]@{ Dn='sys/switch-A'; Model=$script:FabricModel; Vendor='Cisco Systems, Inc.' },
+        [pscustomobject]@{ Dn='sys/switch-B'; Model=$script:FabricModel; Vendor='Cisco Systems, Inc.' }
+    )
+}
+function Get-UcsFirmwareComputeHostPack { param($Ucs,$ErrorAction)
+    return @($script:HostPacks | ForEach-Object { [pscustomobject]@{ Name=$_; Dn="org-root/fw-host-pack-$_"; Descr='' } })
+}
+function Get-UcsFirmwareDistributable { param($Ucs,$ErrorAction) return @([pscustomobject]@{ Name='ucs-6400'; Version='6.0(2d)' }) }
+function Add-UcsFirmwareComputeHostPack { param($Ucs,$Org,$Name,$BladeBundleVersion,$RackBundleVersion,$Descr,$ErrorAction)
+    Note-Call 'Add-UcsFirmwareComputeHostPack'
+    $script:HostPacks += $Name
+}
 function Get-UcsLsmaintAck { param($Ucs,$ErrorAction) return @() }
 function Set-UcsLsmaintAck { param($Ucs,$LsmaintAck,$AdminState,[switch]$Force,$ErrorAction) Note-Call 'Set-UcsLsmaintAck' }
 
@@ -207,7 +230,7 @@ function Read-Host {
         'Select upgrade mode'        { return '2' }    # ESXi + firmware
         'Select batch mode'          { return '1' }    # AUTO
         'manual health checks'       { return 'YES' }
-        'firmware policy number'     { return '1' }
+        'Create host firmware package' { return 'CREATE' }
         'Intersight FQDN'            { return 'pva.example.com' }
         'Nothing to reboot'          { return 'CONTINUE' }
         'remediated to re-check'     { return 'CONTINUE' }
@@ -232,6 +255,7 @@ function Reset-Simulation {
     $Global:IntersightUnusable = $false
     $Global:IntersightUpgradeSurfaceChecked = $false
     $Global:UcsSessions = @{}
+    $Global:UcsFirmwarePolicyByTarget = @{}
 }
 
 Write-Host "`n=== The script loads ===" -ForegroundColor Cyan
@@ -270,6 +294,15 @@ foreach ($mutator in @('Set-VMHost','Set-UcsServiceProfile','Set-UcsLsmaintAck',
 }
 Assert-True "every host is still Connected" (@($script:HostState.Values | Where-Object { $_.ConnectionState -ne 'Connected' }).Count -eq 0)
 
+Write-Host "`n=== The fabric family chose the firmware policy ===" -ForegroundColor Cyan
+$fabricRows = @($Global:RunSummary | Where-Object { $_.Stage -eq 'UCSMFabricDetection' })
+Assert-True "the fabric family was detected" ($fabricRows.Count -ge 1)
+Assert-True "a 6454 was read as the 6400 family" (@($fabricRows | Where-Object { $_.Result -eq '6400' }).Count -ge 1) "got: $(($fabricRows.Result) -join ', ')"
+$policyRows = @($Global:RunSummary | Where-Object { $_.Stage -eq 'UCSMFirmwarePolicySelection' })
+Assert-True "the 6400 mapping resolved to global-602d" (@($policyRows | Where-Object { $_.Details -match 'global-602d' }).Count -ge 1) "got: $(($policyRows.Details) -join ' | ')"
+Assert-True "an existing package was reused, not recreated" (@($policyRows | Where-Object { $_.Result -eq 'Existing' }).Count -ge 1)
+Assert-True "no host firmware package was created when one already existed" (-not $script:Calls.ContainsKey('Add-UcsFirmwareComputeHostPack'))
+
 Write-Host "`n=== The run summary is usable evidence ===" -ForegroundColor Cyan
 Assert-True "summary rows were recorded" ($Global:RunSummary.Count -gt 10) "got $($Global:RunSummary.Count)"
 Assert-True "every row carries the script version" (@($Global:RunSummary | Where-Object { $_.ScriptVersion -ne 'simulation' }).Count -eq 0)
@@ -296,7 +329,7 @@ function Read-Host { param([string]$Prompt)
         'Select upgrade mode'      { return '2' }
         'Select batch mode'        { return '1' }
         'manual health checks'     { return 'YES' }
-        'firmware policy number'   { return '1' }
+        'Create host firmware package' { return 'CREATE' }
         'Nothing to reboot'        { return 'CONTINUE' }
         'remediated to re-check'   { return 'CONTINUE' }
         'No host profile attached' { return 'SKIP' }

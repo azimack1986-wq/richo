@@ -12,6 +12,56 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [18.0.0] — 2026-08-11
+
+The UCS firmware policy is no longer chosen by the operator. It is derived from
+the fabric interconnect family, which removes a decision that could be made
+wrong — hence the major bump.
+
+#### Added
+
+- `Get-UcsFabricFamily` reads the fabric interconnect model from the connected
+  UCSM domain via `Get-UcsNetworkElement` and derives the family from it:
+  `UCS-FI-6454` and `UCS-FI-64108` to 6400, `UCS-FI-6332` and `UCS-FI-6332-16UP`
+  to 6300, `UCS-FI-6248UP` to 6200, `UCS-FI-6536` to 6500. Both fabric
+  interconnects are read; if they disagree the family is `Mixed` and the run
+  stops rather than guessing.
+- `$Global:UcsFirmwarePolicyByFabricFamily` maps family to host firmware package
+  and, for creation only, to bundle versions:
+  - **6400** → `global-602d` (blade `6.0(2d)B`, rack `6.0(2d)C`)
+  - **6300** → `global-436h` (blade `4.3(6h)B`, rack `4.3(6h)C`)
+- `Resolve-UcsFirmwarePolicyForTarget` resolves the package per UCSM domain,
+  reusing it if present. If missing, it warns when the bundle is not among the
+  firmware downloaded to the fabric, shows exactly what it will create, requires
+  a typed `CREATE`, creates the package at `org-root` so any organisation can
+  reference it, and reads it back before continuing. DRY RUN never creates.
+
+#### Changed
+
+- **The interactive firmware policy picker is removed.** No `Out-GridView`, no
+  numbered list, no manual policy name.
+- **The policy is per UCSM domain, not per cluster.** A cluster spanning a 6300
+  and a 6400 domain now gets the correct package in each; previously one policy
+  was chosen from the first domain and applied to all of them.
+- `$FirmwareReconnectInitialWaitMinutes` raised from 25 to 40.
+
+#### Added — tests
+
+- `tests/Test-UcsFabricFamily.ps1` — 25 assertions covering the model strings
+  Cisco ships, mixed and unreadable fabrics, reuse of an existing package,
+  creation with the right org and bundle versions, per-domain caching, declining
+  creation, an unmapped family, and DRY RUN creating nothing.
+- The workflow simulation now asserts the fabric family was detected and drove
+  the policy.
+
+#### Notes
+
+- The bundle versions are only used when creating a missing package, and are
+  assumed to follow the `<version>B` / `<version>C` convention. They must already
+  be downloaded to the fabric interconnect — a package referencing absent
+  firmware applies cleanly and upgrades nothing. Verify with
+  `Get-UcsFirmwareDistributable`.
+
 ### [17.4.0] — 2026-08-11
 
 #### Removed
