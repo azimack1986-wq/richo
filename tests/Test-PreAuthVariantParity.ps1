@@ -56,10 +56,36 @@ function Get-ScriptFunctions {
         $map[$f.Name] = $f.Extent.Text
     }
     return @{
+        Ast       = $ast
         Functions = $map
         Calls     = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
                         ForEach-Object { $_.GetCommandName() } | Where-Object { $_ } | Sort-Object -Unique)
     }
+}
+
+function Get-ConfigurationCallSites {
+    <#
+        Every Set-IntersightConfiguration call, with whether it sits inside the operator's
+        AUTHENTICATION region and whether it is inside a function.
+    #>
+    param([string]$Path, $Ast)
+
+    $text = [System.IO.File]::ReadAllText($Path)
+    $start = $text.IndexOf('# >>> BEGIN INTERSIGHT AUTHENTICATION >>>')
+    $end   = $text.IndexOf('# <<< END INTERSIGHT AUTHENTICATION <<<')
+
+    $functions = @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+
+    return @($Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+        Where-Object { $_.GetCommandName() -eq 'Set-IntersightConfiguration' } |
+        ForEach-Object {
+            $offset = $_.Extent.StartOffset
+            [pscustomobject]@{
+                Line       = $_.Extent.StartLineNumber
+                InRegion   = ($start -ge 0 -and $end -gt $start -and $offset -gt $start -and $offset -lt $end)
+                InFunction = [bool](@($functions | Where-Object { $offset -ge $_.Extent.StartOffset -and $offset -lt $_.Extent.EndOffset }).Count)
+            }
+        })
 }
 
 $script:pass = 0; $script:fail = 0
@@ -77,9 +103,22 @@ foreach ($fn in $AuthOnlyFunctions) {
     Assert-True "pre-auth build does not define $fn" (-not $preAuth.Functions.ContainsKey($fn))
     Assert-True "pre-auth build does not call $fn"   ($preAuth.Calls -notcontains $fn)
 }
-Assert-True "pre-auth build never calls Set-IntersightConfiguration" ($preAuth.Calls -notcontains 'Set-IntersightConfiguration')
-Assert-True "pre-auth build verifies the connection instead"         ($preAuth.Calls -contains 'Assert-IntersightReady')
-Assert-True "main build still authenticates"                         ($main.Calls -contains 'Set-IntersightConfiguration')
+Assert-True "pre-auth build verifies the connection instead" ($preAuth.Calls -contains 'Assert-IntersightReady')
+Assert-True "main build still authenticates"                 ($main.Calls -contains 'Set-IntersightConfiguration')
+
+# The script's own code must never configure Intersight. The operator's block inside the
+# AUTHENTICATION markers may, and is guarded to run once per session - which is the whole point of
+# this build, so the invariant is "only there", not "nowhere".
+$configCalls = @(Get-ConfigurationCallSites -Path $preAuthPath -Ast $preAuth.Ast)
+Assert-True "at most one Set-IntersightConfiguration call exists" ($configCalls.Count -le 1) "found $($configCalls.Count) at line(s) $(($configCalls.Line) -join ', ')"
+foreach ($call in $configCalls) {
+    Assert-True "the call at line $($call.Line) is inside the AUTHENTICATION region" $call.InRegion
+    Assert-True "the call at line $($call.Line) is not inside a function"            (-not $call.InFunction)
+}
+
+# Guarded, so re-running the script in one session cannot re-apply it.
+$preAuthText = [System.IO.File]::ReadAllText($preAuthPath)
+Assert-True "the configuration call is guarded by IntersightConfigurationApplied" ($preAuthText -match 'if \(-not \$Global:IntersightConfigurationApplied\)')
 
 Write-Host "`n=== Shared functions must stay identical ===" -ForegroundColor Cyan
 $shared = @($main.Functions.Keys | Where-Object { $preAuth.Functions.ContainsKey($_) } | Sort-Object)

@@ -56,7 +56,7 @@
     report installed versions when a login actually fails. Verify the environment out of band with
     scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 17.0.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 17.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 17.0.1-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 17.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -117,7 +117,34 @@
 # HTTP signature validation. HashAlgorithm already defaults to SHA256 and HttpSigningHeader to
 # those four headers, so neither needs passing.
 
+# Session guard. Declared before the block below so re-running this script in the same PowerShell
+# session does not re-apply the configuration - that is the failure mode this build exists to
+# avoid, and it does not announce itself.
+if ($null -eq $Global:IntersightConfigurationApplied) { $Global:IntersightConfigurationApplied = $false }
+
 # >>> BEGIN INTERSIGHT AUTHENTICATION >>>
+
+$IntersightServer = 'siepd85csp1000.dpe.protected.mil.au'
+$APIKeyID         = '66a991c2756461301f36ec7f/693b5671756461301fbecc65/69b753f3756461301fd9489d'
+$APIKeyFile       = '\\depot\Production-Filestore\ITP-ICT2222\Jack\GitLab_Repos\intersight\KeyFiles\JackPowerShellKey-SecretKey.txt'
+
+$onPremIntersightConfig = @{
+    BasePath          = "https://$IntersightServer"
+    ApiKeyId          = $APIKeyID
+    APIKeyFile        = $APIKeyFile
+    HttpSigningHeader = @("(request-target)", "Host", "Date", "Digest")
+
+}
+
+if (-not $Global:IntersightConfigurationApplied) {
+    Set-IntersightConfiguration @onPremIntersightConfig #-SkipCertificateCheck
+    $Global:IntersightConfigurationApplied = $true
+    Write-Host "Intersight configuration applied for this PowerShell session: https://$IntersightServer" -ForegroundColor Green
+}
+else {
+    Write-Host "Intersight configuration was already applied in this PowerShell session - not re-applying." -ForegroundColor Yellow
+    Write-Host "If the connection is not working, close PowerShell and start a fresh session." -ForegroundColor Yellow
+}
 
 # <<< END INTERSIGHT AUTHENTICATION <<<
 
@@ -129,7 +156,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "17.0.0-preauth"
+$ScriptVersion = "17.0.1-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -143,11 +170,11 @@ $TargetUcsFirmwarePolicyName = ""
 # Expected CSV columns: Name (the Intersight Fabrics export column matched against CDP/LLDP system
 # name), ServerProfileName (optional - defaults to Name if omitted), Moid (optional, speeds up lookup).
 $IntersightCsvPath = "C:\temp\intersightfabric.csv"
-# This build does NOT authenticate to Intersight. It assumes Set-IntersightConfiguration has
-# already been run in this PowerShell session - see the AUTHENTICATION region below.
-# BasePath is recorded for the run summary only; it is read back from Get-IntersightConfiguration
-# and never set here.
-$Global:IntersightBaseUrl = ""
+# Taken from $IntersightServer in the AUTHENTICATION region above, which runs first, so one edit
+# up there is reflected everywhere the script reports or logs the appliance. Assert-IntersightReady
+# later overwrites this with whatever Get-IntersightConfiguration actually holds, so the value used
+# in the summary is always the one in force rather than the one intended.
+$Global:IntersightBaseUrl = if ($IntersightServer) { "https://$IntersightServer" } else { "" }
 # Set automatically from the entered address: on for an on-prem PVA, off for intersight.com.
 
 # Extra PolicyActionParam name/value pairs sent with the server profile Deploy, as

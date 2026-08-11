@@ -464,6 +464,44 @@ and `$ScriptVersion` from 16.0.0.
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
 
+### [17.0.1-preauth] — 2026-08-10
+
+#### Added
+
+- The operator's own `Set-IntersightConfiguration` block, populated in the
+  `AUTHENTICATION` region: appliance FQDN, API Key ID and the key file path on
+  the Depot share.
+- The block is **guarded to apply once per PowerShell session**. Re-running the
+  script in the same session reports that the configuration is already applied
+  and does not re-send it — re-applying is unreliable and is the fault behind the
+  repeated authentication mismatches. A fresh session starts clean because the
+  guard variable does not exist yet.
+- `$Global:IntersightBaseUrl` is derived from `$IntersightServer`, so the
+  appliance is set in one place and reflected wherever the script reports or logs
+  it. `Assert-IntersightReady` still overwrites it with whatever
+  `Get-IntersightConfiguration` actually holds, so the summary records the value
+  in force rather than the value intended.
+- `tests/Test-PreAuthSessionGuard.ps1` — 16 assertions: the configuration is sent
+  exactly once however many times the region is entered, an undefined guard is
+  treated as not-yet-applied, the values reach the call, `BasePath` carries no
+  `/api` path or trailing slash, the four signing headers arrive in order, and
+  `HashAlgorithm` and `SkipCertificateCheck` stay unset.
+
+#### Changed
+
+- `tests/Test-PreAuthVariantParity.ps1` previously asserted the pre-auth build
+  never calls `Set-IntersightConfiguration`. Now that it carries the operator's
+  block, the invariant is narrower and stronger: at most one call, inside the
+  `AUTHENTICATION` markers, never inside a function, and guarded.
+
+#### Notes
+
+- `APIKeyFile` in the block binds to the module's `ApiKeyFilePath` as an
+  unambiguous abbreviation. The session guard test models the real parameter
+  surface, so that binding is proven rather than assumed.
+- The key file is on a UNC path. If the jump host cannot reach the Depot share,
+  or reaches it slowly, authentication fails or stalls there.
+
 ### [17.0.0-preauth] — 2026-08-10
 
 Derived from `Invoke-AutoDeployFirmwareBatchControl.ps1` 17.0.0 with Intersight
