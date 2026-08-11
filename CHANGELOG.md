@@ -12,6 +12,35 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [17.4.0] — 2026-08-11
+
+#### Removed
+
+- **The pre-flight confirmation prompt.** It asked whether Intersight was in
+  scope and gated the run on the answer, which the detection phase already
+  determines from CDP/LLDP without being told. The pre-flight is now purely
+  informational and asks nothing.
+
+#### Changed
+
+- Requirements are stated as four numbered items, in the script header and
+  printed at the start of a run:
+  1. **PowerShell modules** — PowerShell 7 Core, PowerCLI 12.3.0+, exactly one
+     `Intersight.PowerShell` matching the appliance, UCS PowerTool if any host is
+     UCSM-managed. Nothing is imported.
+  2. **Intersight API key** — for the pre-authenticated build, already applied in
+     the session; for the main build, the Key ID and `.pem` it prompts for.
+  3. **Intersight input file** — the CSV path, its `Name` column, the optional
+     `ServerProfileName` and `Moid` columns, and what a match means. The printed
+     version reports whether the file is actually present at that path.
+  4. **Credentials** — vCenter and UCS Manager.
+
+#### Notes
+
+- Still nothing is verified at start-up. Failures surface where they matter: a
+  missing module at its first cmdlet, a bad Intersight connection before any host
+  is touched, a missing CSV at import.
+
 ### [17.3.0] — 2026-08-11
 
 #### Removed

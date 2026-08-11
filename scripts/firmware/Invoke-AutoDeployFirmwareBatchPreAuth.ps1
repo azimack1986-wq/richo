@@ -38,26 +38,40 @@
     Invoke-AutoDeployFirmwareBatchControl.ps1.
 
 .NOTES
-    REQUIREMENTS - assumed present and already importable, NOT verified or imported at run time.
-    This script contains no Import-Module: loading is the jump host build's job, and PowerShell
-    auto-loads what it needs on first use. Confirm these once when building the host.
+    REQUIREMENTS - assumed present, NOT verified at run time.
 
-      * PowerShell 7 (Core). Intersight.PowerShell is a binary module built for it and can appear
-        installed under Windows PowerShell 5.1 while failing at the first signed request.
-      * VMware PowerCLI - VMware.VimAutomation.Core for hosts, clusters, Maintenance mode and host
-        profile compliance.
-      * An Intersight configuration ALREADY APPLIED in this session (Set-IntersightConfiguration).
-      * Intersight.PowerShell - EXACTLY ONE version, matching the appliance's Intersight release.
-        Side-by-side versions, or a build that disagrees with the appliance, produce an error that
-        blames BasePath and the API key while the credentials are in fact correct. Pin the version
-        with config/module-requirements.psd1 and load it with tools\Import-RichoModuleBundle.ps1.
-      * Cisco UCS PowerTool (Cisco.UCSManager) - only if a host in scope is UCS Manager-managed.
+    1. POWERSHELL MODULES - present and importable. This script contains no Import-Module;
+       loading is the jump host build's job and PowerShell auto-loads on first use.
+       PowerShell 7 (Core) - Intersight.PowerShell is a binary module built for it and can
+         appear installed under Windows PowerShell 5.1 while failing at the first signed request.
+       VMware PowerCLI 12.3.0 or newer - hosts, clusters, Maintenance mode, host profiles.
+       Intersight.PowerShell - EXACTLY ONE version, matching the appliance's Intersight release.
+         Side-by-side versions, or a build that disagrees with the appliance, produce an error
+         that blames BasePath and the API key while the credentials are in fact correct.
+       Cisco UCS PowerTool (Cisco.UCSManager) - only if a host is UCS Manager-managed.
 
-    A missing module still fails clearly at the point of use, and the Intersight login diagnostics
-    report installed versions when a login actually fails. Verify the environment out of band with
-    scripts\intersight\Test-IntersightApiKey.ps1.
+    2. INTERSIGHT API KEY - required only if a host in scope is Intersight-managed.
+       Already applied in the current PowerShell session by Set-IntersightConfiguration - from
+         the AUTHENTICATION region at the top of this script, or run by you beforehand.
+       Applied once per session. This script never re-applies it; if it fails, start a fresh
+         PowerShell session rather than retrying in one that has already tried.
 
-    - Version 17.3.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 17.3.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    3. INTERSIGHT INPUT FILE - required only if a host in scope is Intersight-managed.
+       Path is set by $IntersightCsvPath in User Settings.
+       Column "Name" holds the fabric name, matched against each host's CDP/LLDP neighbour.
+       Optional columns: ServerProfileName, Moid.
+       A host whose CDP/LLDP name matches a row is driven through Intersight; every other host
+       falls through to UCS Manager. Matching allows for -A, -B and suffix-less forms, and for
+       FQDN or short name on either side.
+
+    4. CREDENTIALS - vCenter and UCS Manager, for the prompts during the run.
+
+    None of the above is verified at start-up: probing for it was slow enough on a domain jump
+    host to read as a hang. Failures surface where they matter instead - a missing module at its
+    first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
+    Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
+
+    - Version 17.4.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 17.4.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -157,7 +171,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "17.3.0-preauth"
+$ScriptVersion = "17.4.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -307,50 +321,54 @@ function Test-StageNoAck { return ($Global:RunMode -eq "STAGE_NO_ACK") }
 function Confirm-RunPrerequisites {
     <#
     .SYNOPSIS
-        Pre-flight notice. This build asks for no Intersight credentials.
+        Prints the run requirements. Asks nothing and verifies nothing.
 
     .DESCRIPTION
-        Deliberately does NOT probe for installed modules or PowerShell versions. Enumerating
-        Intersight.PowerShell, whose manifest exports several thousand cmdlets, took long enough on
-        a domain jump host to read as a hang. The requirements are stated in the script header and
-        printed below instead; the environment is assumed to meet them.
+        Informational only - there is no prompt here. The environment is assumed to meet the
+        requirements listed, which are also in the script header.
 
-        Intersight authentication is the caller's responsibility and is not collected here. The
-        pre-configured connection is verified by Assert-IntersightReady before any host is touched,
-        which is early enough to stop harmlessly.
+        Nothing is probed either. Enumerating Intersight.PowerShell, whose manifest exports several
+        thousand cmdlets, took long enough on a domain jump host to read as a hang.
 
-        A missing module still fails clearly - Assert-IntersightPowerShellAvailable and
-        Assert-UcsPowerToolAvailable check for their cmdlets at the point of use.
+        Failures still surface, just later and where they matter: a missing module fails at its
+        first cmdlet, the Intersight connection is verified by Assert-IntersightReady before any
+        host is touched, and a missing CSV stops the run at Import-IntersightServerCsv.
     #>
     if ($Global:PrerequisitesConfirmed) { return }
 
     Write-Host "" -ForegroundColor Cyan
     Write-Host "=====================================================================" -ForegroundColor Cyan
-    Write-Host " PRE-FLIGHT CHECK" -ForegroundColor Cyan
-    Write-Host "=====================================================================" -ForegroundColor Cyan
-    Write-Host "Assumed present on this host (not verified here - see the script header):" -ForegroundColor Cyan
-    Write-Host "  - PowerShell 7 (Core). Intersight.PowerShell is a binary module built for it." -ForegroundColor Gray
-    Write-Host "  - VMware PowerCLI." -ForegroundColor Gray
-    Write-Host "  - Intersight.PowerShell, ONE version only, matching the appliance release." -ForegroundColor Gray
-    Write-Host "  - Cisco UCS PowerTool, if any host in scope is UCS Manager-managed." -ForegroundColor Gray
-    Write-Host "" -ForegroundColor Cyan
-
-    Write-Host "Intersight authentication is NOT performed by this build." -ForegroundColor Yellow
-    Write-Host "It assumes Set-IntersightConfiguration has already been applied in this PowerShell" -ForegroundColor Yellow
-    Write-Host "session - by the AUTHENTICATION region at the top of this script, or by you." -ForegroundColor Yellow
-    Write-Host "The connection is verified before any host is touched; if it is not usable you will" -ForegroundColor Yellow
-    Write-Host "be offered the choice of skipping the Intersight-managed hosts." -ForegroundColor Yellow
-    Write-Host "" -ForegroundColor Yellow
-    Write-Host "Also confirm: UCSM credentials to hand, and $IntersightCsvPath present" -ForegroundColor Yellow
-    Write-Host "if any host is Intersight-managed." -ForegroundColor Yellow
+    Write-Host " REQUIREMENTS - assumed present, not verified here" -ForegroundColor Cyan
     Write-Host "=====================================================================" -ForegroundColor Cyan
 
-    $answer = Read-ChoiceExit -Message "Confirm you are ready to proceed. Answer SKIP if no Intersight-managed hosts are in scope." -AllowedChoices @("YES","SKIP") -ExitMessage "Stopped at the pre-flight prerequisites check."
+    Write-Host "1. PowerShell modules" -ForegroundColor Yellow
+    Write-Host "     PowerShell 7 (Core) - Intersight.PowerShell is a binary module built for it." -ForegroundColor Gray
+    Write-Host "     VMware PowerCLI 12.3.0 or newer." -ForegroundColor Gray
+    Write-Host "     Intersight.PowerShell - ONE version, matching the appliance release." -ForegroundColor Gray
+    Write-Host "     Cisco UCS PowerTool - only if a host in scope is UCS Manager-managed." -ForegroundColor Gray
+    Write-Host "     Nothing is imported by this script; PowerShell auto-loads on first use." -ForegroundColor Gray
 
-    Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Confirm Intersight prerequisites" -Result $answer -Details "Operator confirmation; Intersight configuration supplied by the caller."
-    if ($answer -eq "SKIP") {
-        Write-Host "Continuing. If an Intersight-managed host is detected, the pre-configured connection is verified at that point." -ForegroundColor Yellow
-    }
+    Write-Host "2. Intersight API key" -ForegroundColor Yellow
+    Write-Host "     Already applied in THIS PowerShell session by Set-IntersightConfiguration -" -ForegroundColor Gray
+    Write-Host "     from the AUTHENTICATION region at the top of this script, or by you." -ForegroundColor Gray
+    Write-Host "     Configured for: $(if ($IntersightServer) { "https://$IntersightServer" } else { '<not set in this script>' })" -ForegroundColor Gray
+    Write-Host "     Applied once per session. If it fails, start a fresh session - re-applying" -ForegroundColor Gray
+    Write-Host "     it in a session that has already tried is unreliable." -ForegroundColor Gray
+
+    Write-Host "3. Intersight input file" -ForegroundColor Yellow
+    Write-Host "     $IntersightCsvPath" -ForegroundColor Gray
+    Write-Host "     Column: Name - the fabric name matched against each host's CDP/LLDP neighbour." -ForegroundColor Gray
+    Write-Host "     Optional columns: ServerProfileName, Moid." -ForegroundColor Gray
+    Write-Host "     A host matching a row is driven through Intersight; anything else through UCS" -ForegroundColor Gray
+    Write-Host "     Manager. Required only if any host in scope is Intersight-managed." -ForegroundColor Gray
+    Write-Host "     $(if (Test-Path $IntersightCsvPath) { 'Present.' } else { 'NOT FOUND at that path.' })" -ForegroundColor $(if (Test-Path $IntersightCsvPath) { 'Gray' } else { 'Red' })
+
+    Write-Host "4. Credentials to hand" -ForegroundColor Yellow
+    Write-Host "     vCenter and UCS Manager, for the prompts that follow." -ForegroundColor Gray
+
+    Write-Host "=====================================================================" -ForegroundColor Cyan
+
+    Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "State requirements" -Result "Displayed" -Details "CSV=$IntersightCsvPath; CsvPresent=$(Test-Path $IntersightCsvPath); Intersight configured by the caller."
     $Global:PrerequisitesConfirmed = $true
 }
 
