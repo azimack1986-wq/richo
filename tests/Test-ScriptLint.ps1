@@ -15,8 +15,11 @@
          an empty collection, so a legitimately empty list becomes a mid-run crash.
       4. Format-Table left on the success stream inside a function that also returns a value. The
          caller receives formatting records mixed with data.
-      5. Import-Module anywhere. These scripts assume a prepared host; importing either
-         duplicates the host build's job or fights a pinned bundle already loaded.
+      5. Import-Module anywhere - called OR suggested in a message. These scripts assume a
+         prepared host; importing either duplicates the host build's job or fights a pinned bundle
+         already loaded. A remediation line printing "Import-Module ..." is the script telling the
+         operator to do it by hand, which is the same instruction by another route, and one sat in
+         the PowerCLI load diagnostic while this rule passed on command syntax alone.
       6. Get-Module -ListAvailable outside the caching helper. Repeated enumeration of a module
          exporting thousands of cmdlets is what made the pre-flight look like it had hung.
 
@@ -117,12 +120,27 @@ foreach ($path in $targets) {
     # --- 5. No module imports; modules are assumed present ------------------------------------
     # These scripts run on a prepared jump host. Importing is the host build's job, and an
     # Import-Module here either duplicates it or fights a pinned bundle already loaded.
+    #
+    # Strings count, not just calls. A remediation message telling the operator to run
+    # Import-Module reads as an instruction from the script, and one sat in the PowerCLI load
+    # diagnostic through several releases while this rule passed - it was only looking for a
+    # CommandAst. Comments are exempt: describing the rule is not breaking it.
     $imports = @(
         $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
             Where-Object { $_.GetCommandName() -eq 'Import-Module' } |
             ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Extent.Text)" }
     )
-    Assert-NoFindings "no Import-Module - modules are assumed present" $imports
+    $imports += @(
+        $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) |
+            Where-Object { $_.Value -match '(?i)\bImport-Module\b' } |
+            ForEach-Object { "line $($_.Extent.StartLineNumber): a string tells the operator to run Import-Module - $($_.Extent.Text.Trim())" }
+    )
+    $imports += @(
+        $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ExpandableStringExpressionAst] }, $true) |
+            Where-Object { $_.Value -match '(?i)\bImport-Module\b' } |
+            ForEach-Object { "line $($_.Extent.StartLineNumber): a string tells the operator to run Import-Module - $($_.Extent.Text.Trim())" }
+    )
+    Assert-NoFindings "no Import-Module - not called, and not suggested in a message" $imports
 
     # --- 6. Uncached module enumeration -------------------------------------------------------
     $cacheFunction = @($ast.FindAll({ param($n)

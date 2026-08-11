@@ -71,7 +71,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 19.3.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 19.3.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 19.3.1-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 19.3.1. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -220,7 +220,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "19.3.0-preauth"
+$ScriptVersion = "19.3.1-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -2134,8 +2134,9 @@ function Connect-VCenterServer {
             Write-Host "  3. Read-only or restrictive permissions on the module folder." -ForegroundColor Yellow
             Write-Host "  4. Group Policy requiring signed modules." -ForegroundColor Yellow
             Write-Host "" -ForegroundColor Yellow
-            Write-Host "To see the failure on its own, outside this script:" -ForegroundColor Yellow
-            Write-Host "  Import-Module VMware.VimAutomation.Core -Verbose" -ForegroundColor Gray
+            Write-Host "To see what this host actually has, outside this script:" -ForegroundColor Yellow
+            Write-Host "  Get-Module -ListAvailable VMware.VimAutomation.Core | Select-Object Version,Path" -ForegroundColor Gray
+            Write-Host "  (no version listed means it is not installed for this PowerShell edition)" -ForegroundColor Gray
             Stop-WithMessage "VMware PowerCLI could not be loaded, so vCenter cannot be contacted."
         }
 

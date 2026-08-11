@@ -12,6 +12,26 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [19.3.1] — 2026-08-11
+
+#### Removed
+
+- **The last `Import-Module` reference.** Not a call — the PowerCLI load
+  diagnostic *printed* `Import-Module VMware.VimAutomation.Core -Verbose` as a
+  suggested command. The script telling an operator to run one is the same
+  instruction by another route, on a build whose whole premise is that modules
+  are already present. Replaced with a read-only check that answers the same
+  question without importing anything:
+  `Get-Module -ListAvailable VMware.VimAutomation.Core | Select-Object Version,Path`.
+
+#### Fixed — tests
+
+- **The lint rule could not have caught it.** It searched for `Import-Module`
+  as a `CommandAst` only, so a string containing one passed cleanly — which is
+  how this survived several releases while the rule reported green. It now also
+  checks string and expandable-string literals. Comments stay exempt: describing
+  the rule is not breaking it.
+
 ### [19.3.0] — 2026-08-11
 
 #### Removed
@@ -884,6 +904,11 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [19.3.1-preauth] — 2026-08-11
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 19.3.1 — the printed
+`Import-Module` suggestion is gone. This is the build to run.
 
 ### [19.3.0-preauth] — 2026-08-11
 
