@@ -12,6 +12,52 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [19.4.0] — 2026-08-11
+
+The post-batch health check stopped a live run on a cluster with nothing wrong
+with it, and the stop message did not say what had failed.
+
+#### Fixed
+
+- **Non-shared datastores no longer count.** `Get-Datastore -Location <cluster>`
+  returns local, boot and scratch datastores, which routinely sit under
+  `$MinimumDatastoreFreePercent` free by design and have no bearing on whether a
+  host can be evacuated. Only shared datastores
+  (`Summary.MultipleHostAccess`) are assessed; the rest are listed as a note. A
+  datastore whose sharing cannot be determined is still checked, so the mistake
+  is toward caution.
+- **Acknowledged alarms no longer count.** An acknowledged red alarm is one
+  somebody has already looked at and accepted; treating it as a fresh fault
+  blocks every batch indefinitely, with no way through short of clearing an
+  alarm that was deliberately kept. Unacknowledged red alarms still stop the run
+  — and are now **named** rather than counted, because "3 red alarm(s)" sends
+  someone hunting through vCenter for them.
+- **The stop message carries the reasons.** They were printed above it and
+  scrolled away with the batch output, so the record showed that something
+  failed but not what. They are now in the message, in the run summary row, and
+  in the exported CSV.
+
+#### Added
+
+- `Confirm-ClusterHealthOrChoose` replaces the dead stop on both the pre-batch
+  and post-batch checks:
+  - **RECHECK** — evaluate again. HA, vSAN and DRS raise alarms while a host
+    rejoins and clear them shortly after, so a check run in that window fails a
+    cluster that is already recovering. This is usually all that is needed.
+  - **OVERRIDE** — accept and continue, recorded as `Overridden` naming exactly
+    what was accepted.
+  - **STOP** — stop, as before. `E` still exits.
+  A healthy check prompts for nothing.
+
+#### Added — tests
+
+- `tests/Test-ClusterHealthGate.ps1` — 22 assertions: a nearly full *local*
+  datastore does not fail the cluster while a shared one does, a datastore of
+  unknown sharing is still checked, an acknowledged red alarm passes and an
+  unacknowledged one fails by name, yellow is not a stop, RECHECK re-evaluates
+  and records both the failure and the recovery, OVERRIDE names what was
+  accepted, and STOP carries the reason into the stop message.
+
 ### [19.3.1] — 2026-08-11
 
 #### Removed
@@ -904,6 +950,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [19.4.0-preauth] — 2026-08-11
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 19.4.0 — the cluster health
+gate no longer counts local datastores or acknowledged alarms, names what
+failed, and offers RECHECK/OVERRIDE/STOP. This is the build to run.
 
 ### [19.3.1-preauth] — 2026-08-11
 

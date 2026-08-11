@@ -58,7 +58,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 19.3.1. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 19.4.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -79,8 +79,17 @@
     - The run advances through the cluster automatically. The per-batch typed gates (ACK-BATCH-N and
       SAVE-BATCH-N) have been REMOVED in favour of automatic progression. What now gates each batch is:
       a pre-batch cluster health check, the timed pre-reboot safety window (press E to abort), a host
-      profile compliance check on every rebooted host, and a post-batch cluster health check. Any of
-      those failing stops the run.
+      profile compliance check on every rebooted host, and a post-batch cluster health check.
+    - A failed health check is not a dead end. The reasons are named on screen, written to the run
+      summary, and carried into the stop message itself; the operator chooses RECHECK (evaluate
+      again - HA, vSAN and DRS raise alarms while a host rejoins and clear them shortly after, so
+      this is usually all that is needed), OVERRIDE (accept and continue, recorded as an override
+      naming what was accepted), or STOP.
+      Two things no longer count as unhealthy, because both failed a cluster with nothing wrong
+      with it: non-shared datastores, which sit under $MinimumDatastoreFreePercent% free by design
+      and have no bearing on whether a host can be evacuated; and red alarms somebody has already
+      acknowledged. Unacknowledged red alarms still stop the run, and are now named rather than
+      counted.
     - After each reboot, once the batch is confirmed back in vCenter, the run waits
       $HostProfileComplianceSettleMinutes (default 2) and then scans every host against its attached
       host profile while it is still in Maintenance mode. The wait is there because a host that has
@@ -149,7 +158,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "19.3.1"
+$ScriptVersion = "19.4.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -2597,25 +2606,56 @@ function Get-ClusterHealthReport {
         [void]$reasons.Add("Host(s) in Maintenance mode outside the current batch: $(($newlyInMaintenance | Select-Object -ExpandProperty Name) -join ', ')")
     }
 
+    # Only SHARED datastores bear on whether a host can be evacuated. Local, boot and scratch
+    # datastores routinely sit under 10% free by design, and counting them failed the health check
+    # on a cluster with nothing wrong with it - every batch, for a reason no operator would accept.
+    # A datastore whose sharing cannot be determined is still checked, so the mistake is toward
+    # caution rather than away from it.
     try {
-        $lowDatastores = @(
-            Get-Datastore -Location $Cluster -ErrorAction Stop |
-                Where-Object { $_.CapacityGB -gt 0 -and ((($_.FreeSpaceGB / $_.CapacityGB) * 100) -lt $MinimumDatastoreFreePercent) }
-        )
+        $allDatastores = @(Get-Datastore -Location $Cluster -ErrorAction Stop)
+        $sharedDatastores = @($allDatastores | Where-Object {
+            $shared = $true
+            try { if ($_.ExtensionData.Summary.PSObject.Properties.Name -contains 'MultipleHostAccess') { $shared = [bool]$_.ExtensionData.Summary.MultipleHostAccess } } catch {}
+            $shared
+        })
+        $localSkipped = @($allDatastores | Where-Object { $sharedDatastores -notcontains $_ })
+        if ($localSkipped.Count -gt 0) {
+            Write-Host "  Note: $($localSkipped.Count) non-shared datastore(s) excluded from the free-space check: $(($localSkipped | Select-Object -ExpandProperty Name) -join ', ')" -ForegroundColor DarkGray
+        }
+
+        $lowDatastores = @($sharedDatastores | Where-Object { $_.CapacityGB -gt 0 -and ((($_.FreeSpaceGB / $_.CapacityGB) * 100) -lt $MinimumDatastoreFreePercent) })
         if ($lowDatastores.Count -gt 0) {
             $names = @($lowDatastores | ForEach-Object { "{0} ({1:N1}% free)" -f $_.Name, (($_.FreeSpaceGB / $_.CapacityGB) * 100) })
-            [void]$reasons.Add("Datastore(s) below $MinimumDatastoreFreePercent% free: $($names -join ', ')")
+            [void]$reasons.Add("Shared datastore(s) below $MinimumDatastoreFreePercent% free: $($names -join ', ')")
         }
     }
     catch {
         [void]$reasons.Add("Datastore free space could not be evaluated: $($_.Exception.Message)")
     }
 
+    # Acknowledged alarms are ones somebody has already looked at and accepted. Treating them as a
+    # fresh fault means a single long-standing acknowledged alarm blocks every batch forever, and
+    # the operator has no way to proceed short of clearing an alarm they deliberately kept.
+    # Unacknowledged red alarms are still a stop, and are now named rather than counted - "3 red
+    # alarms" sends someone hunting through vCenter; naming them does not.
     try {
         $freshCluster = Get-Cluster -Name $Cluster.Name -ErrorAction Stop
-        $redAlarms = @($freshCluster.ExtensionData.TriggeredAlarmState | Where-Object { $_.OverallStatus -eq 'red' })
-        if ($redAlarms.Count -gt 0) {
-            [void]$reasons.Add("$($redAlarms.Count) red alarm(s) triggered on cluster '$($Cluster.Name)'")
+        $triggered = @($freshCluster.ExtensionData.TriggeredAlarmState | Where-Object { $_.OverallStatus -eq 'red' })
+        $acknowledged = @($triggered | Where-Object { $true -eq $_.Acknowledged })
+        $active = @($triggered | Where-Object { $true -ne $_.Acknowledged })
+
+        if ($acknowledged.Count -gt 0) {
+            Write-Host "  Note: $($acknowledged.Count) red alarm(s) already acknowledged, not treated as a new fault." -ForegroundColor DarkGray
+        }
+        if ($active.Count -gt 0) {
+            $alarmNames = @($active | ForEach-Object {
+                $label = ""
+                try { $label = [string](Get-View -Id $_.Alarm -ErrorAction SilentlyContinue).Info.Name } catch {}
+                if ([string]::IsNullOrWhiteSpace($label)) { $label = [string]$_.Alarm.Value }
+                if ([string]::IsNullOrWhiteSpace($label)) { $label = "<unnamed alarm>" }
+                $label
+            })
+            [void]$reasons.Add("Unacknowledged red alarm(s) on cluster '$($Cluster.Name)': $(($alarmNames | Select-Object -Unique) -join ', ')")
         }
     }
     catch {}
@@ -3719,6 +3759,85 @@ function Show-ClusterFirmwareVerification {
     }
 }
 
+function Confirm-ClusterHealthOrChoose {
+    <#
+    .SYNOPSIS
+        Evaluates cluster health and, when it fails, lets the operator re-check, override or stop.
+
+    .DESCRIPTION
+        A health failure used to end the run outright, with the reasons printed above a stop message
+        that did not repeat them. On a cluster with nothing actually wrong that reads as the script
+        deciding to quit, and the reason scrolls away with the rest of the batch output. Two things
+        changed:
+
+          - The reasons are carried INTO the decision and into the run summary, so the record says
+            what failed rather than that something did.
+          - The operator gets a choice instead of a dead end:
+              RECHECK  - evaluate again. Usually all that is needed. HA, vSAN and DRS raise alarms
+                         while a host rejoins and clear them a minute later, and a check run in that
+                         window fails on a cluster that is already recovering.
+              OVERRIDE - accept the state and carry on. Recorded as an override naming what was
+                         accepted, so it is a decision on the record rather than a silent pass.
+              STOP     - stop the run, as before.
+
+        Returns the report that was finally accepted. Healthy reports return immediately without
+        prompting - this only speaks up when something failed.
+
+    .PARAMETER Cluster
+        The cluster being worked on.
+
+    .PARAMETER Stage
+        "before" or "after", used in the messages and the summary record.
+
+    .PARAMETER BatchNumber
+        The batch this check belongs to.
+
+    .PARAMETER IgnoreHostNames
+        Hosts excluded from the assessment - passed straight through to Get-ClusterHealthReport.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Cluster,
+        [Parameter(Mandatory=$true)][string]$Stage,
+        [Parameter(Mandatory=$true)][string]$BatchNumber,
+        [array]$IgnoreHostNames = @()
+    )
+
+    while ($true) {
+        $report = Get-ClusterHealthReport -Cluster $Cluster -IgnoreHostNames $IgnoreHostNames
+
+        if ($report.IsHealthy) {
+            Write-Host "Cluster health confirmed $Stage Batch $BatchNumber." -ForegroundColor Green
+            Add-SummaryRecord -Stage "ClusterHealth" -Batch $BatchNumber -HostName "" -Action "$Stage-batch health check" -Result "Healthy" -Details "$($report.ConnectedHosts.Count) host(s) connected."
+            return $report
+        }
+
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Cluster health check FAILED $Stage Batch ${BatchNumber}. Reasons:" -ForegroundColor Yellow
+        $report.Reasons | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+        Add-SummaryRecord -Stage "ClusterHealth" -Batch $BatchNumber -HostName "" -Action "$Stage-batch health check" -Result "Failed" -Details ($report.Reasons -join ' | ')
+
+        Write-Host "  RECHECK  - evaluate again. Alarms raised while a host rejoins usually clear on their own." -ForegroundColor Yellow
+        Write-Host "  OVERRIDE - accept the above and continue. Recorded in the run summary." -ForegroundColor Yellow
+        Write-Host "  STOP     - stop the run here." -ForegroundColor Yellow
+
+        $choice = Read-ChoiceExit `
+            -Message "Cluster '$($Cluster.Name)' is not healthy $Stage Batch $BatchNumber. Choose RECHECK, OVERRIDE, or STOP" `
+            -AllowedChoices @("RECHECK","OVERRIDE","STOP") `
+            -ExitMessage "Stopped at the $Stage-batch health check for Batch $BatchNumber."
+
+        if ($choice -eq "STOP") {
+            Stop-WithMessage "Cluster '$($Cluster.Name)' is not healthy $Stage Batch ${BatchNumber}: $($report.Reasons -join ' | ')"
+        }
+        if ($choice -eq "OVERRIDE") {
+            Write-Host "OVERRIDE: continuing with the cluster in the state described above." -ForegroundColor Red
+            Add-SummaryRecord -Stage "ClusterHealth" -Batch $BatchNumber -HostName "" -Action "$Stage-batch health check" -Result "Overridden" -Details "Operator accepted: $($report.Reasons -join ' | ')"
+            return $report
+        }
+
+        Write-Host "Re-evaluating cluster health..." -ForegroundColor Cyan
+    }
+}
+
 function Invoke-ClusterUpgradeWorkflow {
     param([Parameter(Mandatory=$true)]$Cluster)
     Write-Host "Selected cluster: $($Cluster.Name)" -ForegroundColor Green
@@ -3786,13 +3905,7 @@ function Invoke-ClusterUpgradeWorkflow {
         # returning to service and any drift in cluster state are both reflected.
         $batchSize = 1
         if ($batchMode -eq "AUTO" -and -not (Test-StageNoAck)) {
-            $healthBefore = Get-ClusterHealthReport -Cluster $Cluster
-            if (-not $healthBefore.IsHealthy) {
-                Write-Host "`nCluster health check failed before Batch ${batchNumber}:" -ForegroundColor Yellow
-                $healthBefore.Reasons | ForEach-Object { Write-Host " - $_" -ForegroundColor Yellow }
-                Add-SummaryRecord -Stage "ClusterHealth" -Batch $batchNumber -HostName "" -Action "Pre-batch health check" -Result "Failed" -Details ($healthBefore.Reasons -join ' | ')
-                Stop-WithMessage "Cluster '$($Cluster.Name)' is not healthy enough to start Batch $batchNumber."
-            }
+            [void](Confirm-ClusterHealthOrChoose -Cluster $Cluster -Stage "before" -BatchNumber $batchNumber)
 
             $remainingCandidates = @($pendingHosts | ForEach-Object { Get-VMHost -Name $_ -ErrorAction SilentlyContinue } | Where-Object { $null -ne $_ })
             $sizing = Get-CapacityBasedBatchSize -CandidateHosts $remainingCandidates -Cluster $Cluster
@@ -3935,17 +4048,7 @@ function Invoke-ClusterUpgradeWorkflow {
             # operator has turned off automatic Maintenance mode exit, in which case the hosts
             # just completed are expected to still be in Maintenance and are not a fault.
             $ignoreForHealth = if ($Global:AutoExitMaintenanceMode) { @() } else { @($currentBatchNames) }
-            $healthAfter = Get-ClusterHealthReport -Cluster $Cluster -IgnoreHostNames $ignoreForHealth
-            if ($healthAfter.IsHealthy) {
-                Write-Host "Cluster health confirmed after Batch $batchNumber." -ForegroundColor Green
-                Add-SummaryRecord -Stage "ClusterHealth" -Batch $batchNumber -HostName "" -Action "Post-batch health check" -Result "Healthy" -Details "Continuing automatically to the next batch."
-            }
-            else {
-                Write-Host "`nCluster health check failed after Batch ${batchNumber}:" -ForegroundColor Yellow
-                $healthAfter.Reasons | ForEach-Object { Write-Host " - $_" -ForegroundColor Yellow }
-                Add-SummaryRecord -Stage "ClusterHealth" -Batch $batchNumber -HostName "" -Action "Post-batch health check" -Result "Failed" -Details ($healthAfter.Reasons -join ' | ')
-                Stop-WithMessage "Cluster '$($Cluster.Name)' is not healthy after Batch $batchNumber. Resolve before continuing."
-            }
+            [void](Confirm-ClusterHealthOrChoose -Cluster $Cluster -Stage "after" -BatchNumber $batchNumber -IgnoreHostNames $ignoreForHealth)
         }
 
         Write-Host "Batch $batchNumber completed. Remaining hosts: $($pendingHosts.Count)" -ForegroundColor Green
