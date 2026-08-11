@@ -12,6 +12,63 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [19.1.0] — 2026-08-11
+
+Fixes a defect introduced in 19.0.0: every host reported
+`Compliance: Unknown` on a live run even where vCenter showed it compliant
+after the scan.
+
+#### Fixed
+
+- **The compliance status is read from wherever PowerCLI put it.** It lands on
+  `ComplianceStatus` or `Status`, on the result object or only on its
+  `ExtensionData`, depending on the build. Only the first two were read, so a
+  build that projects it elsewhere yielded no status at all. All four are now
+  read in order, via `Get-ComplianceStatusValue`.
+- **The check-time freshness gate is removed.** 19.0.0 compared the result's
+  check time against the moment the scan was requested and re-scanned, then
+  reported `Unknown`, if it looked older. That comparison fails on
+  `DateTimeKind`: a UTC timestamp surfaced as `Kind=Unspecified` and then run
+  through `ToUniversalTime()` lands hours in the past in any zone east of UTC,
+  so in AEST every result looked stale and every host reported `Unknown`.
+  Whether the scan ran is already settled by `Test-VMHostProfileCompliance`
+  blocking on the check; the timestamp is now display-only.
+  `$HostProfileComplianceScanRetries` is removed with it.
+
+#### Added
+
+- **A second read of the same answer.** If the scan produces no usable status,
+  the run fetches the stored result with `-UseCache`. The scan has completed by
+  then, so that is this scan's result — the same value the vSphere Client shows
+  on the host's Host Profile tab. It is a fallback for reading, never a
+  substitute for scanning: the first call still never passes `-UseCache`.
+- `ConvertTo-ComplianceStatus` normalises to the three values the vSphere API
+  defines — `compliant`, `nonCompliant`, `unknown` — ignoring casing, spaces,
+  hyphens and underscores. An unrecognised status is returned as-is rather than
+  mapped to `Compliant`, so an unfamiliar value can never become a pass.
+
+#### Notes — SINGLE mode
+
+- No change was needed: SINGLE mode already advances host to host on its own.
+  The prompts operators were hitting between hosts were the `C`/`O`/`E`
+  compliance prompt, firing on every host because of the `Unknown` defect above.
+  `tests/Test-WorkflowSimulation.ps1` now runs a four-host cluster in SINGLE
+  mode and fails on any prompt outside the agreed menu items (run mode, upgrade
+  mode, batch mode, manual health checks, firmware package creation), so a stray
+  gate cannot reappear unnoticed.
+
+#### Added — tests
+
+- `tests/Test-ComplianceGate.ps1` grew to 50 assertions: the status is found on
+  `ExtensionData`, the first call never reads the cache, the `-UseCache`
+  fallback runs only after the scan, status strings normalise across casing and
+  separators, an unrecognised status is not a pass, and an hour-old check time
+  no longer overrides a `Compliant` result.
+- The workflow simulation's `Get-UcsLsmaintAck` stub is now stateful — it raises
+  an acknowledgement once a service profile's firmware policy changes, as UCSM
+  does. Returning an empty list unconditionally made every UCS-only batch take
+  the "nothing was staged" path, which is what SINGLE mode exposed.
+
 ### [19.0.0] — 2026-08-11
 
 Two changes to what returns a host to production, plus the firmware package is
@@ -720,6 +777,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [19.1.0-preauth] — 2026-08-11
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 19.1.0 — the compliance
+status read is fixed and the check-time freshness gate is gone. This is the
+build to run.
 
 ### [19.0.0-preauth] — 2026-08-11
 

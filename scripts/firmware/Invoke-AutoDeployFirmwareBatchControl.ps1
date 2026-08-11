@@ -58,7 +58,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 19.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 19.1.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -86,10 +86,14 @@
       host profile while it is still in Maintenance mode. The wait is there because a host that has
       just re-registered reports differences that clear themselves; scanning through that window
       produces failures that are not real.
-      The scan is a real check, never vCenter's cached answer: -UseCache is not passed, any
-      compliance check already running is drained first, and the result's check time is compared
-      against the moment the scan was requested. A result older than the request is re-scanned and,
-      if it stays stale, reported as Unknown - a pre-reboot "Compliant" must never release a host.
+      The scan is a real check: any compliance check already running is drained first, then
+      Test-VMHostProfileCompliance is called WITHOUT -UseCache, so it performs the check and blocks
+      until vCenter finishes it. The status is then read from all four places PowerCLI puts it
+      (ComplianceStatus or Status, on the result or on its ExtensionData); if none of them is
+      readable, the stored result is fetched with -UseCache, which by then is the result of the
+      scan just performed and the same value the vSphere Client shows.
+      Unknown means vCenter would not give a status, and is handled like NonCompliant - it is never
+      inferred from anything this script works out for itself.
       Compliant hosts are taken out of Maintenance mode and the run continues. For anything else the
       operator chooses C to re-scan after remediating, O to override and return the host to service
       as it is, or E to exit. On C the host stays in Maintenance mode and the batch does not advance.
@@ -115,7 +119,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "19.0.0"
+$ScriptVersion = "19.1.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -222,8 +226,6 @@ $HostProfileComplianceSettleMinutes = 2
 # Bound on waiting for a compliance check vCenter or Auto Deploy started itself to finish before
 # this run starts its own, so the scan that answers is the one whose result is acted on.
 $HostProfileComplianceScanTimeoutMinutes = 10
-# How many times to re-scan when vCenter answers from a check taken before the scan was requested.
-$HostProfileComplianceScanRetries = 3
 
 # PowerCLI holds one HTTP request open per blocking task and defaults to a 300-second ceiling,
 # which is shorter than a host evacuation. Raised for the session at vCenter connect time.
@@ -2765,11 +2767,14 @@ function Get-ComplianceCheckTime {
     .DESCRIPTION
         The vSphere API's ComplianceResult carries checkTime, but PowerCLI surfaces it
         inconsistently: some builds project it onto the result object, some leave it on
-        ExtensionData only, and older ones do not expose it at all.
+        ExtensionData only, and older ones do not expose it at all. Both are read, and
+        "not exposed" is reported as $null rather than guessed.
 
-        Both are read, and "not exposed" is reported as $null rather than guessed. Inventing a
-        timestamp would make a stale result look fresh, which is the exact failure the caller uses
-        this to catch.
+        DISPLAY ONLY. This value must not gate whether a result is accepted. It was tried as a
+        freshness check and it fails on DateTimeKind: a UTC timestamp handed back as
+        Kind=Unspecified, converted again, lands hours in the past in any zone east of UTC, so
+        every result looked stale and every host reported Unknown. Whether the scan ran is already
+        settled by Test-VMHostProfileCompliance blocking on the check.
     #>
     param([Parameter(Mandatory=$true)]$ComplianceResult)
 
@@ -2798,10 +2803,78 @@ function Get-ComplianceCheckTime {
     return $null
 }
 
+function Get-ComplianceStatusValue {
+    <#
+    .SYNOPSIS
+        Pulls the compliance status string out of whatever shape the result came back in.
+
+    .DESCRIPTION
+        PowerCLI does not put the status in one place. Depending on the build it is
+        ComplianceStatus or Status, on the result object itself or only on its ExtensionData, and
+        typed as an enum on some builds and a plain string on others. Reading only the first two
+        was what made a genuinely compliant host report Unknown.
+
+        All four are read in order and the first non-empty one wins. Empty is returned rather than
+        a guess, so the caller can decide what to do about it.
+    #>
+    param($ComplianceResult)
+
+    if ($null -eq $ComplianceResult) { return "" }
+
+    # Built defensively: Set-StrictMode -Version Latest makes a reference to an absent property a
+    # terminating error, and absent properties are the normal case here.
+    $candidates = @($ComplianceResult)
+    try {
+        if ($ComplianceResult.PSObject.Properties.Name -contains 'ExtensionData' -and $null -ne $ComplianceResult.ExtensionData) {
+            $candidates += $ComplianceResult.ExtensionData
+        }
+    }
+    catch {}
+
+    foreach ($candidate in $candidates) {
+        if ($null -eq $candidate) { continue }
+        foreach ($prop in @('ComplianceStatus','Status')) {
+            try {
+                if ($candidate.PSObject.Properties.Name -contains $prop -and $null -ne $candidate.$prop) {
+                    $value = [string]$candidate.$prop
+                    if (-not [string]::IsNullOrWhiteSpace($value)) { return $value.Trim() }
+                }
+            }
+            catch {}
+        }
+    }
+    return ""
+}
+
+function ConvertTo-ComplianceStatus {
+    <#
+    .SYNOPSIS
+        Normalises a raw compliance status to Compliant, NonCompliant or Unknown.
+
+    .DESCRIPTION
+        The vSphere API defines exactly three values - compliant, nonCompliant, unknown - but they
+        arrive with different casing and, from an enum, sometimes with separators. Casing, spaces,
+        hyphens and underscores are all ignored so that "nonCompliant", "Non-Compliant" and
+        "NON COMPLIANT" are one status rather than three.
+
+        Anything unrecognised is returned as-is rather than mapped to Compliant. An unfamiliar
+        status must never become a pass by accident.
+    #>
+    param([string]$Raw)
+
+    $normalised = ($Raw -replace '[\s_-]', '')
+    switch -Regex ($normalised) {
+        '^(?i)compliant$'    { return "Compliant" }
+        '^(?i)noncompliant$' { return "NonCompliant" }
+        '^(?i)unknown$'      { return "Unknown" }
+        default              { if ([string]::IsNullOrWhiteSpace($Raw)) { return "Unknown" } else { return $Raw } }
+    }
+}
+
 function Get-VMHostProfileComplianceState {
     <#
     .SYNOPSIS
-        Runs a host profile compliance scan to completion and returns its result.
+        Runs a host profile compliance scan to completion and returns the status vCenter holds.
 
     .DESCRIPTION
         Status is one of Compliant, NonCompliant, NoProfile or Unknown. The compliance result
@@ -2810,18 +2883,20 @@ function Get-VMHostProfileComplianceState {
 
         Two things make the answer worth acting on rather than merely present:
 
-          - -UseCache is never passed. That switch is what makes Test-VMHostProfileCompliance return
-            the last stored result instead of checking. Without it the cmdlet issues a compliance
-            check and blocks until vCenter finishes it, so the scan has completed by the time it
-            returns.
-          - The result's check time is compared against the moment the scan was requested. vCenter
-            can still answer from a check that ran before the reboot, and a pre-reboot "Compliant"
-            is the worst possible answer to act on - it takes the host out of Maintenance mode on
-            the strength of its old configuration. A result older than the request is re-scanned,
-            and if it stays stale it is reported as Unknown, never as Compliant.
+          - The scan itself. -UseCache is not passed on the first call, so the cmdlet issues a
+            real compliance check and blocks until vCenter finishes it. Any check vCenter or Auto
+            Deploy already had running is drained first, so this is the one that answers.
+          - Reading the status vCenter actually holds. The status lands on different properties
+            depending on the PowerCLI build - ComplianceStatus or Status, on the result object or
+            only on its ExtensionData - so all four are read. If none of them yields a status, the
+            run asks vCenter for the stored result with -UseCache: the scan has already completed
+            by then, so that is the same value the vSphere Client shows on the host's Host Profile
+            tab. It is a second read of the same answer, not a substitute for scanning.
 
-        Where the PowerCLI build exposes no check time at all, the synchronous scan is taken at face
-        value; that is its documented behaviour and there is nothing further to verify against.
+        Unknown means vCenter would not tell us, and is treated as a failure to be resolved rather
+        than a pass. It is never inferred from anything this script computes itself - an earlier
+        build compared the result's check time against the scan request to detect a pre-reboot
+        answer, and DateTimeKind made every host east of UTC report Unknown.
     #>
     param([Parameter(Mandatory=$true)]$VMHostObject)
 
@@ -2832,59 +2907,42 @@ function Get-VMHostProfileComplianceState {
         return [pscustomobject]@{ Status="NoProfile"; ProfileName=""; Details="No host profile is attached to this host."; CheckTime=$null }
     }
 
-    $attempts = [math]::Max(1, [int]$HostProfileComplianceScanRetries)
+    # Drain anything vCenter or Auto Deploy started, so the scan below is the one that answers.
+    Wait-VMHostProfileComplianceTask -TimeoutMinutes $HostProfileComplianceScanTimeoutMinutes
+
+    Write-Host "  Running host profile compliance scan..." -ForegroundColor Gray
     $result = $null
-    $checkTime = $null
-    $stale = $false
+    try {
+        # No -UseCache here: this call has to perform the check, not read the previous answer.
+        $result = @(Test-VMHostProfileCompliance -VMHost $VMHostObject -ErrorAction Stop) | Select-Object -First 1
+    }
+    catch {
+        return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test failed: $($_.Exception.Message)"; CheckTime=$null }
+    }
 
-    for ($scan = 1; $scan -le $attempts; $scan++) {
-        # Drain anything vCenter or Auto Deploy started, so the scan below is the one that answers.
-        Wait-VMHostProfileComplianceTask -TimeoutMinutes $HostProfileComplianceScanTimeoutMinutes
+    if ($null -eq $result) {
+        return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test returned no result."; CheckTime=$null }
+    }
 
-        $requestedAt = (Get-Date).ToUniversalTime()
-        Write-Host "  Running host profile compliance scan (attempt $scan of $attempts)..." -ForegroundColor Gray
+    $statusRaw = Get-ComplianceStatusValue -ComplianceResult $result
+    $statusSource = "scan"
 
+    # The scan has completed, so vCenter now holds its result. If this build did not project the
+    # status onto anything readable, ask for the stored one - that is the value the vSphere Client
+    # shows, and it is the result of the scan just performed, not an older one.
+    if ([string]::IsNullOrWhiteSpace($statusRaw) -or (ConvertTo-ComplianceStatus -Raw $statusRaw) -eq "Unknown") {
+        Write-Host "  The scan result did not carry a readable status. Reading the status vCenter now holds..." -ForegroundColor Gray
         try {
-            # No -UseCache: this has to be a real check, not the previously stored answer.
-            $result = @(Test-VMHostProfileCompliance -VMHost $VMHostObject -ErrorAction Stop) | Select-Object -First 1
+            $stored = @(Test-VMHostProfileCompliance -VMHost $VMHostObject -UseCache -ErrorAction Stop) | Select-Object -First 1
+            $storedRaw = Get-ComplianceStatusValue -ComplianceResult $stored
+            if (-not [string]::IsNullOrWhiteSpace($storedRaw) -and (ConvertTo-ComplianceStatus -Raw $storedRaw) -ne "Unknown") {
+                $statusRaw = $storedRaw
+                $statusSource = "stored"
+                if ($null -ne $stored) { $result = $stored }
+            }
         }
         catch {
-            return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test failed: $($_.Exception.Message)"; CheckTime=$null }
-        }
-
-        if ($null -eq $result) {
-            return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test returned no result."; CheckTime=$null }
-        }
-
-        $checkTime = Get-ComplianceCheckTime -ComplianceResult $result
-        $stale = $false
-        if ($null -eq $checkTime) { break }
-
-        # Two minutes of slack, because the jump host's clock and vCenter's are not the same clock.
-        if ($checkTime.ToUniversalTime() -ge $requestedAt.AddMinutes(-2)) { break }
-
-        $stale = $true
-        Write-Host "  vCenter answered from a check taken at $($checkTime.ToUniversalTime().ToString('u')), before this scan was requested." -ForegroundColor Yellow
-        if ($scan -lt $attempts) {
-            Write-Host "  Re-scanning rather than trusting a pre-reboot result." -ForegroundColor Yellow
-            Start-Sleep -Seconds 15
-        }
-    }
-
-    if ($stale) {
-        return [pscustomobject]@{
-            Status      = "Unknown"
-            ProfileName = $profileObj.Name
-            Details     = "vCenter kept returning a compliance result older than the scan request after $attempts attempt(s); last check time $($checkTime.ToUniversalTime().ToString('u'))."
-            CheckTime   = $checkTime
-        }
-    }
-
-    $statusRaw = ""
-    foreach ($prop in @("ComplianceStatus","Status")) {
-        if ($result.PSObject.Properties.Name -contains $prop -and -not [string]::IsNullOrWhiteSpace([string]$result.$prop)) {
-            $statusRaw = [string]$result.$prop
-            break
+            Write-Host "  Could not read the stored compliance status: $($_.Exception.Message)" -ForegroundColor Yellow
         }
     }
 
@@ -2901,13 +2959,15 @@ function Get-VMHostProfileComplianceState {
         }
     }
 
-    $status = switch -Regex ($statusRaw) {
-        '^(?i)compliant$'    { "Compliant";    break }
-        '^(?i)nonCompliant$' { "NonCompliant"; break }
-        default              { if ([string]::IsNullOrWhiteSpace($statusRaw)) { "Unknown" } else { $statusRaw } }
+    $status = ConvertTo-ComplianceStatus -Raw $statusRaw
+    if ($status -eq "Unknown") {
+        $details = "vCenter returned no usable compliance status$(if($statusRaw){" (raw value '$statusRaw')"}). $details".Trim()
+    }
+    elseif ($statusSource -eq "stored") {
+        $details = "Status read from the result vCenter stored for this scan. $details".Trim()
     }
 
-    return [pscustomobject]@{ Status=$status; ProfileName=$profileObj.Name; Details=$details; CheckTime=$checkTime }
+    return [pscustomobject]@{ Status=$status; ProfileName=$profileObj.Name; Details=$details; CheckTime=(Get-ComplianceCheckTime -ComplianceResult $result) }
 }
 
 function Confirm-HostProfileComplianceAndExitMaintenance {

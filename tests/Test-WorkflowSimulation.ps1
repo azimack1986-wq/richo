@@ -66,7 +66,6 @@ $PowerCliWebOperationTimeoutSeconds     = 3600
 # minutes would be two minutes of busy-waiting per batch.
 $HostProfileComplianceSettleMinutes     = 0.01
 $HostProfileComplianceScanTimeoutMinutes = 1
-$HostProfileComplianceScanRetries       = 3
 $RunDirectory                           = [IO.Path]::GetTempPath()
 $SummaryPath                            = Join-Path $RunDirectory "simulation-summary.csv"
 
@@ -152,13 +151,13 @@ function Move-VM { param($VM,$Destination,$Confirm,$ErrorAction) Note-Call 'Move
 function Restart-VMHost { param($VMHost,$Confirm,$ErrorAction) Note-Call 'Restart-VMHost' }
 function Get-VMHostProfile { param($Entity,$ErrorAction) return [pscustomobject]@{ Name = 'HP-Prod' } }
 function Get-Task { param($Status,$Id,$ErrorAction) return @() }
-# CheckTime is stamped at call time, so the freshness comparison in Get-VMHostProfileComplianceState
-# is exercised on the happy path. -UseCache is declared but must never be bound: binding it would
-# mean the script asked vCenter for a stored result instead of a scan.
+# The scan itself must never read the cache. The stored result is only a legitimate second read
+# when the scan produced no usable status, which is not the case here - so a -UseCache call in this
+# simulation means the script skipped the check.
 function Test-VMHostProfileCompliance {
     param($VMHost,[switch]$UseCache,$ErrorAction)
     Note-Call 'Test-VMHostProfileCompliance'
-    if ($UseCache) { throw "-UseCache returns the previous stored result, not a completed scan" }
+    if ($UseCache) { throw "the scan must perform the check, not read vCenter's stored result" }
     return [pscustomobject]@{ ComplianceStatus = 'Compliant'; CheckTime = (Get-Date) }
 }
 
@@ -199,8 +198,19 @@ function Add-UcsFirmwareComputeHostPack { param($Ucs,$Org,$Name,$BladeBundleVers
     if ($BladeBundleVersion -or $RackBundleVersion) { throw "bundle versions must come from the global setting, not from the script" }
     $script:HostPacks += $Name
 }
-function Get-UcsLsmaintAck { param($Ucs,$ErrorAction) return @() }
-function Set-UcsLsmaintAck { param($Ucs,$LsmaintAck,$AdminState,[switch]$Force,$ErrorAction) Note-Call 'Set-UcsLsmaintAck' }
+# UCSM raises a maintenance acknowledgement against a service profile once its firmware policy
+# changes, so the stub does too. Returning an empty list unconditionally made every UCS-only batch
+# look like it had nothing staged, which is a different code path entirely.
+function Get-UcsLsmaintAck { param($Ucs,$ErrorAction)
+    return @($script:UcsPolicyState.Keys |
+        Where-Object { $script:UcsPolicyState[$_] -ne 'fw-old' -and -not $script:UcsAcked.Contains($_) } |
+        ForEach-Object { [pscustomobject]@{ Dn = "org-root/ls-$_/ack"; ServiceProfile = $_ } })
+}
+$script:UcsAcked = New-Object System.Collections.Generic.HashSet[string]
+function Set-UcsLsmaintAck { param($Ucs,$LsmaintAck,$AdminState,[switch]$Force,$ErrorAction)
+    Note-Call 'Set-UcsLsmaintAck'
+    if ($LsmaintAck -and $LsmaintAck.ServiceProfile) { [void]$script:UcsAcked.Add($LsmaintAck.ServiceProfile) }
+}
 
 # Present but never called by the pre-auth build - Assert-IntersightPowerShellAvailable probes for
 # it as a module-presence check. If the simulation ever records a call to this, the pre-auth build
@@ -271,6 +281,11 @@ function Reset-Simulation {
     $Global:IntersightUpgradeSurfaceChecked = $false
     $Global:UcsSessions = @{}
     $Global:UcsFirmwarePolicyByTarget = @{}
+    # The simulated UCSM remembers the policy each service profile was last set to. Left over from a
+    # previous run it would make the next one find nothing to stage, and the run would legitimately
+    # stop to ask - a stale fixture masquerading as a behaviour change.
+    $script:UcsPolicyState = @{}
+    $script:UcsAcked = New-Object System.Collections.Generic.HashSet[string]
 }
 
 Write-Host "`n=== The script loads ===" -ForegroundColor Cyan
@@ -387,6 +402,48 @@ Assert-True "every settle ran to completion" (@($settleRows | Where-Object { $_.
 # The stub throws on -UseCache, so reaching here at all proves a real scan was requested each time.
 Assert-True "a compliance scan was issued for every host" ($script:Calls['Test-VMHostProfileCompliance'] -ge 4) "got $($script:Calls['Test-VMHostProfileCompliance'])"
 Assert-True "the settle wait does not add per-host compliance rows" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' }).Count -eq 4)
+
+# ---------------------------------------------------------------------------
+# SINGLE mode - one host at a time, and nothing may stop to ask between them.
+# ---------------------------------------------------------------------------
+Write-Host "`n=== SINGLE mode runs the whole cluster with no prompts between hosts ===" -ForegroundColor Cyan
+Reset-Simulation -Mode 'LIVE'
+
+# Only the questions the operator agreed to answer. Anything else is a regression: the run is meant
+# to walk the cluster on its own once it has started, and a stray prompt strands it mid-change.
+$AgreedPrompts = @(
+    'Select run mode'
+    'Select upgrade mode'
+    'Select batch mode'
+    'manual health checks'
+    'Create host firmware package'
+)
+$script:UnexpectedPrompts = New-Object System.Collections.Generic.List[string]
+function Read-Host {
+    param([string]$Prompt)
+    $script:PromptLog.Add($Prompt)
+    if ($script:PromptLog.Count -gt $script:MaxPrompts) { throw "Prompt limit exceeded: '$Prompt'" }
+    if (-not (@($AgreedPrompts | Where-Object { $Prompt -match $_ }).Count)) {
+        [void]$script:UnexpectedPrompts.Add($Prompt)
+    }
+    switch -Regex ($Prompt) {
+        'Select run mode'              { return '1' }    # LIVE
+        'Select upgrade mode'          { return '2' }
+        'Select batch mode'            { return '2' }    # SINGLE
+        'manual health checks'         { return 'YES' }
+        'Create host firmware package' { return 'CREATE' }
+        default                        { return 'YES' }
+    }
+}
+
+$singleError = $null
+try { Invoke-ClusterUpgradeWorkflow -Cluster $script:Cluster 6>$null } catch { $singleError = $_ }
+Assert-True "the SINGLE-mode workflow ran to completion" ($null -eq $singleError) "$($singleError)"
+Assert-True "nothing was asked outside the agreed menu items" ($script:UnexpectedPrompts.Count -eq 0) "asked: $(($script:UnexpectedPrompts | Select-Object -Unique) -join ' | ')"
+Assert-True "every host was processed one at a time" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' }).Count -eq 4)
+Assert-True "each host was its own batch" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' } | Select-Object -ExpandProperty Batch -Unique).Count -eq 4)
+Assert-True "every host ended Connected" (@($script:HostState.Values | Where-Object { $_.ConnectionState -ne 'Connected' }).Count -eq 0)
+Assert-True "the cluster completed without intervention" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
 
 Remove-Item -Path $csvDir -Recurse -Force -ErrorAction SilentlyContinue
 

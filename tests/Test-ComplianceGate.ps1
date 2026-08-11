@@ -8,11 +8,12 @@
 
       - Scanning too early. A host that has just re-registered is still starting; the differences it
         reports resolve themselves. The settle wait exists to stop that reading as a real failure.
-      - Reading a stale answer. vCenter can return the result of a check that ran BEFORE the reboot.
-        A pre-reboot "Compliant" is the worst possible answer to act on, because it takes the host
-        out of Maintenance mode on the strength of its old configuration. Stale must become Unknown.
-      - Cached answers. -UseCache is what makes Test-VMHostProfileCompliance hand back the stored
-        result instead of checking, so it must never be passed.
+      - Not reading the status vCenter actually holds. PowerCLI puts it on ComplianceStatus or
+        Status, on the result object or only on its ExtensionData. Reading too few of those is what
+        made a genuinely compliant host report Unknown on a live run.
+      - Scanning from the cache. The first call must never pass -UseCache, or nothing is checked.
+        The stored result is a legitimate SECOND read once the scan has completed - the same value
+        the vSphere Client shows - but never a substitute for the scan.
       - The override. O returns a non-compliant host to service on purpose. It has to work, and it
         has to leave a record saying what was accepted.
 
@@ -30,6 +31,8 @@ if ($errors) { throw "parse errors" }
 $wanted = @(
     'Get-VMHostProfileComplianceState'
     'Get-ComplianceCheckTime'
+    'Get-ComplianceStatusValue'
+    'ConvertTo-ComplianceStatus'
     'Wait-VMHostProfileComplianceTask'
     'Wait-HostProfileComplianceSettle'
     'Confirm-HostProfileComplianceAndExitMaintenance'
@@ -46,7 +49,6 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
 # minutes; its behaviour is asserted separately against a non-zero value.
 $HostProfileComplianceSettleMinutes      = 0
 $HostProfileComplianceScanTimeoutMinutes = 1
-$HostProfileComplianceScanRetries        = 3
 
 $Global:RunMode = 'LIVE'
 $Global:AutoExitMaintenanceMode = $true
@@ -84,70 +86,104 @@ function Set-VMHost { param($VMHost,$State,[switch]$Evacuate,[switch]$RunAsync,$
 
 $testHost = [pscustomobject]@{ Name = 'esx1.example'; ConnectionState = 'Maintenance' }
 
-Write-Host "`n=== The scan is a real check, not a cached answer ===" -ForegroundColor Cyan
+Write-Host "`n=== The scan is a real check, and the status is read from it ===" -ForegroundColor Cyan
+$script:CacheCalls = New-Object System.Collections.Generic.List[bool]
 function Test-VMHostProfileCompliance {
     param($VMHost,[switch]$UseCache,$ErrorAction)
-    $script:ScanCount++
-    if ($UseCache) { $script:UseCacheRequested = $true }
+    $script:CacheCalls.Add([bool]$UseCache)
     return [pscustomobject]@{ ComplianceStatus = 'Compliant'; CheckTime = (Get-Date) }
 }
-$script:ScanCount = 0; $script:UseCacheRequested = $false
+$script:CacheCalls.Clear()
 $state = Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null
-Assert-Equal "a fresh Compliant result is accepted" "Compliant" $state.Status
-Assert-Equal "-UseCache was never passed" $false $script:UseCacheRequested
-Assert-Equal "exactly one scan was issued" 1 $script:ScanCount
-Assert-Equal "the check time is carried back to the caller" $true ($null -ne $state.CheckTime)
+Assert-Equal "a Compliant result is reported as Compliant" "Compliant" $state.Status
+Assert-Equal "exactly one call was made" 1 $script:CacheCalls.Count
+Assert-Equal "the scan did not read from the cache" $false $script:CacheCalls[0]
+Assert-Equal "the check time is carried back for display" $true ($null -ne $state.CheckTime)
 
 Write-Host "`n=== A check already running in vCenter is drained first ===" -ForegroundColor Cyan
-$script:RunningTasks = 2; $script:ScanCount = 0
+$script:RunningTasks = 2
 $state = Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null
 Assert-Equal "the scan still completed" "Compliant" $state.Status
 Assert-Equal "in-flight tasks were drained before scanning" 0 $script:RunningTasks
 
-Write-Host "`n=== A pre-reboot result is never accepted as a pass ===" -ForegroundColor Cyan
-# vCenter answers from a check taken an hour ago - i.e. before the host rebooted.
+Write-Host "`n=== The status is found wherever this PowerCLI build put it ===" -ForegroundColor Cyan
+# This is the live-run defect: the status was on ExtensionData, only ComplianceStatus and Status on
+# the result object were read, and a compliant host reported Unknown.
 function Test-VMHostProfileCompliance {
     param($VMHost,[switch]$UseCache,$ErrorAction)
-    $script:ScanCount++
-    return [pscustomobject]@{ ComplianceStatus = 'Compliant'; CheckTime = (Get-Date).AddHours(-1) }
+    $script:CacheCalls.Add([bool]$UseCache)
+    return [pscustomobject]@{ ExtensionData = [pscustomobject]@{ ComplianceStatus = 'compliant' } }
 }
-$script:ScanCount = 0
-$state = Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null
-Assert-Equal "a stale Compliant becomes Unknown, not Compliant" "Unknown" $state.Status
-Assert-Equal "the scan was retried before giving up" 3 $script:ScanCount
-Assert-Equal "the reason names the staleness" $true ($state.Details -match 'older than the scan request')
+$script:CacheCalls.Clear()
+Assert-Equal "a status on ExtensionData is found" "Compliant" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
+Assert-Equal "and no cache read was needed" 1 $script:CacheCalls.Count
 
-Write-Host "`n=== A stale result that goes fresh is accepted ===" -ForegroundColor Cyan
-$script:ScanCount = 0
 function Test-VMHostProfileCompliance {
     param($VMHost,[switch]$UseCache,$ErrorAction)
-    $script:ScanCount++
-    $when = if ($script:ScanCount -eq 1) { (Get-Date).AddHours(-1) } else { (Get-Date) }
-    return [pscustomobject]@{ ComplianceStatus = 'Compliant'; CheckTime = $when }
+    return [pscustomobject]@{ Status = 'nonCompliant' }
 }
-$state = Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null
-Assert-Equal "the second scan's fresh result is used" "Compliant" $state.Status
-Assert-Equal "it stopped retrying as soon as the result was fresh" 2 $script:ScanCount
+Assert-Equal "the legacy Status property is found" "NonCompliant" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
 
-Write-Host "`n=== A build that reports no check time is taken at face value ===" -ForegroundColor Cyan
-# Older PowerCLI does not project checkTime. The synchronous scan is its own guarantee there, and
-# refusing every result would make the gate unusable on those builds.
-$script:ScanCount = 0
+Write-Host "`n=== Status strings normalise to three values ===" -ForegroundColor Cyan
+foreach ($case in @(
+    @{ Raw='compliant';     Expect='Compliant' },
+    @{ Raw='Compliant';     Expect='Compliant' },
+    @{ Raw='COMPLIANT';     Expect='Compliant' },
+    @{ Raw='nonCompliant';  Expect='NonCompliant' },
+    @{ Raw='Non-Compliant'; Expect='NonCompliant' },
+    @{ Raw='NON COMPLIANT'; Expect='NonCompliant' },
+    @{ Raw='non_compliant'; Expect='NonCompliant' },
+    @{ Raw='unknown';       Expect='Unknown' },
+    @{ Raw='';              Expect='Unknown' }
+)) {
+    Assert-Equal "'$($case.Raw)' normalises to $($case.Expect)" $case.Expect (ConvertTo-ComplianceStatus -Raw $case.Raw)
+}
+# An unfamiliar status must never be rounded down to a pass.
+Assert-Equal "an unrecognised status is returned as-is, not as Compliant" "somethingElse" (ConvertTo-ComplianceStatus -Raw 'somethingElse')
+
+Write-Host "`n=== An unreadable scan falls back to the status vCenter stored ===" -ForegroundColor Cyan
+# The scan has completed by this point, so the stored result IS this scan's result - the same value
+# the vSphere Client shows on the host's Host Profile tab.
 function Test-VMHostProfileCompliance {
     param($VMHost,[switch]$UseCache,$ErrorAction)
-    $script:ScanCount++
-    return [pscustomobject]@{ ComplianceStatus = 'Compliant' }
+    $script:CacheCalls.Add([bool]$UseCache)
+    if ($UseCache) { return [pscustomobject]@{ ComplianceStatus = 'compliant' } }
+    return [pscustomobject]@{ ComplianceStatus = '' }
+}
+$script:CacheCalls.Clear()
+$state = Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null
+Assert-Equal "the stored status is used" "Compliant" $state.Status
+Assert-Equal "the scan ran before the cache was read" $false $script:CacheCalls[0]
+Assert-Equal "then, and only then, the cache was read" $true $script:CacheCalls[1]
+Assert-Equal "the fallback is stated in the detail" $true ($state.Details -match 'stored')
+
+Write-Host "`n=== When vCenter gives nothing, Unknown is reported - never a pass ===" -ForegroundColor Cyan
+function Test-VMHostProfileCompliance {
+    param($VMHost,[switch]$UseCache,$ErrorAction)
+    return [pscustomobject]@{ ComplianceStatus = 'unknown' }
 }
 $state = Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null
-Assert-Equal "no check time still yields Compliant" "Compliant" $state.Status
-Assert-Equal "and does not retry pointlessly" 1 $script:ScanCount
-Assert-Equal "the missing check time is reported as absent, not invented" $true ($null -eq $state.CheckTime)
+Assert-Equal "an unknown status stays Unknown" "Unknown" $state.Status
+Assert-Equal "and says vCenter gave no usable status" $true ($state.Details -match 'no usable compliance status')
+
+function Test-VMHostProfileCompliance { param($VMHost,[switch]$UseCache,$ErrorAction) throw "vCenter unavailable" }
+Assert-Equal "a failed scan is Unknown, never a pass" "Unknown" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
+
+function Test-VMHostProfileCompliance { param($VMHost,[switch]$UseCache,$ErrorAction) return $null }
+Assert-Equal "an empty scan result is Unknown, never a pass" "Unknown" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
 
 Write-Host "`n=== Check time is read from ExtensionData when it is only there ===" -ForegroundColor Cyan
 $stamp = (Get-Date).AddMinutes(-1)
 $fromExtension = [pscustomobject]@{ ComplianceStatus = 'Compliant'; ExtensionData = [pscustomobject]@{ CheckTime = $stamp } }
 Assert-Equal "ExtensionData.CheckTime is found" $stamp (Get-ComplianceCheckTime -ComplianceResult $fromExtension)
 Assert-Equal "an object with neither reports null" $true ($null -eq (Get-ComplianceCheckTime -ComplianceResult ([pscustomobject]@{ ComplianceStatus = 'Compliant' })))
+# Display only. An hour-old check time must not turn a compliant host into Unknown - that comparison
+# was tried, and DateTimeKind made every host east of UTC fail it.
+function Test-VMHostProfileCompliance {
+    param($VMHost,[switch]$UseCache,$ErrorAction)
+    return [pscustomobject]@{ ComplianceStatus = 'Compliant'; CheckTime = (Get-Date).AddHours(-1) }
+}
+Assert-Equal "an old check time does not override the status" "Compliant" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
 
 Write-Host "`n=== A compliant host is taken out of Maintenance mode ===" -ForegroundColor Cyan
 function Test-VMHostProfileCompliance {
