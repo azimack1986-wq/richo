@@ -12,6 +12,58 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [20.0.0] — 2026-08-11
+
+Two changes to what the run touches and what stops it. Both narrow the script's
+remit, hence the major bump.
+
+#### Added
+
+- **Only blades with changes staged are in scope.** Before anything is
+  evacuated, every Intersight-managed host's server profile is read once, and
+  those with nothing to deploy — `Associated`, or any state outside
+  `$Global:IntersightActionableConfigStates` — are dropped from the run
+  (`Remove-IntersightHostsAlreadyDeployed`). Batching one of those evacuated a
+  host, put it into Maintenance mode, waited, found nothing to send, brought it
+  back and reported success — achieving nothing and spending a maintenance
+  window slot. The table is printed up front so the real scope is visible before
+  the first host moves.
+  A profile whose `ConfigState` cannot be **read** stays in scope. "Nothing
+  staged" and "could not tell" are different answers, and dropping a host on the
+  second would silently leave it un-upgraded while the run reported a clean
+  sweep.
+
+#### Removed
+
+- **The cluster health gate, entirely** — `Get-ClusterHealthReport`,
+  `Confirm-ClusterHealthOrChoose`, the pre-batch and post-batch checks, and
+  `$MinimumDatastoreFreePercent`. Removed at the operator's direction after it
+  repeatedly failed a cluster with nothing wrong with it and stopped the run
+  mid-change. **Host profile compliance is now the only health gate**: a host
+  that passes it and comes out of Maintenance mode is back in service, and the
+  run moves on.
+  Cluster-level assurance is now the operator's responsibility, stated in
+  requirement 5 of the pre-flight. Nothing in the run will now notice a
+  datastore filling up, a triggered alarm, or a host dropping out elsewhere in
+  the cluster.
+- `tests/Test-ClusterHealthGate.ps1`, with the code it covered.
+
+#### Fixed
+
+- `Get-Datastore -Location $Cluster` was invalid — the parameter accepts only
+  Datacenter, Folder and DatastoreCluster objects, so passing a cluster threw
+  and the health check failed with *"Datastore free space could not be
+  evaluated"*. That call is gone with the rest of the gate. It never worked, on
+  any release that had it.
+
+#### Changed — tests
+
+- The workflow simulation asserts that **no** `ClusterHealth` stage row is ever
+  written, so a cluster-wide gate cannot reappear quietly.
+- The already-current second pass now proves the exclusion: both deployed
+  Intersight hosts are dropped from scope, the reason names their `ConfigState`,
+  and neither is put into Maintenance mode.
+
 ### [19.4.0] — 2026-08-11
 
 The post-batch health check stopped a live run on a cluster with nothing wrong
@@ -950,6 +1002,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [20.0.0-preauth] — 2026-08-11
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 20.0.0 — only blades with
+changes staged are in scope, and host profile compliance is the only health
+gate. This is the build to run.
 
 ### [19.4.0-preauth] — 2026-08-11
 

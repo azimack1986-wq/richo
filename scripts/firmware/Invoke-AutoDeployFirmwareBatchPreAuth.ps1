@@ -71,7 +71,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 19.4.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 19.4.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 20.0.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 20.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -87,22 +87,25 @@
       answer: skipped for an on-prem PVA, enforced for intersight.com.
     - DRYRUN is the default.
     - UCSM acknowledgement and Intersight accept/reboot are each scoped to their own batch hosts only.
-    - Batch mode is AUTO (sized from live cluster capacity and health, capped at $MaxAbsoluteBatchSize)
-      or SINGLE (one host at a time). There is no free-text batch size.
+    - Batch mode is AUTO (sized from live cluster capacity, capped at $MaxAbsoluteBatchSize) or
+      SINGLE (one host at a time). There is no free-text batch size.
+    - ONLY BLADES WITH CHANGES STAGED ARE IN SCOPE. Before anything is evacuated, every
+      Intersight-managed host's server profile is read once and those with nothing to deploy - an
+      Associated profile, or any state outside $Global:IntersightActionableConfigStates - are
+      dropped from the run. Batching one of those would evacuate a host, wait, find nothing to
+      send, bring it back and report success, having achieved nothing and spent a window slot. A
+      profile whose ConfigState cannot be READ stays in scope: "nothing staged" and "could not
+      tell" are different answers.
+    - HOST PROFILE COMPLIANCE IS THE ONLY HEALTH GATE. A host that passes it and comes out of
+      Maintenance mode is back in service, and the run moves to the next host. The cluster-wide
+      checks - datastore free space, triggered alarms, hosts in Maintenance mode elsewhere - have
+      been REMOVED at the operator's direction, after repeatedly failing a cluster with nothing
+      wrong with it and stopping the run mid-change. Cluster-level assurance is now the operator's
+      responsibility, in the manual health checks stated in the requirements above.
     - The run advances through the cluster automatically. The per-batch typed gates (ACK-BATCH-N and
-      SAVE-BATCH-N) have been REMOVED in favour of automatic progression. What now gates each batch is:
-      a pre-batch cluster health check, the timed pre-reboot safety window (press E to abort), a host
-      profile compliance check on every rebooted host, and a post-batch cluster health check.
-    - A failed health check is not a dead end. The reasons are named on screen, written to the run
-      summary, and carried into the stop message itself; the operator chooses RECHECK (evaluate
-      again - HA, vSAN and DRS raise alarms while a host rejoins and clear them shortly after, so
-      this is usually all that is needed), OVERRIDE (accept and continue, recorded as an override
-      naming what was accepted), or STOP.
-      Two things no longer count as unhealthy, because both failed a cluster with nothing wrong
-      with it: non-shared datastores, which sit under $MinimumDatastoreFreePercent% free by design
-      and have no bearing on whether a host can be evacuated; and red alarms somebody has already
-      acknowledged. Unacknowledged red alarms still stop the run, and are now named rather than
-      counted.
+      SAVE-BATCH-N) have been REMOVED in favour of automatic progression. What gates each batch is
+      the timed pre-reboot safety window (press E to abort) and the host profile compliance check on
+      every rebooted host.
     - After each reboot, once the batch is confirmed back in vCenter, the run waits
       $HostProfileComplianceSettleMinutes (default 2) and then scans every host against its attached
       host profile while it is still in Maintenance mode. The wait is there because a host that has
@@ -156,8 +159,8 @@
       missing one is created, after an explicit confirmation, by NAME ONLY - no blade or rack bundle
       version is written from this script, so the package follows the global firmware setting its
       name refers to. DRY RUN never creates anything.
-    - Batch sizing now enforces $ResourceSafetyBuffer, $MinimumCpuHeadroomPercentAfterBatch,
-      $MinimumMemoryHeadroomPercentAfterBatch and $MinimumDatastoreFreePercent.
+    - Batch sizing enforces $ResourceSafetyBuffer, $MinimumCpuHeadroomPercentAfterBatch and
+      $MinimumMemoryHeadroomPercentAfterBatch.
     - Validate Cisco UCS PowerTool cmdlet names in your installed module version before LIVE RUN. The
       Intersight accept/reboot parameter surface is checked at run time by
       Assert-IntersightUpgradeCmdletSurface, which stops the run rather than guessing if it differs.
@@ -229,7 +232,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "19.4.0-preauth"
+$ScriptVersion = "20.0.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -301,7 +304,6 @@ $Global:EsxiDiscoveryCache = @{}
 $ResourceSafetyBuffer = 0.85
 $MinimumCpuHeadroomPercentAfterBatch = 10
 $MinimumMemoryHeadroomPercentAfterBatch = 10
-$MinimumDatastoreFreePercent = 10
 $MaxAbsoluteBatchSize = 6
 $MaintenanceValidationTimeoutMinutes = 60
 $EsxiOnlyReconnectInitialWaitMinutes = 15
@@ -342,9 +344,6 @@ $Global:UcsServiceProfileCache = @{}
 $Global:ReconnectCredential = $null
 $Global:PromptForReconnectPasswordWhenNeeded = $false
 $Global:AutoExitMaintenanceMode = $true
-# Hosts already in Maintenance mode when the cluster run started. Out of scope, and not counted as
-# a health failure - see Get-ClusterHealthReport.
-$Global:PreExistingMaintenanceHosts = @()
 $Global:PrerequisitesConfirmed = $false
 
 # -----------------------------
@@ -2186,115 +2185,6 @@ function Select-UpgradeMode {
 
 function Test-VMHostOnTargetBuild { param([Parameter(Mandatory=$true)]$VMHostObject) if ([string]::IsNullOrWhiteSpace($TargetEsxiBuild)) { return $false } return ([string]$VMHostObject.Build -eq $TargetEsxiBuild) }
 
-function Get-ClusterHealthReport {
-    <#
-    .SYNOPSIS
-        Evaluates whether the cluster is healthy enough to start or continue batching.
-
-    .DESCRIPTION
-        Checked before every batch and again after each batch completes, so the run only
-        advances through the cluster while the cluster is actually well. Covers host
-        connection state, hosts unexpectedly in Maintenance mode, datastore free space
-        against $MinimumDatastoreFreePercent, and red alarms triggered on the cluster.
-
-    .PARAMETER Cluster
-        The cluster being worked on.
-
-    .PARAMETER IgnoreHostNames
-        Hosts excluded from the assessment - the current batch, which is expected to be
-        in Maintenance mode or rebooting.
-    #>
-    param(
-        [Parameter(Mandatory=$true)]$Cluster,
-        [array]$IgnoreHostNames = @()
-    )
-
-    $reasons = New-Object System.Collections.Generic.List[string]
-
-    $allHosts = @(Get-VMHost -Location $Cluster -ErrorAction Stop)
-    $relevant = @($allHosts | Where-Object { $IgnoreHostNames -notcontains $_.Name })
-
-    $badState = @($relevant | Where-Object { $_.ConnectionState -eq "NotResponding" -or $_.ConnectionState -eq "Disconnected" })
-    if ($badState.Count -gt 0) {
-        [void]$reasons.Add("Host(s) not responding or disconnected: $(($badState | Select-Object -ExpandProperty Name) -join ', ')")
-    }
-
-    # Hosts already parked in Maintenance mode when the run started are a pre-existing condition,
-    # not something this run caused, and they are excluded from its scope anyway. Counting them as a
-    # health failure would stop every batch and make the cluster impossible to work through. They
-    # are still named on screen each time, so they cannot be forgotten.
-    $inMaintenance = @($relevant | Where-Object { $_.ConnectionState -eq "Maintenance" })
-    $preExisting = @($inMaintenance | Where-Object { $Global:PreExistingMaintenanceHosts -contains $_.Name })
-    $newlyInMaintenance = @($inMaintenance | Where-Object { $Global:PreExistingMaintenanceHosts -notcontains $_.Name })
-
-    if ($preExisting.Count -gt 0) {
-        Write-Host "  Note: host(s) already in Maintenance mode before this run started, and out of scope: $(($preExisting | Select-Object -ExpandProperty Name) -join ', ')" -ForegroundColor DarkYellow
-    }
-    if ($newlyInMaintenance.Count -gt 0) {
-        [void]$reasons.Add("Host(s) in Maintenance mode outside the current batch: $(($newlyInMaintenance | Select-Object -ExpandProperty Name) -join ', ')")
-    }
-
-    # Only SHARED datastores bear on whether a host can be evacuated. Local, boot and scratch
-    # datastores routinely sit under 10% free by design, and counting them failed the health check
-    # on a cluster with nothing wrong with it - every batch, for a reason no operator would accept.
-    # A datastore whose sharing cannot be determined is still checked, so the mistake is toward
-    # caution rather than away from it.
-    try {
-        $allDatastores = @(Get-Datastore -Location $Cluster -ErrorAction Stop)
-        $sharedDatastores = @($allDatastores | Where-Object {
-            $shared = $true
-            try { if ($_.ExtensionData.Summary.PSObject.Properties.Name -contains 'MultipleHostAccess') { $shared = [bool]$_.ExtensionData.Summary.MultipleHostAccess } } catch {}
-            $shared
-        })
-        $localSkipped = @($allDatastores | Where-Object { $sharedDatastores -notcontains $_ })
-        if ($localSkipped.Count -gt 0) {
-            Write-Host "  Note: $($localSkipped.Count) non-shared datastore(s) excluded from the free-space check: $(($localSkipped | Select-Object -ExpandProperty Name) -join ', ')" -ForegroundColor DarkGray
-        }
-
-        $lowDatastores = @($sharedDatastores | Where-Object { $_.CapacityGB -gt 0 -and ((($_.FreeSpaceGB / $_.CapacityGB) * 100) -lt $MinimumDatastoreFreePercent) })
-        if ($lowDatastores.Count -gt 0) {
-            $names = @($lowDatastores | ForEach-Object { "{0} ({1:N1}% free)" -f $_.Name, (($_.FreeSpaceGB / $_.CapacityGB) * 100) })
-            [void]$reasons.Add("Shared datastore(s) below $MinimumDatastoreFreePercent% free: $($names -join ', ')")
-        }
-    }
-    catch {
-        [void]$reasons.Add("Datastore free space could not be evaluated: $($_.Exception.Message)")
-    }
-
-    # Acknowledged alarms are ones somebody has already looked at and accepted. Treating them as a
-    # fresh fault means a single long-standing acknowledged alarm blocks every batch forever, and
-    # the operator has no way to proceed short of clearing an alarm they deliberately kept.
-    # Unacknowledged red alarms are still a stop, and are now named rather than counted - "3 red
-    # alarms" sends someone hunting through vCenter; naming them does not.
-    try {
-        $freshCluster = Get-Cluster -Name $Cluster.Name -ErrorAction Stop
-        $triggered = @($freshCluster.ExtensionData.TriggeredAlarmState | Where-Object { $_.OverallStatus -eq 'red' })
-        $acknowledged = @($triggered | Where-Object { $true -eq $_.Acknowledged })
-        $active = @($triggered | Where-Object { $true -ne $_.Acknowledged })
-
-        if ($acknowledged.Count -gt 0) {
-            Write-Host "  Note: $($acknowledged.Count) red alarm(s) already acknowledged, not treated as a new fault." -ForegroundColor DarkGray
-        }
-        if ($active.Count -gt 0) {
-            $alarmNames = @($active | ForEach-Object {
-                $label = ""
-                try { $label = [string](Get-View -Id $_.Alarm -ErrorAction SilentlyContinue).Info.Name } catch {}
-                if ([string]::IsNullOrWhiteSpace($label)) { $label = [string]$_.Alarm.Value }
-                if ([string]::IsNullOrWhiteSpace($label)) { $label = "<unnamed alarm>" }
-                $label
-            })
-            [void]$reasons.Add("Unacknowledged red alarm(s) on cluster '$($Cluster.Name)': $(($alarmNames | Select-Object -Unique) -join ', ')")
-        }
-    }
-    catch {}
-
-    return [pscustomobject]@{
-        IsHealthy      = ($reasons.Count -eq 0)
-        Reasons        = @($reasons)
-        ConnectedHosts = @($relevant | Where-Object { $_.ConnectionState -eq "Connected" })
-    }
-}
-
 function Get-CapacityBasedBatchSize {
     <#
     .SYNOPSIS
@@ -2388,8 +2278,8 @@ function Select-BatchMode {
     Write-Host "  2. SINGLE - one host at a time" -ForegroundColor Cyan
     Write-Host "  3. Exit" -ForegroundColor Cyan
     Write-Host "Both modes then run through the whole cluster automatically, batch after batch," -ForegroundColor Yellow
-    Write-Host "pausing only for the pre-reboot safety window, a host profile that is not" -ForegroundColor Yellow
-    Write-Host "compliant, or a failed cluster health check." -ForegroundColor Yellow
+    Write-Host "pausing only for the pre-reboot safety window, or a host profile that is not" -ForegroundColor Yellow
+    Write-Host "compliant. Host profile compliance is the only health gate." -ForegroundColor Yellow
 
     $choice = Read-ChoiceExit -Message "Select batch mode" -AllowedChoices @("1","2","3") -ExitMessage "Stopped during batch mode selection."
     if ($choice -eq "3") { Stop-SafeExit -Message "Stopped during batch mode selection." }
@@ -3163,8 +3053,6 @@ function Reset-ClusterScopedState {
 
     # Firmware policy is derived per UCSM domain, so the resolved map is cluster-scoped.
     $Global:UcsFirmwarePolicyByTarget = @{}
-    # Belongs to the cluster just finished - a second cluster's parked hosts are its own.
-    $Global:PreExistingMaintenanceHosts = @()
     Set-Variable -Name TargetUcsFirmwarePolicyName -Scope Script -Value ""
 }
 
@@ -3387,83 +3275,54 @@ function Show-ClusterFirmwareVerification {
     }
 }
 
-function Confirm-ClusterHealthOrChoose {
+function Remove-IntersightHostsAlreadyDeployed {
     <#
     .SYNOPSIS
-        Evaluates cluster health and, when it fails, lets the operator re-check, override or stop.
+        Drops Intersight-managed hosts whose server profile has nothing staged.
 
     .DESCRIPTION
-        A health failure used to end the run outright, with the reasons printed above a stop message
-        that did not repeat them. On a cluster with nothing actually wrong that reads as the script
-        deciding to quit, and the reason scrolls away with the rest of the batch output. Two things
-        changed:
+        A profile in Associated - or any state that is not one of
+        $Global:IntersightActionableConfigStates - has no changes waiting to be deployed. Batching
+        such a host evacuates it, puts it into Maintenance mode, waits, finds nothing to send,
+        brings it back and reports success, having achieved nothing and cost a maintenance window
+        slot. Only the profiles with changes pending are worth touching.
 
-          - The reasons are carried INTO the decision and into the run summary, so the record says
-            what failed rather than that something did.
-          - The operator gets a choice instead of a dead end:
-              RECHECK  - evaluate again. Usually all that is needed. HA, vSAN and DRS raise alarms
-                         while a host rejoins and clear them a minute later, and a check run in that
-                         window fails on a cluster that is already recovering.
-              OVERRIDE - accept the state and carry on. Recorded as an override naming what was
-                         accepted, so it is a decision on the record rather than a silent pass.
-              STOP     - stop the run, as before.
+        Read once, here, before anything is evacuated - not per batch - so the operator sees the
+        real scope of the run up front.
 
-        Returns the report that was finally accepted. Healthy reports return immediately without
-        prompting - this only speaks up when something failed.
+        A profile whose ConfigState cannot be READ is kept in scope. "Nothing staged" and "could
+        not tell" are different answers, and dropping a host on the second one would silently leave
+        it un-upgraded while the run reported a clean sweep.
 
-    .PARAMETER Cluster
-        The cluster being worked on.
-
-    .PARAMETER Stage
-        "before" or "after", used in the messages and the summary record.
-
-    .PARAMETER BatchNumber
-        The batch this check belongs to.
-
-    .PARAMETER IgnoreHostNames
-        Hosts excluded from the assessment - passed straight through to Get-ClusterHealthReport.
+    .PARAMETER CandidateHosts
+        The hosts currently in scope.
     #>
-    param(
-        [Parameter(Mandatory=$true)]$Cluster,
-        [Parameter(Mandatory=$true)][string]$Stage,
-        [Parameter(Mandatory=$true)][string]$BatchNumber,
-        [array]$IgnoreHostNames = @()
-    )
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$CandidateHosts)
 
-    while ($true) {
-        $report = Get-ClusterHealthReport -Cluster $Cluster -IgnoreHostNames $IgnoreHostNames
+    $intersightNames = @($CandidateHosts | Where-Object { $Global:IntersightHostMap.ContainsKey($_.Name) } | Select-Object -ExpandProperty Name)
+    if ($intersightNames.Count -eq 0) { return @($CandidateHosts) }
 
-        if ($report.IsHealthy) {
-            Write-Host "Cluster health confirmed $Stage Batch $BatchNumber." -ForegroundColor Green
-            Add-SummaryRecord -Stage "ClusterHealth" -Batch $BatchNumber -HostName "" -Action "$Stage-batch health check" -Result "Healthy" -Details "$($report.ConnectedHosts.Count) host(s) connected."
-            return $report
-        }
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Checking which Intersight server profiles actually have changes staged..." -ForegroundColor Cyan
 
-        Write-Host "" -ForegroundColor Yellow
-        Write-Host "Cluster health check FAILED $Stage Batch ${BatchNumber}. Reasons:" -ForegroundColor Yellow
-        $report.Reasons | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
-        Add-SummaryRecord -Stage "ClusterHealth" -Batch $BatchNumber -HostName "" -Action "$Stage-batch health check" -Result "Failed" -Details ($report.Reasons -join ' | ')
+    $rows = @(Get-IntersightPendingInconsistencyForBatch -HostNames $intersightNames)
+    $rows | Select-Object Host,ServerProfile,ConfigState,RequiresDeploy | Format-Table -AutoSize | Out-Host
 
-        Write-Host "  RECHECK  - evaluate again. Alarms raised while a host rejoins usually clear on their own." -ForegroundColor Yellow
-        Write-Host "  OVERRIDE - accept the above and continue. Recorded in the run summary." -ForegroundColor Yellow
-        Write-Host "  STOP     - stop the run here." -ForegroundColor Yellow
-
-        $choice = Read-ChoiceExit `
-            -Message "Cluster '$($Cluster.Name)' is not healthy $Stage Batch $BatchNumber. Choose RECHECK, OVERRIDE, or STOP" `
-            -AllowedChoices @("RECHECK","OVERRIDE","STOP") `
-            -ExitMessage "Stopped at the $Stage-batch health check for Batch $BatchNumber."
-
-        if ($choice -eq "STOP") {
-            Stop-WithMessage "Cluster '$($Cluster.Name)' is not healthy $Stage Batch ${BatchNumber}: $($report.Reasons -join ' | ')"
-        }
-        if ($choice -eq "OVERRIDE") {
-            Write-Host "OVERRIDE: continuing with the cluster in the state described above." -ForegroundColor Red
-            Add-SummaryRecord -Stage "ClusterHealth" -Batch $BatchNumber -HostName "" -Action "$Stage-batch health check" -Result "Overridden" -Details "Operator accepted: $($report.Reasons -join ' | ')"
-            return $report
-        }
-
-        Write-Host "Re-evaluating cluster health..." -ForegroundColor Cyan
+    $settled = @($rows | Where-Object { $_.StateKnown -and -not $_.RequiresDeploy })
+    if ($settled.Count -eq 0) {
+        Write-Host "Every Intersight-managed host has changes staged. All remain in scope." -ForegroundColor Green
+        return @($CandidateHosts)
     }
+
+    foreach ($row in $settled) {
+        Add-SummaryRecord -Stage "Scope" -Batch "" -HostName $row.Host -Action "Exclude from run" -Result "AlreadyDeployed" -Details "Server profile '$($row.ServerProfile)' is $($row.ConfigState) - nothing staged to deploy."
+    }
+
+    $settledNames = @($settled | Select-Object -ExpandProperty Host)
+    Write-Host "Excluding $($settled.Count) host(s) with nothing staged: $(($settledNames | Sort-Object) -join ', ')" -ForegroundColor Yellow
+    Write-Host "They are already where this run would put them, so there is nothing to do to them." -ForegroundColor Yellow
+
+    return @($CandidateHosts | Where-Object { $settledNames -notcontains $_.Name })
 }
 
 function Invoke-ClusterUpgradeWorkflow {
@@ -3477,13 +3336,12 @@ function Invoke-ClusterUpgradeWorkflow {
     $allClusterHosts = @(Get-VMHost -Location $Cluster | Sort-Object Name)
     if ($allClusterHosts.Count -eq 0) { Stop-WithMessage "No hosts found in selected cluster." }
 
-    # Recorded before anything is touched, so a host parked in Maintenance mode by someone else is
-    # never mistaken for one this run put there. Only hosts that are Connected enter scope, so these
-    # are out of the run either way - this stops them failing every health check as well.
-    $Global:PreExistingMaintenanceHosts = @($allClusterHosts | Where-Object { $_.ConnectionState -eq "Maintenance" } | Select-Object -ExpandProperty Name)
-    if ($Global:PreExistingMaintenanceHosts.Count -gt 0) {
-        Write-Host "Host(s) already in Maintenance mode and out of scope for this run: $($Global:PreExistingMaintenanceHosts -join ', ')" -ForegroundColor Yellow
-        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Pre-existing Maintenance mode" -Result "Excluded" -Details ($Global:PreExistingMaintenanceHosts -join ', ')
+    # Informational only. These hosts are not Connected, so they never enter scope - but saying so
+    # is better than an operator wondering later why they were left out.
+    $parkedHosts = @($allClusterHosts | Where-Object { $_.ConnectionState -eq "Maintenance" } | Select-Object -ExpandProperty Name)
+    if ($parkedHosts.Count -gt 0) {
+        Write-Host "Host(s) already in Maintenance mode and out of scope for this run: $($parkedHosts -join ', ')" -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Pre-existing Maintenance mode" -Result "Excluded" -Details ($parkedHosts -join ', ')
     }
 
     if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") { Build-InfrastructureHostMapping -Hosts $allClusterHosts }
@@ -3511,9 +3369,14 @@ function Invoke-ClusterUpgradeWorkflow {
         }
     }
 
+    # Only the blades with changes pending are worth a maintenance window slot.
+    if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE" -and -not (Test-StageNoAck)) {
+        $patchCandidateHosts = @(Remove-IntersightHostsAlreadyDeployed -CandidateHosts $patchCandidateHosts)
+    }
+
     if ($patchCandidateHosts.Count -eq 0) {
         if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") {
-            Stop-WithMessage "No Connected firmware candidate hosts available. Firmware mode only requires hosts to be Connected; it does not exclude hosts already on the target ESXi build."
+            Stop-WithMessage "Nothing to do: every host in this cluster is already deployed, or was excluded above. No Intersight server profile has changes staged."
         }
         else {
             Stop-WithMessage "No Connected ESXi patch candidate hosts available after excluding hosts already on the target ESXi build."
@@ -3529,12 +3392,10 @@ function Invoke-ClusterUpgradeWorkflow {
     while ($pendingHosts.Count -gt 0) {
         $batchNumber++
 
-        # Health and capacity are re-evaluated for every batch, not once up front, so hosts
-        # returning to service and any drift in cluster state are both reflected.
+        # Capacity is re-evaluated for every batch, not once up front, so hosts returning to
+        # service are reflected in the next batch's size.
         $batchSize = 1
         if ($batchMode -eq "AUTO" -and -not (Test-StageNoAck)) {
-            [void](Confirm-ClusterHealthOrChoose -Cluster $Cluster -Stage "before" -BatchNumber $batchNumber)
-
             $remainingCandidates = @($pendingHosts | ForEach-Object { Get-VMHost -Name $_ -ErrorAction SilentlyContinue } | Where-Object { $null -ne $_ })
             $sizing = Get-CapacityBasedBatchSize -CandidateHosts $remainingCandidates -Cluster $Cluster
             $sizing.Diagnostics | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
@@ -3669,15 +3530,11 @@ function Invoke-ClusterUpgradeWorkflow {
 
         foreach ($hostName in $currentBatchNames) { [void]$pendingHosts.Remove($hostName) }
 
-        # Post-batch health gate. Passing it is what allows the run to move to the next batch
-        # on its own; failing it stops the run rather than compounding a problem.
-        if (-not (Test-DryRun) -and -not (Test-StageNoAck)) {
-            # Every host should now be back in service, so nothing is excluded - unless the
-            # operator has turned off automatic Maintenance mode exit, in which case the hosts
-            # just completed are expected to still be in Maintenance and are not a fault.
-            $ignoreForHealth = if ($Global:AutoExitMaintenanceMode) { @() } else { @($currentBatchNames) }
-            [void](Confirm-ClusterHealthOrChoose -Cluster $Cluster -Stage "after" -BatchNumber $batchNumber -IgnoreHostNames $ignoreForHealth)
-        }
+        # No post-batch cluster health gate. Host profile compliance is the gate: a host that
+        # passes it and comes out of Maintenance mode is back in service, and the run moves on.
+        # The cluster-wide checks that used to sit here - datastore free space, triggered alarms,
+        # hosts in Maintenance mode elsewhere - were removed at the operator's direction after
+        # they repeatedly failed a cluster with nothing wrong with it and stopped the run.
 
         Write-Host "Batch $batchNumber completed. Remaining hosts: $($pendingHosts.Count)" -ForegroundColor Green
         if ($pendingHosts.Count -gt 0) {

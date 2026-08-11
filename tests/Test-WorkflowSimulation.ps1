@@ -414,7 +414,9 @@ Assert-True "every host ended Connected, not left in Maintenance" (@($script:Hos
 Assert-True "compliance was checked for all four hosts" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' } | Select-Object -ExpandProperty Host -Unique).Count -eq 4)
 Assert-True "maintenance mode was exited for all four hosts" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ExitMaintenance' -and $_.Result -eq 'Sent' }).Count -eq 4)
 Assert-True "the cluster completed" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
-Assert-True "post-batch health was confirmed each batch" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterHealth' -and $_.Result -eq 'Healthy' }).Count -ge 1)
+# Host profile compliance is the only health gate. The cluster-wide checks were removed after
+# repeatedly failing a cluster with nothing wrong with it, so nothing may reintroduce one quietly.
+Assert-True "no cluster health gate runs" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterHealth' }).Count -eq 0) "found: $(($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterHealth' } | ForEach-Object { $_.Details }) -join ' | ')"
 
 Write-Host "`n=== Compliance was scanned, not read from cache ===" -ForegroundColor Cyan
 # The settle wait sits between the reconnect gate and the first scan of each batch. If it stops
@@ -474,6 +476,16 @@ Assert-True "each host was its own batch" (@($Global:RunSummary | Where-Object {
 Assert-True "every host ended Connected" (@($script:HostState.Values | Where-Object { $_.ConnectionState -ne 'Connected' }).Count -eq 0)
 Assert-True "the cluster completed without intervention" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
 
+Write-Host "`n=== The cluster closes with a verification read from the platforms ===" -ForegroundColor Cyan
+# Read back from Intersight, UCS Manager and vCenter after the fact - a completed run has to be able
+# to show what the infrastructure now reports, not just that the script hit no errors.
+$verification = @($Global:RunSummary | Where-Object { $_.Stage -eq 'PostChangeVerification' })
+Assert-True "every host was verified after the change" ($verification.Count -eq 4) "got $($verification.Count)"
+Assert-True "nothing was left outstanding" (@($verification | Where-Object { $_.Result -ne 'Clean' }).Count -eq 0) "not clean: $(($verification | Where-Object { $_.Result -ne 'Clean' } | ForEach-Object { "$($_.Host): $($_.Details)" }) -join ' | ')"
+Assert-True "Intersight hosts report no staged changes" (@($verification | Where-Object { $_.Details -match 'Intersight' -and $_.Details -match 'outstanding: None' }).Count -eq 2)
+Assert-True "UCS hosts report the resolved firmware policy" (@($verification | Where-Object { $_.Details -match 'Policy: global-602d' }).Count -eq 2)
+Assert-True "UCS hosts are compared against the version the policy name refers to" (@($verification | Where-Object { $_.Details -match 'running: 6\.0\(2d\); target: 6\.0\(2d\)' }).Count -eq 2) "got: $(($verification | Where-Object { $_.Details -match 'Policy:' } | ForEach-Object { $_.Details }) -join ' | ')"
+
 # ---------------------------------------------------------------------------
 # A second pass over a cluster that is already current. Nothing is staged, so
 # nothing reboots - and that is a result, not a question.
@@ -495,18 +507,14 @@ $secondPassError = $null
 try { Invoke-ClusterUpgradeWorkflow -Cluster $script:Cluster 6>$null } catch { $secondPassError = $_ }
 Assert-True "the second pass ran to completion" ($null -eq $secondPassError) "$($secondPassError)"
 Assert-True "nothing was asked outside the agreed menu items" ($script:UnexpectedPrompts.Count -eq 0) "asked: $(($script:UnexpectedPrompts | Select-Object -Unique) -join ' | ')"
-Assert-True "no firmware action was needed" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'BatchAction' -and $_.Result -eq 'NoneNeeded' }).Count -ge 1)
 Assert-True "and the cluster still completed" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
 
-Write-Host "`n=== The cluster closes with a verification read from the platforms ===" -ForegroundColor Cyan
-# Read back from Intersight, UCS Manager and vCenter after the fact - a completed run has to be able
-# to show what the infrastructure now reports, not just that the script hit no errors.
-$verification = @($Global:RunSummary | Where-Object { $_.Stage -eq 'PostChangeVerification' })
-Assert-True "every host was verified after the change" ($verification.Count -eq 4) "got $($verification.Count)"
-Assert-True "nothing was left outstanding" (@($verification | Where-Object { $_.Result -ne 'Clean' }).Count -eq 0) "not clean: $(($verification | Where-Object { $_.Result -ne 'Clean' } | ForEach-Object { "$($_.Host): $($_.Details)" }) -join ' | ')"
-Assert-True "Intersight hosts report no staged changes" (@($verification | Where-Object { $_.Details -match 'Intersight' -and $_.Details -match 'outstanding: None' }).Count -eq 2)
-Assert-True "UCS hosts report the resolved firmware policy" (@($verification | Where-Object { $_.Details -match 'Policy: global-602d' }).Count -eq 2)
-Assert-True "UCS hosts are compared against the version the policy name refers to" (@($verification | Where-Object { $_.Details -match 'running: 6\.0\(2d\); target: 6\.0\(2d\)' }).Count -eq 2) "got: $(($verification | Where-Object { $_.Details -match 'Policy:' } | ForEach-Object { $_.Details }) -join ' | ')"
+# The Intersight profiles are Associated by now, so those hosts are dropped before anything is
+# evacuated. Batching them would take a host out of service, find nothing to send, and put it back.
+$excluded = @($Global:RunSummary | Where-Object { $_.Stage -eq 'Scope' -and $_.Result -eq 'AlreadyDeployed' })
+Assert-True "both already-deployed Intersight hosts were dropped from scope" ($excluded.Count -eq 2) "got $($excluded.Count)"
+Assert-True "the reason names the ConfigState" (@($excluded | Where-Object { $_.Details -match 'Associated' }).Count -eq 2)
+Assert-True "neither was put into Maintenance mode" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' -and $excluded.Host -contains $_.Host }).Count -eq 0)
 
 Write-Host "`n=== A server left on the old firmware is caught, not passed ===" -ForegroundColor Cyan
 # The policy can be right and acknowledged and the server still be on the old image if the
