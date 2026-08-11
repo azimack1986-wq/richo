@@ -12,6 +12,42 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [17.1.0] — 2026-08-11
+
+Triggered by a live run failing at PowerCLI load, then reviewed with a static
+lint written around the bug classes this script has actually shipped.
+
+#### Fixed
+
+- **A failed vCenter connection left the cleanup trying to disconnect a session
+  that never existed**, reporting "Could not find VIServer with name ..." on top
+  of the real error. `$global:vCenter` was recorded before `Connect-VIServer`
+  succeeded; a separate `$global:vCenterConnected` is now set only after a
+  successful connect, and both disconnect sites honour it.
+- **A PowerCLI module load failure was unactionable.** `Connect-VIServer`
+  auto-loads `VMware.VimAutomation.Core`, and PowerShell reports only "the
+  command was found in the module ... but the module could not be loaded" — which
+  names neither cause nor fix. The import is now explicit, so the real inner
+  exception is shown along with the causes that produce it: blocked module files
+  after an offline or share-based install, a PowerCLI version predating
+  PowerShell 7 support, restrictive folder permissions, and Group Policy
+  requiring signed modules.
+- **`Format-Table` was leaking rendering records into three functions' return
+  values**, including `Wait-BatchReconnectAfterReboot`, whose result the caller
+  actually inspects. Every display table now goes through `Out-Host`.
+- **Fifteen mandatory `[array]` parameters lacked `[AllowEmptyCollection()]`.**
+  Parameter binding fails outright on an empty collection, turning a legitimately
+  empty list into a mid-run crash — the same defect already fixed once in
+  `Get-CapacityBasedBatchSize`.
+
+#### Added
+
+- `tests/Test-ScriptLint.ps1` — static checks across all five scripts for the bug
+  classes shipped in this codebase, each of which is silent at parse time: bare
+  commands joined with `-and`/`-or`, assignment to read-only automatic variables,
+  mandatory arrays without `[AllowEmptyCollection()]`, `Format-Table` on a
+  function's success stream, and uncached module enumeration. 30 assertions.
+
 ### [17.0.0] — 2026-08-10
 
 Checked against Cisco's published SDK reference and issue tracker. One finding

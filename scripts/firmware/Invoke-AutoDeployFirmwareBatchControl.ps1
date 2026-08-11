@@ -42,7 +42,7 @@
     report installed versions when a login actually fails. Verify the environment out of band with
     scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 17.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 17.1.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -84,7 +84,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "17.0.0"
+$ScriptVersion = "17.1.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -218,7 +218,7 @@ function Stop-WithMessage {
 }
 
 function Read-ChoiceExit {
-    param([Parameter(Mandatory=$true)][string]$Message,[Parameter(Mandatory=$true)][array]$AllowedChoices,[string]$ExitMessage="Script stopped at a safe checkpoint by implementor.")
+    param([Parameter(Mandatory=$true)][string]$Message,[Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$AllowedChoices,[string]$ExitMessage="Script stopped at a safe checkpoint by implementor.")
     $normalizedAllowed = @($AllowedChoices | ForEach-Object { $_.ToString().ToUpper() })
     do {
         $answer = (Read-Host "$Message Type one of: $($AllowedChoices -join ', '), or EXIT").Trim().ToUpper()
@@ -800,7 +800,7 @@ function Select-UcsFirmwarePolicyFromUcs {
     }
 
     Write-Host "Available UCSM host firmware packages returned by UCS PowerTool for this UCSM target:" -ForegroundColor Cyan
-    $policyRows | Select-Object Name,Dn | Format-Table -AutoSize
+    $policyRows | Select-Object Name,Dn | Format-Table -AutoSize | Out-Host
 
     $manualSelectionName = "<MANUAL - enter firmware policy name>"
     $selectionRows = @($policyRows | Select-Object Name,Dn,Description)
@@ -891,7 +891,7 @@ function Test-UcsFirmwarePolicyExists {
 }
 
 function Build-InfrastructureHostMapping {
-    param([Parameter(Mandatory=$true)][array]$Hosts)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts)
 
     Import-IntersightServerCsv
     $Global:IntersightHostMap = @{}
@@ -926,7 +926,7 @@ function Build-InfrastructureHostMapping {
 
     if ($intersightRoutedRows.Count -gt 0) {
         Write-Host "Detected as Intersight-managed (CDP/LLDP name matched the Name column in $IntersightCsvPath, allowing for -A, -B and suffix-less forms):" -ForegroundColor Green
-        $intersightRoutedRows | Format-Table -AutoSize
+        $intersightRoutedRows | Format-Table -AutoSize | Out-Host
         foreach ($row in $intersightRoutedRows) {
             Add-SummaryRecord -Stage "InfrastructureDetection" -Batch "" -HostName $row.Host -Action "Detect infrastructure" -Result "Intersight" -Details "CdpSystemName=$($row.CdpSystemName); MatchedOn=$($row.MatchedOn); CsvName=$($row.IntersightCsvName)."
         }
@@ -990,7 +990,7 @@ function Build-InfrastructureHostMapping {
 
     Write-Host "" -ForegroundColor Cyan
     Write-Host "UCSM discovery summary for cluster hosts:" -ForegroundColor Cyan
-    $discoveryRows | Select-Object Host,Vmnic,CdpSystemName,UcsTarget,Discovery | Format-Table -AutoSize
+    $discoveryRows | Select-Object Host,Vmnic,CdpSystemName,UcsTarget,Discovery | Format-Table -AutoSize | Out-Host
 
     $missingTargets = @($discoveryRows | Where-Object { [string]::IsNullOrWhiteSpace($_.UcsTarget) })
     if ($missingTargets.Count -gt 0) {
@@ -1054,7 +1054,7 @@ function Build-InfrastructureHostMapping {
 
     Write-Host "" -ForegroundColor Cyan
     Write-Host "UCSM host mapping and current firmware policy:" -ForegroundColor Cyan
-    $mappingRows | Select-Object Host,Vmnic,UcsTarget,ServiceProfileDn,CurrentPolicy | Format-Table -AutoSize
+    $mappingRows | Select-Object Host,Vmnic,UcsTarget,ServiceProfileDn,CurrentPolicy | Format-Table -AutoSize | Out-Host
 
     $uniqueTargets = @($mappingRows | Select-Object -ExpandProperty UcsTarget -Unique)
     if ($uniqueTargets.Count -eq 0) { Stop-WithMessage "No UCSM targets were discovered for firmware policy selection." }
@@ -1070,7 +1070,7 @@ function Build-InfrastructureHostMapping {
 
     Write-Host "" -ForegroundColor Cyan
     Write-Host "Final UCSM host mapping with selected target firmware policy:" -ForegroundColor Cyan
-    $mappingRows | Select-Object Host,Vmnic,UcsTarget,ServiceProfileDn,CurrentPolicy,TargetPolicy | Format-Table -AutoSize
+    $mappingRows | Select-Object Host,Vmnic,UcsTarget,ServiceProfileDn,CurrentPolicy,TargetPolicy | Format-Table -AutoSize | Out-Host
 
     foreach ($targetName in $uniqueTargets) {
         $ucsSession = Get-UcsSessionForTarget -UcsTarget $targetName
@@ -1086,7 +1086,7 @@ function Build-InfrastructureHostMapping {
 
 function Set-UcsFirmwarePolicyForBatch {
     param(
-        [Parameter(Mandatory=$true)][array]$HostNames,
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,
         [Parameter(Mandatory=$true)][string]$BatchNumber,
         # RECHECK re-enters this function. Bounded so a policy that never converges ends in a
         # clean stop instead of recursing until the call stack gives out.
@@ -1098,7 +1098,7 @@ function Set-UcsFirmwarePolicyForBatch {
 
     Write-Host "" -ForegroundColor Cyan
     Write-Host "UCS firmware policy change preview for Batch ${BatchNumber}:" -ForegroundColor Cyan
-    $rows | Select-Object Host,UcsTarget,ServiceProfileDn,CurrentPolicy,TargetPolicy | Format-Table -AutoSize
+    $rows | Select-Object Host,UcsTarget,ServiceProfileDn,CurrentPolicy,TargetPolicy | Format-Table -AutoSize | Out-Host
 
     if (Test-DryRun) {
         Write-Host "DRY RUN: Would apply target UCS firmware policy to current batch service profiles only." -ForegroundColor Green
@@ -1153,7 +1153,7 @@ function Set-UcsFirmwarePolicyForBatch {
 
     Write-Host "" -ForegroundColor Cyan
     Write-Host "UCS firmware policy verification after change for Batch ${BatchNumber}:" -ForegroundColor Cyan
-    $verificationRows | Select-Object Host,ServiceProfileDn,BeforePolicy,RequestedPolicy,AfterPolicy,Result | Format-Table -AutoSize
+    $verificationRows | Select-Object Host,ServiceProfileDn,BeforePolicy,RequestedPolicy,AfterPolicy,Result | Format-Table -AutoSize | Out-Host
 
     $proofTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $proofPath = Join-Path $RunDirectory "UCSM-Firmware-Policy-Verification-Batch-$BatchNumber-$proofTimestamp.csv"
@@ -1168,7 +1168,7 @@ function Set-UcsFirmwarePolicyForBatch {
     $failedVerification = @($verificationRows | Where-Object { $_.Result -ne "Verified" })
     if ($failedVerification.Count -gt 0) {
         Write-Host "WARNING: One or more service profiles did not verify with the requested target policy after the set command." -ForegroundColor Yellow
-        $failedVerification | Select-Object Host,ServiceProfileDn,BeforePolicy,RequestedPolicy,AfterPolicy,Result | Format-Table -AutoSize
+        $failedVerification | Select-Object Host,ServiceProfileDn,BeforePolicy,RequestedPolicy,AfterPolicy,Result | Format-Table -AutoSize | Out-Host
         if (-not (Test-StageNoAck)) {
             if ($Attempt -ge $MaxAttempts) {
                 Stop-WithMessage "Firmware policy verification still failing after $MaxAttempts attempts for Batch $BatchNumber. Resolve in UCSM before continuing."
@@ -1181,7 +1181,7 @@ function Set-UcsFirmwarePolicyForBatch {
 }
 
 function Get-UcsPendingRebootObjectsForBatch {
-    param([Parameter(Mandatory=$true)][array]$HostNames)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames)
     $pendingRows = New-Object System.Collections.ArrayList
 
     # Pending-ack objects are fetched once per UCSM domain for the whole batch instead of once per
@@ -1207,9 +1207,9 @@ function Get-UcsPendingRebootObjectsForBatch {
 }
 
 function Invoke-UcsPendingAckForBatch {
-    param([Parameter(Mandatory=$true)][array]$HostNames,[Parameter(Mandatory=$true)][string]$BatchNumber)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,[Parameter(Mandatory=$true)][string]$BatchNumber)
     $pendingRows = @(Get-UcsPendingRebootObjectsForBatch -HostNames $HostNames)
-    $pendingRows | Select-Object Host,UcsTarget,ServiceProfileDn,PendingAckFound,AckDn | Format-Table -AutoSize
+    $pendingRows | Select-Object Host,UcsTarget,ServiceProfileDn,PendingAckFound,AckDn | Format-Table -AutoSize | Out-Host
     if (Test-DryRun) { Write-Host "DRY RUN: Would acknowledge only listed current-batch UCSM pending objects." -ForegroundColor Green; return }
 
     # The typed ACK-BATCH-N gate that used to sit here has been removed so the run advances
@@ -1969,7 +1969,7 @@ function Initialize-IntersightRoutedHosts {
     }
 
     Write-Host "Intersight server profile mapping:" -ForegroundColor Cyan
-    $rows | Format-Table -AutoSize
+    $rows | Format-Table -AutoSize | Out-Host
     Add-SummaryRecord -Stage "IntersightMapping" -Batch "" -HostName "" -Action "Resolve server profiles" -Result "Completed" -Details "$($rows.Count) host(s) resolved and Intersight authenticated before any batch work."
 }
 
@@ -2137,7 +2137,7 @@ function Get-IntersightProfileDeployState {
 }
 
 function Get-IntersightPendingInconsistencyForBatch {
-    param([Parameter(Mandatory=$true)][array]$HostNames)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames)
     $rows = New-Object System.Collections.ArrayList
     foreach ($hostName in $HostNames) {
         $map = $Global:IntersightHostMap[$hostName]
@@ -2157,7 +2157,7 @@ function Get-IntersightPendingInconsistencyForBatch {
 }
 
 function Invoke-IntersightAcceptAndRebootImmediateForBatch {
-    param([Parameter(Mandatory=$true)][array]$HostNames,[Parameter(Mandatory=$true)][string]$BatchNumber)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,[Parameter(Mandatory=$true)][string]$BatchNumber)
 
     if ($HostNames.Count -eq 0) { return }
 
@@ -2252,8 +2252,68 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
 # vCenter workflow helpers
 # -----------------------------
 
+function Connect-VCenterServer {
+    <#
+    .SYNOPSIS
+        Loads PowerCLI and connects to vCenter, reporting a module load failure usefully.
+
+    .DESCRIPTION
+        Connect-VIServer auto-loads VMware.VimAutomation.Core, and when that load fails PowerShell
+        reports only "the command was found in the module ... but the module could not be loaded",
+        which names neither the reason nor the fix. The import is done explicitly here so the real
+        inner exception can be shown, along with the causes that actually produce it.
+
+        Also sets $global:vCenterConnected only after the connection succeeds. Recording the name
+        before connecting meant a failed connect left the cleanup trying to disconnect a session
+        that was never established.
+
+    .PARAMETER Server
+        vCenter FQDN or IP.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Server)
+
+    try {
+        Import-Module VMware.VimAutomation.Core -ErrorAction Stop
+    }
+    catch {
+        Write-Host "" -ForegroundColor Red
+        Write-Host "VMware PowerCLI (VMware.VimAutomation.Core) could not be loaded." -ForegroundColor Red
+        Write-Host "Underlying error:" -ForegroundColor Red
+        Write-Host (Get-ExceptionDetail -ErrorRecord $_) -ForegroundColor Gray
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Usual causes, most common first:" -ForegroundColor Yellow
+        Write-Host "  1. Module files still carry the blocked flag, typical after an offline or" -ForegroundColor Yellow
+        Write-Host "     share-based install. Unblock them:" -ForegroundColor Yellow
+        Write-Host "       Get-ChildItem -Path (Split-Path (Get-Module -ListAvailable VMware.VimAutomation.Core | Select-Object -First 1).ModuleBase -Parent) -Recurse | Unblock-File" -ForegroundColor Gray
+        Write-Host "  2. PowerCLI version too old for this PowerShell. 12.3.0 and newer support" -ForegroundColor Yellow
+        Write-Host "     PowerShell 7.x; older builds are Windows PowerShell only. You are on" -ForegroundColor Yellow
+        Write-Host "     $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)." -ForegroundColor Yellow
+        Write-Host "  3. Read-only or restrictive permissions on the module folder." -ForegroundColor Yellow
+        Write-Host "  4. Group Policy requiring signed modules." -ForegroundColor Yellow
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Run this on its own to see the failure directly:" -ForegroundColor Yellow
+        Write-Host "  Import-Module VMware.VimAutomation.Core -Verbose" -ForegroundColor Gray
+        Add-SummaryRecord -Stage "vCenterConnect" -Batch "" -HostName "" -Action "Load PowerCLI" -Result "Failed" -Details $_.Exception.Message
+        Stop-WithMessage "VMware PowerCLI could not be loaded, so vCenter cannot be contacted."
+    }
+
+    Write-Host "Connecting to vCenter: $Server" -ForegroundColor Cyan
+    try {
+        Connect-VIServer -Server $Server -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Add-SummaryRecord -Stage "vCenterConnect" -Batch "" -HostName "" -Action "Connect" -Result "Failed" -Details $_.Exception.Message
+        Write-Host "Could not connect to vCenter '$Server': $($_.Exception.Message)" -ForegroundColor Red
+        Stop-WithMessage "vCenter connection failed."
+    }
+
+    # Only now is there something to disconnect.
+    $global:vCenterConnected = $true
+    Write-Host "Connected to vCenter." -ForegroundColor Green
+}
+
 function Select-ClusterInteractive {
-    param([Parameter(Mandatory=$true)][array]$Clusters)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Clusters)
     try {
         $selectedCluster = $Clusters | Select-Object Name | Out-GridView -Title "Select vCenter Cluster" -PassThru
         if ($null -ne $selectedCluster -and $selectedCluster.Name) { return ($Clusters | Where-Object { $_.Name -eq $selectedCluster.Name } | Select-Object -First 1) }
@@ -2532,7 +2592,7 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
         return the host through the same Maintenance mode cycle.
     #>
     param(
-        [Parameter(Mandatory=$true)][array]$HostNames,
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,
         [Parameter(Mandatory=$true)][string]$BatchNumber
     )
 
@@ -2597,7 +2657,7 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
 }
 
 function Invoke-RebootSafetyWindow {
-    param([int]$TimeoutSeconds=90,[Parameter(Mandatory=$true)][array]$HostNames,[Parameter(Mandatory=$true)][string]$BatchNumber)
+    param([int]$TimeoutSeconds=90,[Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,[Parameter(Mandatory=$true)][string]$BatchNumber)
     Write-Host "`nBATCH REBOOT SAFETY CHECK: Batch $BatchNumber reboot/action starts in $TimeoutSeconds seconds." -ForegroundColor Yellow
     Write-Host "Press C to continue immediately, E to exit safely, or wait for auto-continue." -ForegroundColor Cyan
     $endTime = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -2611,7 +2671,7 @@ function Invoke-RebootSafetyWindow {
 }
 
 function Move-PoweredOffAndSuspendedVMsForBatch {
-    param([Parameter(Mandatory=$true)][array]$CurrentBatchNames,[Parameter(Mandatory=$true)]$Cluster)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$CurrentBatchNames,[Parameter(Mandatory=$true)]$Cluster)
     if ((Test-DryRun) -or (Test-StageNoAck)) { Write-Host "DRY/STAGE: Would move powered-off/suspended VMs from batch hosts where applicable." -ForegroundColor Green; return $true }
     $destinationHosts = @(Get-VMHost -Location $Cluster | Where-Object { $_.ConnectionState -eq "Connected" -and ($CurrentBatchNames -notcontains $_.Name) })
     if ($destinationHosts.Count -eq 0) { Stop-WithMessage "No connected non-batch destination hosts available for powered-off/suspended VM movement." }
@@ -2646,7 +2706,7 @@ function Request-MaintenanceModeForBatch {
     .PARAMETER HostNames
         The hosts making up the current batch.
     #>
-    param([Parameter(Mandatory=$true)][array]$HostNames)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames)
 
     if ((Test-DryRun) -or (Test-StageNoAck)) { Write-Host "DRY/STAGE: Would request Maintenance mode for $($HostNames -join ', ')." -ForegroundColor Green; return }
 
@@ -2663,7 +2723,7 @@ function Request-MaintenanceModeForBatch {
 }
 
 function Wait-BatchMaintenanceMode {
-    param([Parameter(Mandatory=$true)][array]$HostNames,[int]$TimeoutMinutes=60)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,[int]$TimeoutMinutes=60)
     if ((Test-DryRun) -or (Test-StageNoAck)) { return @(foreach ($name in $HostNames) { Get-VMHost -Name $name -ErrorAction SilentlyContinue }) }
     $timeout = (Get-Date).AddMinutes($TimeoutMinutes)
     do {
@@ -2676,12 +2736,12 @@ function Wait-BatchMaintenanceMode {
 }
 
 function Get-BatchConnectionStateSummary {
-    param([Parameter(Mandatory=$true)][array]$HostNames)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames)
     return @(foreach ($hostName in $HostNames) { $h = Get-VMHost -Name $hostName -ErrorAction SilentlyContinue; if($h){[pscustomobject]@{Host=$h.Name;Found=$true;ConnectionState=[string]$h.ConnectionState;PowerState=[string]$h.PowerState;Build=$h.Build}}else{[pscustomobject]@{Host=$hostName;Found=$false;ConnectionState="NotFound";PowerState="Unknown";Build=""}} })
 }
 
 function Wait-BatchReconnectAfterReboot {
-    param([Parameter(Mandatory=$true)][array]$HostNames,[int]$InitialWaitMinutes,[string]$ModeLabel)
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,[int]$InitialWaitMinutes,[string]$ModeLabel)
     if ((Test-DryRun) -or (Test-StageNoAck)) { return (Get-BatchConnectionStateSummary -HostNames $HostNames) }
     Write-Host "$ModeLabel initial wait: $InitialWaitMinutes minutes. Press R to recheck early, E to exit." -ForegroundColor Yellow
     $endTime = (Get-Date).AddMinutes($InitialWaitMinutes)
@@ -2693,7 +2753,7 @@ function Wait-BatchReconnectAfterReboot {
     }
     do {
         $summary = Get-BatchConnectionStateSummary -HostNames $HostNames
-        $summary | Format-Table -AutoSize
+        $summary | Format-Table -AutoSize | Out-Host
         $bad = @($summary | Where-Object { $_.ConnectionState -ne "Connected" -and $_.ConnectionState -ne "Maintenance" })
         if ($bad.Count -eq 0) { return $summary }
         $choice = Read-ChoiceExit -Message "Reconnect incomplete. Choose RECHECK, OVERRIDE, or STOP" -AllowedChoices @("RECHECK","OVERRIDE","STOP")
@@ -2831,7 +2891,7 @@ function Invoke-ClusterUpgradeWorkflow {
             $currentBatchIntersightNames = @($currentBatchNames | Where-Object { $Global:IntersightHostMap.ContainsKey($_) })
             if ($currentBatchUcsNames.Count -gt 0) {
                 Set-UcsFirmwarePolicyForBatch -HostNames $currentBatchUcsNames -BatchNumber $batchNumber
-                Get-UcsPendingRebootObjectsForBatch -HostNames $currentBatchUcsNames | Select-Object Host,UcsTarget,ServiceProfileDn,PendingAckFound,AckDn | Format-Table -AutoSize
+                Get-UcsPendingRebootObjectsForBatch -HostNames $currentBatchUcsNames | Select-Object Host,UcsTarget,ServiceProfileDn,PendingAckFound,AckDn | Format-Table -AutoSize | Out-Host
             }
             if ($currentBatchIntersightNames.Count -gt 0) {
                 # STAGE_NO_ACK never acknowledges/reboots - see the Test-StageNoAck branch inside
@@ -2950,6 +3010,7 @@ function Invoke-ClusterUpgradeWorkflow {
 # -----------------------------
 
 $global:vCenter = $null
+$global:vCenterConnected = $false
 $continueScript = $true
 try {
     Write-Host "" -ForegroundColor Cyan
@@ -2963,9 +3024,7 @@ try {
         if (-not $global:vCenter) {
             $vCenterInput = Read-Host "Enter vCenter FQDN or IP, or press Enter to use $DefaultVCenter"
             if ($vCenterInput -eq "") { $global:vCenter = $DefaultVCenter } else { $global:vCenter = $vCenterInput }
-            Write-Host "Connecting to vCenter: $global:vCenter" -ForegroundColor Cyan
-            Connect-VIServer -Server $global:vCenter -ErrorAction Stop | Out-Null
-            Write-Host "Connected to vCenter." -ForegroundColor Green
+            Connect-VCenterServer -Server $global:vCenter
         }
         $clusters = @(Get-Cluster | Sort-Object Name)
         if ($clusters.Count -eq 0) { Stop-WithMessage "No clusters found in vCenter." }
@@ -2976,7 +3035,10 @@ try {
         Write-Host "  1. Select another cluster in the same vCenter`n  2. Connect to a different vCenter`n  3. Exit script" -ForegroundColor Yellow
         $next = Read-ChoiceExit -Message "Select next action" -AllowedChoices @("1","2","3") -ExitMessage "Stopped at Step 27."
         if ($next -eq "1") { continue }
-        if ($next -eq "2") { try { Disconnect-VIServer -Server $global:vCenter -Confirm:$false | Out-Null } catch {}; $global:vCenter = $null; continue }
+        if ($next -eq "2") {
+            if ($global:vCenterConnected) { try { Disconnect-VIServer -Server $global:vCenter -Confirm:$false | Out-Null } catch {} }
+            $global:vCenter = $null; $global:vCenterConnected = $false; continue
+        }
         if ($next -eq "3") { $continueScript = $false }
     }
 } catch {
@@ -2996,5 +3058,7 @@ try {
     $Global:IntersightSession = $null
     $Global:IntersightApiKeyId = ""
     $Global:IntersightApiKeyFilePath = ""
-    try { if ($global:vCenter) { Disconnect-VIServer -Server $global:vCenter -Confirm:$false | Out-Null; Write-Host "Disconnected from vCenter." -ForegroundColor Green } } catch { Write-Host "Could not disconnect cleanly from vCenter." -ForegroundColor Yellow }
+    # Only if a connection was actually established - otherwise this reports a confusing
+    # "Could not find VIServer" on top of whatever really went wrong.
+    try { if ($global:vCenterConnected) { Disconnect-VIServer -Server $global:vCenter -Confirm:$false | Out-Null; Write-Host "Disconnected from vCenter." -ForegroundColor Green } } catch { Write-Host "Could not disconnect cleanly from vCenter." -ForegroundColor Yellow }
 }
