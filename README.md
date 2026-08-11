@@ -143,6 +143,8 @@ They are independent, so any one can be run on its own:
 | `Test-PreAuthVariantParity.ps1` | The two builds have not drifted apart |
 | `Test-PreAuthSessionGuard.ps1` | Intersight is configured exactly once per session |
 | `Test-ComplianceGate.ps1` | The host profile gate: settle, the four status routes, C/O/E |
+| `Test-MaintenanceModeEntry.ps1` | Hosts evacuate one at a time, in cluster order |
+| `Test-IntersightRebootActivate.ps1` | Reboot-to-activate is sent, and confirmed accepted |
 | `Test-UcsFabricFamily.ps1` | FI family detection and the firmware package it selects |
 | `Test-BatchSizingAndCompliance.ps1` | Capacity-based batch sizing, compliance result parsing |
 | `Test-IntersightNameMatching.ps1` | CSV name matching across -A/-B, FQDN and short forms |

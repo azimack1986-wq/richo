@@ -12,6 +12,53 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [20.1.0] — 2026-08-11
+
+#### Fixed
+
+- **AUTO mode never got its hosts into Maintenance mode.** Every host in the
+  batch was requested at once, on the theory that DRS would exclude all of them
+  from placement so each VM moved once. On a live cluster it did the opposite:
+  the capacity available to receive the VMs was shrinking at the same time as
+  the VMs needed placing, so migrations ran continuously and no host arrived.
+  Hosts now enter **one at a time, in cluster list order** — each requested,
+  then waited for, before the next is asked. A host that will not evacuate
+  within `$MaintenanceValidationTimeoutMinutes` stops the run naming it, with
+  the rest of the batch untouched rather than stacking a second stuck
+  evacuation on the first. SINGLE mode is a batch of one, so it is byte-for-byte
+  the behaviour it already had.
+
+#### Added
+
+- **Reboot Immediately to Activate on every Intersight deploy**
+  (`$Global:IntersightRebootImmediatelyToActivate`, on by default). Without it
+  the firmware stages against the profile and nothing restarts.
+  Cisco does not publish the identifier that carries it — `PolicyActionParam`
+  takes free-form `Name`/`Value` strings and neither the SDK reference nor the
+  API schema enumerates them — so it is set in one place
+  (`$Global:IntersightRebootActionParamName` / `...Value`) and printed in full
+  with every deploy.
+- `Confirm-IntersightDeployAccepted`, because that identifier is **not trusted**.
+  A wrong one is either rejected — which throws, and the run stops — or silently
+  ignored, in which case the Deploy is accepted, the firmware stages, nothing
+  reboots, and the run waits out its whole post-reboot window before reporting
+  the batch complete. The profile is now re-read after each deploy and the run
+  stops if it is still sitting in a staged state, naming the setting to correct.
+
+#### Added — tests
+
+- `tests/Test-MaintenanceModeEntry.ps1` — 20 assertions. The one that matters
+  records the state of the whole batch at the moment each request is issued: no
+  request may go out while another host is still entering. The old design passes
+  "every host ended in Maintenance mode" against a stub, so that assertion alone
+  proves nothing.
+- `tests/Test-IntersightRebootActivate.ps1` — 18 assertions, centred on the
+  silently-ignored case: a profile still staged after the deploy stops the run,
+  for every actionable `ConfigState`, and the acknowledgement is asserted to be
+  on by default.
+- The workflow simulation asserts every deploy carried the acknowledgement and
+  that each was confirmed accepted rather than assumed.
+
 ### [20.0.0] — 2026-08-11
 
 Two changes to what the run touches and what stops it. Both narrow the script's
@@ -1002,6 +1049,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [20.1.0-preauth] — 2026-08-11
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 20.1.0 — hosts enter
+Maintenance mode one at a time in cluster order, and every Intersight deploy
+carries Reboot Immediately to Activate. This is the build to run.
 
 ### [20.0.0-preauth] — 2026-08-11
 

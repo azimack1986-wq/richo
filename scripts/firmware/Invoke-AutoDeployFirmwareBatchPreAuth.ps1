@@ -71,7 +71,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 20.0.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 20.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 20.1.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 20.1.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -87,6 +87,23 @@
       answer: skipped for an on-prem PVA, enforced for intersight.com.
     - DRYRUN is the default.
     - UCSM acknowledgement and Intersight accept/reboot are each scoped to their own batch hosts only.
+    - REBOOT IMMEDIATELY TO ACTIVATE is sent with every Intersight deploy
+      ($Global:IntersightRebootImmediatelyToActivate, on by default). Without it the firmware
+      stages and nothing restarts. Cisco does not publish the identifier that carries it -
+      PolicyActionParam takes free-form Name and Value strings and neither the SDK reference nor
+      the API schema enumerates them - so it is set in one place
+      ($Global:IntersightRebootActionParamName / ...Value), printed in full with every deploy, and
+      NOT trusted: Confirm-IntersightDeployAccepted re-reads the profile afterwards and stops the
+      run if it is still sitting in its staged state, rather than waiting out a post-reboot window
+      for a restart that was never scheduled. Correct that pair if your appliance names it
+      differently.
+    - Maintenance mode is entered ONE HOST AT A TIME, in cluster list order - first hosts in the
+      cluster first, working through. Each host is requested and then waited for before the next is
+      asked. Requesting a whole batch at once was tried and does not work: the capacity available to
+      receive the VMs shrinks at the same time as the VMs need placing, so migrations run
+      continuously and no host arrives. A host that will not evacuate within
+      $MaintenanceValidationTimeoutMinutes stops the run, naming it, with the rest of the batch
+      untouched. SINGLE mode is a batch of one, so its behaviour is unchanged.
     - Batch mode is AUTO (sized from live cluster capacity, capped at $MaxAbsoluteBatchSize) or
       SINGLE (one host at a time). There is no free-text batch size.
     - ONLY BLADES WITH CHANGES STAGED ARE IN SCOPE. Before anything is evacuated, every
@@ -232,7 +249,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "20.0.0-preauth"
+$ScriptVersion = "20.1.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -274,12 +291,29 @@ $IntersightCsvPath = "C:\temp\intersightfabric.csv"
 $Global:IntersightBaseUrl = if ($IntersightServer) { "https://$IntersightServer" } else { "" }
 # Set automatically from the entered address: on for an on-prem PVA, off for intersight.com.
 
-# Extra PolicyActionParam name/value pairs sent with the server profile Deploy, as
-# @{ Name = '...'; Value = '...' } entries. Empty by default: the parameter names that carry a
-# reboot acknowledgement are not published in the SDK reference, and guessing at the name of a
-# parameter whose job is to authorise a disruptive reboot is not a safe default. Populate this
-# once confirmed against your appliance rather than editing the deploy call.
+# REBOOT IMMEDIATELY TO ACTIVATE.
+# Intersight stages a firmware change against the server profile and does not activate it until the
+# server reboots. Without this acknowledgement the deploy is accepted, nothing restarts, and the run
+# then waits out its post-reboot window for a reboot that was never going to happen.
+$Global:IntersightRebootImmediatelyToActivate = $true
+
+# The action parameter that carries it. Cisco does not publish the identifier - PolicyActionParam
+# takes free-form Name and Value strings and neither the SDK reference nor the API schema
+# enumerates them - so THIS IS THE PAIR TO CORRECT if your appliance names it differently.
+# It is not left to chance: the exact pair is printed with every deploy, a rejection stops the run
+# naming this setting, and Confirm-IntersightDeployAccepted re-reads the profile afterwards, so an
+# identifier that is silently ignored is caught rather than assumed to have worked.
+$Global:IntersightRebootActionParamName  = 'RebootImmediatelyToActivate'
+$Global:IntersightRebootActionParamValue = 'true'
+
+# Any FURTHER PolicyActionParam name/value pairs to send with the Deploy, as
+# @{ Name = '...'; Value = '...' } entries. Empty by default - the reboot acknowledgement above is
+# sent separately and does not need an entry here.
 $Global:IntersightDeployActionParams = @()
+
+# How long to wait for a deployed profile to leave its staged state before deciding the deploy was
+# not really accepted. Seconds, because this is an acceptance check and not the upgrade itself.
+$Global:IntersightDeployAcceptedTimeoutSeconds = 180
 $Global:IntersightSession = $null
 $Global:IntersightServerList = @{}
 $Global:IntersightHostMap = @{}
@@ -1987,6 +2021,93 @@ function Get-IntersightPendingInconsistencyForBatch {
     return @($rows)
 }
 
+function Confirm-IntersightDeployAccepted {
+    <#
+    .SYNOPSIS
+        Re-reads a server profile after a Deploy to confirm the appliance actually took it.
+
+    .DESCRIPTION
+        The reboot acknowledgement is sent as a PolicyActionParam whose identifier Cisco does not
+        publish. A wrong identifier has two possible outcomes and only one of them is loud: the
+        appliance either rejects the call - which throws, and the caller stops - or it ignores the
+        parameter, accepts the Deploy, and leaves the firmware staged with nothing rebooting. The
+        second is the dangerous one. The run would then sit out its whole post-reboot window
+        waiting for a restart that was never scheduled, and report the batch as done.
+
+        So the deploy is not trusted on the strength of the call returning. The profile is re-read
+        until it leaves the state it was staged in - Pending-changes, Inconsistent and the rest of
+        $Global:IntersightActionableConfigStates - which is the appliance confirming it has picked
+        the change up. If it is still sitting there when the window closes, the run stops and names
+        the setting to correct.
+
+        This is deliberately a short window. It is checking that the deploy was ACCEPTED, not that
+        the upgrade finished - the reconnect wait covers the upgrade.
+
+    .PARAMETER Row
+        The row for this host from Get-IntersightPendingInconsistencyForBatch.
+
+    .PARAMETER BatchNumber
+        The batch, for the summary record.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Row,
+        [Parameter(Mandatory=$true)][string]$BatchNumber
+    )
+
+    $timeoutSeconds = [int]$Global:IntersightDeployAcceptedTimeoutSeconds
+    if ($timeoutSeconds -le 0) { return }
+
+    Write-Host "  Confirming the appliance accepted the deploy for '$($Row.ServerProfile)'..." -ForegroundColor Gray
+
+    $endTime = (Get-Date).AddSeconds($timeoutSeconds)
+    $lastState = $Row.ConfigState
+
+    while ((Get-Date) -lt $endTime) {
+        Start-Sleep -Seconds 15
+
+        # By Moid where there is one - it identifies the profile exactly - falling back to the name
+        # so a profile the mapping resolved without a Moid is still re-read rather than skipped.
+        $current = $null
+        try {
+            if (-not [string]::IsNullOrWhiteSpace([string]$Row.ProfileMoid)) {
+                # Through Get-IntersightResultList like every other query. A Moid lookup usually
+                # returns the object itself rather than a page, but "usually" is what produced the
+                # null-Moid bug this helper exists to prevent, and it handles both shapes.
+                $current = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $Row.ProfileMoid -ErrorAction Stop) | Select-Object -First 1
+            }
+            else {
+                $current = Get-IntersightServerProfileByName -Name $Row.ServerProfile
+            }
+        }
+        catch { }
+        if ($null -eq $current) { continue }
+
+        $state = Get-IntersightProfileDeployState -ServerProfile $current
+        if (-not $state.StateKnown) { continue }
+        $lastState = $state.ConfigState
+
+        if (-not $state.RequiresDeploy) {
+            Write-Host "  Accepted - '$($Row.ServerProfile)' is now $($state.ConfigState)." -ForegroundColor Green
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm deploy accepted" -Result "Accepted" -Details "ConfigState moved from $($Row.ConfigState) to $($state.ConfigState)."
+            return
+        }
+    }
+
+    Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm deploy accepted" -Result "NotAccepted" -Details "Still $lastState after $timeoutSeconds second(s); the reboot acknowledgement was probably not accepted."
+
+    Write-Host "" -ForegroundColor Yellow
+    Write-Host "'$($Row.ServerProfile)' is still $lastState $timeoutSeconds second(s) after the deploy was sent." -ForegroundColor Yellow
+    Write-Host "The appliance took the call but has not picked the change up, which is what happens when" -ForegroundColor Yellow
+    Write-Host "the reboot acknowledgement is not recognised: the firmware stages and nothing restarts." -ForegroundColor Yellow
+    Write-Host "Check the action parameter identifier this run is sending:" -ForegroundColor Yellow
+    Write-Host "  `$Global:IntersightRebootActionParamName  = '$Global:IntersightRebootActionParamName'" -ForegroundColor Gray
+    Write-Host "  `$Global:IntersightRebootActionParamValue = '$Global:IntersightRebootActionParamValue'" -ForegroundColor Gray
+    Write-Host "Deploy this profile once from the Intersight GUI with Reboot Immediately to Activate" -ForegroundColor Yellow
+    Write-Host "ticked, and correct the pair above to match what the appliance expects." -ForegroundColor Yellow
+
+    Stop-WithMessage "Intersight accepted the Deploy for '$($Row.ServerProfile)' but the profile is still $lastState, so nothing is rebooting. Stopping rather than waiting out a post-reboot window for a restart that was not scheduled."
+}
+
 function Invoke-IntersightAcceptAndRebootImmediateForBatch {
     param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,[Parameter(Mandatory=$true)][string]$BatchNumber)
 
@@ -2050,28 +2171,38 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             # not the server.Profile that was being passed. It would never have worked as written.
             #
             # Set-IntersightServerProfile -Action accepts only Deploy and Unassign; Activate was
-            # withdrawn from the SDK. Any extra acknowledgement travels as ActionParams, which stay
-            # empty unless configured - see $Global:IntersightDeployActionParams.
+            # withdrawn from the SDK. The reboot acknowledgement travels as an ActionParam - see
+            # $Global:IntersightRebootImmediatelyToActivate.
             $deployParams = @{
                 Moid        = $row.ProfileMoid
                 Action      = 'Deploy'
                 ErrorAction = 'Stop'
             }
 
-            if ($Global:IntersightDeployActionParams.Count -gt 0) {
-                $actionParams = @(
-                    $Global:IntersightDeployActionParams | ForEach-Object {
-                        Initialize-IntersightPolicyActionParam -Name $_.Name -Value $_.Value
-                    }
-                )
-                $deployParams['ActionParams'] = $actionParams
-                Write-Host "  With ActionParams: $((($Global:IntersightDeployActionParams | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '))" -ForegroundColor DarkGray
+            $requestedPairs = @()
+            if ($Global:IntersightRebootImmediatelyToActivate) {
+                $requestedPairs += [pscustomobject]@{ Name = $Global:IntersightRebootActionParamName; Value = $Global:IntersightRebootActionParamValue }
+            }
+            foreach ($extra in $Global:IntersightDeployActionParams) {
+                $requestedPairs += [pscustomobject]@{ Name = $extra.Name; Value = $extra.Value }
+            }
+
+            if ($requestedPairs.Count -gt 0) {
+                $deployParams['ActionParams'] = @($requestedPairs | ForEach-Object { Initialize-IntersightPolicyActionParam -Name $_.Name -Value $_.Value })
+                # Printed in full every time. The identifier is not published, so the log has to show
+                # exactly what was sent for anyone reconciling this against the appliance afterwards.
+                Write-Host "  ActionParams: $((($requestedPairs | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '))" -ForegroundColor DarkGray
+            }
+            else {
+                Write-Host "  No reboot acknowledgement is being sent. The firmware will stage but not activate until this blade is rebooted by hand." -ForegroundColor Yellow
             }
 
             Set-IntersightServerProfile @deployParams | Out-Null
 
             $Global:BatchActionsSent++
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Sent" -Details "ServerProfile=$($row.ServerProfile); ConfigState was $($row.ConfigState); Set-IntersightServerProfile -Action Deploy sent."
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Sent" -Details "ServerProfile=$($row.ServerProfile); ConfigState was $($row.ConfigState); ActionParams=$((($requestedPairs | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '))."
+
+            Confirm-IntersightDeployAccepted -Row $row -BatchNumber $BatchNumber
         } catch {
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Failed" -Details $_.Exception.Message
             Stop-WithMessage "Intersight server profile deploy failed for '$($row.Host)': $($_.Exception.Message)"
@@ -2935,49 +3066,103 @@ function Move-PoweredOffAndSuspendedVMsForBatch {
     return $true
 }
 
+function Wait-VMHostInMaintenance {
+    <#
+    .SYNOPSIS
+        Waits for one host to reach Maintenance mode. Returns $true if it does.
+
+    .DESCRIPTION
+        Polls rather than holding a request open. A blocking Set-VMHost keeps one HTTP request
+        alive for the whole evacuation, and PowerCLI's WebOperationTimeoutSeconds ceiling is
+        shorter than a production host takes, so the request is torn down mid-evacuation and
+        surfaces as "An error occurred while sending the request" with the host left partway in.
+
+        Returns $false on timeout rather than throwing, so the caller decides what a host that will
+        not evacuate means.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$HostName,
+        [int]$TimeoutMinutes = 60
+    )
+
+    $endTime = (Get-Date).AddMinutes($TimeoutMinutes)
+    while ((Get-Date) -lt $endTime) {
+        $current = $null
+        try { $current = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue } catch {}
+        if ($null -ne $current -and $current.ConnectionState -eq "Maintenance") { return $true }
+        Write-Host "    still evacuating '$HostName'..." -ForegroundColor Gray
+        Start-Sleep -Seconds 30
+    }
+    return $false
+}
+
 function Request-MaintenanceModeForBatch {
     <#
     .SYNOPSIS
-        Puts every host in the batch into Maintenance mode with evacuation.
+        Puts the batch into Maintenance mode ONE HOST AT A TIME, in cluster order.
 
     .DESCRIPTION
-        How the request is issued follows from the batch size, so there is nothing to choose:
+        Each host is requested, then waited for, before the next is asked. Only when it has
+        actually reached Maintenance mode does the run move to the host after it.
 
-          One host   - a single blocking call. There is no second host to overlap with.
-          Many hosts - all requested with -RunAsync, then Wait-BatchMaintenanceMode polls until
-                       the whole batch has arrived.
+        This reverses an earlier design that requested the whole batch at once on the theory that
+        DRS would exclude every one of them from placement and each VM would move once. On a live
+        cluster it did not behave that way: with several hosts entering maintenance together, the
+        capacity available to receive their VMs was shrinking at the same time as the VMs needed
+        placing. The result was continuous migration and no host ever arriving - exactly what a
+        multi-host batch is supposed to avoid. One at a time, every VM has the whole rest of the
+        cluster to land on, and the host completes.
 
-        Issuing a multi-host batch asynchronously is not only faster, it is more correct. A
-        blocking call per host evacuates them one at a time, and DRS is free to place VMs onto a
-        host later in the same batch - which then has to evacuate them again. Requesting the whole
-        batch up front puts every one of them into "entering maintenance" together, so DRS
-        excludes all of them from placement and each VM moves once.
+        Order is the cluster list order the batch was built in - the first hosts in the cluster
+        first, working through - so the sequence is predictable and repeatable rather than
+        whichever host DRS happened to finish first.
+
+        SINGLE mode is a batch of one, so this is exactly what it already did: one request, then
+        poll. Its behaviour is unchanged.
+
+        A host that will not reach Maintenance mode within $MaintenanceValidationTimeoutMinutes
+        stops the run, naming that host. The rest of the batch is left untouched rather than
+        stacking a second stuck evacuation on top of the first.
 
     .PARAMETER HostNames
-        The hosts making up the current batch.
+        The hosts making up the current batch, in the order they should be evacuated.
     #>
     param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames)
 
-    if ((Test-DryRun) -or (Test-StageNoAck)) { Write-Host "DRY/STAGE: Would request Maintenance mode for $($HostNames -join ', ')." -ForegroundColor Green; return }
+    if ((Test-DryRun) -or (Test-StageNoAck)) { Write-Host "DRY/STAGE: Would request Maintenance mode, one at a time, for $($HostNames -join ', ')." -ForegroundColor Green; return }
 
-    Write-Host "Requesting Maintenance mode with evacuation for $($HostNames.Count) host(s)." -ForegroundColor Cyan
+    Write-Host "Entering Maintenance mode one host at a time, in cluster order: $($HostNames -join ', ')" -ForegroundColor Cyan
 
+    $position = 0
     foreach ($hostName in $HostNames) {
+        $position++
         $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
-        if ($hostObj.ConnectionState -eq "Connected") {
-            # ALWAYS -RunAsync, including for a single host.
-            #
-            # A blocking Set-VMHost holds one HTTP request open for the whole evacuation. PowerCLI's
-            # WebOperationTimeoutSeconds defaults to 300, and evacuating a production host takes
-            # longer than five minutes, so the request is torn down mid-evacuation and surfaces as
-            # "An error occurred while sending the request" - with the host left partway into
-            # maintenance. Issuing the task and polling for the result has no such ceiling, and
-            # Wait-BatchMaintenanceMode already does exactly that.
-            Set-VMHost -VMHost $hostObj -State Maintenance -Evacuate -RunAsync -Confirm:$false -ErrorAction Stop | Out-Null
+
+        if ($hostObj.ConnectionState -eq "Maintenance") {
+            Write-Host "  [$position of $($HostNames.Count)] '$hostName' is already in Maintenance mode." -ForegroundColor Green
+            Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "AlreadyIn" -Details "Host was already in Maintenance mode."
+            continue
         }
+
+        if ($hostObj.ConnectionState -ne "Connected") {
+            Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "Failed" -Details "ConnectionState was $($hostObj.ConnectionState)."
+            Stop-WithMessage "'$hostName' is $($hostObj.ConnectionState), not Connected, so it cannot be evacuated. Resolve in vCenter before continuing."
+        }
+
+        Write-Host "  [$position of $($HostNames.Count)] Requesting Maintenance mode with evacuation for '$hostName'." -ForegroundColor Cyan
+        # -RunAsync and then poll: see Wait-VMHostInMaintenance for why a blocking call fails.
+        Set-VMHost -VMHost $hostObj -State Maintenance -Evacuate -RunAsync -Confirm:$false -ErrorAction Stop | Out-Null
+
+        if (-not (Wait-VMHostInMaintenance -HostName $hostName -TimeoutMinutes $MaintenanceValidationTimeoutMinutes)) {
+            Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "Timeout" -Details "Did not reach Maintenance mode within $MaintenanceValidationTimeoutMinutes minute(s)."
+            Stop-WithMessage "'$hostName' did not reach Maintenance mode within $MaintenanceValidationTimeoutMinutes minute(s). The rest of this batch has not been touched. Check DRS, VM affinity rules, and VMs that cannot be migrated (attached media, no shared storage) in vCenter."
+        }
+
+        Write-Host "  [$position of $($HostNames.Count)] '$hostName' is in Maintenance mode." -ForegroundColor Green
+        Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "Entered" -Details "Evacuated and in Maintenance mode."
     }
 
-    Write-Host "Maintenance mode requested. Waiting for evacuation to complete - this is polled, not held open." -ForegroundColor Cyan
+    Write-Host "All $($HostNames.Count) host(s) in this batch are in Maintenance mode." -ForegroundColor Green
 }
 
 function Wait-BatchMaintenanceMode {
@@ -3413,6 +3598,9 @@ function Invoke-ClusterUpgradeWorkflow {
             $batchSize = [Math]::Min($pendingHosts.Count, [int]$MaxAbsoluteBatchSize)
         }
 
+        # Cluster list order, first hosts first. $pendingHosts was built from the cluster's hosts
+        # sorted by name, and taking from the front keeps each batch - and the order hosts are
+        # evacuated within it - predictable and repeatable rather than whatever DRS finishes first.
         $currentBatchNames = @($pendingHosts | Select-Object -First $batchSize)
         $Global:BatchActionsSent = 0
         Write-Host "`nBATCH ${batchNumber} ($batchMode, $($currentBatchNames.Count) host(s)): $($currentBatchNames -join ', ')" -ForegroundColor Cyan

@@ -94,6 +94,10 @@ $Global:IntersightProfileCache          = @{}
 $Global:IntersightUpgradeSurfaceChecked = $false
 $Global:IntersightDeployActionParams    = @()
 $Global:IntersightActionableConfigStates = @('Pending-changes','Inconsistent','Out-of-sync','Not-deployed')
+$Global:IntersightRebootImmediatelyToActivate = $true
+$Global:IntersightRebootActionParamName       = 'RebootImmediatelyToActivate'
+$Global:IntersightRebootActionParamValue      = 'true'
+$Global:IntersightDeployAcceptedTimeoutSeconds = 5
 $Global:EsxiDiscoveryCache              = @{}
 $Global:UcsFirmwarePolicyByTarget       = @{}
 $Global:AllowUcsFirmwarePolicyCreation  = $true
@@ -247,8 +251,10 @@ function Get-IntersightServerProfile {
         })
     }
 }
+$script:DeployActionParams = New-Object System.Collections.Generic.List[string]
 function Set-IntersightServerProfile { param($Moid,$Action,$ActionParams,$ErrorAction)
     Note-Call 'Set-IntersightServerProfile'
+    foreach ($ap in @($ActionParams)) { if ($ap) { $script:DeployActionParams.Add("$($ap.Name)=$($ap.Value)") } }
     if ($Moid) { [void]$script:IntersightDeployed.Add([string]$Moid) }
 }
 function Initialize-IntersightPolicyActionParam { param($Name,$Value) return [pscustomobject]@{ Name=$Name; Value=$Value } }
@@ -311,6 +317,7 @@ function Reset-Simulation {
     $script:UcsPolicyState = @{}
     $script:UcsAcked = New-Object System.Collections.Generic.HashSet[string]
     $script:IntersightDeployed = New-Object System.Collections.Generic.HashSet[string]
+    $script:DeployActionParams = New-Object System.Collections.Generic.List[string]
 }
 
 Write-Host "`n=== The script loads ===" -ForegroundColor Cyan
@@ -407,6 +414,10 @@ Write-Host "`n=== The firmware actions actually fired ===" -ForegroundColor Cyan
 Assert-True "UCS service profiles were updated" ($script:Calls.ContainsKey('Set-UcsServiceProfile'))
 Assert-True "Intersight profiles were deployed" ($script:Calls.ContainsKey('Set-IntersightServerProfile'))
 Assert-True "the deploy ran for both Intersight hosts" ($script:Calls['Set-IntersightServerProfile'] -eq 2) "got $($script:Calls['Set-IntersightServerProfile'])"
+# Without the reboot acknowledgement the firmware stages and nothing restarts, and the run then
+# waits out its whole post-reboot window for a reboot that was never scheduled.
+Assert-True "every deploy carried the reboot acknowledgement" (@($script:DeployActionParams | Where-Object { $_ -eq 'RebootImmediatelyToActivate=true' }).Count -eq 2) "sent: $($script:DeployActionParams -join ' | ')"
+Assert-True "the deploy was confirmed as accepted, not assumed" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm deploy accepted' -and $_.Result -eq 'Accepted' }).Count -eq 2)
 Assert-True "the pre-reboot safety window was honoured" ($script:Calls.ContainsKey('RebootSafetyWindow'))
 
 Write-Host "`n=== Hosts were returned to service ===" -ForegroundColor Cyan
