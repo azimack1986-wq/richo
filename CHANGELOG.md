@@ -459,3 +459,47 @@ Baseline as received, imported unchanged in commit `8c2f849` so subsequent work
 reads as a diff. Versioned by filename
 (`AutoDeployUCSMIntersightFirmwareBatchControlv15`); superseded by git history
 and `$ScriptVersion` from 16.0.0.
+
+---
+
+## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [17.0.0-preauth] — 2026-08-10
+
+Derived from `Invoke-AutoDeployFirmwareBatchControl.ps1` 17.0.0 with Intersight
+authentication removed, for operators who apply their own
+`Set-IntersightConfiguration` and want the controller to leave it alone.
+
+#### Removed
+
+- Every function whose job was to establish an Intersight connection:
+  `Connect-IntersightTarget`, `Get-IntersightCredentialIfNeeded`,
+  `Get-IntersightBaseUrlIfNeeded`, `ConvertTo-IntersightBaseUrl`,
+  `Test-IntersightSaaSUrl`, `Show-OpenFileDialog`,
+  `Write-IntersightLoginDiagnostics`, `Test-IntersightEndpointReachable`.
+- All prompts for an API Key ID, private key file and appliance FQDN, and the
+  settings that held them.
+- `Set-IntersightConfiguration` is never called. The caller's session
+  configuration is left exactly as found, including at script exit.
+
+#### Added
+
+- An `AUTHENTICATION` region at the top, between explicit markers, for the
+  operator's own configuration call — or leave it empty and run the call in the
+  same session beforehand.
+- `Assert-IntersightReady`, which does not authenticate. Once per run, before any
+  host is touched, it reads back `Get-IntersightConfiguration`, confirms a
+  BasePath is set, and issues one small read to prove the connection works. A
+  failure is reported and never retried, and still routes into the existing offer
+  to skip the Intersight-managed hosts and continue with the rest.
+- `tests/Test-PreAuthVariantParity.ps1` — compares every function the two builds
+  share and fails on any drift outside a declared exception list, asserts the
+  auth functions are absent and `Set-IntersightConfiguration` is never called,
+  and fails if a declared exception stops differing so stale entries cannot mask
+  a regression. 26 assertions.
+
+#### Notes
+
+- Everything else — CDP/LLDP detection, CSV name matching, UCS Manager, batching,
+  host profile compliance, cluster health, the Step 27 menu — is byte-identical
+  to the main controller and verified so by the parity test.
