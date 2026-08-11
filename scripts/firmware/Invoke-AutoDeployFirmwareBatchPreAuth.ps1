@@ -71,7 +71,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 20.2.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 20.2.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 20.3.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 20.3.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -89,14 +89,18 @@
     - UCSM acknowledgement and Intersight accept/reboot are each scoped to their own batch hosts only.
     - REBOOT IMMEDIATELY TO ACTIVATE is sent with every Intersight deploy
       ($Global:IntersightRebootImmediatelyToActivate, on by default). Without it the firmware
-      stages and nothing restarts. Cisco does not publish the identifier that carries it -
-      PolicyActionParam takes free-form Name and Value strings and neither the SDK reference nor
-      the API schema enumerates them - so it is set in one place
-      ($Global:IntersightRebootActionParamName / ...Value), printed in full with every deploy, and
-      NOT trusted: Confirm-IntersightDeployAccepted re-reads the profile afterwards and stops the
-      run if it is still sitting in its staged state, rather than waiting out a post-reboot window
-      for a restart that was never scheduled. Correct that pair if your appliance names it
-      differently.
+      stages against the profile and nothing restarts.
+      It is ProceedOnReboot on a PolicyScheduledAction - "ProceedOnReboot can be used to
+      acknowledge server reboot while triggering deploy/activate", in the SDK's own words - not an
+      action parameter:
+          $a = Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot $true
+          Set-IntersightServerProfile -Moid <moid> -ScheduledActions @($a)
+      -Action Deploy is NOT also sent: the scheduled action carries the action, and sending both
+      gives the profile the same instruction twice in two different forms.
+      The cmdlet surface for this is checked before any host is evacuated, and the result is not
+      trusted either: Confirm-IntersightDeployAccepted re-reads the profile afterwards and stops
+      the run if it is still sitting in its staged state, rather than waiting out a post-reboot
+      window for a restart that was never scheduled.
     - THIS SCRIPT MIGRATES NOTHING. The batch is sized from live cluster capacity and its hosts go
       straight into Maintenance mode; DRS moves the running VMs, once, as part of that. Two things
       that used to happen first have been removed: a cold migration of every powered-off and
@@ -256,7 +260,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "20.2.0-preauth"
+$ScriptVersion = "20.3.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -304,18 +308,19 @@ $Global:IntersightBaseUrl = if ($IntersightServer) { "https://$IntersightServer"
 # then waits out its post-reboot window for a reboot that was never going to happen.
 $Global:IntersightRebootImmediatelyToActivate = $true
 
-# The action parameter that carries it. Cisco does not publish the identifier - PolicyActionParam
-# takes free-form Name and Value strings and neither the SDK reference nor the API schema
-# enumerates them - so THIS IS THE PAIR TO CORRECT if your appliance names it differently.
-# It is not left to chance: the exact pair is printed with every deploy, a rejection stops the run
-# naming this setting, and Confirm-IntersightDeployAccepted re-reads the profile afterwards, so an
-# identifier that is silently ignored is caught rather than assumed to have worked.
-$Global:IntersightRebootActionParamName  = 'RebootImmediatelyToActivate'
-$Global:IntersightRebootActionParamValue = 'true'
+# It is carried by ProceedOnReboot on a PolicyScheduledAction, NOT by an action parameter. The
+# SDK documents it in as many words: "ProceedOnReboot can be used to acknowledge server reboot
+# while triggering deploy/activate."
+#
+#     $action = Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot $true
+#     Set-IntersightServerProfile -Moid <moid> -ScheduledActions @($action)
+#
+# An earlier build sent this as a PolicyActionParam named RebootImmediatelyToActivate. That was the
+# wrong mechanism: PolicyActionParam takes free-form strings, so the appliance accepted the Deploy,
+# ignored the parameter, staged the firmware and rebooted nothing.
 
-# Any FURTHER PolicyActionParam name/value pairs to send with the Deploy, as
-# @{ Name = '...'; Value = '...' } entries. Empty by default - the reboot acknowledgement above is
-# sent separately and does not need an entry here.
+# Any PolicyActionParam name/value pairs to send alongside, as @{ Name = '...'; Value = '...' }
+# entries. Empty by default and not needed for the reboot acknowledgement.
 $Global:IntersightDeployActionParams = @()
 
 # How long to wait for a deployed profile to leave its staged state before deciding the deploy was
@@ -1628,6 +1633,24 @@ function Assert-IntersightUpgradeCmdletSurface {
         Stop-WithMessage "Set-IntersightServerProfile in the installed Intersight.PowerShell version does not accept: $($missingParams -join ', '). Run 'Get-Help Set-IntersightServerProfile -Full' and update this script's deploy call before a LIVE RUN."
     }
 
+    # The reboot acknowledgement is the whole point of the run - without it the firmware stages and
+    # nothing restarts - so its surface is checked here, before any host is evacuated, rather than
+    # discovered on the first deploy with a blade already in Maintenance mode.
+    if ($Global:IntersightRebootImmediatelyToActivate) {
+        if (-not $deployCmd.Parameters.ContainsKey("ScheduledActions")) {
+            Stop-WithMessage "Set-IntersightServerProfile in the installed Intersight.PowerShell version does not accept -ScheduledActions, which is how the reboot acknowledgement is sent. Update the module, or set `$Global:IntersightRebootImmediatelyToActivate to `$false and reboot the blades by hand."
+        }
+        $scheduledCmd = Get-Command -Name Initialize-IntersightPolicyScheduledAction -ErrorAction SilentlyContinue
+        if ($null -eq $scheduledCmd) {
+            Stop-WithMessage "Initialize-IntersightPolicyScheduledAction is not available in the installed Intersight.PowerShell version, so the reboot acknowledgement cannot be built. Update the module before a LIVE RUN."
+        }
+        foreach ($needed in @("Action","ProceedOnReboot")) {
+            if (-not $scheduledCmd.Parameters.ContainsKey($needed)) {
+                Stop-WithMessage "Initialize-IntersightPolicyScheduledAction does not accept -$needed in this module version. Run 'Get-Help Initialize-IntersightPolicyScheduledAction -Full' and update this script's deploy call before a LIVE RUN."
+            }
+        }
+    }
+
     if ($Global:IntersightDeployActionParams.Count -gt 0) {
         if ($null -eq (Get-Command -Name Initialize-IntersightPolicyActionParam -ErrorAction SilentlyContinue)) {
             Stop-WithMessage "IntersightDeployActionParams is populated but Initialize-IntersightPolicyActionParam is not available in this module version. Clear the setting or install a module version that provides it."
@@ -2104,13 +2127,13 @@ function Confirm-IntersightDeployAccepted {
 
     Write-Host "" -ForegroundColor Yellow
     Write-Host "'$($Row.ServerProfile)' is still $lastState $timeoutSeconds second(s) after the deploy was sent." -ForegroundColor Yellow
-    Write-Host "The appliance took the call but has not picked the change up, which is what happens when" -ForegroundColor Yellow
-    Write-Host "the reboot acknowledgement is not recognised: the firmware stages and nothing restarts." -ForegroundColor Yellow
-    Write-Host "Check the action parameter identifier this run is sending:" -ForegroundColor Yellow
-    Write-Host "  `$Global:IntersightRebootActionParamName  = '$Global:IntersightRebootActionParamName'" -ForegroundColor Gray
-    Write-Host "  `$Global:IntersightRebootActionParamValue = '$Global:IntersightRebootActionParamValue'" -ForegroundColor Gray
-    Write-Host "Deploy this profile once from the Intersight GUI with Reboot Immediately to Activate" -ForegroundColor Yellow
-    Write-Host "ticked, and correct the pair above to match what the appliance expects." -ForegroundColor Yellow
+    Write-Host "The appliance took the call but has not picked the change up: the firmware is staged and" -ForegroundColor Yellow
+    Write-Host "nothing is restarting." -ForegroundColor Yellow
+    Write-Host "This run sent Deploy with ProceedOnReboot = true, the documented acknowledgement." -ForegroundColor Yellow
+    Write-Host "Worth checking, in order:" -ForegroundColor Yellow
+    Write-Host "  - the blade is powered on and reachable from the appliance;" -ForegroundColor Yellow
+    Write-Host "  - no other workflow is already running against this server profile;" -ForegroundColor Yellow
+    Write-Host "  - Requests in the Intersight GUI, for a rejected or queued workflow on this profile." -ForegroundColor Yellow
 
     Stop-WithMessage "Intersight accepted the Deploy for '$($Row.ServerProfile)' but the profile is still $lastState, so nothing is rebooting. Stopping rather than waiting out a post-reboot window for a restart that was not scheduled."
 }
@@ -2177,37 +2200,40 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             # and its -Server takes a ComputePhysicalRelationship (compute.Blade / compute.RackUnit),
             # not the server.Profile that was being passed. It would never have worked as written.
             #
-            # Set-IntersightServerProfile -Action accepts only Deploy and Unassign; Activate was
-            # withdrawn from the SDK. The reboot acknowledgement travels as an ActionParam - see
-            # $Global:IntersightRebootImmediatelyToActivate.
+            # Deploy WITH the reboot acknowledgement, in one call.
+            #
+            # -Action Deploy on its own is the "deploy and wait for someone to reboot the blade"
+            # form: the appliance accepts it, stages the firmware, and leaves the profile in
+            # Pending-changes. The acknowledgement is ProceedOnReboot on a PolicyScheduledAction,
+            # which carries the action itself - so -Action is NOT also sent, or the profile would
+            # be given the same instruction twice in two different forms.
             $deployParams = @{
                 Moid        = $row.ProfileMoid
-                Action      = 'Deploy'
                 ErrorAction = 'Stop'
             }
 
-            $requestedPairs = @()
+            $sentDescription = ""
             if ($Global:IntersightRebootImmediatelyToActivate) {
-                $requestedPairs += [pscustomobject]@{ Name = $Global:IntersightRebootActionParamName; Value = $Global:IntersightRebootActionParamValue }
-            }
-            foreach ($extra in $Global:IntersightDeployActionParams) {
-                $requestedPairs += [pscustomobject]@{ Name = $extra.Name; Value = $extra.Value }
-            }
-
-            if ($requestedPairs.Count -gt 0) {
-                $deployParams['ActionParams'] = @($requestedPairs | ForEach-Object { Initialize-IntersightPolicyActionParam -Name $_.Name -Value $_.Value })
-                # Printed in full every time. The identifier is not published, so the log has to show
-                # exactly what was sent for anyone reconciling this against the appliance afterwards.
-                Write-Host "  ActionParams: $((($requestedPairs | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '))" -ForegroundColor DarkGray
+                $scheduledAction = Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot $true
+                $deployParams['ScheduledActions'] = @($scheduledAction)
+                $sentDescription = "ScheduledActions: Action=Deploy, ProceedOnReboot=true"
             }
             else {
+                $deployParams['Action'] = 'Deploy'
+                $sentDescription = "Action=Deploy, no reboot acknowledgement"
                 Write-Host "  No reboot acknowledgement is being sent. The firmware will stage but not activate until this blade is rebooted by hand." -ForegroundColor Yellow
             }
 
+            if ($Global:IntersightDeployActionParams.Count -gt 0) {
+                $deployParams['ActionParams'] = @($Global:IntersightDeployActionParams | ForEach-Object { Initialize-IntersightPolicyActionParam -Name $_.Name -Value $_.Value })
+                $sentDescription += "; ActionParams: $((($Global:IntersightDeployActionParams | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '))"
+            }
+
+            Write-Host "  $sentDescription" -ForegroundColor DarkGray
             Set-IntersightServerProfile @deployParams | Out-Null
 
             $Global:BatchActionsSent++
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Sent" -Details "ServerProfile=$($row.ServerProfile); ConfigState was $($row.ConfigState); ActionParams=$((($requestedPairs | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '))."
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Sent" -Details "ServerProfile=$($row.ServerProfile); ConfigState was $($row.ConfigState); $sentDescription."
 
             Confirm-IntersightDeployAccepted -Row $row -BatchNumber $BatchNumber
         } catch {

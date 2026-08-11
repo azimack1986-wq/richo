@@ -4,18 +4,18 @@
 
 .DESCRIPTION
     Intersight stages a firmware change against the server profile and does not activate it until
-    the server reboots. The acknowledgement that authorises that reboot travels as a
-    PolicyActionParam whose identifier Cisco does not publish - Name and Value are free-form
-    strings and neither the SDK reference nor the API schema enumerates them.
+    the server reboots. The acknowledgement that authorises that reboot is ProceedOnReboot on a
+    PolicyScheduledAction - "ProceedOnReboot can be used to acknowledge server reboot while
+    triggering deploy/activate", in the SDK's own words - sent through -ScheduledActions.
 
-    That leaves one dangerous failure mode. A wrong identifier is either rejected, which throws and
-    stops the run, or silently ignored - in which case the Deploy is accepted, the firmware stages,
-    nothing reboots, and the run waits out its entire post-reboot window for a restart that was
-    never scheduled before reporting the batch complete.
+    An earlier build sent it as a PolicyActionParam named RebootImmediatelyToActivate. That is the
+    wrong mechanism, and it failed in the worst possible way: PolicyActionParam takes free-form
+    strings, so the appliance accepted the Deploy, ignored the parameter, staged the firmware and
+    rebooted nothing. Hence the assertions here on how the deploy is composed, not just that one
+    was sent.
 
-    So the deploy is not trusted on the strength of the call returning. These assertions cover the
-    re-read that catches it: a profile still sitting in its staged state after the deploy stops the
-    run and names the setting to correct.
+    The deploy is also not trusted on the strength of the call returning - that is what caught the
+    wrong mechanism. A profile still sitting in its staged state afterwards stops the run.
 
     Standalone - no Pester, no Intersight module, no appliance.
 
@@ -33,8 +33,6 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $Global:IntersightActionableConfigStates = @('Pending-changes','Inconsistent','Out-of-sync','Not-deployed')
-$Global:IntersightRebootActionParamName  = 'RebootImmediatelyToActivate'
-$Global:IntersightRebootActionParamValue = 'true'
 # Two seconds, not the production 180. Start-Sleep is stubbed here, so the wait loop spins at full
 # speed and a realistic timeout would make the stuck cases take minutes of wall clock each.
 $Global:IntersightDeployAcceptedTimeoutSeconds = 2
@@ -132,8 +130,16 @@ Write-Host "`n=== The acknowledgement is on by default ===" -ForegroundColor Cya
 # If this ever defaults to off, firmware stages across a whole cluster and nothing activates.
 $scriptText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "reboot-immediately defaults to enabled" $true ($scriptText -match '\$Global:IntersightRebootImmediatelyToActivate\s*=\s*\$true')
-Assert-Equal "the action parameter name is set in one place" $true ($scriptText -match "\`$Global:IntersightRebootActionParamName\s*=\s*'RebootImmediatelyToActivate'")
-Assert-Equal "the deploy sends it as an ActionParam" $true ($scriptText -match 'IntersightRebootActionParamName; Value = \$Global:IntersightRebootActionParamValue')
+# The mechanism, not just the intent. The previous build passed "reboot-immediately is enabled"
+# while sending it in a form the appliance ignored.
+Assert-Equal "the acknowledgement is built as a scheduled action" $true ($scriptText -match "Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot \`$true")
+Assert-Equal "and sent through -ScheduledActions" $true ($scriptText -match "\`$deployParams\['ScheduledActions'\]")
+# The scheduled action carries the action. Sending -Action as well instructs the profile twice.
+# The QUOTED form only: $Global:IntersightRebootImmediatelyToActivate is the switch that turns the
+# acknowledgement on and legitimately contains the same words, as does the comment recording why
+# the old mechanism was wrong.
+Assert-Equal "no string literal is passed as an action parameter name" $true (-not ($scriptText -match "'RebootImmediatelyToActivate'"))
+Assert-Equal "the acknowledgement is not built from an ActionParam" $true (-not ($scriptText -match 'Initialize-IntersightPolicyActionParam[^\r\n]*Reboot'))
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

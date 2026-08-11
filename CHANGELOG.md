@@ -12,6 +12,53 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [20.3.0] — 2026-08-11
+
+20.2.0 sent the reboot acknowledgement by the wrong mechanism entirely, and the
+acceptance check added alongside it is what caught that.
+
+#### Fixed
+
+- **Reboot Immediately to Activate is `ProceedOnReboot` on a
+  `PolicyScheduledAction`, not a `PolicyActionParam`.** The SDK documents it in
+  as many words — *"ProceedOnReboot can be used to acknowledge server reboot
+  while triggering deploy/activate"* — on
+  `Initialize-IntersightPolicyScheduledAction`, sent through
+  `Set-IntersightServerProfile -ScheduledActions`.
+
+  ```powershell
+  $a = Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot $true
+  Set-IntersightServerProfile -Moid <moid> -ScheduledActions @($a)
+  ```
+
+  20.2.0 sent a `PolicyActionParam` named `RebootImmediatelyToActivate`, which
+  I could not find documented and guessed at. `PolicyActionParam` takes
+  free-form `Name`/`Value` strings, so the appliance accepted the Deploy,
+  ignored the parameter, staged the firmware and rebooted nothing — the profile
+  sat in `Pending-changes` and the run stopped.
+- **`-Action Deploy` is no longer sent alongside.** The scheduled action carries
+  the action; sending both instructs the profile twice in two different forms.
+  `-Action Deploy` on its own is the deploy-and-wait-for-a-manual-reboot form,
+  which is exactly what was happening.
+- The surface for `-ScheduledActions`, `Initialize-IntersightPolicyScheduledAction`
+  and its `-Action`/`-ProceedOnReboot` parameters is now checked **before any
+  host is evacuated**, rather than discovered on the first deploy with a blade
+  already in Maintenance mode.
+- `Confirm-IntersightDeployAccepted`'s failure message no longer points at
+  settings that have been removed; it lists what to check on the appliance
+  instead.
+
+#### Changed — tests
+
+- `tests/Test-IntersightRebootActivate.ps1` asserts on **how the deploy is
+  composed**, not just that one was sent: the acknowledgement is built with
+  `Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot
+  $true`, goes through `-ScheduledActions`, and no string literal is passed as
+  an action parameter name. The previous suite passed "reboot-immediately is
+  enabled" while the script sent it in a form the appliance ignored.
+- The workflow simulation's `Set-IntersightServerProfile` stub **throws** if
+  `-Action` arrives alongside `-ScheduledActions`.
+
 ### [20.2.0] — 2026-08-11
 
 AUTO still never reached Maintenance mode. 20.1.0 fixed the ordering, but the
@@ -1081,6 +1128,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [20.3.0-preauth] — 2026-08-11
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 20.3.0 — the reboot
+acknowledgement is `ProceedOnReboot` on a scheduled action, which is what
+actually triggers the activation reboot. This is the build to run.
 
 ### [20.2.0-preauth] — 2026-08-11
 
