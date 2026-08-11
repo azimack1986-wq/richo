@@ -221,7 +221,7 @@ else {
     else {
         Write-Check -Name "Single module version" -Result PASS -Detail "$($distinct[0])  $($available[0].ModuleBase)"
     }
-    Import-Module Intersight.PowerShell -ErrorAction SilentlyContinue
+    # No Import-Module - the module is assumed present and auto-loads on first use.
 }
 
 # ---------------------------------------------------------------------------

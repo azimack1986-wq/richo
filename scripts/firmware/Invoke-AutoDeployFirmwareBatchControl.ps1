@@ -25,8 +25,9 @@
     and vice versa. The detection table shows which form produced each match.
 
 .NOTES
-    REQUIREMENTS - assumed present, NOT verified at run time. Confirm once when building the jump
-    host; probing for them on every run was slow enough to look like a hang.
+    REQUIREMENTS - assumed present and already importable, NOT verified or imported at run time.
+    This script contains no Import-Module: loading is the jump host build's job, and PowerShell
+    auto-loads what it needs on first use. Confirm these once when building the host.
 
       * PowerShell 7 (Core). Intersight.PowerShell is a binary module built for it and can appear
         installed under Windows PowerShell 5.1 while failing at the first signed request.
@@ -42,7 +43,7 @@
     report installed versions when a login actually fails. Verify the environment out of band with
     scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 17.2.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 17.3.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -84,7 +85,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "17.2.0"
+$ScriptVersion = "17.3.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -2276,30 +2277,10 @@ function Connect-VCenterServer {
     #>
     param([Parameter(Mandatory=$true)][string]$Server)
 
-    try {
-        Import-Module VMware.VimAutomation.Core -ErrorAction Stop
-    }
-    catch {
-        Write-Host "" -ForegroundColor Red
-        Write-Host "VMware PowerCLI (VMware.VimAutomation.Core) could not be loaded." -ForegroundColor Red
-        Write-Host "Underlying error:" -ForegroundColor Red
-        Write-Host (Get-ExceptionDetail -ErrorRecord $_) -ForegroundColor Gray
-        Write-Host "" -ForegroundColor Yellow
-        Write-Host "Usual causes, most common first:" -ForegroundColor Yellow
-        Write-Host "  1. Module files still carry the blocked flag, typical after an offline or" -ForegroundColor Yellow
-        Write-Host "     share-based install. Unblock them:" -ForegroundColor Yellow
-        Write-Host "       Get-ChildItem -Path (Split-Path (Get-Module -ListAvailable VMware.VimAutomation.Core | Select-Object -First 1).ModuleBase -Parent) -Recurse | Unblock-File" -ForegroundColor Gray
-        Write-Host "  2. PowerCLI version too old for this PowerShell. 12.3.0 and newer support" -ForegroundColor Yellow
-        Write-Host "     PowerShell 7.x; older builds are Windows PowerShell only. You are on" -ForegroundColor Yellow
-        Write-Host "     $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)." -ForegroundColor Yellow
-        Write-Host "  3. Read-only or restrictive permissions on the module folder." -ForegroundColor Yellow
-        Write-Host "  4. Group Policy requiring signed modules." -ForegroundColor Yellow
-        Write-Host "" -ForegroundColor Yellow
-        Write-Host "Run this on its own to see the failure directly:" -ForegroundColor Yellow
-        Write-Host "  Import-Module VMware.VimAutomation.Core -Verbose" -ForegroundColor Gray
-        Add-SummaryRecord -Stage "vCenterConnect" -Batch "" -HostName "" -Action "Load PowerCLI" -Result "Failed" -Details $_.Exception.Message
-        Stop-WithMessage "VMware PowerCLI could not be loaded, so vCenter cannot be contacted."
-    }
+    # No Import-Module anywhere in this script - PowerCLI is assumed present and PowerShell
+    # auto-loads it on the first Connect-VIServer. When that auto-load fails, PowerShell reports
+    # only "the command was found in the module ... but the module could not be loaded", which
+    # names neither cause nor fix, so the catch below recognises that message and supplies both.
 
     # Long-running vSphere tasks outlive the 300-second default and are torn down mid-flight with
     # "An error occurred while sending the request". Session scope only - nothing persists.
@@ -2318,6 +2299,28 @@ function Connect-VCenterServer {
     }
     catch {
         Add-SummaryRecord -Stage "vCenterConnect" -Batch "" -HostName "" -Action "Connect" -Result "Failed" -Details $_.Exception.Message
+
+        if ($_.Exception.Message -match 'could not be loaded|was found in the module') {
+            Write-Host "" -ForegroundColor Red
+            Write-Host "VMware PowerCLI (VMware.VimAutomation.Core) is present but failed to load." -ForegroundColor Red
+            Write-Host "Underlying error:" -ForegroundColor Red
+            Write-Host (Get-ExceptionDetail -ErrorRecord $_) -ForegroundColor Gray
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "Usual causes, most common first:" -ForegroundColor Yellow
+            Write-Host "  1. Module files still carry the blocked flag, typical after an offline or" -ForegroundColor Yellow
+            Write-Host "     share-based install. Unblock them:" -ForegroundColor Yellow
+            Write-Host "       Get-ChildItem `"`$env:ProgramFiles\WindowsPowerShell\Modules\VMware*`" -Recurse | Unblock-File" -ForegroundColor Gray
+            Write-Host "  2. PowerCLI version too old for this PowerShell. 12.3.0 and newer support" -ForegroundColor Yellow
+            Write-Host "     PowerShell 7.x; older builds are Windows PowerShell only. You are on" -ForegroundColor Yellow
+            Write-Host "     $($PSVersionTable.PSEdition) $($PSVersionTable.PSVersion)." -ForegroundColor Yellow
+            Write-Host "  3. Read-only or restrictive permissions on the module folder." -ForegroundColor Yellow
+            Write-Host "  4. Group Policy requiring signed modules." -ForegroundColor Yellow
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "To see the failure on its own, outside this script:" -ForegroundColor Yellow
+            Write-Host "  Import-Module VMware.VimAutomation.Core -Verbose" -ForegroundColor Gray
+            Stop-WithMessage "VMware PowerCLI could not be loaded, so vCenter cannot be contacted."
+        }
+
         Write-Host "Could not connect to vCenter '$Server': $($_.Exception.Message)" -ForegroundColor Red
         Stop-WithMessage "vCenter connection failed."
     }

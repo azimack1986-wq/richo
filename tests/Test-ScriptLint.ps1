@@ -15,7 +15,9 @@
          an empty collection, so a legitimately empty list becomes a mid-run crash.
       4. Format-Table left on the success stream inside a function that also returns a value. The
          caller receives formatting records mixed with data.
-      5. Get-Module -ListAvailable outside the caching helper. Repeated enumeration of a module
+      5. Import-Module anywhere. These scripts assume a prepared host; importing either
+         duplicates the host build's job or fights a pinned bundle already loaded.
+      6. Get-Module -ListAvailable outside the caching helper. Repeated enumeration of a module
          exporting thousands of cmdlets is what made the pre-flight look like it had hung.
 
     Standalone - no Pester, no vendor modules, no infrastructure.
@@ -30,7 +32,6 @@ $targets = @(
     Join-Path $repoRoot 'scripts/firmware/Invoke-AutoDeployFirmwareBatchPreAuth.ps1'
     Join-Path $repoRoot 'scripts/intersight/Test-IntersightApiKey.ps1'
     Join-Path $repoRoot 'tools/Save-RichoModuleBundle.ps1'
-    Join-Path $repoRoot 'tools/Import-RichoModuleBundle.ps1'
 )
 
 $script:pass = 0; $script:fail = 0
@@ -113,7 +114,17 @@ foreach ($path in $targets) {
     )
     Assert-NoFindings "no Format-Table leaking into a function's return value" $formatLeaks
 
-    # --- 5. Uncached module enumeration -------------------------------------------------------
+    # --- 5. No module imports; modules are assumed present ------------------------------------
+    # These scripts run on a prepared jump host. Importing is the host build's job, and an
+    # Import-Module here either duplicates it or fights a pinned bundle already loaded.
+    $imports = @(
+        $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+            Where-Object { $_.GetCommandName() -eq 'Import-Module' } |
+            ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Extent.Text)" }
+    )
+    Assert-NoFindings "no Import-Module - modules are assumed present" $imports
+
+    # --- 6. Uncached module enumeration -------------------------------------------------------
     $cacheFunction = @($ast.FindAll({ param($n)
         $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-AvailableModuleVersion' }, $true))
     $enumerations = @(

@@ -12,6 +12,32 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [17.3.0] — 2026-08-11
+
+#### Removed
+
+- **Every `Import-Module` call.** The scripts assume a prepared jump host:
+  loading modules is the host build's job, PowerShell auto-loads what it needs on
+  first use, and an import here either duplicates that or fights a pinned bundle
+  already loaded into the session.
+
+#### Changed
+
+- The PowerCLI load diagnostics survive the removal. Auto-loading still happens
+  on the first `Connect-VIServer`, so the catch there recognises the "command was
+  found in the module ... but the module could not be loaded" message and reports
+  the same causes and fixes it did before: blocked module files, a PowerCLI
+  version predating PowerShell 7 support, folder permissions, and Group Policy
+  signing requirements.
+- The `REQUIREMENTS` header now states that modules must be present *and already
+  importable*, and that nothing is imported at run time.
+
+#### Added
+
+- A lint rule forbidding `Import-Module` in the controllers and the API key
+  checker, so it cannot creep back. `tools/Import-RichoModuleBundle.ps1` is
+  exempt — importing a pinned bundle is its entire purpose.
+
 ### [17.2.0] — 2026-08-11
 
 `Set-VMHost` failed a live run with "An error occurred while sending the
