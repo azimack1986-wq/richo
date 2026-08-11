@@ -150,7 +150,11 @@ function Get-VMHost {
 function Set-VMHost {
     param($VMHost,$State,[switch]$Evacuate,[switch]$RunAsync,$Confirm,$ErrorAction)
     Note-Call 'Set-VMHost'
-    if ($Evacuate -and -not $RunAsync) { throw "Blocking evacuate would exceed WebOperationTimeoutSeconds - must use -RunAsync" }
+    # Only ENTERING is long enough to blow PowerCLI's request ceiling; exiting is immediate.
+    if ($State -eq 'Maintenance' -and -not $RunAsync) { throw "A blocking Set-VMHost exceeds WebOperationTimeoutSeconds mid-evacuation - must use -RunAsync" }
+    # -Evacuate is evacuatePoweredOffVms: it cold-migrates every powered-off and suspended VM off
+    # the host first, which DRS then undoes. Nothing in this run should be asking for that.
+    if ($Evacuate) { throw "-Evacuate cold-migrates powered-off VMs; the run must not ask for it" }
     $script:HostState[$VMHost.Name].ConnectionState = if ($State -eq 'Maintenance') { 'Maintenance' } else { 'Connected' }
 }
 function Get-Datastore { param($Location,$ErrorAction) return @([pscustomobject]@{ Name='ds1'; CapacityGB=1000; FreeSpaceGB=500 }) }

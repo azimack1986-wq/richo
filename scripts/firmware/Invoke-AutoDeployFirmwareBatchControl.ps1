@@ -58,7 +58,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 20.1.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 20.2.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -84,11 +84,18 @@
       run if it is still sitting in its staged state, rather than waiting out a post-reboot window
       for a restart that was never scheduled. Correct that pair if your appliance names it
       differently.
+    - THIS SCRIPT MIGRATES NOTHING. The batch is sized from live cluster capacity and its hosts go
+      straight into Maintenance mode; DRS moves the running VMs, once, as part of that. Two things
+      that used to happen first have been removed: a cold migration of every powered-off and
+      suspended VM off each host, and the -Evacuate switch on Set-VMHost (which IS
+      evacuatePoweredOffVms, and forces the same thing). On a large cluster that took longer than
+      the upgrade, moved data with no reason to move, and was undone by DRS the moment the host
+      came back. Powered-off and suspended VMs do not block Maintenance mode.
     - Maintenance mode is entered ONE HOST AT A TIME, in cluster list order - first hosts in the
       cluster first, working through. Each host is requested and then waited for before the next is
       asked. Requesting a whole batch at once was tried and does not work: the capacity available to
       receive the VMs shrinks at the same time as the VMs need placing, so migrations run
-      continuously and no host arrives. A host that will not evacuate within
+      continuously and no host arrives. A host that does not reach Maintenance mode within
       $MaintenanceValidationTimeoutMinutes stops the run, naming it, with the rest of the batch
       untouched. SINGLE mode is a batch of one, so its behaviour is unchanged.
     - Batch mode is AUTO (sized from live cluster capacity, capped at $MaxAbsoluteBatchSize) or
@@ -178,7 +185,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "20.1.0"
+$ScriptVersion = "20.2.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -3423,21 +3430,6 @@ function Invoke-RebootSafetyWindow {
     return $true
 }
 
-function Move-PoweredOffAndSuspendedVMsForBatch {
-    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$CurrentBatchNames,[Parameter(Mandatory=$true)]$Cluster)
-    if ((Test-DryRun) -or (Test-StageNoAck)) { Write-Host "DRY/STAGE: Would move powered-off/suspended VMs from batch hosts where applicable." -ForegroundColor Green; return $true }
-    $destinationHosts = @(Get-VMHost -Location $Cluster | Where-Object { $_.ConnectionState -eq "Connected" -and ($CurrentBatchNames -notcontains $_.Name) })
-    if ($destinationHosts.Count -eq 0) { Stop-WithMessage "No connected non-batch destination hosts available for powered-off/suspended VM movement." }
-    foreach ($hostName in $CurrentBatchNames) {
-        $vms = @(Get-VMHost -Name $hostName | Get-VM -ErrorAction SilentlyContinue | Where-Object { $_.PowerState -eq "PoweredOff" -or $_.PowerState -eq "Suspended" })
-        foreach ($vm in $vms) {
-            $dest = $destinationHosts | Get-Random
-            Move-VM -VM $vm -Destination $dest -Confirm:$false -ErrorAction Stop | Out-Null
-        }
-    }
-    return $true
-}
-
 function Wait-VMHostInMaintenance {
     <#
     .SYNOPSIS
@@ -3474,6 +3466,12 @@ function Request-MaintenanceModeForBatch {
         Puts the batch into Maintenance mode ONE HOST AT A TIME, in cluster order.
 
     .DESCRIPTION
+        Nothing is migrated by this script. The batch is sized from live cluster capacity and its
+        hosts are then put straight into Maintenance mode; DRS moves the running VMs, once, in the
+        course of doing that. An earlier version cold-migrated every powered-off and suspended VM
+        off each host first - which on a large cluster took longer than the upgrade, moved data
+        that had no need to move, and was undone by DRS as soon as the host came back.
+
         Each host is requested, then waited for, before the next is asked. Only when it has
         actually reached Maintenance mode does the run move to the host after it.
 
@@ -3521,9 +3519,15 @@ function Request-MaintenanceModeForBatch {
             Stop-WithMessage "'$hostName' is $($hostObj.ConnectionState), not Connected, so it cannot be evacuated. Resolve in vCenter before continuing."
         }
 
-        Write-Host "  [$position of $($HostNames.Count)] Requesting Maintenance mode with evacuation for '$hostName'." -ForegroundColor Cyan
+        Write-Host "  [$position of $($HostNames.Count)] Requesting Maintenance mode for '$hostName'." -ForegroundColor Cyan
+        # NO -Evacuate. That switch is evacuatePoweredOffVms: it cold-migrates every powered-off and
+        # suspended VM off the host before it will enter Maintenance mode, which on a large cluster
+        # is slow, moves data for no reason, and is undone by DRS the moment the host returns.
+        # Powered-off and suspended VMs do not block Maintenance mode - only running ones do, and
+        # DRS moves those itself in a fully automated cluster.
+        #
         # -RunAsync and then poll: see Wait-VMHostInMaintenance for why a blocking call fails.
-        Set-VMHost -VMHost $hostObj -State Maintenance -Evacuate -RunAsync -Confirm:$false -ErrorAction Stop | Out-Null
+        Set-VMHost -VMHost $hostObj -State Maintenance -RunAsync -Confirm:$false -ErrorAction Stop | Out-Null
 
         if (-not (Wait-VMHostInMaintenance -HostName $hostName -TimeoutMinutes $MaintenanceValidationTimeoutMinutes)) {
             Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "Timeout" -Details "Did not reach Maintenance mode within $MaintenanceValidationTimeoutMinutes minute(s)."
@@ -3993,7 +3997,8 @@ function Invoke-ClusterUpgradeWorkflow {
             continue
         }
 
-        Move-PoweredOffAndSuspendedVMsForBatch -CurrentBatchNames $currentBatchNames -Cluster $Cluster | Out-Null
+        # Straight into Maintenance mode. Nothing is migrated by this script first - see
+        # Request-MaintenanceModeForBatch.
         Request-MaintenanceModeForBatch -HostNames $currentBatchNames
         $batchMaintenanceHosts = Wait-BatchMaintenanceMode -HostNames $currentBatchNames -TimeoutMinutes $MaintenanceValidationTimeoutMinutes
         if ($null -eq $batchMaintenanceHosts) { Stop-WithMessage "Batch is not fully in Maintenance mode within timeout." }

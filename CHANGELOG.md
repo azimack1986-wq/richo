@@ -12,6 +12,38 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [20.2.0] — 2026-08-11
+
+AUTO still never reached Maintenance mode. 20.1.0 fixed the ordering, but the
+run was stalling *before* that, in a step neither of us had looked at.
+
+#### Removed
+
+- **`Move-PoweredOffAndSuspendedVMsForBatch`.** Before requesting Maintenance
+  mode it cold-migrated every powered-off and suspended VM off each host in the
+  batch, one at a time, to a randomly chosen destination. On a 21-host cluster
+  with a batch of 6 that is a very long queue of cold migrations — which is what
+  the run was doing when it appeared to hang — and DRS undoes the placement as
+  soon as the host comes back. In SINGLE mode the batch is one host, so it was
+  short enough never to look like a problem.
+- **`-Evacuate` on `Set-VMHost`.** That switch *is* `evacuatePoweredOffVms`: it
+  forces the same cold migration inside vCenter instead of in the script.
+  Powered-off and suspended VMs do not block Maintenance mode — only running
+  ones do, and in a fully automated DRS cluster DRS moves those itself, once,
+  as part of entering.
+
+  **This script now migrates nothing.** The batch is sized from live cluster
+  capacity and its hosts go straight into Maintenance mode.
+
+#### Added — tests
+
+- `tests/Test-MaintenanceModeEntry.ps1` asserts no request passes `-Evacuate`,
+  the script contains no `Move-VM` call, and no powered-off VM sweep survives
+  anywhere in the file.
+- The workflow simulation's `Set-VMHost` stub now **throws** on `-Evacuate`, and
+  on a blocking enter-Maintenance call. Exiting Maintenance mode is still
+  allowed to block — it returns immediately, and requiring async there was wrong.
+
 ### [20.1.0] — 2026-08-11
 
 #### Fixed
@@ -1049,6 +1081,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [20.2.0-preauth] — 2026-08-11
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 20.2.0 — the script migrates
+nothing; hosts go straight into Maintenance mode and DRS handles the running
+VMs. This is the build to run.
 
 ### [20.1.0-preauth] — 2026-08-11
 

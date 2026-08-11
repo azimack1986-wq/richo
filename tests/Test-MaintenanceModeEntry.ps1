@@ -63,6 +63,7 @@ function Reset-Cluster {
     $script:RequestOrder = New-Object System.Collections.Generic.List[string]
     $script:StateAtRequest = New-Object System.Collections.Generic.List[string]
     $script:AsyncUsed = New-Object System.Collections.Generic.List[bool]
+    $script:EvacuateUsed = New-Object System.Collections.Generic.List[bool]
     $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 }
 
@@ -81,10 +82,12 @@ function Get-VMHost {
     return $null
 }
 
+$script:EvacuateUsed = New-Object System.Collections.Generic.List[bool]
 function Set-VMHost {
     param($VMHost,$State,[switch]$Evacuate,[switch]$RunAsync,$Confirm,$ErrorAction)
     $script:RequestOrder.Add($VMHost.Name)
     $script:AsyncUsed.Add([bool]$RunAsync)
+    $script:EvacuateUsed.Add([bool]$Evacuate)
     # The state of every OTHER host at the moment this request goes out. Under the old
     # request-everything-at-once design, hosts later in the batch would already be 'Entering'.
     $others = @($script:State.Keys | Where-Object { $_ -ne $VMHost.Name } | Sort-Object | ForEach-Object { "$_=$($script:State[$_])" })
@@ -113,6 +116,15 @@ Write-Host "`n=== The evacuation is polled, never held open ===" -ForegroundColo
 # A blocking Set-VMHost holds one HTTP request open past PowerCLI's timeout ceiling and is torn
 # down mid-evacuation, leaving the host partway in.
 Assert-Equal "every request used -RunAsync" 4 (@($script:AsyncUsed | Where-Object { $_ }).Count)
+
+Write-Host "`n=== Nothing is migrated to make room ===" -ForegroundColor Cyan
+# -Evacuate is evacuatePoweredOffVms: it cold-migrates every powered-off and suspended VM off the
+# host before it will enter Maintenance mode. On a large cluster that takes longer than the upgrade
+# and DRS undoes it the moment the host returns. Powered-off VMs do not block Maintenance mode.
+Assert-Equal "no request passed -Evacuate" 0 (@($script:EvacuateUsed | Where-Object { $_ }).Count)
+$scriptText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "the script never calls Move-VM" $true (-not ($scriptText -match '(?m)^\s*Move-VM\b'))
+Assert-Equal "and no powered-off VM sweep survives" $true (-not ($scriptText -match 'Move-PoweredOffAndSuspendedVMsForBatch'))
 
 Write-Host "`n=== SINGLE mode is a batch of one and behaves exactly as before ===" -ForegroundColor Cyan
 Reset-Cluster -Names @('esx01')
