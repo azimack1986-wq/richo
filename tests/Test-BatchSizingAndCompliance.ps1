@@ -19,7 +19,8 @@ if ($errors) { throw "parse errors" }
 
 $wanted = @('Get-CapacityBasedBatchSize','Get-VMHostProfileComplianceState',
             'Get-ComplianceCheckTime','Get-ComplianceStatusValue','ConvertTo-ComplianceStatus',
-            'Wait-VMHostProfileComplianceTask')
+            'Get-ComplianceFailureDetail','Select-ComplianceResultForHost',
+            'Get-ComplianceStatusFromComplianceManager','Wait-VMHostProfileComplianceTask')
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $wanted -contains $_.Name } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
@@ -35,6 +36,9 @@ $MinimumMemoryHeadroomPercentAfterBatch = 10
 $HostProfileComplianceScanTimeoutMinutes = 1
 
 function Get-Task { param($Status,$Id,$ErrorAction) return @() }
+# No vCenter connection, so the ProfileComplianceManager route is genuinely unavailable - these
+# cases are about what the cmdlet itself returned.
+function Get-View { param($VIObject,$Id,$ErrorAction) throw "not connected" }
 function Start-Sleep { param($Seconds,$Milliseconds) }
 
 $script:pass = 0; $script:fail = 0

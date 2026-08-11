@@ -12,6 +12,70 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [19.2.0] — 2026-08-11
+
+`Test-VMHostProfileCompliance -VMHost` returned *nothing at all* on a live run —
+no error, no result — against an Auto Deploy host in Maintenance mode, while the
+vSphere Client showed the host compliant. 19.1.0 read the result from more
+places, which does not help when there is no result to read.
+
+#### Added
+
+- **Four routes to the compliance status**, tried in order, stopping at the
+  first that gives a usable answer:
+  1. `Test-VMHostProfileCompliance -VMHost` — a real check, no `-UseCache`.
+  2. **`ProfileComplianceManager.QueryComplianceStatus` via `Get-View`** — the
+     source the vSphere Client reads, so it is the authority on what vCenter
+     holds. It reads rather than scans, which is correct at this point: route 1
+     has already asked for a scan.
+  3. `Test-VMHostProfileCompliance -UseCache`.
+  4. `Test-VMHostProfileCompliance -Profile`, filtered back to this host. Last,
+     because it checks every host attached to the profile.
+  When every route declines, the detail names each one and what it returned, so
+  the next run says which to fix rather than repeating "no result".
+- `Select-ComplianceResultForHost` matches a result to its host on `VMHost`,
+  `VMHostId` or an `Entity` managed object reference. Routes 2 and 4 return rows
+  for several hosts, and taking the first would report another host's status.
+- `Get-ComplianceFailureDetail` reads the differences from
+  `IncomplianceElementList` (PowerCLI) or `Failure` (raw API), so a
+  non-compliant host says which setting drifted.
+- **Post-change verification at cluster completion**, read back from the
+  platforms and written to `Post-Change-Verification-<cluster>-<timestamp>.csv`:
+  ESXi build against the target, Intersight `ConfigState` with whether anything
+  is still staged, and the UCS host firmware package now on each service profile
+  with any acknowledgement still open. `Outstanding: None` on every row is the
+  result a completed run should show.
+
+#### Fixed
+
+- **Exiting Maintenance mode is confirmed, not assumed.** `Set-VMHost -State
+  Connected` returns when vCenter accepts the change, not when the host has
+  left Maintenance mode. The cluster health check immediately after fails on any
+  host still in Maintenance, so the run stopped one host in — which is what made
+  an override look like it had ended the run and gone back to the menu. The run
+  now waits up to `$ExitMaintenanceTimeoutMinutes` (default 10) for the
+  transition to land, and stops with a clear message only if it never does.
+- **Hosts already in Maintenance mode when the run started no longer fail every
+  health check.** They are out of scope either way — only Connected hosts enter
+  the run — and they are a pre-existing condition rather than something this run
+  caused. Recorded at cluster start, excluded from the assessment, and named on
+  screen each time so they cannot be forgotten.
+- `Get-ComplianceCheckTime` no longer takes a mandatory parameter. When every
+  route declined there was no result to pass it, and the binding failure threw
+  out of the whole function — precisely the case it needed to survive.
+
+#### Added — tests
+
+- `tests/Test-ComplianceGate.ps1` at 63 assertions: the manager route answers
+  when the scan returns nothing, a result for a different host is never used for
+  this one, the profile-wide scan runs only once everything else is exhausted,
+  every declining route is named in the detail, and a host that will not leave
+  Maintenance mode times out rather than being assumed out.
+- The workflow simulation now asserts the closing verification covers every
+  host with nothing outstanding, and its Intersight stub is stateful — a profile
+  reaches `Associated` once deployed, so a completed run can actually come back
+  clean.
+
 ### [19.1.0] — 2026-08-11
 
 Fixes a defect introduced in 19.0.0: every host reported
@@ -777,6 +841,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [19.2.0-preauth] — 2026-08-11
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 19.2.0 — four routes to the
+compliance status, a confirmed exit from Maintenance mode, and the post-change
+verification at cluster completion. This is the build to run.
 
 ### [19.1.0-preauth] — 2026-08-11
 

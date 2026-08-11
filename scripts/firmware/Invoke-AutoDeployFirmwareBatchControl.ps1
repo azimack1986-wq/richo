@@ -58,7 +58,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 19.1.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 19.2.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -86,14 +86,33 @@
       host profile while it is still in Maintenance mode. The wait is there because a host that has
       just re-registered reports differences that clear themselves; scanning through that window
       produces failures that are not real.
-      The scan is a real check: any compliance check already running is drained first, then
-      Test-VMHostProfileCompliance is called WITHOUT -UseCache, so it performs the check and blocks
-      until vCenter finishes it. The status is then read from all four places PowerCLI puts it
-      (ComplianceStatus or Status, on the result or on its ExtensionData); if none of them is
-      readable, the stored result is fetched with -UseCache, which by then is the result of the
-      scan just performed and the same value the vSphere Client shows.
-      Unknown means vCenter would not give a status, and is handled like NonCompliant - it is never
-      inferred from anything this script works out for itself.
+      Getting the status is not one call. Test-VMHostProfileCompliance -VMHost has been seen to
+      return nothing at all against an Auto Deploy host in Maintenance mode - no error, no result -
+      so four routes are tried in order, stopping at the first that gives a usable status:
+        1. Test-VMHostProfileCompliance -VMHost, without -UseCache, so it performs the check and
+           blocks until vCenter finishes it. Any check already running is drained first.
+        2. The ProfileComplianceManager's QueryComplianceStatus, via Get-View. This is the source
+           the vSphere Client reads, so it is the authority on what vCenter holds.
+        3. Test-VMHostProfileCompliance -UseCache, PowerCLI's own read of the stored result.
+        4. Test-VMHostProfileCompliance -Profile, a real check across every host on the profile,
+           filtered back to this host. Last, because it is the expensive one.
+      The status is read from all four places PowerCLI puts it - ComplianceStatus or Status, on the
+      result or on its ExtensionData - and results covering several hosts are matched to this one
+      rather than taken first.
+      Unknown means every route declined, and is handled like NonCompliant. It is never inferred
+      from anything this script works out for itself, and the detail names each route and what it
+      returned so the next run says which one to fix.
+    - Exiting Maintenance mode is confirmed, not assumed. vCenter reports the old state briefly
+      after accepting the change, and the cluster health check that follows fails on any host still
+      in Maintenance - which stopped the run one host in, having actually succeeded. The run now
+      waits up to $ExitMaintenanceTimeoutMinutes for the transition to land.
+    - Hosts already in Maintenance mode when the run started are out of scope AND excluded from the
+      health assessment. They are a pre-existing condition, not something this run caused, and
+      counting them would fail every batch. They are named on screen each time instead.
+    - When the cluster completes, a post-change verification is read back from the platforms
+      themselves and written to Post-Change-Verification-<cluster>-<timestamp>.csv: ESXi build
+      against the target, Intersight ConfigState with whether anything is still staged, and the
+      UCS host firmware package now on each service profile with any acknowledgement still open.
       Compliant hosts are taken out of Maintenance mode and the run continues. For anything else the
       operator chooses C to re-scan after remediating, O to override and return the host to service
       as it is, or E to exit. On C the host stays in Maintenance mode and the batch does not advance.
@@ -119,7 +138,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "19.1.0"
+$ScriptVersion = "19.2.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -226,6 +245,10 @@ $HostProfileComplianceSettleMinutes = 2
 # Bound on waiting for a compliance check vCenter or Auto Deploy started itself to finish before
 # this run starts its own, so the scan that answers is the one whose result is acted on.
 $HostProfileComplianceScanTimeoutMinutes = 10
+# Bound on waiting for a host to actually leave Maintenance mode after being told to. vCenter
+# reports the old state briefly, and the cluster health check that follows fails on any host still
+# in Maintenance - so the run must see the transition land before it moves on.
+$ExitMaintenanceTimeoutMinutes = 10
 
 # PowerCLI holds one HTTP request open per blocking task and defaults to a 300-second ceiling,
 # which is shorter than a host evacuation. Raised for the session at vCenter connect time.
@@ -246,6 +269,9 @@ $Global:UcsServiceProfileCache = @{}
 $Global:ReconnectCredential = $null
 $Global:PromptForReconnectPasswordWhenNeeded = $false
 $Global:AutoExitMaintenanceMode = $true
+# Hosts already in Maintenance mode when the cluster run started. Out of scope, and not counted as
+# a health failure - see Get-ClusterHealthReport.
+$Global:PreExistingMaintenanceHosts = @()
 $Global:PrerequisitesConfirmed = $false
 
 # -----------------------------
@@ -2537,9 +2563,19 @@ function Get-ClusterHealthReport {
         [void]$reasons.Add("Host(s) not responding or disconnected: $(($badState | Select-Object -ExpandProperty Name) -join ', ')")
     }
 
+    # Hosts already parked in Maintenance mode when the run started are a pre-existing condition,
+    # not something this run caused, and they are excluded from its scope anyway. Counting them as a
+    # health failure would stop every batch and make the cluster impossible to work through. They
+    # are still named on screen each time, so they cannot be forgotten.
     $inMaintenance = @($relevant | Where-Object { $_.ConnectionState -eq "Maintenance" })
-    if ($inMaintenance.Count -gt 0) {
-        [void]$reasons.Add("Host(s) in Maintenance mode outside the current batch: $(($inMaintenance | Select-Object -ExpandProperty Name) -join ', ')")
+    $preExisting = @($inMaintenance | Where-Object { $Global:PreExistingMaintenanceHosts -contains $_.Name })
+    $newlyInMaintenance = @($inMaintenance | Where-Object { $Global:PreExistingMaintenanceHosts -notcontains $_.Name })
+
+    if ($preExisting.Count -gt 0) {
+        Write-Host "  Note: host(s) already in Maintenance mode before this run started, and out of scope: $(($preExisting | Select-Object -ExpandProperty Name) -join ', ')" -ForegroundColor DarkYellow
+    }
+    if ($newlyInMaintenance.Count -gt 0) {
+        [void]$reasons.Add("Host(s) in Maintenance mode outside the current batch: $(($newlyInMaintenance | Select-Object -ExpandProperty Name) -join ', ')")
     }
 
     try {
@@ -2776,7 +2812,9 @@ function Get-ComplianceCheckTime {
         every result looked stale and every host reported Unknown. Whether the scan ran is already
         settled by Test-VMHostProfileCompliance blocking on the check.
     #>
-    param([Parameter(Mandatory=$true)]$ComplianceResult)
+    param($ComplianceResult)
+
+    if ($null -eq $ComplianceResult) { return $null }
 
     # Built defensively rather than as a literal list: Set-StrictMode -Version Latest turns a
     # reference to an absent ExtensionData property into a terminating error, and PowerCLI builds
@@ -2871,32 +2909,130 @@ function ConvertTo-ComplianceStatus {
     }
 }
 
+function Select-ComplianceResultForHost {
+    <#
+    .SYNOPSIS
+        Picks the compliance result belonging to one host out of a set covering several.
+
+    .DESCRIPTION
+        Two of the routes below return results for every host attached to the profile, not just the
+        one being processed. Taking the first of those would report another host's status against
+        this one, so the match is explicit.
+
+        The identifying property differs by route and PowerCLI build - VMHost, VMHostId, or an
+        Entity managed object reference on ExtensionData - so all of them are tried. A single result
+        with nothing to match on is accepted, because a route that returns exactly one row for a
+        query scoped to one host is answering about that host.
+    #>
+    param(
+        [AllowEmptyCollection()][array]$Results,
+        [Parameter(Mandatory=$true)]$VMHostObject
+    )
+
+    $rows = @($Results | Where-Object { $null -ne $_ })
+    if ($rows.Count -eq 0) { return $null }
+
+    $hostName = [string]$VMHostObject.Name
+    $hostId = ""
+    try { $hostId = [string]$VMHostObject.Id } catch {}
+    $hostMoRef = ""
+    try { $hostMoRef = [string]$VMHostObject.ExtensionData.MoRef.Value } catch {}
+
+    foreach ($row in $rows) {
+        foreach ($candidate in @(
+            { [string]$row.VMHost.Name }
+            { [string]$row.VMHost }
+            { [string]$row.VMHostId }
+            { [string]$row.Entity.Value }
+            { [string]$row.ExtensionData.Entity.Value }
+        )) {
+            $value = ""
+            try { $value = & $candidate } catch { continue }
+            if ([string]::IsNullOrWhiteSpace($value)) { continue }
+            if ($value -eq $hostName -or $value -eq $hostId -or ($hostMoRef -and $value -eq $hostMoRef)) { return $row }
+            # An FQDN on one side and a short name on the other still identify the same host.
+            if ($hostName -and ($value.Split('.')[0] -eq $hostName.Split('.')[0]) -and $value -match '^[A-Za-z]') { return $row }
+        }
+    }
+
+    if ($rows.Count -eq 1) { return $rows[0] }
+    return $null
+}
+
+function Get-ComplianceStatusFromComplianceManager {
+    <#
+    .SYNOPSIS
+        Reads the compliance status vCenter holds, straight from the ProfileComplianceManager.
+
+    .DESCRIPTION
+        This is the same source the vSphere Client reads for the host's Host Profile tab, so when
+        the client shows Compliant and the cmdlet shows nothing, this is what settles it.
+        QueryComplianceStatus returns the stored result rather than starting a check - which is
+        exactly what is wanted here, because a real scan has already been issued by the time this
+        route is reached.
+
+        Everything is probed before it is used. Get-View, the ComplianceManager reference, the
+        method itself and the managed object references can all be absent or shaped differently
+        across versions, and this is a fallback: it must return empty and let the next route try,
+        never take the run down with it.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$VMHostObject,
+        $ProfileObject
+    )
+
+    $entityRefs = @()
+    try { if ($null -ne $VMHostObject.ExtensionData.MoRef) { $entityRefs = @($VMHostObject.ExtensionData.MoRef) } } catch {}
+    if ($entityRefs.Count -eq 0) { return @() }
+
+    $profileRefs = $null
+    try { if ($null -ne $ProfileObject -and $null -ne $ProfileObject.ExtensionData.MoRef) { $profileRefs = @($ProfileObject.ExtensionData.MoRef) } } catch {}
+
+    $manager = $null
+    try {
+        $serviceInstance = Get-View ServiceInstance -ErrorAction Stop
+        $managerRef = $serviceInstance.Content.ComplianceManager
+        if ($null -eq $managerRef) { return @() }
+        $manager = Get-View -Id $managerRef -ErrorAction Stop
+    }
+    catch { return @() }
+
+    if ($null -eq $manager) { return @() }
+    if (-not (@($manager | Get-Member -Name 'QueryComplianceStatus' -MemberType Method,ScriptMethod -ErrorAction SilentlyContinue).Count)) { return @() }
+
+    try { return @($manager.QueryComplianceStatus($profileRefs, $entityRefs)) } catch { return @() }
+}
+
 function Get-VMHostProfileComplianceState {
     <#
     .SYNOPSIS
-        Runs a host profile compliance scan to completion and returns the status vCenter holds.
+        Establishes a host's profile compliance status, trying every route vCenter offers.
 
     .DESCRIPTION
-        Status is one of Compliant, NonCompliant, NoProfile or Unknown. The compliance result
-        property name differs across PowerCLI versions, so both ComplianceStatus and Status are
-        read before giving up.
+        Status is one of Compliant, NonCompliant, NoProfile or Unknown.
 
-        Two things make the answer worth acting on rather than merely present:
+        Test-VMHostProfileCompliance -VMHost is the obvious call and usually the right one, but on
+        a live run against an Auto Deploy host in Maintenance mode it returned NOTHING - no error,
+        no result - and every host reported Unknown while the vSphere Client showed them compliant.
+        So it is no longer the only route. Four are tried, in this order, stopping at the first that
+        yields a usable status:
 
-          - The scan itself. -UseCache is not passed on the first call, so the cmdlet issues a
-            real compliance check and blocks until vCenter finishes it. Any check vCenter or Auto
-            Deploy already had running is drained first, so this is the one that answers.
-          - Reading the status vCenter actually holds. The status lands on different properties
-            depending on the PowerCLI build - ComplianceStatus or Status, on the result object or
-            only on its ExtensionData - so all four are read. If none of them yields a status, the
-            run asks vCenter for the stored result with -UseCache: the scan has already completed
-            by then, so that is the same value the vSphere Client shows on the host's Host Profile
-            tab. It is a second read of the same answer, not a substitute for scanning.
+          1. Test-VMHostProfileCompliance -VMHost. A real check: -UseCache is not passed, so the
+             cmdlet performs the scan and blocks until vCenter finishes it.
+          2. The ProfileComplianceManager's QueryComplianceStatus, via Get-View. This is the source
+             the vSphere Client reads, so it is the authority on what vCenter actually holds. It
+             reads rather than scans, which is correct here - route 1 has already asked for a scan.
+          3. Test-VMHostProfileCompliance -UseCache, PowerCLI's own read of the stored result.
+          4. Test-VMHostProfileCompliance -Profile. A real check, across every host attached to the
+             profile. Last because it is the expensive one, and its results are filtered back down
+             to this host.
 
-        Unknown means vCenter would not tell us, and is treated as a failure to be resolved rather
-        than a pass. It is never inferred from anything this script computes itself - an earlier
-        build compared the result's check time against the scan request to detect a pre-reboot
-        answer, and DateTimeKind made every host east of UTC report Unknown.
+        Any check vCenter or Auto Deploy already had running is drained before route 1, so route 1
+        is the scan that answers rather than colliding with one already in flight.
+
+        Unknown means every route declined to give a status. It is handled like NonCompliant, and
+        the detail names each route and what it returned, so the next run says which one to fix
+        rather than repeating "no result".
     #>
     param([Parameter(Mandatory=$true)]$VMHostObject)
 
@@ -2907,69 +3043,133 @@ function Get-VMHostProfileComplianceState {
         return [pscustomobject]@{ Status="NoProfile"; ProfileName=""; Details="No host profile is attached to this host."; CheckTime=$null }
     }
 
-    # Drain anything vCenter or Auto Deploy started, so the scan below is the one that answers.
+    # Drain anything vCenter or Auto Deploy started, so route 1 is the scan that answers.
     Wait-VMHostProfileComplianceTask -TimeoutMinutes $HostProfileComplianceScanTimeoutMinutes
 
-    Write-Host "  Running host profile compliance scan..." -ForegroundColor Gray
+    $routes = @(
+        [pscustomobject]@{
+            Name   = "scan by host"
+            Note   = "Running host profile compliance scan..."
+            Script = { Test-VMHostProfileCompliance -VMHost $VMHostObject -ErrorAction Stop }
+        }
+        [pscustomobject]@{
+            Name   = "compliance manager"
+            Note   = "No status from the scan. Reading the status vCenter holds (ProfileComplianceManager)..."
+            Script = { Get-ComplianceStatusFromComplianceManager -VMHostObject $VMHostObject -ProfileObject $profileObj }
+        }
+        [pscustomobject]@{
+            Name   = "stored result"
+            Note   = "Still no status. Reading vCenter's stored compliance result..."
+            Script = { Test-VMHostProfileCompliance -VMHost $VMHostObject -UseCache -ErrorAction Stop }
+        }
+        [pscustomobject]@{
+            Name   = "scan by profile"
+            Note   = "Still no status. Scanning host profile '$($profileObj.Name)' across every host attached to it..."
+            Script = { Test-VMHostProfileCompliance -Profile $profileObj -ErrorAction Stop }
+        }
+    )
+
     $result = $null
-    try {
-        # No -UseCache here: this call has to perform the check, not read the previous answer.
-        $result = @(Test-VMHostProfileCompliance -VMHost $VMHostObject -ErrorAction Stop) | Select-Object -First 1
-    }
-    catch {
-        return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test failed: $($_.Exception.Message)"; CheckTime=$null }
-    }
+    $statusRaw = ""
+    $answeredBy = ""
+    $routeNotes = New-Object System.Collections.Generic.List[string]
 
-    if ($null -eq $result) {
-        return [pscustomobject]@{ Status="Unknown"; ProfileName=$profileObj.Name; Details="Compliance test returned no result."; CheckTime=$null }
-    }
+    foreach ($route in $routes) {
+        Write-Host "  $($route.Note)" -ForegroundColor Gray
 
-    $statusRaw = Get-ComplianceStatusValue -ComplianceResult $result
-    $statusSource = "scan"
-
-    # The scan has completed, so vCenter now holds its result. If this build did not project the
-    # status onto anything readable, ask for the stored one - that is the value the vSphere Client
-    # shows, and it is the result of the scan just performed, not an older one.
-    if ([string]::IsNullOrWhiteSpace($statusRaw) -or (ConvertTo-ComplianceStatus -Raw $statusRaw) -eq "Unknown") {
-        Write-Host "  The scan result did not carry a readable status. Reading the status vCenter now holds..." -ForegroundColor Gray
-        try {
-            $stored = @(Test-VMHostProfileCompliance -VMHost $VMHostObject -UseCache -ErrorAction Stop) | Select-Object -First 1
-            $storedRaw = Get-ComplianceStatusValue -ComplianceResult $stored
-            if (-not [string]::IsNullOrWhiteSpace($storedRaw) -and (ConvertTo-ComplianceStatus -Raw $storedRaw) -ne "Unknown") {
-                $statusRaw = $storedRaw
-                $statusSource = "stored"
-                if ($null -ne $stored) { $result = $stored }
-            }
-        }
+        $rows = @()
+        try { $rows = @(& $route.Script) }
         catch {
-            Write-Host "  Could not read the stored compliance status: $($_.Exception.Message)" -ForegroundColor Yellow
+            [void]$routeNotes.Add("$($route.Name): failed - $($_.Exception.Message)")
+            continue
         }
+
+        $rows = @($rows | Where-Object { $null -ne $_ })
+        if ($rows.Count -eq 0) {
+            [void]$routeNotes.Add("$($route.Name): no result")
+            continue
+        }
+
+        $row = Select-ComplianceResultForHost -Results $rows -VMHostObject $VMHostObject
+        if ($null -eq $row) {
+            [void]$routeNotes.Add("$($route.Name): $($rows.Count) result(s), none for this host")
+            continue
+        }
+
+        $raw = Get-ComplianceStatusValue -ComplianceResult $row
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            [void]$routeNotes.Add("$($route.Name): result carried no status property")
+            if ($null -eq $result) { $result = $row }
+            continue
+        }
+        if ((ConvertTo-ComplianceStatus -Raw $raw) -eq "Unknown") {
+            [void]$routeNotes.Add("$($route.Name): reported '$raw'")
+            if ($null -eq $result) { $result = $row }
+            continue
+        }
+
+        $result = $row
+        $statusRaw = $raw
+        $answeredBy = $route.Name
+        break
     }
 
-    $details = ""
-    foreach ($prop in @("IncomplianceElementList","ExtensionData")) {
-        if ($result.PSObject.Properties.Name -contains $prop -and $null -ne $result.$prop) {
-            try {
-                $elements = @($result.IncomplianceElementList)
-                if ($elements.Count -gt 0) {
-                    $details = ($elements | ForEach-Object { [string]$_ } | Select-Object -First 5) -join ' | '
-                }
-            } catch {}
-            break
-        }
-    }
+    $details = Get-ComplianceFailureDetail -ComplianceResult $result
 
     $status = ConvertTo-ComplianceStatus -Raw $statusRaw
     if ($status -eq "Unknown") {
-        $details = "vCenter returned no usable compliance status$(if($statusRaw){" (raw value '$statusRaw')"}). $details".Trim()
+        $details = ("vCenter gave no usable compliance status. Routes tried - $($routeNotes -join '; '). $details").Trim()
     }
-    elseif ($statusSource -eq "stored") {
-        $details = "Status read from the result vCenter stored for this scan. $details".Trim()
+    elseif ($answeredBy -ne "scan by host") {
+        $details = ("Status obtained via the '$answeredBy' route; the direct scan gave nothing. $details").Trim()
     }
 
     return [pscustomobject]@{ Status=$status; ProfileName=$profileObj.Name; Details=$details; CheckTime=(Get-ComplianceCheckTime -ComplianceResult $result) }
 }
 
+function Get-ComplianceFailureDetail {
+    <#
+    .SYNOPSIS
+        Summarises why a host is non-compliant, in a line an operator can act on.
+
+    .DESCRIPTION
+        The differences arrive as IncomplianceElementList on a PowerCLI result and as Failure on a
+        raw ComplianceResult from the API, so both are read. Capped at five entries: the point is to
+        say which setting drifted, not to reproduce the whole compliance report on the console.
+    #>
+    param($ComplianceResult)
+
+    if ($null -eq $ComplianceResult) { return "" }
+
+    try {
+        if ($ComplianceResult.PSObject.Properties.Name -contains 'IncomplianceElementList' -and $null -ne $ComplianceResult.IncomplianceElementList) {
+            $elements = @($ComplianceResult.IncomplianceElementList)
+            if ($elements.Count -gt 0) {
+                return (($elements | ForEach-Object { [string]$_ } | Select-Object -First 5) -join ' | ')
+            }
+        }
+    }
+    catch {}
+
+    foreach ($source in @($ComplianceResult, $ComplianceResult.ExtensionData)) {
+        try {
+            if ($null -eq $source) { continue }
+            if ($source.PSObject.Properties.Name -notcontains 'Failure' -or $null -eq $source.Failure) { continue }
+            $failures = @($source.Failure)
+            if ($failures.Count -eq 0) { continue }
+            return (($failures | ForEach-Object {
+                $text = ""
+                try { if ($_.PSObject.Properties.Name -contains 'Message' -and $null -ne $_.Message) { $text = [string]$_.Message.Message } } catch {}
+                if ([string]::IsNullOrWhiteSpace($text)) { try { $text = [string]$_.Expression } catch {} }
+                if ([string]::IsNullOrWhiteSpace($text)) { $text = [string]$_ }
+                $text
+            } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 5) -join ' | ')
+        }
+        catch {}
+    }
+
+    return ""
+}
 function Confirm-HostProfileComplianceAndExitMaintenance {
     <#
     .SYNOPSIS
@@ -3070,7 +3270,16 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
             if ($Global:AutoExitMaintenanceMode) {
                 Write-Host "  Taking '$hostName' out of Maintenance mode." -ForegroundColor Green
                 Set-VMHost -VMHost $hostObj -State Connected -Confirm:$false -ErrorAction Stop | Out-Null
-                Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Sent" -Details "Exited after host profile compliance passed."
+
+                # vCenter reports the old state for a moment after the exit is accepted. The very
+                # next thing the batch loop does is a cluster health check that fails on any host in
+                # Maintenance mode, so returning before the transition lands stops the run one host
+                # in - which reads as "the override didn't continue".
+                if (-not (Wait-VMHostOutOfMaintenance -HostName $hostName -TimeoutMinutes $ExitMaintenanceTimeoutMinutes)) {
+                    Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Timeout" -Details "Still in Maintenance mode $ExitMaintenanceTimeoutMinutes minute(s) after the exit was sent."
+                    Stop-WithMessage "'$hostName' is still in Maintenance mode $ExitMaintenanceTimeoutMinutes minute(s) after being told to exit. Check for a stuck task or a DRS/vMotion problem in vCenter before continuing."
+                }
+                Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Sent" -Details "Confirmed Connected after host profile compliance was accepted."
             }
             else {
                 Write-Host "  AutoExitMaintenanceMode is disabled - leaving '$hostName' in Maintenance mode." -ForegroundColor Yellow
@@ -3078,6 +3287,46 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
             }
         }
     }
+}
+
+function Wait-VMHostOutOfMaintenance {
+    <#
+    .SYNOPSIS
+        Waits until vCenter reports a host as out of Maintenance mode. Returns $true if it does.
+
+    .DESCRIPTION
+        Set-VMHost -State Connected returns once vCenter has accepted the change, which is not the
+        same as the host having left Maintenance mode. For a short window afterwards Get-VMHost
+        still reports Maintenance, and the cluster health check that runs immediately after treats
+        any host in Maintenance mode as a failure - so the run stops one host in, having actually
+        succeeded.
+
+        Returns $false on timeout rather than throwing, so the caller decides what a host that will
+        not come out of Maintenance mode means.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$HostName,
+        [int]$TimeoutMinutes = 10
+    )
+
+    if ((Test-DryRun) -or (Test-StageNoAck)) { return $true }
+
+    $endTime = (Get-Date).AddMinutes($TimeoutMinutes)
+    $announced = $false
+    while ((Get-Date) -lt $endTime) {
+        $current = $null
+        try { $current = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue } catch {}
+        if ($null -ne $current -and $current.ConnectionState -ne "Maintenance") {
+            Write-Host "  '$HostName' is out of Maintenance mode (ConnectionState: $($current.ConnectionState))." -ForegroundColor Green
+            return $true
+        }
+        if (-not $announced) {
+            Write-Host "  Waiting for '$HostName' to leave Maintenance mode..." -ForegroundColor Gray
+            $announced = $true
+        }
+        Start-Sleep -Seconds 5
+    }
+    return $false
 }
 
 function Invoke-RebootSafetyWindow {
@@ -3227,7 +3476,147 @@ function Reset-ClusterScopedState {
 
     # Firmware policy is derived per UCSM domain, so the resolved map is cluster-scoped.
     $Global:UcsFirmwarePolicyByTarget = @{}
+    # Belongs to the cluster just finished - a second cluster's parked hosts are its own.
+    $Global:PreExistingMaintenanceHosts = @()
     Set-Variable -Name TargetUcsFirmwarePolicyName -Scope Script -Value ""
+}
+
+function Show-ClusterFirmwareVerification {
+    <#
+    .SYNOPSIS
+        Closing report: what each host ended up on, and whether anything is still outstanding.
+
+    .DESCRIPTION
+        Printed once the cluster is complete, before the run returns to the menu, so the change
+        record does not rest on "no errors were shown". Read straight from the platforms rather
+        than from the run summary - the summary says what the script did, this says what the
+        infrastructure now reports.
+
+        Per host:
+          ESXi build     - against $TargetEsxiBuild.
+          Intersight     - the server profile's ConfigState, and whether anything is still staged.
+                           "None" in the Outstanding column is the result being looked for: the
+                           deploy landed and nothing is waiting.
+          UCS Manager    - the host firmware package now on the service profile, against the one
+                           this run resolved for that domain, plus any acknowledgement still
+                           pending against the profile.
+
+        Every read is best effort. This runs after the work is done, so a platform that will not
+        answer is reported as unreadable rather than being allowed to fail a completed cluster.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Cluster,
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames
+    )
+
+    if ($HostNames.Count -eq 0) { return }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "=== Post-change verification: $($Cluster.Name) ===" -ForegroundColor Cyan
+
+    if ((Test-DryRun) -or (Test-StageNoAck)) {
+        Write-Host "DRY/STAGE: no verification read - nothing was changed." -ForegroundColor Green
+        return
+    }
+
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    foreach ($hostName in ($HostNames | Sort-Object)) {
+        $esxiBuild = ""
+        $connection = ""
+        try {
+            $hostObj = Get-VMHost -Name $hostName -ErrorAction SilentlyContinue
+            if ($null -ne $hostObj) { $esxiBuild = [string]$hostObj.Build; $connection = [string]$hostObj.ConnectionState }
+        }
+        catch {}
+
+        $buildResult = if ([string]::IsNullOrWhiteSpace($TargetEsxiBuild)) { "n/a" }
+                       elseif ($esxiBuild -eq $TargetEsxiBuild) { "On target" }
+                       else { "NOT on target" }
+
+        $platform = "ESXi only"
+        $firmware = ""
+        $outstanding = ""
+
+        if ($Global:IntersightHostMap.ContainsKey($hostName)) {
+            $platform = "Intersight"
+            try {
+                $serverProfile = Resolve-IntersightServerProfileForHost -HostName $hostName -IntersightCsvRow $Global:IntersightHostMap[$hostName].IntersightCsvRow
+                $deployState = Get-IntersightProfileDeployState -ServerProfile $serverProfile
+                $firmware = "ConfigState: $($deployState.ConfigState)"
+                $outstanding = if ($deployState.RequiresDeploy) { "PENDING - $($deployState.ConfigState) still staged" }
+                               elseif (-not $deployState.StateKnown) { "Unreadable - ConfigState not reported" }
+                               else { "None" }
+            }
+            catch {
+                $firmware = "Unreadable"
+                $outstanding = "Unreadable - $($_.Exception.Message)"
+            }
+        }
+        elseif ($Global:UcsHostMap.ContainsKey($hostName)) {
+            $platform = "UCS Manager"
+            try {
+                $map = $Global:UcsHostMap[$hostName]
+                $ucsSession = Get-UcsSessionForTarget -UcsTarget $map.UcsTarget
+                $serviceProfile = Get-UcsServiceProfile -Ucs $ucsSession -Dn $map.ServiceProfileDn -ErrorAction Stop | Select-Object -First 1
+                if ($null -eq $serviceProfile) { throw "Service profile $($map.ServiceProfileDn) could not be read back." }
+                $currentPolicy = Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $serviceProfile
+                $expectedPolicy = if ($Global:UcsFirmwarePolicyByTarget.ContainsKey($map.UcsTarget)) { [string]$Global:UcsFirmwarePolicyByTarget[$map.UcsTarget] } else { "" }
+
+                $firmware = "Policy: $(if($currentPolicy){$currentPolicy}else{'<none>'})"
+                if ($expectedPolicy -and $currentPolicy -ne $expectedPolicy) {
+                    $outstanding = "POLICY MISMATCH - expected '$expectedPolicy'"
+                }
+                else {
+                    $stillPending = @()
+                    try {
+                        $stillPending = @(Get-UcsLsmaintAck -Ucs $ucsSession -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Dn -like "$($map.ServiceProfileDn)/*" -or $_.Dn -eq "$($map.ServiceProfileDn)/ack" })
+                    }
+                    catch {}
+                    $outstanding = if ($stillPending.Count -gt 0) { "PENDING - acknowledgement still open" } else { "None" }
+                }
+            }
+            catch {
+                $firmware = "Unreadable"
+                $outstanding = "Unreadable - $($_.Exception.Message)"
+            }
+        }
+
+        [void]$rows.Add([pscustomobject]@{
+            Host        = $hostName
+            Platform    = $platform
+            Connection  = $connection
+            EsxiBuild   = $esxiBuild
+            EsxiResult  = $buildResult
+            Firmware    = $firmware
+            Outstanding = $outstanding
+        })
+    }
+
+    $rows | Select-Object Host,Platform,Connection,EsxiBuild,EsxiResult,Firmware,Outstanding | Format-Table -AutoSize | Out-Host
+
+    foreach ($row in $rows) {
+        Add-SummaryRecord -Stage "PostChangeVerification" -Batch "" -HostName $row.Host -Action "Verify after change" -Result $(if ($row.Outstanding -eq "None") { "Clean" } else { "Attention" }) -Details "$($row.Platform); ESXi $($row.EsxiBuild) ($($row.EsxiResult)); $($row.Firmware); outstanding: $($row.Outstanding)"
+    }
+
+    $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $path = Join-Path $RunDirectory "Post-Change-Verification-$($Cluster.Name)-$timestamp.csv"
+    try {
+        $rows | Export-Csv -Path $path -NoTypeInformation -Encoding UTF8
+        Write-Host "Verification exported to: $path" -ForegroundColor Green
+    }
+    catch {
+        Write-Host "Failed to export the verification CSV: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    $attention = @($rows | Where-Object { $_.Outstanding -ne "None" })
+    if ($attention.Count -eq 0) {
+        Write-Host "All $($rows.Count) host(s) verified: nothing outstanding on Intersight or UCS Manager." -ForegroundColor Green
+    }
+    else {
+        Write-Host "$($attention.Count) of $($rows.Count) host(s) need attention - see the Outstanding column above." -ForegroundColor Yellow
+    }
 }
 
 function Invoke-ClusterUpgradeWorkflow {
@@ -3240,6 +3629,15 @@ function Invoke-ClusterUpgradeWorkflow {
 
     $allClusterHosts = @(Get-VMHost -Location $Cluster | Sort-Object Name)
     if ($allClusterHosts.Count -eq 0) { Stop-WithMessage "No hosts found in selected cluster." }
+
+    # Recorded before anything is touched, so a host parked in Maintenance mode by someone else is
+    # never mistaken for one this run put there. Only hosts that are Connected enter scope, so these
+    # are out of the run either way - this stops them failing every health check as well.
+    $Global:PreExistingMaintenanceHosts = @($allClusterHosts | Where-Object { $_.ConnectionState -eq "Maintenance" } | Select-Object -ExpandProperty Name)
+    if ($Global:PreExistingMaintenanceHosts.Count -gt 0) {
+        Write-Host "Host(s) already in Maintenance mode and out of scope for this run: $($Global:PreExistingMaintenanceHosts -join ', ')" -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Pre-existing Maintenance mode" -Result "Excluded" -Details ($Global:PreExistingMaintenanceHosts -join ', ')
+    }
 
     if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") { Build-InfrastructureHostMapping -Hosts $allClusterHosts }
 
@@ -3435,6 +3833,7 @@ function Invoke-ClusterUpgradeWorkflow {
             Write-Host "Continuing automatically to Batch $($batchNumber + 1)." -ForegroundColor Green
         }
     }
+    Show-ClusterFirmwareVerification -Cluster $Cluster -HostNames @($patchCandidateHosts | Select-Object -ExpandProperty Name)
     Add-SummaryRecord -Stage "ClusterComplete" -Batch "" -HostName "" -Action "Complete cluster" -Result "Completed" -Details $Cluster.Name
 }
 

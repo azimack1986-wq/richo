@@ -66,6 +66,7 @@ $PowerCliWebOperationTimeoutSeconds     = 3600
 # minutes would be two minutes of busy-waiting per batch.
 $HostProfileComplianceSettleMinutes     = 0.01
 $HostProfileComplianceScanTimeoutMinutes = 1
+$ExitMaintenanceTimeoutMinutes          = 1
 $RunDirectory                           = [IO.Path]::GetTempPath()
 $SummaryPath                            = Join-Path $RunDirectory "simulation-summary.csv"
 
@@ -78,6 +79,7 @@ $Global:UcsHostMap                      = @{}
 $Global:UcsCandidateCache               = @{}
 $Global:UcsServiceProfileCache          = @{}
 $Global:AutoExitMaintenanceMode         = $true
+$Global:PreExistingMaintenanceHosts     = @()
 $Global:PrerequisitesConfirmed          = $true
 $Global:BatchActionsSent                = 0
 $Global:IntersightBaseUrl               = 'https://pva.example.com'
@@ -100,11 +102,13 @@ $Global:UcsFirmwarePolicyByFabricFamily = @{
     '6300' = 'global-436h'
 }
 
-# Intersight CSV: esx01/esx02 belong to fabric SS101, esx03/esx04 do not appear at all.
+# Intersight CSV: esx01 is behind fabric SS101 and esx02 behind SS102; esx03/esx04 do not appear at
+# all. One row per host, because a shared row would give both hosts the same server profile - and a
+# deploy for the first would then look like "nothing staged" for the second.
 $csvDir = Join-Path ([IO.Path]::GetTempPath()) ("wfsim-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $csvDir | Out-Null
 $IntersightCsvPath = Join-Path $csvDir 'intersightfabric.csv'
-"Name`nPD24000001SS101-A.dpe.example" | Set-Content -Path $IntersightCsvPath -Encoding UTF8
+"Name`nPD24000001SS101-A.dpe.example`nPD24000001SS102-A.dpe.example" | Set-Content -Path $IntersightCsvPath -Encoding UTF8
 
 # ---------------------------------------------------------------------------
 # Simulated estate
@@ -217,26 +221,42 @@ function Set-UcsLsmaintAck { param($Ucs,$LsmaintAck,$AdminState,[switch]$Force,$
 # has started configuring Intersight, which it must not.
 function Set-IntersightConfiguration { param($BasePath,$ApiKeyId,$ApiKeyFilePath,$HttpSigningHeader,$ErrorAction) Note-Call 'Set-IntersightConfiguration' }
 function Get-IntersightConfiguration { return [pscustomobject]@{ BasePath = $Global:IntersightBaseUrl; ApiKeyId = 'a/b/c' } }
+# ConfigState is stateful: a profile starts with staged changes and reaches Associated once it has
+# been deployed. A stub frozen on Pending-changes would make the closing verification report every
+# Intersight host as still outstanding, which is the opposite of what a completed run should show.
+$script:IntersightDeployed = New-Object System.Collections.Generic.HashSet[string]
 function Get-IntersightServerProfile {
     param($Moid,$Filter,$Top,$Skip,$ErrorAction)
     # Paged shape, as the real cmdlet returns - exercises Get-IntersightResultList.
+    # Lookups arrive by filter on the first pass and by Moid once the profile is cached, so both
+    # have to resolve back to the same profile. Collapsing a Moid lookup to one generic profile made
+    # every host share it, and one host's deploy then looked like every host's.
     $name = 'sp-generic'
     if ($Filter -and $Filter -match "Name eq '([^']+)'") { $name = $Matches[1] }
+    elseif ($Moid -and "$Moid" -match '^moid-(.+)$') { $name = $Matches[1] }
+    $state = if ($script:IntersightDeployed.Contains("moid-$name")) { 'Associated' } else { 'Pending-changes' }
     return [pscustomobject]@{
         Results = @([pscustomobject]@{
             Name = $name; Moid = "moid-$name"
-            ConfigContext = [pscustomobject]@{ ConfigState = 'Pending-changes' }
+            ConfigContext = [pscustomobject]@{ ConfigState = $state }
         })
     }
 }
-function Set-IntersightServerProfile { param($Moid,$Action,$ActionParams,$ErrorAction) Note-Call 'Set-IntersightServerProfile' }
+function Set-IntersightServerProfile { param($Moid,$Action,$ActionParams,$ErrorAction)
+    Note-Call 'Set-IntersightServerProfile'
+    if ($Moid) { [void]$script:IntersightDeployed.Add([string]$Moid) }
+}
 function Initialize-IntersightPolicyActionParam { param($Name,$Value) return [pscustomobject]@{ Name=$Name; Value=$Value } }
 
 # CDP/LLDP: the one place the script talks to vCenter through Get-View, replaced wholesale so the
 # simulation controls which fabric each host reports.
 function Get-EsxiDiscoveryProtocolInfo {
     param($VMHostObject)
-    $fabric = if ($VMHostObject.Name -match 'esx0[12]') { 'PD24000001SS101-A.dpe.example' } else { 'PD24000002SS201-A.dpe.example' }
+    $fabric = switch -Regex ($VMHostObject.Name) {
+        'esx01' { 'PD24000001SS101-A.dpe.example'; break }
+        'esx02' { 'PD24000001SS102-B.dpe.example'; break }   # -B form, so suffix matching is exercised
+        default { 'PD24000002SS201-A.dpe.example' }
+    }
     return @([pscustomobject]@{ Host=$VMHostObject.Name; Vmnic='vmnic0'; SystemName=$fabric; PortId='1' })
 }
 
@@ -286,6 +306,7 @@ function Reset-Simulation {
     # stop to ask - a stale fixture masquerading as a behaviour change.
     $script:UcsPolicyState = @{}
     $script:UcsAcked = New-Object System.Collections.Generic.HashSet[string]
+    $script:IntersightDeployed = New-Object System.Collections.Generic.HashSet[string]
 }
 
 Write-Host "`n=== The script loads ===" -ForegroundColor Cyan
@@ -444,6 +465,15 @@ Assert-True "every host was processed one at a time" (@($Global:RunSummary | Whe
 Assert-True "each host was its own batch" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' } | Select-Object -ExpandProperty Batch -Unique).Count -eq 4)
 Assert-True "every host ended Connected" (@($script:HostState.Values | Where-Object { $_.ConnectionState -ne 'Connected' }).Count -eq 0)
 Assert-True "the cluster completed without intervention" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
+
+Write-Host "`n=== The cluster closes with a verification read from the platforms ===" -ForegroundColor Cyan
+# Read back from Intersight, UCS Manager and vCenter after the fact - a completed run has to be able
+# to show what the infrastructure now reports, not just that the script hit no errors.
+$verification = @($Global:RunSummary | Where-Object { $_.Stage -eq 'PostChangeVerification' })
+Assert-True "every host was verified after the change" ($verification.Count -eq 4) "got $($verification.Count)"
+Assert-True "nothing was left outstanding" (@($verification | Where-Object { $_.Result -ne 'Clean' }).Count -eq 0) "not clean: $(($verification | Where-Object { $_.Result -ne 'Clean' } | ForEach-Object { "$($_.Host): $($_.Details)" }) -join ' | ')"
+Assert-True "Intersight hosts report no staged changes" (@($verification | Where-Object { $_.Details -match 'Intersight' -and $_.Details -match 'outstanding: None' }).Count -eq 2)
+Assert-True "UCS hosts report the resolved firmware policy" (@($verification | Where-Object { $_.Details -match 'Policy: global-602d' }).Count -eq 2)
 
 Remove-Item -Path $csvDir -Recurse -Force -ErrorAction SilentlyContinue
 

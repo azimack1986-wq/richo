@@ -33,6 +33,10 @@ $wanted = @(
     'Get-ComplianceCheckTime'
     'Get-ComplianceStatusValue'
     'ConvertTo-ComplianceStatus'
+    'Get-ComplianceFailureDetail'
+    'Select-ComplianceResultForHost'
+    'Get-ComplianceStatusFromComplianceManager'
+    'Wait-VMHostOutOfMaintenance'
     'Wait-VMHostProfileComplianceTask'
     'Wait-HostProfileComplianceSettle'
     'Confirm-HostProfileComplianceAndExitMaintenance'
@@ -49,6 +53,7 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
 # minutes; its behaviour is asserted separately against a non-zero value.
 $HostProfileComplianceSettleMinutes      = 0
 $HostProfileComplianceScanTimeoutMinutes = 1
+$ExitMaintenanceTimeoutMinutes           = 1
 
 $Global:RunMode = 'LIVE'
 $Global:AutoExitMaintenanceMode = $true
@@ -79,12 +84,29 @@ function Get-Task {
     return @([pscustomobject]@{ Name = 'CheckCompliance_Task'; Description = 'Check compliance' })
 }
 function Get-VMHostProfile { param($Entity,$ErrorAction) return [pscustomobject]@{ Name = 'HP-Prod' } }
+# The ProfileComplianceManager route. $script:ManagerResults is what QueryComplianceStatus returns;
+# $null makes Get-View unavailable, as it is on a session with no vCenter connection.
+$script:ManagerResults = $null
+# No [Parameter()] attributes: they make this an advanced function, which adds the common
+# parameters and then collides with the explicit $ErrorAction the script passes.
+function Get-View {
+    param($VIObject,$Id,$ErrorAction)
+    if ($null -eq $script:ManagerResults) { throw "Get-View is not available" }
+    if ($Id) {
+        return [pscustomobject]@{ } | Add-Member -MemberType ScriptMethod -Name QueryComplianceStatus -Value {
+            param($profileRefs,$entityRefs) return $script:ManagerResults } -PassThru
+    }
+    return [pscustomobject]@{ Content = [pscustomobject]@{ ComplianceManager = 'compliance-manager-1' } }
+}
 function Get-VMHost { param($Name,$Location,$ErrorAction)
     return [pscustomobject]@{ Name = $Name; ConnectionState = $script:HostConnectionState } }
 function Set-VMHost { param($VMHost,$State,[switch]$Evacuate,[switch]$RunAsync,$Confirm,$ErrorAction)
     $script:HostConnectionState = if ($State -eq 'Maintenance') { 'Maintenance' } else { 'Connected' } }
 
-$testHost = [pscustomobject]@{ Name = 'esx1.example'; ConnectionState = 'Maintenance' }
+$testHost = [pscustomobject]@{
+    Name = 'esx1.example'; ConnectionState = 'Maintenance'; Id = 'HostSystem-host-1'
+    ExtensionData = [pscustomobject]@{ MoRef = [pscustomobject]@{ Value = 'host-1'; Type = 'HostSystem' } }
+}
 
 Write-Host "`n=== The scan is a real check, and the status is read from it ===" -ForegroundColor Cyan
 $script:CacheCalls = New-Object System.Collections.Generic.List[bool]
@@ -185,9 +207,63 @@ function Test-VMHostProfileCompliance {
 }
 Assert-Equal "an old check time does not override the status" "Compliant" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
 
+Write-Host "`n=== The ProfileComplianceManager answers when the scan returns nothing ===" -ForegroundColor Cyan
+# This is the live failure: Test-VMHostProfileCompliance -VMHost returned no result at all - no
+# error, no rows - while the vSphere Client showed the host compliant. The manager is the source
+# the client reads, so it is what settles it.
+function Test-VMHostProfileCompliance { param($VMHost,[switch]$UseCache,$ErrorAction) return @() }
+$script:ManagerResults = @([pscustomobject]@{
+    Entity = [pscustomobject]@{ Value = 'host-1' }; ComplianceStatus = 'compliant'; CheckTime = (Get-Date) })
+$state = Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null
+Assert-Equal "the manager's status is used" "Compliant" $state.Status
+Assert-Equal "the detail names the route that answered" $true ($state.Details -match 'compliance manager')
+
+Write-Host "`n=== A result for a different host is never used for this one ===" -ForegroundColor Cyan
+$script:ManagerResults = @([pscustomobject]@{
+    Entity = [pscustomobject]@{ Value = 'host-99' }; ComplianceStatus = 'compliant' },
+    [pscustomobject]@{ Entity = [pscustomobject]@{ Value = 'host-42' }; ComplianceStatus = 'compliant' })
+Assert-Equal "two results, neither for this host, is not a pass" "Unknown" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
+$script:ManagerResults = @([pscustomobject]@{
+    Entity = [pscustomobject]@{ Value = 'host-99' }; ComplianceStatus = 'nonCompliant' },
+    [pscustomobject]@{ Entity = [pscustomobject]@{ Value = 'host-1' }; ComplianceStatus = 'compliant' })
+Assert-Equal "the row matching this host is picked out of several" "Compliant" (Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null).Status
+
+Write-Host "`n=== The profile-wide scan is the last resort, and is filtered ===" -ForegroundColor Cyan
+$script:ManagerResults = $null      # manager unavailable
+$script:ProfileScanCalled = $false
+function Test-VMHostProfileCompliance {
+    param($VMHost,$Profile,[switch]$UseCache,$ErrorAction)
+    if ($Profile) {
+        $script:ProfileScanCalled = $true
+        return @(
+            [pscustomobject]@{ VMHost = [pscustomobject]@{ Name = 'esx9.example' }; ComplianceStatus = 'nonCompliant' },
+            [pscustomobject]@{ VMHost = [pscustomobject]@{ Name = 'esx1.example' }; ComplianceStatus = 'compliant' })
+    }
+    return @()
+}
+$state = Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null
+Assert-Equal "the profile-wide scan ran once everything else was exhausted" $true $script:ProfileScanCalled
+Assert-Equal "and only this host's row was used" "Compliant" $state.Status
+
+Write-Host "`n=== When every route declines, the detail says which ===" -ForegroundColor Cyan
+function Test-VMHostProfileCompliance { param($VMHost,$Profile,[switch]$UseCache,$ErrorAction) return @() }
+$state = Get-VMHostProfileComplianceState -VMHostObject $testHost 6>$null
+Assert-Equal "no route answering is Unknown" "Unknown" $state.Status
+foreach ($route in @('scan by host','compliance manager','stored result','scan by profile')) {
+    Assert-Equal "the detail records the '$route' route" $true ($state.Details -match [regex]::Escape($route))
+}
+
+Write-Host "`n=== The exit from Maintenance mode is confirmed, not assumed ===" -ForegroundColor Cyan
+# vCenter reports the old state for a moment. Returning before the transition lands stops the very
+# next cluster health check, which is what made an override look like it had ended the run.
+$script:HostConnectionState = 'Maintenance'
+Assert-Equal "a host that never leaves Maintenance mode times out" $false (Wait-VMHostOutOfMaintenance -HostName 'esx1.example' -TimeoutMinutes 0.001 6>$null)
+$script:HostConnectionState = 'Connected'
+Assert-Equal "a host that has left is confirmed" $true (Wait-VMHostOutOfMaintenance -HostName 'esx1.example' -TimeoutMinutes 1 6>$null)
+
 Write-Host "`n=== A compliant host is taken out of Maintenance mode ===" -ForegroundColor Cyan
 function Test-VMHostProfileCompliance {
-    param($VMHost,[switch]$UseCache,$ErrorAction)
+    param($VMHost,$Profile,[switch]$UseCache,$ErrorAction)
     return [pscustomobject]@{ ComplianceStatus = 'Compliant'; CheckTime = (Get-Date) }
 }
 $script:HostConnectionState = 'Maintenance'
