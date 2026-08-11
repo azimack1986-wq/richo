@@ -177,7 +177,7 @@ function Get-UcsServiceProfile {
     $spName = if ($Name) { $Name } elseif ($Dn) { ($Dn -split '/')[-1] -replace '^ls-','' } else { $null }
     if (-not $spName) { return @() }
     if (-not $script:UcsPolicyState.ContainsKey($spName)) { $script:UcsPolicyState[$spName] = 'fw-old' }
-    return [pscustomobject]@{ Name = $spName; Dn = "org-root/ls-$spName"; HostFwPolicyName = $script:UcsPolicyState[$spName] }
+    return [pscustomobject]@{ Name = $spName; Dn = "org-root/ls-$spName"; PnDn = 'sys/chassis-1/blade-1'; HostFwPolicyName = $script:UcsPolicyState[$spName] }
 }
 function Set-UcsServiceProfile {
     param($Ucs,$ServiceProfile,$HostFwPolicyName,[switch]$Force,$ErrorAction)
@@ -205,6 +205,11 @@ function Add-UcsFirmwareComputeHostPack { param($Ucs,$Org,$Name,$BladeBundleVers
 # UCSM raises a maintenance acknowledgement against a service profile once its firmware policy
 # changes, so the stub does too. Returning an empty list unconditionally made every UCS-only batch
 # look like it had nothing staged, which is a different code path entirely.
+# The version each server reports running. global-602d means 6.0(2d), so a server on that version
+# verifies clean and a server left behind is caught by the comparison.
+$script:UcsRunningVersion = '6.0(2d)'
+function Get-UcsFirmwareRunning { param($Ucs,$ErrorAction)
+    return @([pscustomobject]@{ Dn='sys/chassis-1/blade-1/mgmt/fw-system'; Deployment='system'; Type='blade-controller'; Version=$script:UcsRunningVersion }) }
 function Get-UcsLsmaintAck { param($Ucs,$ErrorAction)
     return @($script:UcsPolicyState.Keys |
         Where-Object { $script:UcsPolicyState[$_] -ne 'fw-old' -and -not $script:UcsAcked.Contains($_) } |
@@ -274,7 +279,6 @@ function Read-Host {
         'Select run mode'            { return '2' }    # DRY RUN
         'Select upgrade mode'        { return '2' }    # ESXi + firmware
         'Select batch mode'          { return '1' }    # AUTO
-        'manual health checks'       { return 'YES' }
         'Create host firmware package' { return 'CREATE' }
         'Intersight FQDN'            { return 'pva.example.com' }
         'Nothing to reboot'          { return 'CONTINUE' }
@@ -379,7 +383,6 @@ function Read-Host { param([string]$Prompt)
         'Select run mode'          { return '1' }    # LIVE
         'Select upgrade mode'      { return '2' }
         'Select batch mode'        { return '1' }
-        'manual health checks'     { return 'YES' }
         'Create host firmware package' { return 'CREATE' }
         'Nothing to reboot'        { return 'CONTINUE' }
         'O to override'            { return 'C' }
@@ -436,9 +439,12 @@ $AgreedPrompts = @(
     'Select run mode'
     'Select upgrade mode'
     'Select batch mode'
-    'manual health checks'
     'Create host firmware package'
 )
+# The manual health check / change gate question is deliberately NOT here. It moved into the
+# requirements printed at the start of the run: it asks about a change record the script cannot
+# see, so asking again mid-run gates nothing and only interrupts an unattended cluster.
+$RemovedPrompts = @('manual health checks', 'change gates')
 $script:UnexpectedPrompts = New-Object System.Collections.Generic.List[string]
 function Read-Host {
     param([string]$Prompt)
@@ -451,7 +457,6 @@ function Read-Host {
         'Select run mode'              { return '1' }    # LIVE
         'Select upgrade mode'          { return '2' }
         'Select batch mode'            { return '2' }    # SINGLE
-        'manual health checks'         { return 'YES' }
         'Create host firmware package' { return 'CREATE' }
         default                        { return 'YES' }
     }
@@ -461,10 +466,37 @@ $singleError = $null
 try { Invoke-ClusterUpgradeWorkflow -Cluster $script:Cluster 6>$null } catch { $singleError = $_ }
 Assert-True "the SINGLE-mode workflow ran to completion" ($null -eq $singleError) "$($singleError)"
 Assert-True "nothing was asked outside the agreed menu items" ($script:UnexpectedPrompts.Count -eq 0) "asked: $(($script:UnexpectedPrompts | Select-Object -Unique) -join ' | ')"
+foreach ($gone in $RemovedPrompts) {
+    Assert-True "the '$gone' prompt stayed removed" (-not (@($script:PromptLog | Where-Object { $_ -match $gone }).Count))
+}
 Assert-True "every host was processed one at a time" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' }).Count -eq 4)
 Assert-True "each host was its own batch" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' } | Select-Object -ExpandProperty Batch -Unique).Count -eq 4)
 Assert-True "every host ended Connected" (@($script:HostState.Values | Where-Object { $_.ConnectionState -ne 'Connected' }).Count -eq 0)
 Assert-True "the cluster completed without intervention" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
+
+# ---------------------------------------------------------------------------
+# A second pass over a cluster that is already current. Nothing is staged, so
+# nothing reboots - and that is a result, not a question.
+# ---------------------------------------------------------------------------
+Write-Host "`n=== An already-current cluster runs through without stopping to ask ===" -ForegroundColor Cyan
+# Intersight reporting RequiresDeploy=false is the state the run is trying to reach. Stopping to ask
+# about it strands an unattended cluster on a host that needed nothing doing. The prompt is reserved
+# for a state that could not be READ - which is not the same thing and must never be treated as one.
+$carriedPolicy    = $script:UcsPolicyState
+$carriedAcked     = $script:UcsAcked
+$carriedDeployed  = $script:IntersightDeployed
+Reset-Simulation -Mode 'LIVE'
+$script:UcsPolicyState     = $carriedPolicy
+$script:UcsAcked           = $carriedAcked
+$script:IntersightDeployed = $carriedDeployed
+
+$script:UnexpectedPrompts = New-Object System.Collections.Generic.List[string]
+$secondPassError = $null
+try { Invoke-ClusterUpgradeWorkflow -Cluster $script:Cluster 6>$null } catch { $secondPassError = $_ }
+Assert-True "the second pass ran to completion" ($null -eq $secondPassError) "$($secondPassError)"
+Assert-True "nothing was asked outside the agreed menu items" ($script:UnexpectedPrompts.Count -eq 0) "asked: $(($script:UnexpectedPrompts | Select-Object -Unique) -join ' | ')"
+Assert-True "no firmware action was needed" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'BatchAction' -and $_.Result -eq 'NoneNeeded' }).Count -ge 1)
+Assert-True "and the cluster still completed" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
 
 Write-Host "`n=== The cluster closes with a verification read from the platforms ===" -ForegroundColor Cyan
 # Read back from Intersight, UCS Manager and vCenter after the fact - a completed run has to be able
@@ -474,6 +506,55 @@ Assert-True "every host was verified after the change" ($verification.Count -eq 
 Assert-True "nothing was left outstanding" (@($verification | Where-Object { $_.Result -ne 'Clean' }).Count -eq 0) "not clean: $(($verification | Where-Object { $_.Result -ne 'Clean' } | ForEach-Object { "$($_.Host): $($_.Details)" }) -join ' | ')"
 Assert-True "Intersight hosts report no staged changes" (@($verification | Where-Object { $_.Details -match 'Intersight' -and $_.Details -match 'outstanding: None' }).Count -eq 2)
 Assert-True "UCS hosts report the resolved firmware policy" (@($verification | Where-Object { $_.Details -match 'Policy: global-602d' }).Count -eq 2)
+Assert-True "UCS hosts are compared against the version the policy name refers to" (@($verification | Where-Object { $_.Details -match 'running: 6\.0\(2d\); target: 6\.0\(2d\)' }).Count -eq 2) "got: $(($verification | Where-Object { $_.Details -match 'Policy:' } | ForEach-Object { $_.Details }) -join ' | ')"
+
+Write-Host "`n=== A server left on the old firmware is caught, not passed ===" -ForegroundColor Cyan
+# The policy can be right and acknowledged and the server still be on the old image if the
+# activation did not take. Only the end-state version comparison shows that.
+$script:UcsRunningVersion = '4.3(6h)'
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+Show-ClusterFirmwareVerification -Cluster $script:Cluster -HostNames @('esx03.dpe.example') 6>$null
+$stale = @($Global:RunSummary | Where-Object { $_.Stage -eq 'PostChangeVerification' })
+Assert-True "the mismatch is flagged" ($stale[0].Result -eq 'Attention') "got $($stale[0].Result)"
+Assert-True "and names both versions" ($stale[0].Details -match 'VERSION MISMATCH - running 4\.3\(6h\), expected 6\.0\(2d\)') "got: $($stale[0].Details)"
+$script:UcsRunningVersion = '6.0(2d)'
+
+Write-Host "`n=== A state that cannot be read still stops to ask ===" -ForegroundColor Cyan
+# "Nothing staged" and "could not tell" look identical from the outside - no action gets sent either
+# way - and must not be conflated. RequiresDeploy=false is a result and is carried on through;
+# a ConfigState the appliance would not report is a question, and the run asks it.
+#
+# Note this is the narrow case: a reachable appliance that will not report one profile's state. An
+# appliance that cannot be driven at all is caught earlier, before any host is batched.
+function Get-IntersightServerProfile {
+    param($Moid,$Filter,$Top,$Skip,$ErrorAction)
+    $name = 'sp-generic'
+    if ($Filter -and $Filter -match "Name eq '([^']+)'") { $name = $Matches[1] }
+    elseif ($Moid -and "$Moid" -match '^moid-(.+)$') { $name = $Matches[1] }
+    # No ConfigContext: the profile is there, its state is not.
+    return [pscustomobject]@{ Results = @([pscustomobject]@{ Name = $name; Moid = "moid-$name" }) }
+}
+$script:AskedAboutState = $false
+function Read-Host {
+    param([string]$Prompt)
+    $script:PromptLog.Add($Prompt)
+    if ($script:PromptLog.Count -gt $script:MaxPrompts) { throw "Prompt limit exceeded: '$Prompt'" }
+    if ($Prompt -match 'could not be confirmed as current|ConfigState|state could not be read') { $script:AskedAboutState = $true }
+    switch -Regex ($Prompt) {
+        'Select run mode'              { return '1' }
+        'Select upgrade mode'          { return '2' }
+        'Select batch mode'            { return '2' }
+        'Create host firmware package' { return 'CREATE' }
+        'Reconnect incomplete'         { return 'OVERRIDE' }
+        'STOP'                         { return 'CONTINUE' }
+        default                        { return 'YES' }
+    }
+}
+$carriedPolicy = $script:UcsPolicyState; $carriedAcked = $script:UcsAcked; $carriedDeployed = $script:IntersightDeployed
+Reset-Simulation -Mode 'LIVE'
+$script:UcsPolicyState = $carriedPolicy; $script:UcsAcked = $carriedAcked; $script:IntersightDeployed = $carriedDeployed
+try { Invoke-ClusterUpgradeWorkflow -Cluster $script:Cluster 6>$null } catch {}
+Assert-True "an unreadable ConfigState is raised with the operator, not carried on through" $script:AskedAboutState
 
 Remove-Item -Path $csvDir -Recurse -Force -ErrorAction SilentlyContinue
 

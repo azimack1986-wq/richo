@@ -58,7 +58,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 19.2.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 19.3.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -109,10 +109,21 @@
     - Hosts already in Maintenance mode when the run started are out of scope AND excluded from the
       health assessment. They are a pre-existing condition, not something this run caused, and
       counting them would fail every batch. They are named on screen each time instead.
+    - An Intersight profile reporting RequiresDeploy=false is the state the run is trying to reach,
+      so it is carried on through rather than asked about. The run only stops for a state it could
+      not READ - "nothing staged" and "could not tell" produce the same silence and must not be
+      treated as the same answer.
     - When the cluster completes, a post-change verification is read back from the platforms
-      themselves and written to Post-Change-Verification-<cluster>-<timestamp>.csv: ESXi build
-      against the target, Intersight ConfigState with whether anything is still staged, and the
-      UCS host firmware package now on each service profile with any acknowledgement still open.
+      themselves and written to Post-Change-Verification-<cluster>-<timestamp>.csv:
+        ESXi        - build against $TargetEsxiBuild.
+        Intersight  - ConfigState, and whether anything is still staged.
+        UCS Manager - the host firmware package now on the service profile, AND the version the
+                      server reports running compared against the version that package name refers
+                      to (global-602d is 6.0(2d), global-436h is 4.3(6h)). The version is read back
+                      out of the name, so no bundle version is written anywhere by this script -
+                      but a server whose activation did not take is still caught, which the policy
+                      name alone would not show.
+      "Outstanding: None" on every row is what a completed run should look like.
       Compliant hosts are taken out of Maintenance mode and the run continues. For anything else the
       operator chooses C to re-scan after remediating, O to override and return the host to service
       as it is, or E to exit. On C the host stays in Maintenance mode and the batch does not advance.
@@ -138,7 +149,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "19.2.0"
+$ScriptVersion = "19.3.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -527,6 +538,13 @@ function Confirm-RunPrerequisites {
 
     Write-Host "4. Credentials to hand" -ForegroundColor Yellow
     Write-Host "     vCenter and UCS Manager, for the prompts that follow." -ForegroundColor Gray
+
+    Write-Host "5. Manual health checks and change gates" -ForegroundColor Yellow
+    Write-Host "     Completed and accepted BEFORE starting. The run does not ask again." -ForegroundColor Gray
+    Write-Host "     Everything it can check itself it checks per batch - cluster health, capacity," -ForegroundColor Gray
+    Write-Host "     datastore free space, host profile compliance - and stops if any of them fail." -ForegroundColor Gray
+    Write-Host "     What it cannot see is the change record: approval, window, and whatever your" -ForegroundColor Gray
+    Write-Host "     process requires signed off. That is yours to have done by this point." -ForegroundColor Gray
 
     Write-Host "=====================================================================" -ForegroundColor Cyan
 
@@ -3481,6 +3499,67 @@ function Reset-ClusterScopedState {
     Set-Variable -Name TargetUcsFirmwarePolicyName -Scope Script -Value ""
 }
 
+function ConvertTo-UcsBundleVersionFromPolicyName {
+    <#
+    .SYNOPSIS
+        Derives the firmware version a host firmware package name refers to, or "" if it does not.
+
+    .DESCRIPTION
+        The package names encode the version they point at - global-602d is 6.0(2d), global-436h is
+        4.3(6h) - which is the whole reason those names exist. Reading the version back out of the
+        name keeps the end-state comparison honest without reintroducing a version table: the script
+        still writes no bundle version anywhere, it only reads what the name already says.
+
+        A name that does not follow the convention returns empty. Half-decoding an unfamiliar name
+        would produce a comparison against a version nobody chose, which is worse than no comparison.
+    #>
+    param([string]$PolicyName)
+
+    if ([string]::IsNullOrWhiteSpace($PolicyName)) { return "" }
+    if ($PolicyName -match '(?i)(\d)(\d)(\d+)([a-z])$') {
+        return "$($Matches[1]).$($Matches[2])($($Matches[3])$($Matches[4]))"
+    }
+    return ""
+}
+
+function Get-UcsRunningFirmwareVersion {
+    <#
+    .SYNOPSIS
+        Returns the firmware version a UCS server is actually running, or "" if it cannot be read.
+
+    .DESCRIPTION
+        Read from Get-UcsFirmwareRunning under the physical server the service profile is associated
+        with (PnDn), preferring the system deployment - the running image rather than the backup or
+        boot-loader entries, which report different versions and would make a current server look
+        wrong.
+
+        Best effort. This is a report on work already done, so an unreadable version is reported as
+        unreadable and never fails a completed cluster.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$UcsSession,
+        [Parameter(Mandatory=$true)]$ServiceProfile
+    )
+
+    $pnDn = ""
+    try { $pnDn = [string]$ServiceProfile.PnDn } catch {}
+    if ([string]::IsNullOrWhiteSpace($pnDn)) { return "" }
+
+    $running = @()
+    try { $running = @(Get-UcsFirmwareRunning -Ucs $UcsSession -ErrorAction SilentlyContinue | Where-Object { $_.Dn -like "$pnDn/*" }) } catch { return "" }
+    if ($running.Count -eq 0) { return "" }
+
+    foreach ($filter in @(
+        { $_.Deployment -eq 'system' -and $_.Type -eq 'blade-controller' }
+        { $_.Deployment -eq 'system' }
+        { $true }
+    )) {
+        $match = @($running | Where-Object $filter | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.Version) } | Select-Object -First 1)
+        if ($match.Count -gt 0) { return [string]$match[0].Version }
+    }
+    return ""
+}
+
 function Show-ClusterFirmwareVerification {
     <#
     .SYNOPSIS
@@ -3563,18 +3642,38 @@ function Show-ClusterFirmwareVerification {
                 $currentPolicy = Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $serviceProfile
                 $expectedPolicy = if ($Global:UcsFirmwarePolicyByTarget.ContainsKey($map.UcsTarget)) { [string]$Global:UcsFirmwarePolicyByTarget[$map.UcsTarget] } else { "" }
 
-                $firmware = "Policy: $(if($currentPolicy){$currentPolicy}else{'<none>'})"
+                # End-state comparison: the version the package name refers to, against the version
+                # the server reports running. Derived from the name, not from a version table - the
+                # script still writes no bundle version, it only reads what the name already says.
+                $expectedVersion = ConvertTo-UcsBundleVersionFromPolicyName -PolicyName $(if ($expectedPolicy) { $expectedPolicy } else { $currentPolicy })
+                $runningVersion = Get-UcsRunningFirmwareVersion -UcsSession $ucsSession -ServiceProfile $serviceProfile
+
+                $firmware = "Policy: $(if($currentPolicy){$currentPolicy}else{'<none>'}); running: $(if($runningVersion){$runningVersion}else{'unreadable'}); target: $(if($expectedVersion){$expectedVersion}else{'n/a'})"
+
+                $stillPending = @()
+                try {
+                    $stillPending = @(Get-UcsLsmaintAck -Ucs $ucsSession -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Dn -like "$($map.ServiceProfileDn)/*" -or $_.Dn -eq "$($map.ServiceProfileDn)/ack" })
+                }
+                catch {}
+
                 if ($expectedPolicy -and $currentPolicy -ne $expectedPolicy) {
                     $outstanding = "POLICY MISMATCH - expected '$expectedPolicy'"
                 }
+                elseif ($stillPending.Count -gt 0) {
+                    $outstanding = "PENDING - acknowledgement still open"
+                }
+                elseif ($expectedVersion -and $runningVersion -and ($runningVersion -notlike "$expectedVersion*")) {
+                    # The running version is the end state that matters. The policy can be right and
+                    # acknowledged and the server still be on the old image if the activation did not
+                    # take, and only this comparison would show it.
+                    $outstanding = "VERSION MISMATCH - running $runningVersion, expected $expectedVersion"
+                }
+                elseif ($expectedVersion -and -not $runningVersion) {
+                    $outstanding = "Unverified - running firmware version could not be read"
+                }
                 else {
-                    $stillPending = @()
-                    try {
-                        $stillPending = @(Get-UcsLsmaintAck -Ucs $ucsSession -ErrorAction SilentlyContinue |
-                            Where-Object { $_.Dn -like "$($map.ServiceProfileDn)/*" -or $_.Dn -eq "$($map.ServiceProfileDn)/ack" })
-                    }
-                    catch {}
-                    $outstanding = if ($stillPending.Count -gt 0) { "PENDING - acknowledgement still open" } else { "None" }
+                    $outstanding = "None"
                 }
             }
             catch {
@@ -3640,8 +3739,6 @@ function Invoke-ClusterUpgradeWorkflow {
     }
 
     if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") { Build-InfrastructureHostMapping -Hosts $allClusterHosts }
-
-    if ((Read-YesNoExit -Message "Have all manual health checks/change gates been completed and accepted?") -ne "YES") { Stop-WithMessage "Manual health checks were not confirmed." }
 
     $alreadyTargetHosts = @($allClusterHosts | Where-Object { Test-VMHostOnTargetBuild -VMHostObject $_ })
 
@@ -3761,30 +3858,52 @@ function Invoke-ClusterUpgradeWorkflow {
             if ($Global:BatchActionsSent -eq 0 -and -not (Test-DryRun)) {
                 Write-Host "" -ForegroundColor Yellow
                 Write-Host "No firmware action was sent for Batch ${batchNumber}. Nothing is rebooting." -ForegroundColor Yellow
-                Write-Host "Every host in this batch reported no staged changes to deploy:" -ForegroundColor Yellow
+
+                # A host that reports RequiresDeploy=false is already where the run is trying to put
+                # it. That is a result, not a problem, and stopping to ask about it strands an
+                # unattended cluster on a host that needed nothing doing. So the ask is reserved for
+                # the case that genuinely warrants it: a state the run could not read. An unreadable
+                # state is not the same as "nothing to do" and must never be treated as one.
+                $unresolved = New-Object System.Collections.Generic.List[string]
+                Write-Host "Batch state:" -ForegroundColor Yellow
                 foreach ($hostName in $currentBatchNames) {
                     $stateText = "unknown"
                     if ($Global:IntersightHostMap.ContainsKey($hostName)) {
                         try {
                             $sp = Resolve-IntersightServerProfileForHost -HostName $hostName -IntersightCsvRow $Global:IntersightHostMap[$hostName].IntersightCsvRow
-                            $stateText = "Intersight ConfigState=$((Get-IntersightProfileDeployState -ServerProfile $sp).ConfigState)"
-                        } catch { $stateText = "Intersight state unreadable" }
+                            $deployState = Get-IntersightProfileDeployState -ServerProfile $sp
+                            $stateText = "Intersight ConfigState=$($deployState.ConfigState), RequiresDeploy=$($deployState.RequiresDeploy)"
+                            if (-not $deployState.StateKnown) { [void]$unresolved.Add("$hostName (Intersight state not readable)") }
+                            elseif ($deployState.RequiresDeploy) { [void]$unresolved.Add("$hostName (Intersight still has changes staged)") }
+                        }
+                        catch {
+                            $stateText = "Intersight state unreadable - $($_.Exception.Message)"
+                            [void]$unresolved.Add("$hostName (Intersight state unreadable)")
+                        }
                     }
                     else {
                         $stateText = "UCSM - no pending activity found on the service profile"
                     }
                     Write-Host "  $hostName - $stateText" -ForegroundColor Yellow
                 }
-                Write-Host "That is expected if these hosts already run the target firmware. If it is not" -ForegroundColor Yellow
-                Write-Host "expected, the policy change may not have been staged against these profiles." -ForegroundColor Yellow
-                Add-SummaryRecord -Stage "BatchAction" -Batch $batchNumber -HostName "" -Action "Send firmware action" -Result "None" -Details "No host in the batch had staged changes to deploy; post-reboot wait skipped."
 
-                $choice = Read-ChoiceExit `
-                    -Message "Nothing to reboot for Batch $batchNumber. Choose CONTINUE to treat these hosts as already current and move on, or STOP" `
-                    -AllowedChoices @("CONTINUE","STOP") `
-                    -ExitMessage "Stopped because Batch $batchNumber had no firmware action to send."
-                if ($choice -eq "STOP") {
-                    Stop-WithMessage "Batch $batchNumber had no firmware action to send. Confirm the firmware policy is staged against these profiles before re-running."
+                if ($unresolved.Count -eq 0) {
+                    Write-Host "Nothing is staged anywhere in this batch, so there is nothing to reboot. Continuing." -ForegroundColor Green
+                    Add-SummaryRecord -Stage "BatchAction" -Batch $batchNumber -HostName "" -Action "Send firmware action" -Result "NoneNeeded" -Details "Every host reported no staged changes (Intersight RequiresDeploy=false, no UCSM pending activity); continued without prompting."
+                }
+                else {
+                    Write-Host "These host(s) could not be confirmed as already current:" -ForegroundColor Yellow
+                    $unresolved | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+                    Write-Host "The policy change may not have been staged against those profiles." -ForegroundColor Yellow
+                    Add-SummaryRecord -Stage "BatchAction" -Batch $batchNumber -HostName "" -Action "Send firmware action" -Result "None" -Details "No action sent and $($unresolved.Count) host(s) unconfirmed: $($unresolved -join '; ')"
+
+                    $choice = Read-ChoiceExit `
+                        -Message "Nothing to reboot for Batch $batchNumber, and $($unresolved.Count) host(s) could not be confirmed as current. Choose CONTINUE to move on, or STOP" `
+                        -AllowedChoices @("CONTINUE","STOP") `
+                        -ExitMessage "Stopped because Batch $batchNumber had no firmware action to send."
+                    if ($choice -eq "STOP") {
+                        Stop-WithMessage "Batch $batchNumber had no firmware action to send. Confirm the firmware policy is staged against these profiles before re-running."
+                    }
                 }
 
                 # Skip the reboot wait entirely, then let the normal compliance and health path run.

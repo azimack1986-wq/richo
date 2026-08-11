@@ -12,6 +12,49 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [19.3.0] — 2026-08-11
+
+#### Removed
+
+- **The "Have all manual health checks/change gates been completed and accepted?"
+  prompt.** It asked about a change record the script cannot see, so answering it
+  gated nothing — it only interrupted a run that is meant to walk the cluster
+  unattended. It is now requirement 5 in the pre-flight, stated before anything
+  starts. Everything the script *can* check it still checks per batch — cluster
+  health, capacity, datastore free space, host profile compliance — and still
+  stops if any of them fail.
+
+#### Changed
+
+- **An Intersight profile reporting `RequiresDeploy=false` is no longer asked
+  about.** That is the state the run is trying to reach; stopping to confirm it
+  strands an unattended cluster on a host that needed nothing doing. The prompt
+  is now reserved for a state that could not be *read* — "nothing staged" and
+  "could not tell" produce the same silence and must not be treated as the same
+  answer. An unreadable `ConfigState` still stops the run to ask.
+- **The post-change verification now compares the UCS end state, not just the
+  policy.** The version each server reports running (`Get-UcsFirmwareRunning`,
+  system deployment, under the service profile's `PnDn`) is compared against the
+  version the package name refers to — `global-602d` is 6.0(2d), `global-436h`
+  is 4.3(6h). The version is read back *out of the name*, so this script still
+  writes no bundle version anywhere; but a server where the activation did not
+  take is now caught, which a matching policy name alone would not show. A name
+  off that convention yields no comparison rather than a comparison against a
+  version nobody chose.
+
+#### Added — tests
+
+- The workflow simulation runs a **second pass over an already-current cluster**
+  and fails if anything is asked: nothing is staged, so nothing reboots, and
+  that is a result rather than a question. A separate pass asserts that an
+  unreadable `ConfigState` *is* still raised with the operator.
+- The end-state version comparison is covered both ways — a server on the right
+  version verifies clean, a server left on the old one reports
+  `VERSION MISMATCH` naming both versions.
+- `ConvertTo-UcsBundleVersionFromPolicyName` has its own assertions, including
+  that an unrecognised name yields nothing.
+- The simulation now fails if the removed health-check prompt reappears.
+
 ### [19.2.0] — 2026-08-11
 
 `Test-VMHostProfileCompliance -VMHost` returned *nothing at all* on a live run —
@@ -841,6 +884,13 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [19.3.0-preauth] — 2026-08-11
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 19.3.0 — the manual health
+check prompt moves into the requirements, `RequiresDeploy=false` is carried on
+through, and the closing verification compares the UCS end-state firmware
+version. This is the build to run.
 
 ### [19.2.0-preauth] — 2026-08-11
 

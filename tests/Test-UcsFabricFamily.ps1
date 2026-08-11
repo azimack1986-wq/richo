@@ -136,6 +136,22 @@ Assert-Equal "DRY RUN still reports the policy it would use" "global-436h" (Reso
 Assert-Equal "DRY RUN created nothing" 0 $script:Created.Count
 $Global:RunMode = 'LIVE'
 
+Write-Host "`n=== The target version is read back out of the policy name ===" -ForegroundColor Cyan
+# The end-state comparison needs a version to compare against, and the package names already encode
+# one. Reading it back from the name keeps the script free of a version table while still being able
+# to say whether a server actually landed on the right firmware.
+$ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+    Where-Object { $_.Name -eq 'ConvertTo-UcsBundleVersionFromPolicyName' } |
+    ForEach-Object { Invoke-Expression $_.Extent.Text }
+
+Assert-Equal "global-602d means 6.0(2d)" "6.0(2d)" (ConvertTo-UcsBundleVersionFromPolicyName -PolicyName 'global-602d')
+Assert-Equal "global-436h means 4.3(6h)" "4.3(6h)" (ConvertTo-UcsBundleVersionFromPolicyName -PolicyName 'global-436h')
+Assert-Equal "casing does not matter" "6.0(2d)" (ConvertTo-UcsBundleVersionFromPolicyName -PolicyName 'GLOBAL-602D')
+# A name nobody can decode must produce no comparison at all, rather than a comparison against a
+# version nobody chose.
+Assert-Equal "a name off the convention yields nothing" "" (ConvertTo-UcsBundleVersionFromPolicyName -PolicyName 'site-standard-fw')
+Assert-Equal "an empty name yields nothing" "" (ConvertTo-UcsBundleVersionFromPolicyName -PolicyName '')
+
 Write-Host "`n=== The script contains no hard-coded bundle versions ===" -ForegroundColor Cyan
 # A stub can only prove what was passed on the paths the test walks. This proves it for the whole
 # file: the moment someone reintroduces -BladeBundleVersion, the policy stops following the global
