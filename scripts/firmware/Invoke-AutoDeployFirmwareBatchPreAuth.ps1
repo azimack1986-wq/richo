@@ -71,7 +71,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 20.3.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 20.3.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 20.4.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 20.4.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -91,16 +91,21 @@
       ($Global:IntersightRebootImmediatelyToActivate, on by default). Without it the firmware
       stages against the profile and nothing restarts.
       It is ProceedOnReboot on a PolicyScheduledAction - "ProceedOnReboot can be used to
-      acknowledge server reboot while triggering deploy/activate", in the SDK's own words - not an
-      action parameter:
+      acknowledge server reboot while triggering deploy/activate", in the SDK's own words - sent
+      ALONGSIDE -Action Deploy, not instead of it:
           $a = Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot $true
-          Set-IntersightServerProfile -Moid <moid> -ScheduledActions @($a)
-      -Action Deploy is NOT also sent: the scheduled action carries the action, and sending both
-      gives the profile the same instruction twice in two different forms.
+          Set-IntersightServerProfile -Moid <moid> -Action Deploy -ScheduledActions @($a)
+      -Action Deploy is what demonstrably starts the Deploy Firmware Policy workflow; a live run
+      with only ScheduledActions produced no workflow at all.
       The cmdlet surface for this is checked before any host is evacuated, and the result is not
       trusted either: Confirm-IntersightDeployAccepted re-reads the profile afterwards and stops
       the run if it is still sitting in its staged state, rather than waiting out a post-reboot
       window for a restart that was never scheduled.
+      THE REBOOT MUST COME FROM INTERSIGHT. $Global:IntersightRebootHostToActivate can activate the
+      staged firmware with a vCenter-side Restart-VMHost instead - "install on next reboot" is the
+      documented behaviour, and the host is already evacuated - but it is OFF by default, because
+      it is a different thing from what was asked for and it would hide an appliance that is not
+      acting on the acknowledgement.
     - THIS SCRIPT MIGRATES NOTHING. The batch is sized from live cluster capacity and its hosts go
       straight into Maintenance mode; DRS moves the running VMs, once, as part of that. Two things
       that used to happen first have been removed: a cold migration of every powered-off and
@@ -260,7 +265,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "20.3.0-preauth"
+$ScriptVersion = "20.4.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -323,9 +328,18 @@ $Global:IntersightRebootImmediatelyToActivate = $true
 # entries. Empty by default and not needed for the reboot acknowledgement.
 $Global:IntersightDeployActionParams = @()
 
-# How long to wait for a deployed profile to leave its staged state before deciding the deploy was
-# not really accepted. Seconds, because this is an acceptance check and not the upgrade itself.
+# How long to wait for a deployed profile to leave its staged state before deciding the appliance
+# is going to wait for a reboot instead. Seconds, because this is an acceptance check and not the
+# upgrade itself.
 $Global:IntersightDeployAcceptedTimeoutSeconds = 180
+
+# FALLBACK ONLY, AND OFF BY DEFAULT: activate by rebooting the host from vCenter.
+# The reboot is meant to come from Intersight, as part of the deploy, which is what Reboot
+# Immediately to Activate does. A vCenter-side Restart-VMHost would also activate the staged
+# firmware - "install on next reboot" is the documented behaviour - but it is a different thing
+# from what the operator asked for and it hides an appliance that is not acting on the
+# acknowledgement. Left off, a deploy that does not take stops the run instead.
+$Global:IntersightRebootHostToActivate = $false
 $Global:IntersightSession = $null
 $Global:IntersightServerList = @{}
 $Global:IntersightHostMap = @{}
@@ -2054,7 +2068,7 @@ function Get-IntersightPendingInconsistencyForBatch {
 function Confirm-IntersightDeployAccepted {
     <#
     .SYNOPSIS
-        Re-reads a server profile after a Deploy to confirm the appliance actually took it.
+        Re-reads a server profile after a Deploy. Returns $true if the appliance picked it up.
 
     .DESCRIPTION
         The reboot acknowledgement is sent as a PolicyActionParam whose identifier Cisco does not
@@ -2085,7 +2099,7 @@ function Confirm-IntersightDeployAccepted {
     )
 
     $timeoutSeconds = [int]$Global:IntersightDeployAcceptedTimeoutSeconds
-    if ($timeoutSeconds -le 0) { return }
+    if ($timeoutSeconds -le 0) { return $true }
 
     Write-Host "  Confirming the appliance accepted the deploy for '$($Row.ServerProfile)'..." -ForegroundColor Gray
 
@@ -2119,23 +2133,96 @@ function Confirm-IntersightDeployAccepted {
         if (-not $state.RequiresDeploy) {
             Write-Host "  Accepted - '$($Row.ServerProfile)' is now $($state.ConfigState)." -ForegroundColor Green
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm deploy accepted" -Result "Accepted" -Details "ConfigState moved from $($Row.ConfigState) to $($state.ConfigState)."
-            return
+            return $true
         }
     }
 
-    Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm deploy accepted" -Result "NotAccepted" -Details "Still $lastState after $timeoutSeconds second(s); the reboot acknowledgement was probably not accepted."
+    Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm deploy accepted" -Result "AwaitingReboot" -Details "Still $lastState after $timeoutSeconds second(s); the firmware is staged and waiting for a restart."
 
-    Write-Host "" -ForegroundColor Yellow
-    Write-Host "'$($Row.ServerProfile)' is still $lastState $timeoutSeconds second(s) after the deploy was sent." -ForegroundColor Yellow
-    Write-Host "The appliance took the call but has not picked the change up: the firmware is staged and" -ForegroundColor Yellow
-    Write-Host "nothing is restarting." -ForegroundColor Yellow
-    Write-Host "This run sent Deploy with ProceedOnReboot = true, the documented acknowledgement." -ForegroundColor Yellow
-    Write-Host "Worth checking, in order:" -ForegroundColor Yellow
-    Write-Host "  - the blade is powered on and reachable from the appliance;" -ForegroundColor Yellow
-    Write-Host "  - no other workflow is already running against this server profile;" -ForegroundColor Yellow
-    Write-Host "  - Requests in the Intersight GUI, for a rejected or queued workflow on this profile." -ForegroundColor Yellow
+    Write-Host "  '$($Row.ServerProfile)' is still $lastState. The firmware is staged and waiting for a reboot." -ForegroundColor Yellow
+    return $false
+}
 
-    Stop-WithMessage "Intersight accepted the Deploy for '$($Row.ServerProfile)' but the profile is still $lastState, so nothing is rebooting. Stopping rather than waiting out a post-reboot window for a restart that was not scheduled."
+function Invoke-IntersightActivationReboot {
+    <#
+    .SYNOPSIS
+        Reboots a host so that firmware staged against its server profile activates.
+
+    .DESCRIPTION
+        The documented behaviour of a firmware policy in IMM is "install on next reboot": deploying
+        the profile stages the firmware and leaves it there until the server restarts. Reboot
+        Immediately to Activate is a way of asking Intersight to perform that restart.
+
+        Where the appliance does not act on that acknowledgement, this performs the restart from the
+        vCenter side instead. That is not a workaround for a broken deploy - the deploy did its job,
+        the firmware is staged - it is supplying the reboot the staged firmware is waiting for. It
+        needs no API this script cannot verify, and the run is already in exactly the right state
+        for it: the host is in Maintenance mode, evacuated, with nothing running on it.
+
+        The reboot is issued and left to run. Wait-BatchReconnectAfterReboot already polls for the
+        host coming back, and the host profile compliance gate still stands between it and any
+        workload.
+
+    .PARAMETER HostName
+        The ESXi host to restart.
+
+    .PARAMETER ServerProfileName
+        The server profile whose firmware is staged, for the messages and the summary.
+
+    .PARAMETER BatchNumber
+        The batch, for the summary record.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$HostName,
+        [Parameter(Mandatory=$true)][string]$ServerProfileName,
+        [Parameter(Mandatory=$true)][string]$BatchNumber
+    )
+
+    if (-not $Global:IntersightRebootHostToActivate) {
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "'$ServerProfileName' still has its firmware staged and Intersight has not restarted the blade." -ForegroundColor Yellow
+        Write-Host "This run sent Action=Deploy with ProceedOnReboot = true, which is the documented" -ForegroundColor Yellow
+        Write-Host "acknowledgement, and the appliance has not acted on it." -ForegroundColor Yellow
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "The Deploy dialog in the GUI ticks THREE boxes, and Cisco publishes the API name of" -ForegroundColor Yellow
+        Write-Host "none of them:" -ForegroundColor Yellow
+        Write-Host "  - Reboot immediately to activate" -ForegroundColor Gray
+        Write-Host "  - Deploy all associated policies whether modified or not" -ForegroundColor Gray
+        Write-Host "  - I understand that potential disruption may occur (mandatory)" -ForegroundColor Gray
+        Write-Host "To settle it, deploy one profile from the GUI with the browser's developer tools open" -ForegroundColor Yellow
+        Write-Host "(F12 > Network) and capture the PATCH to /api/v1/server/Profiles/<moid>. The request" -ForegroundColor Yellow
+        Write-Host "body names those three fields exactly, and this script can then send the same." -ForegroundColor Yellow
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "The blade is left running and untouched. Nothing has been activated." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $HostName -Action "Reboot to activate" -Result "NotActivated" -Details "Intersight did not restart the blade; firmware staged on '$ServerProfileName' remains inactive."
+        Stop-WithMessage "Intersight staged the firmware for '$ServerProfileName' but did not restart the blade, so nothing activated. Capture the GUI's deploy request as described above before re-running."
+    }
+
+    # Only reached when the operator has deliberately turned the vCenter-side reboot on.
+
+    $hostObj = $null
+    try { $hostObj = Get-VMHost -Name $HostName -ErrorAction Stop } catch {
+        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $HostName -Action "Reboot to activate" -Result "Failed" -Details "Host could not be read from vCenter: $($_.Exception.Message)"
+        Stop-WithMessage "'$HostName' has firmware staged but could not be read from vCenter to reboot it: $($_.Exception.Message)"
+    }
+
+    # Only from Maintenance mode. Rebooting a host with running VMs on it to activate firmware is
+    # not something this script should ever do on its own.
+    if ($hostObj.ConnectionState -ne "Maintenance") {
+        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $HostName -Action "Reboot to activate" -Result "Failed" -Details "ConnectionState was $($hostObj.ConnectionState), not Maintenance."
+        Stop-WithMessage "'$HostName' has firmware staged but is $($hostObj.ConnectionState), not in Maintenance mode, so this run will not reboot it."
+    }
+
+    Write-Host "  Rebooting '$HostName' so the staged firmware activates." -ForegroundColor Cyan
+    try {
+        Restart-VMHost -VMHost $hostObj -Confirm:$false -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $HostName -Action "Reboot to activate" -Result "Failed" -Details $_.Exception.Message
+        Stop-WithMessage "Could not reboot '$HostName' to activate the staged firmware: $($_.Exception.Message)"
+    }
+
+    Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $HostName -Action "Reboot to activate" -Result "Sent" -Details "Rebooted from Maintenance mode so firmware staged on '$ServerProfileName' activates."
 }
 
 function Invoke-IntersightAcceptAndRebootImmediateForBatch {
@@ -2200,28 +2287,29 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             # and its -Server takes a ComputePhysicalRelationship (compute.Blade / compute.RackUnit),
             # not the server.Profile that was being passed. It would never have worked as written.
             #
-            # Deploy WITH the reboot acknowledgement, in one call.
+            # -Action Deploy AND the scheduled action, together.
             #
-            # -Action Deploy on its own is the "deploy and wait for someone to reboot the blade"
-            # form: the appliance accepts it, stages the firmware, and leaves the profile in
-            # Pending-changes. The acknowledgement is ProceedOnReboot on a PolicyScheduledAction,
-            # which carries the action itself - so -Action is NOT also sent, or the profile would
-            # be given the same instruction twice in two different forms.
+            # -Action Deploy is what demonstrably starts the Deploy Firmware Policy workflow on the
+            # appliance - a live run with it produced that workflow, and a live run with only
+            # ScheduledActions did not. ProceedOnReboot is the documented acknowledgement that the
+            # server may be restarted to activate. Neither has been observed to be sufficient on
+            # its own against this appliance, so both are sent, and the run does not depend on
+            # either: if the profile is still staged afterwards, the host is rebooted from vCenter,
+            # which is the "install on next reboot" the staged firmware is waiting for.
             $deployParams = @{
                 Moid        = $row.ProfileMoid
+                Action      = 'Deploy'
                 ErrorAction = 'Stop'
             }
 
-            $sentDescription = ""
+            $sentDescription = "Action=Deploy"
             if ($Global:IntersightRebootImmediatelyToActivate) {
                 $scheduledAction = Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot $true
                 $deployParams['ScheduledActions'] = @($scheduledAction)
-                $sentDescription = "ScheduledActions: Action=Deploy, ProceedOnReboot=true"
+                $sentDescription += "; ScheduledActions: Action=Deploy, ProceedOnReboot=true"
             }
             else {
-                $deployParams['Action'] = 'Deploy'
-                $sentDescription = "Action=Deploy, no reboot acknowledgement"
-                Write-Host "  No reboot acknowledgement is being sent. The firmware will stage but not activate until this blade is rebooted by hand." -ForegroundColor Yellow
+                $sentDescription += "; no reboot acknowledgement"
             }
 
             if ($Global:IntersightDeployActionParams.Count -gt 0) {
@@ -2235,7 +2323,13 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             $Global:BatchActionsSent++
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Sent" -Details "ServerProfile=$($row.ServerProfile); ConfigState was $($row.ConfigState); $sentDescription."
 
-            Confirm-IntersightDeployAccepted -Row $row -BatchNumber $BatchNumber
+            # A profile still sitting in Pending-changes is not a failed deploy. A firmware policy in
+            # IMM installs on next reboot, so the firmware is staged and waiting for a restart -
+            # which this run then supplies, because the host is already evacuated and in
+            # Maintenance mode with nothing on it.
+            if (-not (Confirm-IntersightDeployAccepted -Row $row -BatchNumber $BatchNumber)) {
+                Invoke-IntersightActivationReboot -HostName $row.Host -ServerProfileName $row.ServerProfile -BatchNumber $BatchNumber
+            }
         } catch {
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Failed" -Details $_.Exception.Message
             Stop-WithMessage "Intersight server profile deploy failed for '$($row.Host)': $($_.Exception.Message)"

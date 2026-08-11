@@ -12,6 +12,43 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [20.4.0] — 2026-08-11
+
+#### Fixed
+
+- **`-Action Deploy` is sent again, alongside the scheduled action.** Removing
+  it in 20.3.0 was a guess and it was wrong: a live run with `-Action Deploy`
+  produced the *Deploy Firmware Policy* workflow on the appliance, and a run
+  with only `-ScheduledActions` produced no workflow at all. Both now go in one
+  call — `-Action Deploy` starts the deploy, `ProceedOnReboot` acknowledges the
+  restart.
+
+#### Changed
+
+- **The reboot must come from Intersight.** `$Global:IntersightRebootHostToActivate`
+  can activate staged firmware with a vCenter-side `Restart-VMHost` instead —
+  "install on next reboot" is the documented behaviour and the host is already
+  evacuated — but it is **off by default**. It is a different thing from what
+  the operator asked for, and leaving it on would hide an appliance that is not
+  acting on the acknowledgement.
+- When Intersight stages the firmware and does not restart the blade, the run
+  stops with the three checkboxes the GUI's Deploy dialog ticks, and how to
+  capture what it actually sends: deploy one profile from the GUI with developer
+  tools open and read the `PATCH` to `/api/v1/server/Profiles/<moid>`. That
+  request body names the fields Cisco does not publish. The blade is left
+  running and untouched.
+- `Confirm-IntersightDeployAccepted` returns a verdict instead of stopping
+  inside itself, so the caller decides what an un-actioned deploy means.
+
+#### Notes
+
+- The API names behind the Deploy dialog's three checkboxes — *Reboot
+  immediately to activate*, *Deploy all associated policies whether modified or
+  not*, and the mandatory disruption acknowledgement — are **not published**.
+  `ProceedOnReboot` is documented and is sent; the other two have no documented
+  equivalent I could verify. Two attempts at guessing an identifier for this
+  have now failed, so the script no longer guesses.
+
 ### [20.3.0] — 2026-08-11
 
 20.2.0 sent the reboot acknowledgement by the wrong mechanism entirely, and the
@@ -1128,6 +1165,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [20.4.0-preauth] — 2026-08-11
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 20.4.0 — `-Action Deploy` is
+sent alongside `ProceedOnReboot`, and the reboot must come from Intersight.
+This is the build to run.
 
 ### [20.3.0-preauth] — 2026-08-11
 

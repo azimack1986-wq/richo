@@ -74,7 +74,7 @@ $row = [pscustomobject]@{ Host = 'esx01.example'; ServerProfile = 'sp-esx01'; Pr
 Write-Host "`n=== A deploy the appliance picks up is accepted ===" -ForegroundColor Cyan
 $script:States = @('Configuring'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
-Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null
+Assert-Equal "it reports accepted" $true (Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null)
 Assert-Equal "it is recorded as accepted" "Accepted" $Global:RunSummary[0].Result
 Assert-Equal "and the state it moved to is named" $true ($Global:RunSummary[0].Details -match 'Configuring')
 
@@ -82,7 +82,7 @@ Write-Host "`n=== A profile that takes a moment to move is still accepted ===" -
 # The appliance does not always change state on the first read.
 $script:States = @('Pending-changes','Pending-changes','Associated'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
-Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null
+[void](Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null)
 Assert-Equal "the later read is what counts" "Accepted" $Global:RunSummary[0].Result
 
 Write-Host "`n=== A silently ignored acknowledgement stops the run ===" -ForegroundColor Cyan
@@ -90,21 +90,16 @@ Write-Host "`n=== A silently ignored acknowledgement stops the run ===" -Foregro
 # unchecked the run waits out its whole post-reboot window and then reports the batch complete.
 $script:States = @('Pending-changes'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
-$stopMessage = ""
-try { Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null } catch { $stopMessage = "$_" }
-Assert-Equal "the run stops rather than waiting for a reboot that is not coming" $true ($stopMessage -match 'STOP:')
-Assert-Equal "the message says nothing is rebooting" $true ($stopMessage -match 'nothing is rebooting')
-Assert-Equal "and names the profile" $true ($stopMessage -match 'sp-esx01')
-Assert-Equal "it is recorded as not accepted" "NotAccepted" $Global:RunSummary[0].Result
+$accepted = Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null
+Assert-Equal "the deploy is reported as not accepted" $false $accepted
+Assert-Equal "it is recorded as awaiting a reboot" "AwaitingReboot" $Global:RunSummary[0].Result
 Assert-Equal "with the state it was stuck in" $true ($Global:RunSummary[0].Details -match 'Pending-changes')
 
 Write-Host "`n=== Every actionable state is treated as 'not picked up' ===" -ForegroundColor Cyan
 foreach ($stuck in @('Pending-changes','Inconsistent','Out-of-sync','Not-deployed')) {
     $script:States = @($stuck); $script:Reads = 0
     $Global:RunSummary = New-Object System.Collections.Generic.List[object]
-    $stopped = $false
-    try { Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null } catch { $stopped = $true }
-    Assert-Equal "still $stuck stops the run" $true $stopped
+    Assert-Equal "still $stuck is reported as not accepted" $false (Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null)
 }
 
 Write-Host "`n=== A paged response is unwrapped, not read as a profile ===" -ForegroundColor Cyan
@@ -113,7 +108,7 @@ Write-Host "`n=== A paged response is unwrapped, not read as a profile ===" -For
 $script:Paged = $true
 $script:States = @('Associated'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
-Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null
+[void](Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null)
 Assert-Equal "the profile inside the page is read" "Accepted" $Global:RunSummary[0].Result
 $script:Paged = $false
 
@@ -121,7 +116,7 @@ Write-Host "`n=== The check can be turned off, but not by accident ===" -Foregro
 $Global:IntersightDeployAcceptedTimeoutSeconds = 0
 $script:States = @('Pending-changes'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
-Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null
+[void](Confirm-IntersightDeployAccepted -Row $row -BatchNumber '1' 6>$null)
 Assert-Equal "a zero timeout skips the check entirely" 0 $Global:RunSummary.Count
 Assert-Equal "and reads nothing" 0 $script:Reads
 $Global:IntersightDeployAcceptedTimeoutSeconds = 2
@@ -134,6 +129,8 @@ Assert-Equal "reboot-immediately defaults to enabled" $true ($scriptText -match 
 # while sending it in a form the appliance ignored.
 Assert-Equal "the acknowledgement is built as a scheduled action" $true ($scriptText -match "Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot \`$true")
 Assert-Equal "and sent through -ScheduledActions" $true ($scriptText -match "\`$deployParams\['ScheduledActions'\]")
+# Both. -Action Deploy is what starts the workflow; ProceedOnReboot acknowledges the restart.
+Assert-Equal "-Action Deploy is sent as well" $true ($scriptText -match "Action      = 'Deploy'")
 # The scheduled action carries the action. Sending -Action as well instructs the profile twice.
 # The QUOTED form only: $Global:IntersightRebootImmediatelyToActivate is the switch that turns the
 # acknowledgement on and legitimately contains the same words, as does the comment recording why

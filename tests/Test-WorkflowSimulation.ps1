@@ -260,9 +260,9 @@ function Set-IntersightServerProfile { param($Moid,$Action,$ActionParams,$Schedu
     Note-Call 'Set-IntersightServerProfile'
     foreach ($ap in @($ActionParams)) { if ($ap) { $script:DeployActionParams.Add("$($ap.Name)=$($ap.Value)") } }
     foreach ($sa in @($ScheduledActions)) { if ($sa) { $script:DeployActionParams.Add("$($sa.Action):ProceedOnReboot=$($sa.ProceedOnReboot)") } }
-    # The scheduled action carries the action; sending -Action as well would instruct the profile
-    # twice in two different forms.
-    if ($ScheduledActions -and $Action) { throw "-Action must not be sent alongside -ScheduledActions" }
+    # Both are required: -Action Deploy is what starts the deploy workflow, ProceedOnReboot is the
+    # acknowledgement that the server may be restarted to activate.
+    if ($ScheduledActions -and -not $Action) { throw "-Action Deploy must be sent alongside -ScheduledActions" }
     if ($Moid) { [void]$script:IntersightDeployed.Add([string]$Moid) }
 }
 function Initialize-IntersightPolicyActionParam { param($Name,$Value) return [pscustomobject]@{ Name=$Name; Value=$Value } }
