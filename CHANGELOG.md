@@ -12,6 +12,48 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [20.5.1] — 2026-08-12
+
+#### Fixed
+
+- **`AssignedServer.Moid` read as empty on every profile**, so no power action
+  was ever sent — "the server it is assigned to could not be identified".
+  Relationship properties in this SDK are not plain objects: they are generated
+  `<Type>Relationship` wrappers holding a `MoMoRef` on **`ActualInstance`**, and
+  the Moid lives there. Cisco's `GettingStarted.md` prints the shape verbatim
+  (`IamAccountRelationship { ActualInstance: class MoMoRef { ... } }`), and the
+  SDK's own `GetCmdletBase.cs` reaches through it the same way:
+  ```csharp
+  if (item.Value.GetType().Name.EndsWith("Relationship"))
+      var actualInstance = item.Value.GetType().GetProperty("ActualInstance").GetValue(item.Value);
+  ```
+  This is the same class of defect as reading a paged response instead of the
+  object inside it — the property is present, populated, and unreadable the
+  obvious way.
+
+#### Added
+
+- `Get-IntersightRelationshipMoid` probes every shape the Moid can arrive in:
+  the object itself, `ActualInstance`, a doubly-wrapped instance, the
+  `AdditionalProperties` bag when the model did not recognise the concrete type,
+  and a bare 24-hex-character Moid string. Anything else yields `""` — a string
+  that is not a Moid is never treated as one.
+- **A second read with the relationship expanded.** If neither property yields a
+  Moid, the profile is re-read with `-Expand AssignedServer`. An unexpanded
+  relationship can carry nothing useful at all, which is why the Intersight GUI
+  expands it on this very page.
+- **A diagnostic that names the shape.** If it still comes back empty, the run
+  prints the relationship's .NET type, its property names, and its
+  `ActualInstance` type and properties. Two live runs have now been lost to a
+  property that was present and unreadable; "could not be identified" on its own
+  does not tell anyone which property to reach for.
+
+#### Added — tests
+
+- `tests/Test-IntersightPowerAction.ps1` grew to 28 assertions, covering each
+  wrapper shape, the expand fallback (and that it asks for `AssignedServer`),
+  and that an arbitrary string is never mistaken for a Moid.
+
 ### [20.5.0] — 2026-08-12
 
 Staging the firmware works. The restart is what the appliance does not reliably
@@ -1223,6 +1265,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [20.5.1-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 20.5.1 — the assigned server
+is read through `ActualInstance`, so the power cycle actually reaches a server.
+This is the build to run.
 
 ### [20.5.0-preauth] — 2026-08-12
 

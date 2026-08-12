@@ -30,6 +30,7 @@ if ($errors) { throw "parse errors" }
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in @('Get-IntersightAssignedServerMoid','Invoke-IntersightServerPowerAction',
+                                 'Get-IntersightRelationshipMoid','Write-IntersightRelationshipShape',
                                  'Invoke-IntersightActivationPowerCycle','Wait-IntersightActivationCheckIn',
                                  'Get-IntersightProfileDeployState','Get-IntersightResultList','Read-PendingConsoleKey') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
@@ -64,7 +65,7 @@ function Get-IntersightComputeServerSetting { param($Moid,$Filter,$ErrorAction)
 function Set-IntersightComputeServerSetting { param($Moid,$AdminPowerState,$ErrorAction)
     $script:PowerCalls.Add("$Moid=$AdminPowerState")
     if ($script:PowerThrows) { throw "server is not reachable" } }
-function Get-IntersightServerProfile { param($Moid,$Filter,$ErrorAction)
+function Get-IntersightServerProfile { param($Moid,$Filter,$Expand,$ErrorAction)
     $index = [Math]::Min($script:Reads, $script:States.Count - 1)
     $script:Reads++
     return [pscustomobject]@{
@@ -75,10 +76,48 @@ function Get-IntersightServerProfile { param($Moid,$Filter,$ErrorAction)
 
 $row = [pscustomobject]@{ Host='esx01.example'; ServerProfile='sp-esx01'; ProfileMoid='moid-1'; ConfigState='Pending-changes'; ServerProfileObj=$null }
 
+Write-Host "`n=== The Moid is found whatever shape the relationship arrived in ===" -ForegroundColor Cyan
+# This is the live defect. AssignedServer was present on every profile and .Moid read as empty,
+# because relationships in this SDK are generated oneOf wrappers, not plain objects - the same
+# class of problem as reading a paged response instead of the object inside it.
+Assert-Equal "a plain object" "m1" (Get-IntersightRelationshipMoid -Relationship ([pscustomobject]@{ Moid = 'm1' }))
+Assert-Equal "a wrapper with ActualInstance" "m2" (Get-IntersightRelationshipMoid -Relationship ([pscustomobject]@{ Moid = ''; ActualInstance = [pscustomobject]@{ Moid = 'm2' } }))
+Assert-Equal "a doubly-wrapped instance" "m3" (Get-IntersightRelationshipMoid -Relationship ([pscustomobject]@{ ActualInstance = [pscustomobject]@{ ActualInstance = [pscustomobject]@{ Moid = 'm3' } } }))
+Assert-Equal "an unmapped type in AdditionalProperties" "m4" (Get-IntersightRelationshipMoid -Relationship ([pscustomobject]@{ AdditionalProperties = @{ Moid = 'm4' } }))
+Assert-Equal "a bare Moid string" "67ca67ad617675301f7bb5a1" (Get-IntersightRelationshipMoid -Relationship '67ca67ad617675301f7bb5a1')
+# Never a guess: a string that is not a Moid, and an object with nothing on it, both yield nothing.
+Assert-Equal "an arbitrary string is not treated as a Moid" "" (Get-IntersightRelationshipMoid -Relationship 'siepd85vcp0007')
+Assert-Equal "an empty relationship yields nothing" "" (Get-IntersightRelationshipMoid -Relationship ([pscustomobject]@{ Name = 'x' }))
+Assert-Equal "null yields nothing" "" (Get-IntersightRelationshipMoid -Relationship $null)
+
 Write-Host "`n=== The server comes from the profile ===" -ForegroundColor Cyan
-Assert-Equal "AssignedServer is used" "server-abc" (Get-IntersightAssignedServerMoid -ServerProfile ([pscustomobject]@{ AssignedServer = [pscustomobject]@{ Moid = 'server-abc' } }))
-Assert-Equal "AssociatedServer is the fallback" "server-xyz" (Get-IntersightAssignedServerMoid -ServerProfile ([pscustomobject]@{ AssociatedServer = [pscustomobject]@{ Moid = 'server-xyz' } }))
-Assert-Equal "a profile with neither reports nothing, rather than guessing" "" (Get-IntersightAssignedServerMoid -ServerProfile ([pscustomobject]@{ Name = 'sp' }))
+Assert-Equal "AssignedServer is used" "server-abc" (Get-IntersightAssignedServerMoid -ServerProfile ([pscustomobject]@{ AssignedServer = [pscustomobject]@{ Moid = 'server-abc' } }) -Quiet)
+Assert-Equal "AssociatedServer is the fallback" "server-xyz" (Get-IntersightAssignedServerMoid -ServerProfile ([pscustomobject]@{ AssociatedServer = [pscustomobject]@{ Moid = 'server-xyz' } }) -Quiet)
+Assert-Equal "a wrapped AssignedServer is still read" "server-wrapped" (Get-IntersightAssignedServerMoid -ServerProfile ([pscustomobject]@{ AssignedServer = [pscustomobject]@{ ActualInstance = [pscustomobject]@{ Moid = 'server-wrapped' } } }) -Quiet)
+Assert-Equal "a profile with neither reports nothing, rather than guessing" "" (Get-IntersightAssignedServerMoid -ServerProfile ([pscustomobject]@{ Name = 'sp' }) -Quiet)
+
+Write-Host "`n=== An unreadable relationship is re-read with the server expanded ===" -ForegroundColor Cyan
+# An unexpanded relationship can carry nothing useful at all, which is why the GUI expands it.
+$script:ExpandCalls = New-Object System.Collections.Generic.List[string]
+function Get-IntersightServerProfile { param($Moid,$Filter,$Expand,$ErrorAction)
+    if ($Expand) {
+        $script:ExpandCalls.Add([string]$Expand)
+        return [pscustomobject]@{ Name='sp-esx01'; Moid='moid-1'; AssignedServer = [pscustomobject]@{ Moid = 'server-expanded' } }
+    }
+    return [pscustomobject]@{ Name='sp-esx01'; Moid='moid-1'; AssignedServer = [pscustomobject]@{ Name = 'blade' } } }
+$flat = [pscustomobject]@{ Name='sp-esx01'; AssignedServer = [pscustomobject]@{ Name = 'blade' } }
+Assert-Equal "the expanded read supplies the Moid" "server-expanded" (Get-IntersightAssignedServerMoid -ServerProfile $flat -ProfileMoid 'moid-1' -Quiet)
+Assert-Equal "and it asked for AssignedServer" "AssignedServer" $script:ExpandCalls[0]
+
+# Restore the profile stub the rest of the suite drives.
+function Get-IntersightServerProfile { param($Moid,$Filter,$Expand,$ErrorAction)
+    $index = [Math]::Min($script:Reads, $script:States.Count - 1)
+    $script:Reads++
+    return [pscustomobject]@{
+        Name = 'sp-esx01'; Moid = 'moid-1'
+        AssignedServer = if ($script:ServerMoid) { [pscustomobject]@{ Moid = $script:ServerMoid } } else { $null }
+        ConfigContext = [pscustomobject]@{ ConfigState = $script:States[$index] }
+    } }
 
 Write-Host "`n=== PowerCycle resets the server ===" -ForegroundColor Cyan
 # 'Reboot' would restart the IMC and leave the blade running - see the notes above.

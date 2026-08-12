@@ -58,7 +58,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 20.5.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 20.5.1. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -206,7 +206,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "20.5.0"
+$ScriptVersion = "20.5.1"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -2538,31 +2538,132 @@ function Confirm-IntersightDeployAccepted {
     return $false
 }
 
+function Get-IntersightRelationshipMoid {
+    <#
+    .SYNOPSIS
+        Pulls the Moid out of an Intersight relationship property, whatever shape it arrived in.
+
+    .DESCRIPTION
+        Relationship properties in this SDK are not plain objects. They are generated oneOf
+        wrappers, so the Moid can be on the object itself, on an ActualInstance the wrapper holds,
+        or in the AdditionalProperties bag when the model did not recognise the concrete type. On a
+        live run AssignedServer.Moid read as empty on every profile, which is what stopped any
+        power action being sent - the same class of problem as a paged response whose Moid is null
+        because the page, not the object, was being read.
+
+        All the shapes are tried, plus the case where the relationship serialises to nothing but
+        the Moid string itself. Returns "" rather than guessing.
+    #>
+    param($Relationship)
+
+    if ($null -eq $Relationship) { return "" }
+
+    # A bare Moid string.
+    if ($Relationship -is [string]) {
+        if ($Relationship -match '^[0-9a-fA-F]{24}$') { return $Relationship }
+        return ""
+    }
+
+    foreach ($candidate in @(
+        { [string]$Relationship.Moid }
+        { [string]$Relationship.ActualInstance.Moid }
+        { [string]$Relationship.ActualInstance.ActualInstance.Moid }
+        { [string]$Relationship.AdditionalProperties['Moid'] }
+        { [string]$Relationship.AdditionalProperties.Moid }
+    )) {
+        $value = ""
+        try { $value = & $candidate } catch { continue }
+        if (-not [string]::IsNullOrWhiteSpace($value)) { return $value.Trim() }
+    }
+
+    return ""
+}
+
+function Write-IntersightRelationshipShape {
+    <#
+    .SYNOPSIS
+        Describes a relationship object that yielded no Moid, so the next run says what to read.
+
+    .DESCRIPTION
+        Purely diagnostic. Two live runs have now been lost to a property that was present and
+        unreadable, and "could not be identified" on its own does not tell anyone which property to
+        reach for. This prints the type and the property names actually on the object.
+    #>
+    param([string]$Label, $Relationship)
+
+    if ($null -eq $Relationship) { Write-Host "    $Label : null" -ForegroundColor DarkGray; return }
+    try {
+        $typeName = $Relationship.GetType().FullName
+        $names = @($Relationship.PSObject.Properties.Name) -join ', '
+        Write-Host "    $Label : type $typeName" -ForegroundColor DarkGray
+        Write-Host "      properties: $names" -ForegroundColor DarkGray
+        if ($Relationship.PSObject.Properties.Name -contains 'ActualInstance' -and $null -ne $Relationship.ActualInstance) {
+            Write-Host "      ActualInstance type: $($Relationship.ActualInstance.GetType().FullName)" -ForegroundColor DarkGray
+            Write-Host "      ActualInstance properties: $((@($Relationship.ActualInstance.PSObject.Properties.Name)) -join ', ')" -ForegroundColor DarkGray
+        }
+    }
+    catch { Write-Host "    $Label : could not be described - $($_.Exception.Message)" -ForegroundColor DarkGray }
+}
+
 function Get-IntersightAssignedServerMoid {
     <#
     .SYNOPSIS
         Returns the Moid of the server a profile is assigned to, or "" if it cannot be read.
 
     .DESCRIPTION
-        Read from AssignedServer, falling back to AssociatedServer - which of the two carries the
-        relationship differs by how the profile was created and by appliance release, and a profile
-        that is deployed always has at least one of them.
+        Reads AssignedServer, then AssociatedServer - which of the two carries the relationship
+        differs by how the profile was created and by appliance release - and gets the Moid out of
+        each through Get-IntersightRelationshipMoid, because the relationship is a typed wrapper
+        rather than a plain object.
+
+        If neither yields anything, the profile is re-read with the relationships expanded. An
+        unexpanded relationship can serialise with nothing useful on it at all, and $expand is
+        exactly what the Intersight GUI does on this page for this reason.
 
         Never throws. This runs after the firmware is already staged, and a lookup that fails is a
         reason to say so and leave the blade alone, not a reason to end the run.
     #>
-    param([Parameter(Mandatory=$true)]$ServerProfile)
+    param(
+        [Parameter(Mandatory=$true)]$ServerProfile,
+        [string]$ProfileMoid = "",
+        [switch]$Quiet
+    )
 
     foreach ($property in @('AssignedServer','AssociatedServer')) {
         try {
             if ($ServerProfile.PSObject.Properties.Name -notcontains $property) { continue }
-            $relationship = $ServerProfile.$property
-            if ($null -eq $relationship) { continue }
-            $moid = [string]$relationship.Moid
+            $moid = Get-IntersightRelationshipMoid -Relationship $ServerProfile.$property
             if (-not [string]::IsNullOrWhiteSpace($moid)) { return $moid }
         }
         catch {}
     }
+
+    # Second attempt: ask the appliance to expand the relationships. Only worth doing once, and
+    # only when there is a Moid to ask about.
+    if (-not [string]::IsNullOrWhiteSpace($ProfileMoid)) {
+        foreach ($expandValue in @('AssignedServer', 'AssociatedServer')) {
+            try {
+                $expanded = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $ProfileMoid -Expand $expandValue -ErrorAction Stop) | Select-Object -First 1
+                if ($null -eq $expanded) { continue }
+                foreach ($property in @('AssignedServer','AssociatedServer')) {
+                    if ($expanded.PSObject.Properties.Name -notcontains $property) { continue }
+                    $moid = Get-IntersightRelationshipMoid -Relationship $expanded.$property
+                    if (-not [string]::IsNullOrWhiteSpace($moid)) { return $moid }
+                }
+            }
+            catch {}
+        }
+    }
+
+    if (-not $Quiet) {
+        Write-Host "  No server Moid could be read from the profile. What the relationships look like:" -ForegroundColor DarkGray
+        foreach ($property in @('AssignedServer','AssociatedServer')) {
+            $value = $null
+            try { if ($ServerProfile.PSObject.Properties.Name -contains $property) { $value = $ServerProfile.$property } } catch {}
+            Write-IntersightRelationshipShape -Label $property -Relationship $value
+        }
+    }
+
     return ""
 }
 
@@ -2703,7 +2804,7 @@ function Invoke-IntersightActivationPowerCycle {
             $current = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $Row.ProfileMoid -ErrorAction Stop) | Select-Object -First 1
         }
         if ($null -eq $current) { $current = $Row.ServerProfileObj }
-        if ($null -ne $current) { $serverMoid = Get-IntersightAssignedServerMoid -ServerProfile $current }
+        if ($null -ne $current) { $serverMoid = Get-IntersightAssignedServerMoid -ServerProfile $current -ProfileMoid ([string]$Row.ProfileMoid) }
     }
     catch {
         Write-Host "  Could not re-read '$($Row.ServerProfile)' to find its server: $($_.Exception.Message)" -ForegroundColor Yellow
