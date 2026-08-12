@@ -12,6 +12,56 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [20.7.0] — 2026-08-12
+
+The activation now runs in the order the appliance imposes, and **nothing in
+vCenter happens until it has finished**.
+
+1. Check the host, stage the firmware (deploy the profile).
+2. **Pause 40 minutes.** 20.6.0 power-cycled immediately and was refused —
+   `action_not_allowed_firmware_upgrade_in_progress` — because the deploy's own
+   firmware task was still running. Waiting first is what the appliance requires.
+3. **Ask Intersight** whether that task has finished for this profile's server
+   (`firmware/UpgradeStatuses`). Finished → power-cycle the blade. Still going →
+   prompt **RETRY**, which re-checks the **Intersight task**, not vCenter, and
+   power-cycles the moment it reports finished. No cap on retries.
+4. **Hold up to 40 minutes, polling.** Every minute it asks whether the profile
+   has stopped requiring a deploy and no firmware task is running, and returns
+   the moment both are true rather than sleeping out the window.
+5. Only then back to vCenter — and the batch **skips its own post-reboot wait**,
+   because this one already served it. A host is not held for 80 minutes.
+
+#### Changed
+
+- `Invoke-IntersightActivationPowerCycle` rewritten to that sequence. The
+  power action is no longer attempted before the wait.
+- `RETRY` re-checks the Intersight firmware task. Previously the retry loop
+  fell through to vCenter's reconnect wait, which checked the wrong system.
+- `$Global:IntersightActivationHeldForBatch` tells the batch loop the wait has
+  been served, so `$initialWait` drops to 0 for that batch. The reconnect check
+  still polls until the host is actually back — only the fixed wait in front of
+  it is skipped.
+
+#### Added
+
+- `Get-IntersightFirmwareTaskState` — Running / Finished / Unknown from
+  `firmware/UpgradeStatuses`. **Unknown is not treated as Finished**: where the
+  status cannot be read the power action is attempted and the appliance's
+  refusal is taken as authoritative, because it is.
+- `Wait-IntersightActivationComplete` — the polling hold. `C` moves on, `E`
+  exits. Reaching the ceiling is not a failure.
+- `$Global:IntersightActivationHoldMinutes` (default 40).
+
+#### Added — tests
+
+- `tests/Test-IntersightPowerAction.ps1` at 53 assertions, including a static
+  check that **no vCenter cmdlet appears anywhere in the activation path** —
+  `Get-VMHost`, `Set-VMHost`, `Restart-VMHost`, `Test-VMHostProfileCompliance`
+  and the rest — and that it reads `Get-IntersightFirmwareUpgradeStatus`
+  instead. A running task means no power action is attempted at all; `RETRY`
+  power-cycles once the task reports finished; the hold returns early when the
+  profile settles.
+
 ### [20.6.0] — 2026-08-12
 
 The server is now found and the power action reaches it. Intersight's reply told
@@ -1313,6 +1363,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [20.7.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 20.7.0 — stage, pause 40
+minutes, check the Intersight task, power-cycle, hold and poll, then vCenter.
+This is the build to run.
 
 ### [20.6.0-preauth] — 2026-08-12
 
