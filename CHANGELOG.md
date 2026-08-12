@@ -12,6 +12,26 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [21.8.1] — 2026-08-12
+
+Housekeeping after an audit of the script's size and hot paths.
+
+#### Fixed
+
+- **One redundant Intersight round trip per poll, per host.** 21.8.0's activation
+  poll read the server profile twice: once with `-Expand RunningWorkflows` for the
+  workflow, then again for `ConfigState`. The expanded read already carries
+  `ConfigContext`, so the second GET was pure waste — 3 calls per poll where 2 do.
+  At a 30-second interval against the 60-minute ceiling that is up to 120 fewer
+  calls per host. The unexpanded fetch remains as the fallback for when the
+  workflow read does not answer.
+
+#### Removed
+
+- `Read-YesNoExit` and `Resolve-UcsTargetForHost` — defined, never called. Both
+  were superseded (by `Read-ChoiceExit` and by the CDP/LLDP discovery in
+  `Build-InfrastructureHostMapping`) and had been carried since.
+
 ### [21.8.0] — 2026-08-12
 
 The 60-minute waits are gone as a *mechanism*. Progress through the activation is
@@ -1737,6 +1757,11 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [21.8.1-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 21.8.1 — one fewer Intersight
+call per poll, and two dead functions removed. This is the build to run.
 
 ### [21.8.0-preauth] — 2026-08-12
 

@@ -299,7 +299,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "21.8.0"
+$ScriptVersion = "21.8.1"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -564,17 +564,6 @@ function Read-ChoiceExit {
         if ($answer -eq "E" -and $normalizedAllowed -notcontains "E") { $answer = "EXIT" }
         if ($answer -eq "EXIT") { Stop-SafeExit -Message $ExitMessage }
     } until ($normalizedAllowed -contains $answer)
-    return $answer
-}
-
-function Read-YesNoExit {
-    param([Parameter(Mandatory=$true)][string]$Message,[string]$ExitMessage="Script stopped at a safe checkpoint by implementor.")
-    do {
-        $answer = (Read-Host "$Message Type YES, NO, or EXIT").Trim().ToUpper()
-        if ($answer -eq "Y") { $answer = "YES" }
-        if ($answer -eq "N") { $answer = "NO" }
-        if ($answer -eq "EXIT") { Stop-SafeExit -Message $ExitMessage }
-    } until ($answer -eq "YES" -or $answer -eq "NO")
     return $answer
 }
 
@@ -1146,36 +1135,6 @@ function Get-EsxiPreferredDiscovery {
     $result = if ($preferred.Count -gt 0) { $preferred[0] } else { $null }
     $Global:EsxiDiscoveryCache[$VMHostObject.Name] = $result
     return $result
-}
-
-function Resolve-UcsTargetForHost {
-    param([Parameter(Mandatory=$true)]$VMHostObject)
-
-    $preferredRow = Get-EsxiPreferredDiscovery -VMHostObject $VMHostObject
-    $preferred = @($preferredRow | Where-Object { $null -ne $_ })
-
-    if ($preferred.Count -gt 0) {
-        $systemName = $preferred[0].SystemName
-        $candidate = (Get-UcsCandidateListFromSystemName -SystemName $systemName | Select-Object -First 1)
-        Write-Host "Host $($VMHostObject.Name) VMNIC $($preferred[0].Vmnic) UCSM target to use is: $candidate" -ForegroundColor Cyan
-
-        if ($Global:UcsCandidateCache.ContainsKey($candidate)) {
-            return [pscustomobject]@{ Host=$VMHostObject.Name; Vmnic=$preferred[0].Vmnic; CdpSystemName=$systemName; UcsTarget=$Global:UcsCandidateCache[$candidate]; Discovery="CACHE" }
-        }
-
-        $session = Connect-UcsCached -UcsTarget $candidate
-        if ($null -ne $session) {
-            $Global:UcsCandidateCache[$candidate] = $candidate
-            return [pscustomobject]@{ Host=$VMHostObject.Name; Vmnic=$preferred[0].Vmnic; CdpSystemName=$systemName; UcsTarget=$candidate; Discovery="AUTO" }
-        }
-
-        Write-Host "Auto UCSM login failed for discovered target '$candidate'. Manual UCSM target is required." -ForegroundColor Yellow
-        $manualRow = Read-ManualUcsTargetForHost -VMHostObject $VMHostObject -DetectedSystemName $systemName -SuggestedUcsTarget $candidate
-        $manualRow.Vmnic = $preferred[0].Vmnic
-        return $manualRow
-    }
-
-    return (Read-ManualUcsTargetForHost -VMHostObject $VMHostObject)
 }
 
 function Get-ShortHostName { param([Parameter(Mandatory=$true)][string]$HostName) return ($HostName.Trim().Split('.')[0]) }
@@ -3139,6 +3098,10 @@ function Get-IntersightProfileWorkflowActivity {
     $result = [pscustomobject]@{
         Known = $false; Running = $false; Failed = $false
         Status = "Unknown"; Name = ""; Progress = $null; Count = 0; Detail = ""
+        # The profile object this read returned. The caller needs ConfigState from the same poll,
+        # and it is already here - re-fetching it would be a third round trip per poll, every poll,
+        # for every host in the batch.
+        Profile = $null
     }
 
     if ([string]::IsNullOrWhiteSpace($ProfileMoid)) {
@@ -3158,6 +3121,7 @@ function Get-IntersightProfileWorkflowActivity {
             if ($profileNow.PSObject.Properties.Name -notcontains 'RunningWorkflows') { continue }
 
             $result.Known = $true
+            $result.Profile = $profileNow
             $expanded = $useExpand
             $entries = @($profileNow.RunningWorkflows | Where-Object { $null -ne $_ })
             break
@@ -3354,12 +3318,17 @@ function Wait-IntersightActivationComplete {
             # 2. The firmware upgrade.
             $taskState = Get-IntersightFirmwareTaskState -ServerMoid $ServerMoid
 
-            # 3. The profile itself.
+            # 3. The profile itself. Reuse the object the workflow read already returned - it is
+            # the same GET, and asking twice per poll costs a round trip per host per 30 seconds
+            # for nothing. Only fetch it when that read did not answer.
             $stillStaged = $false
             $stateKnown = $false
             $configState = "unreadable"
             try {
-                $profileNow = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $ProfileMoid -ErrorAction Stop) | Select-Object -First 1
+                $profileNow = $workflow.Profile
+                if ($null -eq $profileNow) {
+                    $profileNow = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $ProfileMoid -ErrorAction Stop) | Select-Object -First 1
+                }
                 if ($null -ne $profileNow) {
                     $state = Get-IntersightProfileDeployState -ServerProfile $profileNow
                     $stateKnown = $state.StateKnown
