@@ -101,6 +101,48 @@ Assert-Equal "disconnected hosts are excluded from sizing" 2 $r.SafeBatchSize
 $r = Get-CapacityBasedBatchSize -CandidateHosts @() -Cluster $cluster
 Assert-Equal "no connected hosts returns 0" 0 $r.SafeBatchSize
 
+Write-Host "`n=== Hosts already in Maintenance mode are in scope, and cost no capacity ===" -ForegroundColor Cyan
+# They were previously skipped for being not-Connected, which left them on old firmware while the
+# run reported the cluster complete. They are already evacuated, so taking them frees nothing and
+# costs nothing - their slots are added on top of what the connected hosts can afford.
+function New-ParkedHost { param([string]$Name)
+    New-TestHost -Name $Name -CpuTotal 100000 -CpuUsed 0 -MemTotal 512 -MemUsed 0 -State "Maintenance" }
+
+# Nothing connected can be spared at 70% CPU, but the parked hosts still can be - and must be,
+# or the very hosts this run was asked to capture are the ones it strands.
+$busyPlusParked = @((New-Cluster -Count 10 -CpuUsedEach 70000 -MemUsedEach 153.6)) + @((New-ParkedHost -Name "parked1"), (New-ParkedHost -Name "parked2"))
+$r = Get-CapacityBasedBatchSize -CandidateHosts $busyPlusParked -Cluster $cluster
+Assert-Equal "a cluster too busy to spare a connected host still takes the parked ones" 2 $r.SafeBatchSize
+
+# Every candidate parked: always safe, never a capacity stop.
+$r = Get-CapacityBasedBatchSize -CandidateHosts @((New-ParkedHost -Name "p1"), (New-ParkedHost -Name "p2"), (New-ParkedHost -Name "p3")) -Cluster $cluster
+Assert-Equal "a batch made up entirely of parked hosts is never refused" 3 $r.SafeBatchSize
+
+# The free slots ride on top of the sized connected batch: 5 connected + 1 parked = 6.
+$r = Get-CapacityBasedBatchSize -CandidateHosts (@((New-Cluster -Count 10 -CpuUsedEach 32000 -MemUsedEach 153.6)) + @((New-ParkedHost -Name "parked1"))) -Cluster $cluster
+Assert-Equal "a parked host is added on top of the capacity-sized batch" 6 $r.SafeBatchSize
+
+# ...but never past the absolute cap. Connected already sizes to 6 here.
+$r = Get-CapacityBasedBatchSize -CandidateHosts (@((New-Cluster -Count 10 -CpuUsedEach 30000 -MemUsedEach 153.6)) + @((New-ParkedHost -Name "parked1"), (New-ParkedHost -Name "parked2"))) -Cluster $cluster
+Assert-Equal "free slots never push the batch past MaxAbsoluteBatchSize" 6 $r.SafeBatchSize
+
+# One connected host plus parked ones is still a valid batch.
+$r = Get-CapacityBasedBatchSize -CandidateHosts (@((New-Cluster -Count 1 -CpuUsedEach 1000 -MemUsedEach 10)) + @((New-ParkedHost -Name "parked1"), (New-ParkedHost -Name "parked2"))) -Cluster $cluster
+Assert-Equal "one connected host plus two parked is a batch of three" 3 $r.SafeBatchSize
+
+# NotResponding and Disconnected are still out. There is nothing to drive through vCenter on a
+# host it cannot reach, and this is the distinction the change had to preserve.
+$unreachable = @((New-Cluster -Count 3 -CpuUsedEach 1000 -MemUsedEach 10)) + @((New-TestHost -Name "down1" -CpuTotal 100000 -CpuUsed 0 -MemTotal 512 -MemUsed 0 -State "NotResponding"))
+$r = Get-CapacityBasedBatchSize -CandidateHosts $unreachable -Cluster $cluster
+Assert-Equal "NotResponding is still excluded, not treated as free" 2 $r.SafeBatchSize
+
+Write-Host "`n=== The workflow puts parked hosts in scope, and takes them first ===" -ForegroundColor Cyan
+$workflowText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "the firmware candidate filter admits Maintenance" $true ($workflowText -match '\$patchCandidateHosts = @\(\$allClusterHosts \| Where-Object \{ \$_\.ConnectionState -eq "Connected" -or \$_\.ConnectionState -eq "Maintenance" \}\)')
+Assert-Equal "the ESXi-only filter admits Maintenance too" $true ($workflowText -match 'ConnectionState -eq "Connected" -or \$_\.ConnectionState -eq "Maintenance"\) -and \(\$alreadyTargetHosts')
+Assert-Equal "parked hosts are queued ahead of the rest" $true ($workflowText -match '(?s)Where-Object \{ \$_\.ConnectionState -eq "Maintenance" \}\)\) \{ \[void\]\$pendingHosts\.Add.*Where-Object \{ \$_\.ConnectionState -ne "Maintenance" \}\)\) \{ \[void\]\$pendingHosts\.Add')
+Assert-Equal "and they are recorded as in scope, not excluded" $true ($workflowText -match '-Action "Pre-existing Maintenance mode" -Result "InScope"')
+
 Write-Host "`n=== Host profile compliance parsing ===" -ForegroundColor Cyan
 $testHost = New-TestHost -Name "esx1" -CpuTotal 1 -CpuUsed 0 -MemTotal 1 -MemUsed 0
 

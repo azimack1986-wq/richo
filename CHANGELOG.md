@@ -12,6 +12,42 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [21.6.0] — 2026-08-12
+
+#### Fixed
+
+- **Hosts already in Maintenance mode are in scope**, for both the Intersight
+  and the UCS Manager paths. They were filtered out by
+  `ConnectionState -eq "Connected"` and reported as "out of scope for this run",
+  which quietly left them on old firmware while the run reported the cluster
+  complete — the worst kind of miss, because it looked like a success.
+
+#### Changed
+
+- **They are taken first.** Already evacuated means nothing to wait for and no
+  capacity to free, so they head the queue and everything after them keeps the
+  cluster order.
+- **Batch sizing treats their slots as free.** `Get-CapacityBasedBatchSize` now
+  splits candidates into connected and parked: parked hosts are added on top of
+  whatever the connected hosts can afford, still capped at
+  `MaxAbsoluteBatchSize`. Three consequences, all deliberate:
+  - a cluster too busy to spare a single connected host still processes its
+    parked ones instead of stopping on capacity;
+  - a batch made up entirely of parked hosts is always safe and is never
+    refused — refusing it would strand exactly the hosts this change was asked
+    to capture;
+  - `NotResponding` and `Disconnected` stay out of scope. There is nothing to
+    drive through vCenter on a host it cannot reach, and that is the distinction
+    the previous filter was conflating with Maintenance.
+
+#### Note
+
+At the end of its batch a previously-parked host goes through the same host
+profile compliance gate as every other host and, once it passes, **is taken out
+of Maintenance mode**. A host parked deliberately for an unrelated reason will
+be returned to service by this run. That is stated on screen at the start of the
+run, naming the hosts, rather than left to be discovered afterwards.
+
 ### [21.5.0] — 2026-08-12
 
 Operator-directed changes after a clean 21.4.0 run.
@@ -1594,6 +1630,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [21.6.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 21.6.0 — hosts already in
+Maintenance mode are in scope for both Intersight and UCS Manager, taken first,
+and cost no capacity. This is the build to run.
 
 ### [21.5.0-preauth] — 2026-08-12
 

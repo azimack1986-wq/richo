@@ -215,9 +215,17 @@
       after accepting the change, and the cluster health check that follows fails on any host still
       in Maintenance - which stopped the run one host in, having actually succeeded. The run now
       waits up to $ExitMaintenanceTimeoutMinutes for the transition to land.
-    - Hosts already in Maintenance mode when the run started are out of scope AND excluded from the
-      health assessment. They are a pre-existing condition, not something this run caused, and
-      counting them would fail every batch. They are named on screen each time instead.
+    - HOSTS ALREADY IN MAINTENANCE MODE ARE IN SCOPE, for both the Intersight and the UCS Manager
+      paths. They were previously skipped for being not-Connected, which quietly left them on old
+      firmware while the run reported the cluster complete. They are now taken FIRST - being already
+      evacuated they cost no capacity, so the batch sizing treats their slots as free and a batch
+      made up entirely of them is never refused on capacity grounds.
+      The consequence, stated on screen at the start of the run rather than buried: at the end of
+      their batch they go through the same host profile compliance gate as every other host and,
+      once it passes, they are taken OUT of Maintenance mode. A host parked deliberately for an
+      unrelated reason will be returned to service by this run.
+      NotResponding and Disconnected hosts remain out of scope - there is nothing to drive through
+      vCenter on a host it cannot reach.
     - An Intersight profile reporting RequiresDeploy=false is the state the run is trying to reach,
       so it is carried on through rather than asked about. The run only stops for a state it could
       not READ - "nothing staged" and "could not tell" produce the same silence and must not be
@@ -258,7 +266,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "21.5.0"
+$ScriptVersion = "21.6.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -3439,6 +3447,12 @@ function Get-CapacityBasedBatchSize {
 
         Returns SafeBatchSize 0 when even a single host cannot be removed within those limits,
         which the caller treats as a stop rather than as a batch of one.
+
+        A candidate ALREADY in Maintenance mode is free. It is carrying no load and its capacity is
+        already out of the cluster, so removing it costs nothing that is not already spent - it is
+        added to the batch on top of whatever the connected hosts can afford. That also means a
+        batch made up entirely of already-parked hosts is always safe, and must never be refused
+        for want of capacity: refusing it would strand the very hosts this run was asked to capture.
     #>
     param(
         # AllowEmptyCollection so an empty candidate list returns a clean "no capacity" result
@@ -3448,13 +3462,24 @@ function Get-CapacityBasedBatchSize {
     )
 
     $connected = @($CandidateHosts | Where-Object { $_.ConnectionState -eq "Connected" })
+    $parked    = @($CandidateHosts | Where-Object { $_.ConnectionState -eq "Maintenance" })
     $diagnostics = New-Object System.Collections.Generic.List[string]
 
+    # Free slots, capped so a large pool of parked hosts cannot blow past MaxAbsoluteBatchSize.
+    $freeSlots = [Math]::Min($parked.Count, [int]$MaxAbsoluteBatchSize)
+    if ($freeSlots -gt 0) {
+        [void]$diagnostics.Add(("{0} candidate host(s) are already in Maintenance mode and cost no capacity to take." -f $parked.Count))
+    }
+
     if ($connected.Count -eq 0) {
+        if ($freeSlots -gt 0) {
+            return [pscustomobject]@{ SafeBatchSize=$freeSlots; Reason="$freeSlots candidate host(s) already in Maintenance mode - already out of service, so no capacity needs freeing."; Diagnostics=@($diagnostics) }
+        }
         return [pscustomobject]@{ SafeBatchSize=0; Reason="No connected candidate hosts."; Diagnostics=@($diagnostics) }
     }
     if ($connected.Count -eq 1) {
-        return [pscustomobject]@{ SafeBatchSize=1; Reason="Only one connected candidate host - batch of one."; Diagnostics=@($diagnostics) }
+        $only = [Math]::Min(1 + $freeSlots, [int]$MaxAbsoluteBatchSize)
+        return [pscustomobject]@{ SafeBatchSize=$only; Reason="Only one connected candidate host - batch of one$(if ($freeSlots -gt 0) { ", plus $freeSlots already in Maintenance mode" })."; Diagnostics=@($diagnostics) }
     }
 
     $totalCpuMhz = [double](($connected | Measure-Object -Property CpuTotalMhz -Sum).Sum)
@@ -3485,11 +3510,22 @@ function Get-CapacityBasedBatchSize {
         [void]$diagnostics.Add(("Batch of {0}: CPU need {1:N0} vs allowed {2:N0} MHz [{3}]; memory need {4:N1} vs allowed {5:N1} GB [{6}]." -f $n, $usedCpuMhz, $cpuLimit, $(if($cpuOk){"OK"}else{"FAIL"}), $usedMemGB, $memLimit, $(if($memOk){"OK"}else{"FAIL"})))
 
         if ($cpuOk -and $memOk) {
+            $total = [Math]::Min($n + $freeSlots, [int]$MaxAbsoluteBatchSize)
             return [pscustomobject]@{
-                SafeBatchSize = $n
-                Reason        = "Largest batch leaving $MinimumCpuHeadroomPercentAfterBatch% CPU and $MinimumMemoryHeadroomPercentAfterBatch% memory headroom after a $ResourceSafetyBuffer safety buffer, capped at $MaxAbsoluteBatchSize."
+                SafeBatchSize = $total
+                Reason        = "Largest batch leaving $MinimumCpuHeadroomPercentAfterBatch% CPU and $MinimumMemoryHeadroomPercentAfterBatch% memory headroom after a $ResourceSafetyBuffer safety buffer, capped at $MaxAbsoluteBatchSize.$(if ($freeSlots -gt 0) { " $n connected host(s) plus $freeSlots already in Maintenance mode." })"
                 Diagnostics   = @($diagnostics)
             }
+        }
+    }
+
+    # No connected host can be spared. Hosts already in Maintenance mode still can be - they are
+    # out of service either way - so the run takes those rather than stopping on capacity.
+    if ($freeSlots -gt 0) {
+        return [pscustomobject]@{
+            SafeBatchSize = $freeSlots
+            Reason        = "No connected host can be removed within the configured headroom, but $freeSlots candidate host(s) are already in Maintenance mode and cost nothing to take."
+            Diagnostics   = @($diagnostics)
         }
     }
 
@@ -4714,12 +4750,24 @@ function Invoke-ClusterUpgradeWorkflow {
     $allClusterHosts = @(Get-VMHost -Location $Cluster | Sort-Object Name)
     if ($allClusterHosts.Count -eq 0) { Stop-WithMessage "No hosts found in selected cluster." }
 
-    # Informational only. These hosts are not Connected, so they never enter scope - but saying so
-    # is better than an operator wondering later why they were left out.
+    # Hosts already in Maintenance mode are IN SCOPE, at the operator's direction, for both the
+    # Intersight and the UCS Manager paths. They were previously skipped for being not-Connected,
+    # which quietly left them on old firmware while the run reported the cluster complete.
+    #
+    # They cost no capacity to take - they are already out of service - so they are processed
+    # FIRST, ahead of the connected hosts, and the batch sizing treats their slots as free.
+    #
+    # The consequence to be aware of: at the end of the batch they go through the same host profile
+    # compliance gate as every other host and, once it passes, they are taken OUT of Maintenance
+    # mode. A host parked deliberately for something unrelated will be returned to service by this
+    # run. It is called out here rather than buried, so it can be stopped now if that is wrong.
     $parkedHosts = @($allClusterHosts | Where-Object { $_.ConnectionState -eq "Maintenance" } | Select-Object -ExpandProperty Name)
     if ($parkedHosts.Count -gt 0) {
-        Write-Host "Host(s) already in Maintenance mode and out of scope for this run: $($parkedHosts -join ', ')" -ForegroundColor Yellow
-        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Pre-existing Maintenance mode" -Result "Excluded" -Details ($parkedHosts -join ', ')
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Host(s) already in Maintenance mode, IN SCOPE and taken first: $($parkedHosts -join ', ')" -ForegroundColor Yellow
+        Write-Host "They cost no capacity to take, and they will be returned to service once they pass the" -ForegroundColor Yellow
+        Write-Host "host profile compliance check - including any parked for an unrelated reason." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Pre-existing Maintenance mode" -Result "InScope" -Details "Taken first, no capacity cost: $($parkedHosts -join ', ')"
     }
 
     if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") { Build-InfrastructureHostMapping -Hosts $allClusterHosts }
@@ -4729,11 +4777,13 @@ function Invoke-ClusterUpgradeWorkflow {
     if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") {
         # Firmware-only mode must not exclude hosts just because the ESXi build is already current.
         # These hosts still need to be eligible for UCSM firmware policy staging/acknowledgement.
-        $patchCandidateHosts = @($allClusterHosts | Where-Object { $_.ConnectionState -eq "Connected" })
+        # Maintenance counts as in scope - see the note above. NotResponding and Disconnected do
+        # not: there is nothing to drive through vCenter on a host it cannot reach.
+        $patchCandidateHosts = @($allClusterHosts | Where-Object { $_.ConnectionState -eq "Connected" -or $_.ConnectionState -eq "Maintenance" })
     }
     else {
         # ESXi-only mode should skip hosts already on the target ESXi build.
-        $patchCandidateHosts = @($allClusterHosts | Where-Object { $_.ConnectionState -eq "Connected" -and ($alreadyTargetHosts.Name -notcontains $_.Name) })
+        $patchCandidateHosts = @($allClusterHosts | Where-Object { ($_.ConnectionState -eq "Connected" -or $_.ConnectionState -eq "Maintenance") -and ($alreadyTargetHosts.Name -notcontains $_.Name) })
     }
 
     # Hosts excluded because Intersight is unusable must not fall through to the UCS Manager path -
@@ -4757,14 +4807,18 @@ function Invoke-ClusterUpgradeWorkflow {
             Stop-WithMessage "Nothing to do: every host in this cluster is already deployed, or was excluded above. No Intersight server profile has changes staged."
         }
         else {
-            Stop-WithMessage "No Connected ESXi patch candidate hosts available after excluding hosts already on the target ESXi build."
+            Stop-WithMessage "No ESXi patch candidate hosts available. Every host is either already on the target ESXi build, or is neither Connected nor in Maintenance mode."
         }
     }
 
     $batchMode = Select-BatchMode
 
+    # Hosts already in Maintenance mode go first. They are already evacuated, so they consume no
+    # capacity and there is nothing to wait for before acting on them. Everything after them keeps
+    # the cluster order the operator asked for.
     $pendingHosts = New-Object System.Collections.ArrayList
-    foreach ($hostObj in $patchCandidateHosts) { [void]$pendingHosts.Add($hostObj.Name) }
+    foreach ($hostObj in @($patchCandidateHosts | Where-Object { $_.ConnectionState -eq "Maintenance" })) { [void]$pendingHosts.Add($hostObj.Name) }
+    foreach ($hostObj in @($patchCandidateHosts | Where-Object { $_.ConnectionState -ne "Maintenance" })) { [void]$pendingHosts.Add($hostObj.Name) }
     $batchNumber = 0
 
     while ($pendingHosts.Count -gt 0) {
