@@ -131,9 +131,11 @@ Assert-Equal "and sent through -ScheduledActions" $true ($scriptText -match "\`$
 # Activate carries the action itself, so no top-level -Action rides alongside it - that was the
 # old stage-then-activate shape, and it is exactly what the captured GUI request does not send.
 Assert-Equal "the acknowledgement rides on Activate" $true ($scriptText -match "Initialize-IntersightPolicyScheduledAction -Action 'Activate' -ProceedOnReboot \`$true")
-# Including in the comments. Header text describing the old Deploy shape outlived the code once
-# already, and a comment that contradicts the call is worse than no comment.
-Assert-Equal "no example anywhere still shows the Deploy scheduled action" $true (-not ($scriptText -match "Initialize-IntersightPolicyScheduledAction -Action 'Deploy'"))
+# The Deploy scheduled action still exists, but only on the fallback path: Activate is refused
+# from Pending-changes, and the appliance requires Deploy first. It must never be the FIRST thing
+# tried - that was the two-step form, and it is what made the firmware stage and never activate.
+Assert-Equal "Activate is what the deploy reaches for first" $true ($scriptText -match "\`$scheduledAction = Initialize-IntersightPolicyScheduledAction -Action 'Activate'")
+Assert-Equal "Deploy appears only as the fallback when Activate is refused" $true ($scriptText -match "gershwin_user_action_is_not_allowed")
 Assert-Equal "-Action Deploy is only used when the reboot acknowledgement is turned off" $true ($scriptText -match "\`$deployParams\['Action'\] = 'Deploy'")
 # The scheduled action carries the action. Sending -Action as well instructs the profile twice.
 # The QUOTED form only: $Global:IntersightRebootImmediatelyToActivate is the switch that turns the

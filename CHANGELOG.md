@@ -12,6 +12,46 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [21.3.0] — 2026-08-12
+
+21.2.0 sent a bare `Activate` from `Pending-changes` and the appliance refused it:
+
+```
+"message":"Action 'Activate' is not allowed in the current state.",
+"messageId":"gershwin_user_action_is_not_allowed"
+```
+
+#### Fixed
+
+- **`Activate` is only valid once the profile's configuration is already
+  deployed.** From `Pending-changes` — configuration not yet pushed — the
+  appliance requires `Deploy` first. The GUI capture that showed a bare
+  `Activate` was taken against a profile already past that point, which is why
+  it looked like the whole story. It reconciles the two live results exactly:
+  21.0.0 worked because it deployed first and activated later; 21.2.0 failed
+  because it skipped straight to `Activate`.
+- **The appliance now decides, not the script.** `Activate` is still tried
+  first — one call, the fast path, and it is what runs when the state allows it.
+  If the appliance answers `gershwin_user_action_is_not_allowed`, the run falls
+  back to the form it requires:
+  `-Action Deploy` + `ScheduledActions @{Action='Deploy'; ProceedOnReboot=$true}`.
+  Any other error still propagates.
+  Reacting to the appliance's own answer beats predicting which states permit
+  which action — that mapping is not published, and guessing at it has now been
+  wrong twice.
+- The fallback is recorded as `Activate / NotAllowed` in the run summary with
+  the `ConfigState` that refused it, so the pattern across a cluster is visible
+  afterwards rather than scrolling past.
+
+#### Changed — tests
+
+- The simulation's `Set-IntersightServerProfile` stub now enforces the
+  distinction rather than a blanket rule: `Activate` must go on its own, while
+  `Deploy` carries a top-level `-Action` alongside it.
+- `Test-IntersightRebootActivate.ps1` asserts `Activate` is what the deploy
+  reaches for **first**, and that `Deploy` appears only behind the
+  not-allowed check — the two-step form must never become the default again.
+
 ### [21.2.0] — 2026-08-12
 
 #### Added
@@ -1470,6 +1510,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [21.3.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 21.3.0 — Activate is tried
+first, and the appliance's refusal drives the fallback to Deploy with the reboot
+acknowledgement. This is the build to run.
 
 ### [21.2.0-preauth] — 2026-08-12
 

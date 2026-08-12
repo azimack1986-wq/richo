@@ -58,7 +58,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 21.2.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 21.3.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -99,7 +99,15 @@
       still staged. 'PowerCycle' resets the server. The run warns loudly if it is ever configured
       with 'Reboot'.
       THE ORDER, and nothing in vCenter happens until it has finished:
-        1. ACTIVATE FROM THE START - one call, exactly what the GUI sends:
+        0. ACTIVATE IS TRIED FIRST, AND THE APPLIANCE DECIDES. Activate is only valid once the
+           profile's CONFIGURATION is already deployed; from Pending-changes it is refused with
+           "Action 'Activate' is not allowed in the current state"
+           (gershwin_user_action_is_not_allowed). When that happens the run falls back to
+           Deploy WITH the reboot acknowledgement, which is the form the appliance requires:
+             -Action Deploy + ScheduledActions @{Action='Deploy'; ProceedOnReboot=$true}
+           Reacting to the appliance's own answer beats predicting which states permit which
+           action - that is not published, and guessing at it has been wrong twice.
+        1. ACTIVATE FROM THE START where the state allows it - one call, what the GUI sends:
              POST /api/v1/server/Profiles/<moid>
              {"ScheduledActions":[{"Action":"Activate","ProceedOnReboot":true}]}
            Activate, not Deploy. Deploy stages the firmware and leaves the profile waiting for a
@@ -239,7 +247,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "21.2.0"
+$ScriptVersion = "21.3.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -3227,7 +3235,37 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             }
 
             Write-Host "  $sentDescription" -ForegroundColor DarkGray
-            Set-IntersightServerProfile @deployParams | Out-Null
+            try {
+                Set-IntersightServerProfile @deployParams | Out-Null
+            }
+            catch {
+                # "Action 'Activate' is not allowed in the current state."
+                #
+                # Activate is only valid once the profile's CONFIGURATION is already deployed and
+                # all that remains is to activate the firmware. From Pending-changes - the
+                # configuration not yet pushed - the appliance requires Deploy first, and says so
+                # plainly. The GUI capture that showed a bare Activate was taken against a profile
+                # already past that point, which is why it looked like the whole story.
+                #
+                # So: ask for the one-call form, and let the appliance say when it needs the
+                # two-step. Reacting to its answer beats predicting which states permit which
+                # action - that is not published, and guessing at it has been wrong twice already.
+                $message = [string]$_.Exception.Message
+                if (-not ($message -match "(?i)gershwin_user_action_is_not_allowed|not allowed in the current state")) { throw }
+
+                Write-Host "  Activate is not allowed from ConfigState '$($row.ConfigState)'. Deploying first, with the reboot acknowledgement." -ForegroundColor Yellow
+                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Activate" -Result "NotAllowed" -Details "Activate refused from ConfigState $($row.ConfigState); falling back to Deploy with ProceedOnReboot."
+
+                $deployParams = @{
+                    Moid             = $row.ProfileMoid
+                    Action           = 'Deploy'
+                    ScheduledActions = @(Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot $true)
+                    ErrorAction      = 'Stop'
+                }
+                $sentDescription = "Action=Deploy; ScheduledActions: Action=Deploy, ProceedOnReboot=true (Activate refused from $($row.ConfigState))"
+                Write-Host "  $sentDescription" -ForegroundColor DarkGray
+                Set-IntersightServerProfile @deployParams | Out-Null
+            }
 
             $Global:BatchActionsSent++
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Sent" -Details "ServerProfile=$($row.ServerProfile); ConfigState was $($row.ConfigState); $sentDescription."

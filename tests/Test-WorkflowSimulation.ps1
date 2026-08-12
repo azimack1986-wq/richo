@@ -277,8 +277,11 @@ function Set-IntersightServerProfile { param($Moid,$Action,$ActionParams,$Schedu
     foreach ($sa in @($ScheduledActions)) { if ($sa) { $script:DeployActionParams.Add("$($sa.Action):ProceedOnReboot=$($sa.ProceedOnReboot)") } }
     # Both are required: -Action Deploy is what starts the deploy workflow, ProceedOnReboot is the
     # acknowledgement that the server may be restarted to activate.
-    # Activate carries the action itself; a top-level -Action alongside it is the old two-step form.
-    if ($ScheduledActions -and $Action) { throw "-Action must not be sent alongside the Activate scheduled action" }
+    # Activate goes on its own. Deploy carries a top-level -Action alongside it, which is the form
+    # the appliance requires from Pending-changes.
+    foreach ($sa in @($ScheduledActions)) {
+        if ($sa.Action -eq 'Activate' -and $Action) { throw "-Action must not be sent alongside the Activate scheduled action" }
+    }
     if ($Moid) { [void]$script:IntersightDeployed.Add([string]$Moid) }
 }
 function Initialize-IntersightPolicyActionParam { param($Name,$Value) return [pscustomobject]@{ Name=$Name; Value=$Value } }
