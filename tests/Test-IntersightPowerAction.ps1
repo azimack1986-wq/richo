@@ -82,9 +82,11 @@ $script:ActivateCalls = New-Object System.Collections.Generic.List[string]
 $script:ActivateThrows = $false
 function Initialize-IntersightPolicyScheduledAction { param($Action,$ProceedOnReboot)
     return [pscustomobject]@{ Action = $Action; ProceedOnReboot = [bool]$ProceedOnReboot } }
+$script:ActivateThrowsFirst = 0
 function Set-IntersightServerProfile { param($Moid,$Action,$ScheduledActions,$ErrorAction)
     foreach ($sa in @($ScheduledActions)) { $script:ActivateCalls.Add("${Moid}:$($sa.Action):ProceedOnReboot=$($sa.ProceedOnReboot)") }
-    if ($script:ActivateThrows) { throw "Activate refused" } }
+    if ($script:ActivateThrows) { throw "Activate refused" }
+    if ($script:ActivateThrowsFirst -gt 0) { $script:ActivateThrowsFirst--; throw "Activate refused" } }
 function Set-IntersightComputeServerSetting { param($Moid,$AdminPowerState,$ErrorAction)
     $script:PowerCalls.Add("$Moid=$AdminPowerState")
     if ($script:PowerThrows) { throw $(if ($script:PowerError) { $script:PowerError } else { "server is not reachable" }) } }
@@ -191,24 +193,47 @@ Assert-Equal "Activate was sent, not a power action" $true ($script:ActivateCall
 Assert-Equal "and it held for the activation" $true (@('PowerCycled','Activated') -contains (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result))
 Assert-Equal "the batch is told not to hold again on top" $true $Global:IntersightActivationHeldForBatch
 
-Write-Host "`n=== Firmware task still running: no power cycle, the operator is asked ===" -ForegroundColor Cyan
-# This is the live refusal - the appliance will not reset the server underneath its own upgrade.
+Write-Host "`n=== Firmware task still running: Activate is sent anyway, because it IS the acknowledgement ===" -ForegroundColor Cyan
+# The deadlock this replaced. The firmware.Upgrade sits at IN_PROGRESS precisely BECAUSE it is
+# waiting for the reboot acknowledgement, so gating Activate on the upgrade finishing meant it
+# could never finish. A live run looped on "1 firmware upgrade(s) IN_PROGRESS" on every check
+# while the deploy had in fact completed and was waiting to be acknowledged.
 $script:TaskStates = @('InProgress'); $script:TaskReads = 0
 $script:States = @('Pending-changes'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 $script:PowerCalls.Clear(); $script:ActivateCalls.Clear()
 $Global:IntersightActivationHeldForBatch = $false
 Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
-Assert-Equal "nothing was sent while the task was running" $true ($script:PowerCalls.Count -eq 0)
-Assert-Equal "and it is recorded as still staged" "StillStaged" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
-Assert-Equal "the batch is not told it held" $false $Global:IntersightActivationHeldForBatch
+Assert-Equal "Activate goes out while the upgrade is in progress" $true ($script:ActivateCalls.Count -ge 1)
+Assert-Equal "it is the GUI's Activate, not a Deploy" "moid-1:Activate:ProceedOnReboot=True" $script:ActivateCalls[0]
+# A power action genuinely is refused mid-upgrade, so it is not worth attempting there.
+Assert-Equal "no power cycle is attempted underneath a running upgrade" 0 $script:PowerCalls.Count
+Assert-Equal "and it holds for the activation instead of looping" $true (@('PowerCycled','Activated') -contains (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result))
+Assert-Equal "the batch is told not to hold again on top" $true $Global:IntersightActivationHeldForBatch
 
-Write-Host "`n=== RETRY re-checks the task, and power-cycles once it finishes ===" -ForegroundColor Cyan
-# The retry checks the Intersight task again - not vCenter - which is the whole point of it.
-$script:TaskStates = @('InProgress','InProgress','Completed'); $script:TaskReads = 0
+Write-Host "`n=== Activate refused mid-upgrade: no power cycle, the operator is asked ===" -ForegroundColor Cyan
+# Refused AND an upgrade running is the only case that reaches the prompt. The power-cycle fallback
+# stays holstered - the appliance would decline it for the same reason.
+$script:ActivateThrows = $true
+$script:TaskStates = @('InProgress'); $script:TaskReads = 0
 $script:States = @('Pending-changes'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 $script:PowerCalls.Clear(); $script:ActivateCalls.Clear()
+$Global:IntersightActivationHeldForBatch = $false
+Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
+Assert-Equal "nothing was power-cycled underneath the upgrade" 0 $script:PowerCalls.Count
+Assert-Equal "and it is recorded as still staged" "StillStaged" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
+Assert-Equal "the batch is not told it held" $false $Global:IntersightActivationHeldForBatch
+$script:ActivateThrows = $false
+
+Write-Host "`n=== RETRY sends Activate again, and settles once it is accepted ===" -ForegroundColor Cyan
+# The retry re-sends Activate against Intersight - not a vCenter check, which is the whole point.
+$script:ActivateThrowsFirst = 2
+$script:TaskStates = @('InProgress'); $script:TaskReads = 0
+$script:States = @('Pending-changes'); $script:Reads = 0
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+$script:PowerCalls.Clear(); $script:ActivateCalls.Clear()
+$Global:IntersightActivationHeldForBatch = $false
 $script:Answers = @('RETRY','RETRY','CONTINUE'); $script:AnswerIndex = 0
 function Read-Host { param($Prompt)
     $script:PromptCount++
@@ -217,8 +242,9 @@ function Read-Host { param($Prompt)
     $script:AnswerIndex++
     return $answer }
 Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
-Assert-Equal "the blade was activated once the task finished" $true ($script:ActivateCalls.Count -ge 1)
-Assert-Equal "and the activation is recorded" $true (@('PowerCycled','Activated') -contains (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result))
+Assert-Equal "Activate was re-sent on each retry" 3 $script:ActivateCalls.Count
+Assert-Equal "and the activation is recorded once it lands" $true (@('PowerCycled','Activated') -contains (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result))
+$script:ActivateThrowsFirst = 0
 function Read-Host { param($Prompt)
     $script:PromptCount++
     if ($script:PromptCount -gt 20) { throw "the activation loop is not settling" }

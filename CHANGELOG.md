@@ -12,6 +12,44 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [21.4.0] — 2026-08-12
+
+21.3.0 deployed but never activated. A live run sat in this loop indefinitely,
+with the deploy long since finished:
+
+```
+Intersight reports 1 firmware upgrade(s) IN_PROGRESS for this server.
+Check 2 : the firmware task on server 67a3ff8f617675301fa27ff6 is still running.
+Standing off for 40 minute(s) ...
+```
+
+#### Fixed
+
+- **The activation is no longer gated on the firmware task finishing.** That
+  gate was a deadlock of the script's own making. The `firmware.Upgrade` sits at
+  `IN_PROGRESS` *because* it is waiting for the reboot acknowledgement — and
+  `Activate` **is** that acknowledgement. Waiting for the upgrade to finish
+  before sending it meant the only thing that could end the upgrade was being
+  withheld. Every round now re-reads the profile, and if it is still pending,
+  sends `Activate` immediately.
+- **The power cycle stays as the fallback, and keeps its guard.** A power action
+  genuinely is refused mid-upgrade
+  (`action_not_allowed_firmware_upgrade_in_progress`), so it is attempted only
+  when `Activate` was refused *and* no upgrade is running. That refusal was the
+  observation the 21.3.0 gate was wrongly generalised from: it is true of power
+  actions, and false of `Activate`.
+- **The prompt now describes what it is waiting on.** "the firmware task has not
+  finished" became "'<profile>' has not activated yet", and `RETRY` re-sends
+  `Activate` rather than re-reading a task that will not move on its own. There
+  is still no cap and no timeout, and `CONTINUE` still moves to the vCenter
+  checks without ending the run.
+
+#### Fixed (structural)
+
+- A stray brace closed the activation `while` loop one statement early, so the
+  stand-off, the prompt and the retry sat outside the loop they belong to.
+  `RETRY` could never have looped back.
+
 ### [21.3.0] — 2026-08-12
 
 21.2.0 sent a bare `Activate` from `Pending-changes` and the appliance refused it:
@@ -1510,6 +1548,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [21.4.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 21.4.0 — `Activate` is never
+gated on the firmware upgrade finishing, because the upgrade is waiting on the
+activation. This is the build to run.
 
 ### [21.3.0-preauth] — 2026-08-12
 

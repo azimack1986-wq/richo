@@ -318,7 +318,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "21.3.0-preauth"
+$ScriptVersion = "21.4.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -2632,29 +2632,34 @@ function Invoke-IntersightProfileActivate {
 function Invoke-IntersightActivationPowerCycle {
     <#
     .SYNOPSIS
-        Waits for the firmware task to finish, power-cycles the blade, then holds for the reboot.
+        Drives the activation on Intersight until the profile is no longer pending, then holds
+        for the reboot.
 
     .DESCRIPTION
         Runs entirely against Intersight. NO vCENTER ACTION HAPPENS UNTIL THIS RETURNS - the batch
         loop's post-reboot wait and the host profile compliance gate both come after it.
 
-        The order matters, and it is the order the appliance imposes:
+        Each round:
 
-          1. Pause $Global:IntersightActivationWaitMinutes (default 40). The deploy starts a
-             firmware task, and nothing can be done to the server while it runs.
-          2. Ask Intersight whether that task has finished, for this profile's server.
-          3. Finished  - power-cycle the server.
-             Still going - the operator is prompted to RETRY, which re-checks the task straight
-             away. There is no cap: the run waits as long as they want it to.
-          4. Once the power cycle lands, hold $Global:IntersightActivationHoldMinutes (default 40)
-             for the activation and POST to complete, and tell the batch loop it has already
-             served that wait so the host is not held for it twice.
+          1. Re-read the profile. If it is no longer pending, Intersight completed the activation
+             itself and there is nothing left to send.
+          2. Send Activate - ScheduledActions Action=Activate, ProceedOnReboot=true, the same
+             request the GUI's "Reboot immediately to activate" sends.
+          3. If Activate is refused AND no firmware task is running, fall back to a power cycle.
+             A power action is genuinely refused while an upgrade is in progress, so it is only
+             worth trying when one is not.
+          4. Once something lands, hold $Global:IntersightActivationHoldMinutes (default 40) for
+             the activation and POST to complete, and tell the batch loop it has already served
+             that wait so the host is not held for it twice.
+          5. Otherwise stand off $Global:IntersightActivationWaitMinutes (default 40) and offer
+             RETRY / CONTINUE / EXIT. There is no cap: the run waits as long as the operator
+             wants it to.
 
-        The first attempt at this power-cycled immediately and was refused with
-        action_not_allowed_firmware_upgrade_in_progress - the appliance declining to reset the
-        server underneath its own upgrade. That refusal is now the fallback signal for step 2:
-        wherever the status cannot be read, the power action is attempted and its answer is taken
-        as authoritative, because it is.
+        ACTIVATE IS NEVER GATED ON THE FIRMWARE TASK FINISHING. An earlier build waited for the
+        firmware.Upgrade to leave IN_PROGRESS before sending Activate, and deadlocked: the upgrade
+        sits at IN_PROGRESS precisely because it is waiting for the reboot acknowledgement, and
+        Activate is that acknowledgement. A live run looped on "1 firmware upgrade(s) IN_PROGRESS"
+        indefinitely while the deploy had in fact completed.
 
         NOTHING HERE ENDS THE RUN. Not a server that cannot be identified, not a refused power
         action, not a task that is still going. Each is announced and recorded.
@@ -2715,50 +2720,53 @@ function Invoke-IntersightActivationPowerCycle {
             Write-Host "  Check $round : could not read the profile - $($_.Exception.Message)" -ForegroundColor Yellow
         }
 
-        # Step 3. Is the firmware task finished? If it is, power-cycle. If the status cannot be
-        # read, attempt the power action anyway - the appliance's refusal is the better answer.
+        # Step 3. ACTIVATE. Never gated on the firmware task finishing.
+        #
+        # The firmware.Upgrade sits at IN_PROGRESS precisely BECAUSE it is waiting for the reboot
+        # acknowledgement. Waiting for it to finish before activating is a deadlock: the only thing
+        # that ends it is the activation being withheld. A live run sat in exactly that loop,
+        # reporting "1 firmware upgrade(s) IN_PROGRESS" on every check while the deploy had in fact
+        # completed and was waiting to be acknowledged.
+        #
+        # The task state still matters, but only for the POWER CYCLE fallback - the appliance
+        # genuinely does refuse a power action mid-upgrade ("Cannot perform power action when a
+        # firmware upgrade is in progress"). Activate is the acknowledgement, so it is exactly what
+        # an in-progress upgrade is waiting to receive.
         $taskState = Get-IntersightFirmwareTaskState -ServerMoid $serverMoid
-        if ($taskState -eq "Running") {
-            Write-Host "  Check $round : the firmware task on server $serverMoid is still running." -ForegroundColor Yellow
+        Write-Host "  Check $round : firmware task is $taskState. Sending Activate - an upgrade waiting on the acknowledgement is what Activate is for." -ForegroundColor Cyan
+
+        $outcome = Invoke-IntersightProfileActivate -ProfileMoid ([string]$Row.ProfileMoid)
+        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Activate" -Result $outcome -Details "ScheduledActions Action=Activate ProceedOnReboot=true on check $round (task state $taskState)."
+
+        # The power cycle is only worth trying when no upgrade is running - it is refused otherwise,
+        # and a refusal there tells us nothing we do not already know.
+        if ($outcome -eq "Failed" -and $taskState -ne "Running") {
+            $outcome = Invoke-IntersightServerPowerAction -ServerMoid $serverMoid -PowerState $powerState
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result $outcome -Details "Fallback $powerState to server $serverMoid on check $round."
         }
-        else {
-            if ($taskState -eq "Finished") { Write-Host "  Check $round : the firmware task has finished. Power-cycling." -ForegroundColor Green }
-            else { Write-Host "  Check $round : the firmware task state is not readable. Trying the power cycle - the appliance will say if it is too early." -ForegroundColor Gray }
 
-            # Activate first - it is what the GUI sends, and it is the profile's own operation rather
-            # than a power action taken against the server underneath it. The power cycle is the
-            # fallback for a module or appliance that will not take it.
-            $outcome = Invoke-IntersightProfileActivate -ProfileMoid ([string]$Row.ProfileMoid)
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Activate" -Result $outcome -Details "ScheduledActions Action=Activate ProceedOnReboot=true on check $round (task state $taskState)."
-
-            if ($outcome -eq "Failed") {
-                $outcome = Invoke-IntersightServerPowerAction -ServerMoid $serverMoid -PowerState $powerState
-                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result $outcome -Details "Fallback $powerState to server $serverMoid on check $round."
-            }
-
-            if ($outcome -eq "Sent") {
-                # Step 4. Hold for the reboot, and tell the batch loop not to hold again on top.
-                Write-Host "  Activation sent." -ForegroundColor Green
-                $completed = Wait-IntersightActivationComplete -ProfileMoid ([string]$Row.ProfileMoid) -ServerMoid $serverMoid -Label "the activation on '$($Row.ServerProfile)'" -MaxMinutes $Global:IntersightActivationHoldMinutes
-                $Global:IntersightActivationHeldForBatch = $true
-                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result $(if ($completed) { "Activated" } else { "PowerCycled" }) -Details "$powerState landed on server $serverMoid; held up to $($Global:IntersightActivationHoldMinutes) minute(s), completed=$completed."
-                return
-            }
+        if ($outcome -eq "Sent") {
+            # Step 4. Hold for the reboot, and tell the batch loop not to hold again on top.
+            Write-Host "  Activation sent." -ForegroundColor Green
+            $completed = Wait-IntersightActivationComplete -ProfileMoid ([string]$Row.ProfileMoid) -ServerMoid $serverMoid -Label "the activation on '$($Row.ServerProfile)'" -MaxMinutes $Global:IntersightActivationHoldMinutes
+            $Global:IntersightActivationHeldForBatch = $true
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result $(if ($completed) { "Activated" } else { "PowerCycled" }) -Details "Activation landed for server $serverMoid; held up to $($Global:IntersightActivationHoldMinutes) minute(s), completed=$completed."
+            return
         }
 
         # Between checks, not before the first one.
         Wait-IntersightActivationCheckIn -Minutes $Global:IntersightActivationWaitMinutes -Label "the firmware task on '$($Row.ServerProfile)'"
 
         Write-Host "" -ForegroundColor Yellow
-        Write-Host "The firmware task on '$($Row.ServerProfile)' has not finished." -ForegroundColor Yellow
-        Write-Host "  RETRY    - check the task again now, and activate if it has finished." -ForegroundColor Yellow
+        Write-Host "'$($Row.ServerProfile)' has not activated yet." -ForegroundColor Yellow
+        Write-Host "  RETRY    - send Activate again now." -ForegroundColor Yellow
         Write-Host "  CONTINUE - stop waiting and move on to the vCenter checks." -ForegroundColor Yellow
         Write-Host "  EXIT     - stop the run here." -ForegroundColor Yellow
 
         $choice = Read-ChoiceExit `
-            -Message "Firmware on '$($Row.ServerProfile)' is still in progress. Choose RETRY or CONTINUE" `
+            -Message "'$($Row.ServerProfile)' has not activated yet. Choose RETRY or CONTINUE" `
             -AllowedChoices @("RETRY","CONTINUE") `
-            -ExitMessage "Stopped while waiting for the firmware task on '$($Row.ServerProfile)'."
+            -ExitMessage "Stopped while waiting for the activation of '$($Row.ServerProfile)'."
 
         # Anything that is not an explicit RETRY moves on. A loop whose only exit is a successful
         # prompt is a hang, and this one runs on a jump host that may have no console at all.
