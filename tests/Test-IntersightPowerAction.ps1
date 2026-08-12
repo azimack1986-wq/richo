@@ -32,13 +32,13 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
     Where-Object { $_.Name -in @('Get-IntersightAssignedServerMoid','Invoke-IntersightServerPowerAction',
                                  'Get-IntersightRelationshipMoid','Write-IntersightRelationshipShape',
                                  'Invoke-IntersightActivationPowerCycle','Wait-IntersightActivationCheckIn',
-                                 'Get-IntersightProfileDeployState','Get-IntersightResultList','Read-PendingConsoleKey') } |
+                                 'Get-IntersightProfileDeployState','Get-IntersightResultList',
+                                 'Read-ChoiceExit','Read-PendingConsoleKey') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $Global:IntersightActionableConfigStates = @('Pending-changes','Inconsistent','Out-of-sync','Not-deployed')
 $Global:IntersightActivationPowerAction = 'PowerCycle'
 $Global:IntersightActivationWaitMinutes = 0
-$Global:IntersightActivationMaxCheckIns = 2
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 function Add-SummaryRecord { param($Stage,$Batch,$HostName,$Action,$Result,$Details)
     $Global:RunSummary.Add([pscustomobject]@{ Stage=$Stage; Batch=$Batch; Host=$HostName; Action=$Action; Result=$Result; Details=$Details }) }
@@ -62,9 +62,10 @@ $script:ServerMoid = 'server-abc'
 
 function Get-IntersightComputeServerSetting { param($Moid,$Filter,$ErrorAction)
     return [pscustomobject]@{ Moid = $Moid } }
+$script:PowerError = ""
 function Set-IntersightComputeServerSetting { param($Moid,$AdminPowerState,$ErrorAction)
     $script:PowerCalls.Add("$Moid=$AdminPowerState")
-    if ($script:PowerThrows) { throw "server is not reachable" } }
+    if ($script:PowerThrows) { throw $(if ($script:PowerError) { $script:PowerError } else { "server is not reachable" }) } }
 function Get-IntersightServerProfile { param($Moid,$Filter,$Expand,$ErrorAction)
     $index = [Math]::Min($script:Reads, $script:States.Count - 1)
     $script:Reads++
@@ -122,7 +123,7 @@ function Get-IntersightServerProfile { param($Moid,$Filter,$Expand,$ErrorAction)
 Write-Host "`n=== PowerCycle resets the server ===" -ForegroundColor Cyan
 # 'Reboot' would restart the IMC and leave the blade running - see the notes above.
 $script:PowerCalls.Clear()
-Assert-Equal "the action is sent" $true (Invoke-IntersightServerPowerAction -ServerMoid 'server-abc' -PowerState 'PowerCycle' 6>$null)
+Assert-Equal "the action is sent" "Sent" (Invoke-IntersightServerPowerAction -ServerMoid 'server-abc' -PowerState 'PowerCycle' 6>$null)
 Assert-Equal "to the server's own setting Moid" "server-abc=PowerCycle" $script:PowerCalls[0]
 
 Write-Host "`n=== A declined power action does not end the run ===" -ForegroundColor Cyan
@@ -132,9 +133,17 @@ $threw = $false
 $result = $null
 try { $result = Invoke-IntersightServerPowerAction -ServerMoid 'server-abc' -PowerState 'PowerCycle' 6>$null } catch { $threw = $true }
 Assert-Equal "it does not throw" $false $threw
-Assert-Equal "it reports not-sent" $false $result
+Assert-Equal "it reports Failed" "Failed" $result
+
+Write-Host "`n=== An upgrade already running is a 'not yet', not a failure ===" -ForegroundColor Cyan
+# The appliance refuses to power-cycle underneath the upgrade this deploy started. That is correct
+# behaviour, and it clears when the upgrade does - so it must be retried, not given up on.
+$script:PowerError = 'Error calling UpdateComputeServerSetting: {"code":"InvalidRequest","message":"Cannot perform power action when a firmware upgrade is in progress.","messageId":"action_not_allowed_firmware_upgrade_in_progress"}'
+Assert-Equal "it is told apart from a real failure" "UpgradeInProgress" (Invoke-IntersightServerPowerAction -ServerMoid 'server-abc' -PowerState 'PowerCycle' 6>$null)
+$script:PowerError = ""
 $script:PowerThrows = $false
 
+function Read-Host { param($Prompt) return 'CONTINUE' }
 Write-Host "`n=== The activation stands off and checks in, and never ends the run ===" -ForegroundColor Cyan
 # Activation finishes between check-ins.
 $script:States = @('Pending-changes','Associated'); $script:Reads = 0
@@ -150,7 +159,33 @@ $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 $threw = $false
 try { Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null } catch { $threw = $true }
 Assert-Equal "the run does not end" $false $threw
-Assert-Equal "it is recorded as still staged" "StillStaged" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
+Assert-Equal "the operator is offered RECHECK or CONTINUE" "StillStaged" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
+
+Write-Host "`n=== RECHECK waits another window; the loop is not capped ===" -ForegroundColor Cyan
+# The run never decides on its own that an activation has failed - the operator does.
+$script:States = @('Pending-changes','Pending-changes','Pending-changes','Associated'); $script:Reads = 0
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+$script:Answers = @('RECHECK','RECHECK','CONTINUE')
+$script:AnswerIndex = 0
+function Read-Host { param($Prompt)
+    $answer = $script:Answers[[Math]::Min($script:AnswerIndex, $script:Answers.Count - 1)]
+    $script:AnswerIndex++
+    return $answer }
+Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
+Assert-Equal "it kept going until the profile settled" "Activated" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
+function Read-Host { param($Prompt) return 'CONTINUE' }
+
+Write-Host "`n=== A refused power action is retried after each stand-off ===" -ForegroundColor Cyan
+# The upgrade blocking it finishes, and the retry is what actually restarts the blade.
+$script:States = @('Pending-changes'); $script:Reads = 0
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+$script:PowerCalls.Clear()
+$script:PowerThrows = $true
+$script:PowerError = 'action_not_allowed_firmware_upgrade_in_progress'
+Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
+$script:PowerThrows = $false; $script:PowerError = ""
+Assert-Equal "the power action was tried more than once" $true ($script:PowerCalls.Count -ge 2)
+Assert-Equal "the retry is on the record" $true (@($Global:RunSummary | Where-Object { $_.Action -eq 'Power action retry' }).Count -ge 1)
 
 Write-Host "`n=== A profile with no assigned server is reported, not guessed at ===" -ForegroundColor Cyan
 $script:ServerMoid = ''

@@ -71,7 +71,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 20.5.1-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 20.5.1. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 20.6.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 20.6.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -112,12 +112,15 @@
       still staged. 'PowerCycle' resets the server. The run warns loudly if it is ever configured
       with 'Reboot'.
       After the power action the run STANDS OFF for $Global:IntersightActivationWaitMinutes
-      (default 40) and looks again, up to $Global:IntersightActivationMaxCheckIns times, rather
-      than polling on a timeout - an activation takes as long as it takes.
-      NONE OF THIS ENDS THE RUN. Not a server that cannot be identified, not a declined power
-      action, not an activation still going when the check-ins run out. Each is announced and
-      recorded and the batch carries on to the reconnect wait, which is better placed to say
-      whether the host came back.
+      (default 40) and looks again, rather than polling on a timeout - an activation takes as long
+      as it takes. Each stand-off ends with a choice: RECHECK to wait another window, CONTINUE to
+      move on to the post-reboot wait, or EXIT. There is no cap: the run waits exactly as long as
+      the operator wants and never decides on its own that an activation has failed.
+      "Cannot perform power action when a firmware upgrade is in progress" is treated as a NOT YET,
+      not a failure - it means the upgrade this deploy started is still running, so the power
+      action is retried after each stand-off until it lands.
+      NONE OF THIS ENDS THE RUN. Not a server that cannot be identified, not a refused power
+      action, not an activation that is still going. Each is announced and recorded.
     - THIS SCRIPT MIGRATES NOTHING. The batch is sized from live cluster capacity and its hosts go
       straight into Maintenance mode; DRS moves the running VMs, once, as part of that. Two things
       that used to happen first have been removed: a cold migration of every powered-off and
@@ -277,7 +280,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "20.5.1-preauth"
+$ScriptVersion = "20.6.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -360,9 +363,9 @@ $Global:IntersightActivationPowerAction = 'PowerCycle'
 # polling on a timeout. A firmware activation takes as long as it takes, and a run that treats a
 # closed window as a failure is wrong more often than it is right.
 $Global:IntersightActivationWaitMinutes = 40
-# How many of those stand-offs before the run stops watching and carries on to the reconnect wait.
-# It never ends the run - see Invoke-IntersightActivationPowerCycle.
-$Global:IntersightActivationMaxCheckIns = 3
+# There is no cap on the number of stand-offs. After each one the operator is asked RECHECK or
+# CONTINUE, so the run waits exactly as long as they want it to and never decides on its own that
+# an activation has failed. See Invoke-IntersightActivationPowerCycle.
 $Global:IntersightSession = $null
 $Global:IntersightServerList = @{}
 $Global:IntersightHostMap = @{}
@@ -2298,7 +2301,7 @@ function Get-IntersightAssignedServerMoid {
 function Invoke-IntersightServerPowerAction {
     <#
     .SYNOPSIS
-        Issues a power action against a server through Intersight. Returns $true if it was sent.
+        Issues a power action against a server through Intersight. Returns Sent/UpgradeInProgress/Failed.
 
     .DESCRIPTION
         The action goes to compute.ServerSetting, whose AdminPowerState the SDK documents as:
@@ -2317,9 +2320,13 @@ function Invoke-IntersightServerPowerAction {
         The ServerSetting object is found by filtering on the server's Moid. Some releases give it
         the same Moid as the server, so that is tried as a fallback rather than giving up.
 
-        NOTHING HERE THROWS. A power action that cannot be sent is reported and returns $false; the
-        caller decides what to do, and by this point the firmware is already staged, so ending the
-        run would leave the operator worse off than telling them plainly.
+        Returns "Sent", "UpgradeInProgress", or "Failed". The middle one matters: the appliance
+        refuses a power action while a firmware upgrade is running
+        (action_not_allowed_firmware_upgrade_in_progress), and that is not a failure - it is the
+        upgrade this deploy started, still going. The caller stands off and asks again.
+
+        NOTHING HERE THROWS. By this point the firmware is already staged, so ending the run would
+        leave the operator worse off than telling them plainly.
     #>
     param(
         [Parameter(Mandatory=$true)][string]$ServerMoid,
@@ -2328,7 +2335,7 @@ function Invoke-IntersightServerPowerAction {
 
     if ($null -eq (Get-Command -Name Set-IntersightComputeServerSetting -ErrorAction SilentlyContinue)) {
         Write-Host "  Set-IntersightComputeServerSetting is not available in this Intersight.PowerShell version, so no power action can be sent." -ForegroundColor Yellow
-        return $false
+        return "Failed"
     }
 
     # The GUI addresses /api/v1/compute/ServerSettings/<server moid> directly, so the setting
@@ -2355,11 +2362,23 @@ function Invoke-IntersightServerPowerAction {
     Write-Host "  Sending $PowerState to server $ServerMoid (setting $settingMoid)." -ForegroundColor Cyan
     try {
         Set-IntersightComputeServerSetting -Moid $settingMoid -AdminPowerState $PowerState -ErrorAction Stop | Out-Null
-        return $true
+        return "Sent"
     }
     catch {
-        Write-Host "  The power action was not accepted: $($_.Exception.Message)" -ForegroundColor Yellow
-        return $false
+        $message = [string]$_.Exception.Message
+
+        # "Cannot perform power action when a firmware upgrade is in progress" is not a failure.
+        # It means the upgrade this run started is still running, and the appliance is refusing to
+        # power-cycle underneath it - which is exactly right. The answer is to wait and ask again,
+        # not to give up.
+        if ($message -match '(?i)action_not_allowed_firmware_upgrade_in_progress|firmware upgrade is in progress') {
+            Write-Host "  A firmware upgrade is already in progress on this server, so the power action was refused." -ForegroundColor Cyan
+            Write-Host "  That is the upgrade this deploy started. Standing off and asking again." -ForegroundColor Cyan
+            return "UpgradeInProgress"
+        }
+
+        Write-Host "  The power action was not accepted: $message" -ForegroundColor Yellow
+        return "Failed"
     }
 }
 
@@ -2409,9 +2428,13 @@ function Invoke-IntersightActivationPowerCycle {
         server it is assigned to, and the power action goes to that server. vCenter is not involved.
 
         After the action the run stands off for $Global:IntersightActivationWaitMinutes and looks
-        again, up to $Global:IntersightActivationMaxCheckIns times. It does not poll on a timeout
-        and it does not declare failure when the window closes - a firmware activation takes as
-        long as it takes, and "still going" is not "broken".
+        again, then asks RECHECK or CONTINUE. It does not poll on a timeout and it does not declare
+        failure when a window closes - a firmware activation takes as long as it takes, and "still
+        going" is not "broken". The operator decides when to stop waiting.
+
+        A power action refused with "a firmware upgrade is in progress" is retried after each
+        stand-off. That refusal is the appliance declining to power-cycle underneath the upgrade
+        this deploy started, which is correct behaviour, and it clears when the upgrade does.
 
         NOTHING HERE ENDS THE RUN. Not a server that cannot be identified, not a power action the
         appliance declines, not an activation that is still running when the check-ins run out.
@@ -2446,18 +2469,16 @@ function Invoke-IntersightActivationPowerCycle {
     }
 
     $powerState = [string]$Global:IntersightActivationPowerAction
-    $sent = Invoke-IntersightServerPowerAction -ServerMoid $serverMoid -PowerState $powerState
+    $outcome = Invoke-IntersightServerPowerAction -ServerMoid $serverMoid -PowerState $powerState
+    Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result $outcome -Details "$powerState to server $serverMoid for firmware staged on '$($Row.ServerProfile)'."
 
-    if (-not $sent) {
-        Write-Host "  '$($Row.ServerProfile)' still has its firmware staged and no power action was accepted." -ForegroundColor Yellow
-        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result "NotSent" -Details "$powerState was declined for server $serverMoid; firmware staged on '$($Row.ServerProfile)' remains inactive."
-        return
-    }
+    # The loop below is the same whether the power action went out or was refused because the
+    # upgrade is still running. In both cases the next thing to do is wait, look again, and retry
+    # the power action if the profile is still staged - the refusal is a "not yet", not a "no".
+    $round = 0
+    while ($true) {
+        $round++
 
-    Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result "Sent" -Details "$powerState sent to server $serverMoid to activate firmware staged on '$($Row.ServerProfile)'."
-
-    $maxCheckIns = [math]::Max(1, [int]$Global:IntersightActivationMaxCheckIns)
-    for ($checkIn = 1; $checkIn -le $maxCheckIns; $checkIn++) {
         Wait-IntersightActivationCheckIn -Minutes $Global:IntersightActivationWaitMinutes -Label "'$($Row.ServerProfile)'"
 
         $state = $null
@@ -2466,29 +2487,49 @@ function Invoke-IntersightActivationPowerCycle {
             if ($null -ne $profileNow) { $state = Get-IntersightProfileDeployState -ServerProfile $profileNow }
         }
         catch {
-            Write-Host "  Check-in $checkIn of ${maxCheckIns}: could not read the profile - $($_.Exception.Message)" -ForegroundColor Yellow
-            continue
+            Write-Host "  Check-in ${round}: could not read the profile - $($_.Exception.Message)" -ForegroundColor Yellow
         }
 
-        if ($null -eq $state -or -not $state.StateKnown) {
-            Write-Host "  Check-in $checkIn of ${maxCheckIns}: ConfigState not readable yet." -ForegroundColor Yellow
-            continue
+        if ($null -ne $state -and $state.StateKnown) {
+            Write-Host "  Check-in ${round}: '$($Row.ServerProfile)' is $($state.ConfigState)." -ForegroundColor Cyan
+            if (-not $state.RequiresDeploy) {
+                Write-Host "  Activation complete - nothing is staged against '$($Row.ServerProfile)' any more." -ForegroundColor Green
+                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "Activated" -Details "ConfigState is $($state.ConfigState) after $round check-in(s)."
+                return
+            }
+        }
+        else {
+            Write-Host "  Check-in ${round}: ConfigState not readable yet." -ForegroundColor Yellow
         }
 
-        Write-Host "  Check-in $checkIn of ${maxCheckIns}: '$($Row.ServerProfile)' is $($state.ConfigState)." -ForegroundColor Cyan
-        if (-not $state.RequiresDeploy) {
-            Write-Host "  Activation complete - nothing is staged against '$($Row.ServerProfile)' any more." -ForegroundColor Green
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "Activated" -Details "ConfigState is $($state.ConfigState) after $checkIn check-in(s)."
+        # Still staged. If the power action never landed, the upgrade that was blocking it may have
+        # finished by now, so try it again before asking the operator anything.
+        if ($outcome -ne "Sent") {
+            $outcome = Invoke-IntersightServerPowerAction -ServerMoid $serverMoid -PowerState $powerState
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action retry" -Result $outcome -Details "Retry $round of $powerState to server $serverMoid."
+            if ($outcome -eq "Sent") { continue }
+        }
+
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "'$($Row.ServerProfile)' is still staged after $round check-in(s) of $($Global:IntersightActivationWaitMinutes) minute(s)." -ForegroundColor Yellow
+        Write-Host "  RECHECK  - wait another $($Global:IntersightActivationWaitMinutes) minute(s) and look again." -ForegroundColor Yellow
+        Write-Host "  CONTINUE - stop watching and move on to the post-reboot wait." -ForegroundColor Yellow
+        Write-Host "  EXIT     - stop the run here." -ForegroundColor Yellow
+
+        $choice = Read-ChoiceExit `
+            -Message "Firmware on '$($Row.ServerProfile)' has not activated yet. Choose RECHECK or CONTINUE" `
+            -AllowedChoices @("RECHECK","CONTINUE") `
+            -ExitMessage "Stopped while waiting for firmware activation on '$($Row.ServerProfile)'."
+
+        # Anything that is not an explicit RECHECK moves on. Only RECHECK goes round again, so a
+        # prompt that cannot be answered - a lost console, a missing helper - ends the wait instead
+        # of spinning on it. A loop whose only exit is a successful prompt is a hang.
+        if ($choice -ne "RECHECK") {
+            Write-Host "  Moving on. The post-reboot wait will show whether the host comes back." -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "StillStaged" -Details "Continued after $round check-in(s); last power action outcome was $outcome."
             return
         }
     }
-
-    # Still going, or stuck - and this run is not in a position to tell which. Say so and carry on;
-    # the reconnect wait is the next thing that will find out, and it is better placed to.
-    Write-Host "  '$($Row.ServerProfile)' is still staged after $maxCheckIns check-in(s)." -ForegroundColor Yellow
-    Write-Host "  The power action was sent, so the activation may simply still be running. Continuing" -ForegroundColor Yellow
-    Write-Host "  to the reconnect wait, which will show whether the host comes back." -ForegroundColor Yellow
-    Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "StillStaged" -Details "$powerState was sent to server $serverMoid; profile still staged after $maxCheckIns check-in(s) of $($Global:IntersightActivationWaitMinutes) minute(s)."
 }
 
 function Invoke-IntersightAcceptAndRebootImmediateForBatch {

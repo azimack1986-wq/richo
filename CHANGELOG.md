@@ -12,6 +12,54 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [20.6.0] — 2026-08-12
+
+The server is now found and the power action reaches it. Intersight's reply told
+us the rest:
+
+```
+"message":"Cannot perform power action when a firmware upgrade is in progress.",
+"messageId":"action_not_allowed_firmware_upgrade_in_progress"
+```
+
+That is not a failure. It is the appliance declining to power-cycle underneath
+the upgrade this deploy started — correct behaviour, and it clears when the
+upgrade does.
+
+#### Changed
+
+- **`action_not_allowed_firmware_upgrade_in_progress` is treated as "not yet".**
+  `Invoke-IntersightServerPowerAction` now returns `Sent` /
+  `UpgradeInProgress` / `Failed` instead of a bare boolean, so the caller can
+  tell "refused because it is busy" from "refused because something is wrong".
+- **The run stands off 40 minutes, then offers RECHECK.** After each window the
+  profile is re-read; if it is still staged and the power action never landed,
+  the action is **retried** — the upgrade blocking it may have finished. Then
+  the operator chooses:
+  - **RECHECK** — wait another window and look again
+  - **CONTINUE** — stop watching and move on to the post-reboot wait
+  - **EXIT** — stop the run
+- **There is no cap on the number of stand-offs.** `$Global:IntersightActivationMaxCheckIns`
+  is removed. The run waits exactly as long as the operator wants and never
+  decides on its own that an activation has failed.
+
+#### Fixed
+
+- **A loop whose only exit was a successful prompt.** Anything that is not an
+  explicit `RECHECK` now moves on, so a prompt that cannot be answered — a lost
+  console, a missing helper — ends the wait instead of spinning on it. Found by
+  the test suite hanging: `Read-ChoiceExit` was not extracted into the test, the
+  choice came back null, and the `while ($true)` never returned. The same thing
+  would have happened on a jump host with no interactive console.
+
+#### Added — tests
+
+- `tests/Test-IntersightPowerAction.ps1` at 32 assertions: the
+  upgrade-in-progress refusal is told apart from a real failure, a refused
+  action is retried after the stand-off, `RECHECK` keeps waiting until the
+  profile settles, and a prompt counter fails the suite if the loop ever stops
+  converging.
+
 ### [20.5.1] — 2026-08-12
 
 #### Fixed
@@ -1265,6 +1313,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [20.6.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 20.6.0 — a power action
+refused because the upgrade is still running is retried after a 40-minute
+stand-off, then the operator is offered RECHECK. This is the build to run.
 
 ### [20.5.1-preauth] — 2026-08-12
 
