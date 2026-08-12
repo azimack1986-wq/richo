@@ -12,6 +12,37 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [21.2.0] — 2026-08-12
+
+#### Added
+
+- **No vCenter action until the host is genuinely back.** "Back" now means
+  vCenter has it in inventory as Connected or Maintenance **and** its boot time
+  has changed since before the activation. Connection state alone cannot tell
+  *came back* from *never left*, and on a firmware run that is the difference
+  between the compliance scan reading the new firmware or the old one and the
+  host being returned to service un-upgraded.
+  The reconnect table now carries a `Rebooted` column, and the gate names any
+  host still reporting its pre-activation boot time.
+- The baseline is captured **before any action in the batch**, not just before
+  the Intersight activation — a UCS acknowledgement restarts a host too, and a
+  baseline taken after it is the post-reboot value, which would make the gate
+  wait forever for a restart that had already happened. That ordering bug was
+  caught by the simulation, not by reasoning.
+- A batch where nothing was staged clears the baseline, so `Rebooted` reports
+  `Unknown` and the gate passes. No reboot was asked for, so none is waited on.
+- `Rebooted=Unknown` is always accepted. It means there was no baseline to
+  compare against, not that the host failed to restart.
+
+#### Notes — deploy and activate in one action
+
+- Already the case since 21.1.0 and verified in the code this release: one call,
+  `{"ScheduledActions":[{"Action":"Activate","ProceedOnReboot":true}]}`, with no
+  separate staging step. Two header comments still described the old
+  `Action='Deploy'` shape and have been corrected — a comment that contradicts
+  the call is worse than no comment — and the test suite now fails if any
+  example anywhere in the script shows the `Deploy` scheduled action again.
+
 ### [21.1.0] — 2026-08-12
 
 A HAR capture of the GUI watching an activation. It contained no POST — but its
@@ -1439,6 +1470,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [21.2.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 21.2.0 — no vCenter action
+until the host is back in inventory with a changed boot time. This is the build
+to run.
 
 ### [21.1.0-preauth] — 2026-08-12
 

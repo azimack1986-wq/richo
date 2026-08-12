@@ -127,11 +127,13 @@ $scriptText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "reboot-immediately defaults to enabled" $true ($scriptText -match '\$Global:IntersightRebootImmediatelyToActivate\s*=\s*\$true')
 # The mechanism, not just the intent. The previous build passed "reboot-immediately is enabled"
 # while sending it in a form the appliance ignored.
-Assert-Equal "the acknowledgement is built as a scheduled action" $true ($scriptText -match "Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot \`$true")
 Assert-Equal "and sent through -ScheduledActions" $true ($scriptText -match "\`$deployParams\['ScheduledActions'\]")
 # Activate carries the action itself, so no top-level -Action rides alongside it - that was the
 # old stage-then-activate shape, and it is exactly what the captured GUI request does not send.
 Assert-Equal "the acknowledgement rides on Activate" $true ($scriptText -match "Initialize-IntersightPolicyScheduledAction -Action 'Activate' -ProceedOnReboot \`$true")
+# Including in the comments. Header text describing the old Deploy shape outlived the code once
+# already, and a comment that contradicts the call is worse than no comment.
+Assert-Equal "no example anywhere still shows the Deploy scheduled action" $true (-not ($scriptText -match "Initialize-IntersightPolicyScheduledAction -Action 'Deploy'"))
 Assert-Equal "-Action Deploy is only used when the reboot acknowledgement is turned off" $true ($scriptText -match "\`$deployParams\['Action'\] = 'Deploy'")
 # The scheduled action carries the action. Sending -Action as well instructs the profile twice.
 # The QUOTED form only: $Global:IntersightRebootImmediatelyToActivate is the switch that turns the

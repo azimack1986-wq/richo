@@ -71,7 +71,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 21.1.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 21.1.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 21.2.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 21.2.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -91,12 +91,12 @@
       ($Global:IntersightRebootImmediatelyToActivate, on by default). Without it the firmware
       stages against the profile and nothing restarts.
       It is ProceedOnReboot on a PolicyScheduledAction - "ProceedOnReboot can be used to
-      acknowledge server reboot while triggering deploy/activate", in the SDK's own words - sent
-      ALONGSIDE -Action Deploy, not instead of it:
-          $a = Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot $true
-          Set-IntersightServerProfile -Moid <moid> -Action Deploy -ScheduledActions @($a)
-      -Action Deploy is what demonstrably starts the Deploy Firmware Policy workflow; a live run
-      with only ScheduledActions produced no workflow at all.
+      acknowledge server reboot while triggering deploy/activate", in the SDK's own words - and it
+      rides on ACTIVATE, sent as ONE call that both deploys and activates:
+          $a = Initialize-IntersightPolicyScheduledAction -Action 'Activate' -ProceedOnReboot $true
+          Set-IntersightServerProfile -Moid <moid> -ScheduledActions @($a)
+      No top-level -Action goes with it, and there is no separate staging call. Deploy stages and
+      stops; Activate stages and restarts, so one action does the work of the two-step form.
       The cmdlet surface for this is checked before any host is evacuated, and the result is not
       trusted either: Confirm-IntersightDeployAccepted re-reads the profile afterwards and stops
       the run if it is still sitting in its staged state, rather than waiting out a post-reboot
@@ -132,8 +132,15 @@
         4. Once the activation lands, hold up to $Global:IntersightActivationHoldMinutes
            (default 40), POLLING every minute and returning as soon as the profile has settled and
            no upgrade is running.
-        5. Only then does the run go back to vCenter - and it skips its own post-reboot wait,
-           because this one already served it.
+        5. Only then does the run go back to vCenter, and the FIRST thing it does there is wait for
+           the host to reappear in inventory. Nothing is scanned, exited from Maintenance mode or
+           acted on until it has. "Back" means Connected or Maintenance in vCenter AND a boot time
+           that has changed since before the activation - connection state alone cannot tell "came
+           back" from "never left", and on a firmware run the difference is whether the compliance
+           scan runs against the new firmware or the old. The baseline is taken before ANY action
+           in the batch, because a UCS acknowledgement restarts a host just as an activation does.
+           A batch where nothing was staged clears the baseline: no reboot was asked for, so none
+           is waited on.
       After the power action the run STANDS OFF for $Global:IntersightActivationWaitMinutes
       (default 40) and looks again, rather than polling on a timeout - an activation takes as long
       as it takes. Each stand-off ends with a choice: RECHECK to wait another window, CONTINUE to
@@ -303,7 +310,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "21.1.0-preauth"
+$ScriptVersion = "21.2.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -355,12 +362,17 @@ $Global:IntersightRebootImmediatelyToActivate = $true
 # SDK documents it in as many words: "ProceedOnReboot can be used to acknowledge server reboot
 # while triggering deploy/activate."
 #
-#     $action = Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot $true
+#     $action = Initialize-IntersightPolicyScheduledAction -Action 'Activate' -ProceedOnReboot $true
 #     Set-IntersightServerProfile -Moid <moid> -ScheduledActions @($action)
 #
-# An earlier build sent this as a PolicyActionParam named RebootImmediatelyToActivate. That was the
-# wrong mechanism: PolicyActionParam takes free-form strings, so the appliance accepted the Deploy,
-# ignored the parameter, staged the firmware and rebooted nothing.
+# ONE call - deploy and activate together. Captured from the GUI, which sends exactly this:
+#     POST /api/v1/server/Profiles/<moid>
+#     {"ScheduledActions":[{"Action":"Activate","ProceedOnReboot":true}]}
+#
+# Two earlier builds got this wrong in ways that both looked like success. One sent a
+# PolicyActionParam named RebootImmediatelyToActivate - free-form strings, silently ignored. The
+# other sent Action=Deploy on the scheduled action, which stages the firmware and then waits for a
+# restart that never comes. Activate is the one that stages AND restarts.
 
 # Any PolicyActionParam name/value pairs to send alongside, as @{ Name = '...'; Value = '...' }
 # entries. Empty by default and not needed for the reboot acknowledgement.
@@ -412,6 +424,9 @@ $Global:IntersightActionableConfigStates = @(
     'Not-deployed'
 )
 $Global:BatchActionsSent = 0
+# Boot time per host, captured before the reboot is requested. The reconnect gate compares against
+# it so that "the host is Connected" cannot be mistaken for "the host came back".
+$Global:PreRebootBootTimes = @{}
 $Global:IntersightReadyChecked = $false
 $Global:IntersightUnusable = $false
 $Global:IntersightUnusableReason = ""
@@ -3824,9 +3839,61 @@ function Wait-BatchMaintenanceMode {
     return $null
 }
 
+function Get-VMHostBootTime {
+    <#
+    .SYNOPSIS
+        Returns a host's boot time as a string, or "" if it cannot be read.
+
+    .DESCRIPTION
+        The only honest evidence that a host actually restarted. A host that never went down still
+        reports Connected, and reading connection state alone cannot tell "came back" from "never
+        left" - which on a firmware run means the compliance scan and the return to service happen
+        against a host still on the old firmware.
+    #>
+    param([Parameter(Mandatory=$true)]$VMHostObject)
+    try { return [string]$VMHostObject.ExtensionData.Runtime.BootTime } catch { return "" }
+}
+
+function Save-BatchBootTimes {
+    <#
+    .SYNOPSIS
+        Records each host's boot time before anything is asked to reboot it.
+
+    .DESCRIPTION
+        Taken immediately before the Intersight activation, so the reconnect gate afterwards has
+        something to compare against and can require the host to have genuinely restarted.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames)
+
+    $Global:PreRebootBootTimes = @{}
+    foreach ($hostName in $HostNames) {
+        try {
+            $hostObj = Get-VMHost -Name $hostName -ErrorAction SilentlyContinue
+            if ($null -ne $hostObj) { $Global:PreRebootBootTimes[$hostName] = Get-VMHostBootTime -VMHostObject $hostObj }
+        }
+        catch {}
+    }
+}
+
 function Get-BatchConnectionStateSummary {
     param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames)
-    return @(foreach ($hostName in $HostNames) { $h = Get-VMHost -Name $hostName -ErrorAction SilentlyContinue; if($h){[pscustomobject]@{Host=$h.Name;Found=$true;ConnectionState=[string]$h.ConnectionState;PowerState=[string]$h.PowerState;Build=$h.Build}}else{[pscustomobject]@{Host=$hostName;Found=$false;ConnectionState="NotFound";PowerState="Unknown";Build=""}} })
+    return @(foreach ($hostName in $HostNames) {
+        $h = Get-VMHost -Name $hostName -ErrorAction SilentlyContinue
+        if ($h) {
+            $bootTime = Get-VMHostBootTime -VMHostObject $h
+            # Rebooted is Unknown, not False, when there is nothing to compare against. Treating a
+            # missing baseline as "did not reboot" would stall a run that is otherwise fine.
+            $rebooted = "Unknown"
+            if ($Global:PreRebootBootTimes.ContainsKey($hostName)) {
+                $before = [string]$Global:PreRebootBootTimes[$hostName]
+                if ([string]::IsNullOrWhiteSpace($before) -or [string]::IsNullOrWhiteSpace($bootTime)) { $rebooted = "Unknown" }
+                elseif ($bootTime -ne $before) { $rebooted = "Yes" }
+                else { $rebooted = "No" }
+            }
+            [pscustomobject]@{Host=$h.Name;Found=$true;ConnectionState=[string]$h.ConnectionState;PowerState=[string]$h.PowerState;Build=$h.Build;Rebooted=$rebooted}
+        }
+        else { [pscustomobject]@{Host=$hostName;Found=$false;ConnectionState="NotFound";PowerState="Unknown";Build="";Rebooted="Unknown"} }
+    })
 }
 
 function Wait-BatchReconnectAfterReboot {
@@ -3843,8 +3910,21 @@ function Wait-BatchReconnectAfterReboot {
     do {
         $summary = Get-BatchConnectionStateSummary -HostNames $HostNames
         $summary | Format-Table -AutoSize | Out-Host
-        $bad = @($summary | Where-Object { $_.ConnectionState -ne "Connected" -and $_.ConnectionState -ne "Maintenance" })
+
+        # A host counts as back only when vCenter has it in inventory in a usable state AND its
+        # boot time has changed. Connection state alone cannot tell "came back" from "never left",
+        # and on a firmware run the difference is whether the compliance scan and the return to
+        # service happen against the new firmware or the old. Rebooted=Unknown is accepted - it
+        # means there was no baseline to compare, not that the host failed to restart.
+        $bad = @($summary | Where-Object {
+            ($_.ConnectionState -ne "Connected" -and $_.ConnectionState -ne "Maintenance") -or ($_.Rebooted -eq "No")
+        })
         if ($bad.Count -eq 0) { return $summary }
+
+        $notRebooted = @($bad | Where-Object { $_.Rebooted -eq "No" })
+        if ($notRebooted.Count -gt 0) {
+            Write-Host "Still waiting for these host(s) to actually restart - vCenter reports the same boot time as before: $(($notRebooted | Select-Object -ExpandProperty Host) -join ', ')" -ForegroundColor Yellow
+        }
         $choice = Read-ChoiceExit -Message "Reconnect incomplete. Choose RECHECK, OVERRIDE, or STOP" -AllowedChoices @("RECHECK","OVERRIDE","STOP")
         if ($choice -eq "STOP") { return $null }
         if ($choice -eq "OVERRIDE") { return $summary }
@@ -4250,6 +4330,11 @@ function Invoke-ClusterUpgradeWorkflow {
         $currentBatchNames = @($pendingHosts | Select-Object -First $batchSize)
         $Global:BatchActionsSent = 0
         $Global:IntersightActivationHeldForBatch = $false
+
+        # Before ANY action - the UCS acknowledgement restarts a host just as an Intersight
+        # activation does, so a baseline taken after either is the post-reboot value and the gate
+        # would then wait for a restart that had already happened.
+        Save-BatchBootTimes -HostNames $currentBatchNames
         Write-Host "`nBATCH ${batchNumber} ($batchMode, $($currentBatchNames.Count) host(s)): $($currentBatchNames -join ', ')" -ForegroundColor Cyan
 
         if (Test-StageNoAck) {
@@ -4337,6 +4422,10 @@ function Invoke-ClusterUpgradeWorkflow {
 
                 if ($unresolved.Count -eq 0) {
                     Write-Host "Nothing is staged anywhere in this batch, so there is nothing to reboot. Continuing." -ForegroundColor Green
+                    # No action was sent, so no host is going to restart. Clearing the baseline makes
+                    # the reconnect gate report Rebooted=Unknown instead of blocking on a reboot that
+                    # was never asked for.
+                    $Global:PreRebootBootTimes = @{}
                     Add-SummaryRecord -Stage "BatchAction" -Batch $batchNumber -HostName "" -Action "Send firmware action" -Result "NoneNeeded" -Details "Every host reported no staged changes (Intersight RequiresDeploy=false, no UCSM pending activity); continued without prompting."
                 }
                 else {

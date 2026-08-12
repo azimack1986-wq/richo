@@ -145,6 +145,13 @@ function Get-VMHost {
     if ($Name) { return $script:HostState[$Name] }
     return @($script:HostState.Values | Sort-Object Name)
 }
+# Each host object carries a boot time, and the Intersight activation moves it - which is what the
+# reconnect gate now requires before any vCenter work happens. A stub whose boot time never changed
+# would let the gate through on a host that never restarted, proving nothing.
+foreach ($h in $script:HostState.Values) {
+    $h | Add-Member -NotePropertyName ExtensionData -NotePropertyValue ([pscustomobject]@{
+        Runtime = [pscustomobject]@{ BootTime = '2026-08-01T00:00:00Z' } }) -Force
+}
 function Set-VMHost {
     param($VMHost,$State,[switch]$Evacuate,[switch]$RunAsync,$Confirm,$ErrorAction)
     Note-Call 'Set-VMHost'
@@ -224,6 +231,8 @@ function Get-UcsLsmaintAck { param($Ucs,$ErrorAction)
 $script:UcsAcked = New-Object System.Collections.Generic.HashSet[string]
 function Set-UcsLsmaintAck { param($Ucs,$LsmaintAck,$AdminState,[switch]$Force,$ErrorAction)
     Note-Call 'Set-UcsLsmaintAck'
+    $script:BootCounter++
+    foreach ($h in $script:HostState.Values) { $h.ExtensionData.Runtime.BootTime = "2026-08-12T1$($script:BootCounter):00:00Z" }
     if ($LsmaintAck -and $LsmaintAck.ServiceProfile) { [void]$script:UcsAcked.Add($LsmaintAck.ServiceProfile) }
 }
 
@@ -256,8 +265,14 @@ function Get-IntersightServerProfile {
 $script:DeployActionParams = New-Object System.Collections.Generic.List[string]
 function Initialize-IntersightPolicyScheduledAction { param($Action,$ProceedOnReboot)
     return [pscustomobject]@{ Action = $Action; ProceedOnReboot = [bool]$ProceedOnReboot } }
+$script:BootCounter = 0
 function Set-IntersightServerProfile { param($Moid,$Action,$ActionParams,$ScheduledActions,$ErrorAction)
     Note-Call 'Set-IntersightServerProfile'
+    # Activate restarts the blade: every host in the batch comes back with a new boot time.
+    $script:BootCounter++
+    foreach ($h in $script:HostState.Values) {
+        $h.ExtensionData.Runtime.BootTime = "2026-08-12T0$($script:BootCounter):00:00Z"
+    }
     foreach ($ap in @($ActionParams)) { if ($ap) { $script:DeployActionParams.Add("$($ap.Name)=$($ap.Value)") } }
     foreach ($sa in @($ScheduledActions)) { if ($sa) { $script:DeployActionParams.Add("$($sa.Action):ProceedOnReboot=$($sa.ProceedOnReboot)") } }
     # Both are required: -Action Deploy is what starts the deploy workflow, ProceedOnReboot is the
@@ -430,6 +445,8 @@ Assert-True "the deploy was confirmed as accepted, not assumed" (@($Global:RunSu
 Assert-True "the pre-reboot safety window was honoured" ($script:Calls.ContainsKey('RebootSafetyWindow'))
 
 Write-Host "`n=== Hosts were returned to service ===" -ForegroundColor Cyan
+# The reconnect gate must have seen a genuine restart, not just a reachable host.
+Assert-True "the reconnect gate required a real reboot" ($script:BootCounter -gt 0)
 Assert-True "every host ended Connected, not left in Maintenance" (@($script:HostState.Values | Where-Object { $_.ConnectionState -ne 'Connected' }).Count -eq 0) "still in maintenance: $(($script:HostState.Values | Where-Object { $_.ConnectionState -ne 'Connected' } | Select-Object -ExpandProperty Name) -join ', ')"
 Assert-True "compliance was checked for all four hosts" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' } | Select-Object -ExpandProperty Host -Unique).Count -eq 4)
 Assert-True "maintenance mode was exited for all four hosts" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ExitMaintenance' -and $_.Result -eq 'Sent' }).Count -eq 4)
