@@ -33,6 +33,7 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
                                  'Get-IntersightRelationshipMoid','Write-IntersightRelationshipShape',
                                  'Invoke-IntersightActivationPowerCycle','Wait-IntersightActivationCheckIn',
                                  'Get-IntersightFirmwareTaskState','Wait-IntersightActivationComplete',
+                                 'Invoke-IntersightProfileActivate',
                                  'Get-IntersightProfileDeployState','Get-IntersightResultList',
                                  'Read-ChoiceExit','Read-PendingConsoleKey') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
@@ -74,6 +75,13 @@ function Get-IntersightFirmwareUpgradeStatus { param($Filter,$ErrorAction)
     $script:TaskReads++
     return [pscustomobject]@{ UpgradeState = $script:TaskStates[$index] } }
 $script:PowerError = ""
+$script:ActivateCalls = New-Object System.Collections.Generic.List[string]
+$script:ActivateThrows = $false
+function Initialize-IntersightPolicyScheduledAction { param($Action,$ProceedOnReboot)
+    return [pscustomobject]@{ Action = $Action; ProceedOnReboot = [bool]$ProceedOnReboot } }
+function Set-IntersightServerProfile { param($Moid,$Action,$ScheduledActions,$ErrorAction)
+    foreach ($sa in @($ScheduledActions)) { $script:ActivateCalls.Add("${Moid}:$($sa.Action):ProceedOnReboot=$($sa.ProceedOnReboot)") }
+    if ($script:ActivateThrows) { throw "Activate refused" } }
 function Set-IntersightComputeServerSetting { param($Moid,$AdminPowerState,$ErrorAction)
     $script:PowerCalls.Add("$Moid=$AdminPowerState")
     if ($script:PowerThrows) { throw $(if ($script:PowerError) { $script:PowerError } else { "server is not reachable" }) } }
@@ -160,14 +168,23 @@ function Read-Host { param($Prompt)
     if ($script:PromptCount -gt 20) { throw "the activation loop is not settling" }
     return 'CONTINUE' }
 
-Write-Host "`n=== Firmware task finished: the blade is power-cycled ===" -ForegroundColor Cyan
+Write-Host "`n=== The Activate scheduled action is what the GUI sends ===" -ForegroundColor Cyan
+# Captured from the GUI: POST /api/v1/server/Profiles/<moid> with a 67-byte body of
+# {"ScheduledActions":[{"Action":"Activate","ProceedOnReboot":true}]} - Activate, not Deploy.
+$script:ActivateCalls.Clear()
+Assert-Equal "Activate is sent" "Sent" (Invoke-IntersightProfileActivate -ProfileMoid 'moid-1' 6>$null)
+Assert-Equal "with Action=Activate and ProceedOnReboot" "moid-1:Activate:ProceedOnReboot=True" $script:ActivateCalls[0]
+$scriptTextEarly = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "the scheduled action for activation says Activate" $true ($scriptTextEarly -match "Initialize-IntersightPolicyScheduledAction -Action 'Activate' -ProceedOnReboot \`$true")
+
+Write-Host "`n=== Firmware task finished: the blade is activated ===" -ForegroundColor Cyan
 $script:TaskStates = @('Completed'); $script:TaskReads = 0
 $script:States = @('Pending-changes'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
-$script:PowerCalls.Clear()
+$script:PowerCalls.Clear(); $script:ActivateCalls.Clear()
 $Global:IntersightActivationHeldForBatch = $false
 Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
-Assert-Equal "the power cycle was sent" "server-abc=PowerCycle" $script:PowerCalls[0]
+Assert-Equal "Activate was sent, not a power action" $true ($script:ActivateCalls.Count -ge 1 -and $script:PowerCalls.Count -eq 0)
 Assert-Equal "and it held for the activation" $true (@('PowerCycled','Activated') -contains (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result))
 Assert-Equal "the batch is told not to hold again on top" $true $Global:IntersightActivationHeldForBatch
 
@@ -176,10 +193,10 @@ Write-Host "`n=== Firmware task still running: no power cycle, the operator is a
 $script:TaskStates = @('InProgress'); $script:TaskReads = 0
 $script:States = @('Pending-changes'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
-$script:PowerCalls.Clear()
+$script:PowerCalls.Clear(); $script:ActivateCalls.Clear()
 $Global:IntersightActivationHeldForBatch = $false
 Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
-Assert-Equal "no power action was attempted while the task was running" 0 $script:PowerCalls.Count
+Assert-Equal "nothing was sent while the task was running" $true ($script:PowerCalls.Count -eq 0)
 Assert-Equal "and it is recorded as still staged" "StillStaged" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
 Assert-Equal "the batch is not told it held" $false $Global:IntersightActivationHeldForBatch
 
@@ -188,7 +205,7 @@ Write-Host "`n=== RETRY re-checks the task, and power-cycles once it finishes ==
 $script:TaskStates = @('InProgress','InProgress','Completed'); $script:TaskReads = 0
 $script:States = @('Pending-changes'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
-$script:PowerCalls.Clear()
+$script:PowerCalls.Clear(); $script:ActivateCalls.Clear()
 $script:Answers = @('RETRY','RETRY','CONTINUE'); $script:AnswerIndex = 0
 function Read-Host { param($Prompt)
     $script:PromptCount++
@@ -197,7 +214,7 @@ function Read-Host { param($Prompt)
     $script:AnswerIndex++
     return $answer }
 Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
-Assert-Equal "the blade was power-cycled once the task finished" 1 $script:PowerCalls.Count
+Assert-Equal "the blade was activated once the task finished" $true ($script:ActivateCalls.Count -ge 1)
 Assert-Equal "and the activation is recorded" $true (@('PowerCycled','Activated') -contains (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result))
 function Read-Host { param($Prompt)
     $script:PromptCount++
@@ -208,9 +225,9 @@ Write-Host "`n=== A profile that settled on its own needs no power cycle ===" -F
 $script:TaskStates = @('Completed'); $script:TaskReads = 0
 $script:States = @('Associated'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
-$script:PowerCalls.Clear()
+$script:PowerCalls.Clear(); $script:ActivateCalls.Clear()
 Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
-Assert-Equal "nothing was power-cycled" 0 $script:PowerCalls.Count
+Assert-Equal "nothing was activated or power-cycled" $true ($script:PowerCalls.Count -eq 0)
 Assert-Equal "and it is recorded as activated" "Activated" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
 
 Write-Host "`n=== The firmware task state is read, and Unknown is not Finished ===" -ForegroundColor Cyan
@@ -251,7 +268,7 @@ Write-Host "`n=== Nothing in the activation path touches vCenter ===" -Foregroun
 # firmware task for the profile's server - not the host's state in vCenter - and no vCenter action
 # happens until the activation has finished and the function has returned.
 $activationAst = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Invoke-IntersightActivationPowerCycle','Get-IntersightFirmwareTaskState','Invoke-IntersightServerPowerAction','Wait-IntersightActivationComplete') }
+    Where-Object { $_.Name -in @('Invoke-IntersightActivationPowerCycle','Get-IntersightFirmwareTaskState','Invoke-IntersightServerPowerAction','Wait-IntersightActivationComplete','Invoke-IntersightProfileActivate') }
 $activationText = ($activationAst | ForEach-Object { $_.Extent.Text }) -join "`n"
 foreach ($viCmdlet in @('Get-VMHost','Set-VMHost','Restart-VMHost','Get-Cluster','Get-Datastore','Move-VM','Test-VMHostProfileCompliance','Get-VMHostProfile')) {
     Assert-Equal "the activation never calls $viCmdlet" $true (-not ($activationText -match "\b$([regex]::Escape($viCmdlet))\b"))

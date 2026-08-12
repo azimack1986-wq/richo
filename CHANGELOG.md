@@ -12,6 +12,46 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [21.0.0] — 2026-08-12
+
+**The captured request settles it.** Deploying from the GUI with *Reboot
+immediately to activate* ticked sends:
+
+```
+POST /api/v1/server/Profiles/<moid>
+{"ScheduledActions":[{"Action":"Activate","ProceedOnReboot":true}]}
+```
+
+67 bytes — matching the captured `content-length` exactly.
+
+#### Fixed
+
+- **The action is `Activate`, not `Deploy`.** `Deploy` stages the firmware;
+  `Activate` restarts the blade and brings it into service. Every attempt so far
+  sent `Deploy` on the scheduled action, which is why the firmware staged
+  perfectly and nothing ever rebooted.
+  GitHub issue #141 — *"Set-IntersightServerProfile no longer allows Activate"* —
+  is about the **profile's own `-Action` parameter**, which accepts only `Deploy`
+  and `Unassign`. The **scheduled action's** `Action` field is a different field
+  and does accept `Activate`. I conflated the two, and that cost several runs.
+- **The body carries only `ScheduledActions`.** No top-level `Action` goes with
+  the activate.
+
+#### Added
+
+- `Invoke-IntersightProfileActivate` sends exactly that request. It is now the
+  first thing tried once the firmware task reports finished; the server power
+  cycle remains as the fallback if `Activate` is refused.
+
+#### Added — tests
+
+- The activate request is asserted on its shape, not its intent:
+  `Action=Activate`, `ProceedOnReboot=true`, against the profile Moid — plus a
+  static check that the script builds the scheduled action with `'Activate'`.
+  56 assertions in that suite.
+- The suite caught a `"$Moid:"` drive-qualified variable in its own stub — the
+  same PowerShell trap this codebase hit once before.
+
 ### [20.7.0] — 2026-08-12
 
 The activation now runs in the order the appliance imposes, and **nothing in
@@ -1363,6 +1403,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [21.0.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 21.0.0 — the activation sends
+`{"ScheduledActions":[{"Action":"Activate","ProceedOnReboot":true}]}`, captured
+from the GUI. This is the build to run.
 
 ### [20.7.0-preauth] — 2026-08-12
 

@@ -58,7 +58,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 20.7.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 21.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -103,9 +103,14 @@
         2. Pause $Global:IntersightActivationWaitMinutes (default 40). The deploy starts a firmware
            task and the appliance will not touch the server while it runs.
         3. Ask INTERSIGHT - not vCenter - whether that task has finished for this profile's server.
-           Finished    -> power-cycle the blade.
+           Finished    -> send the ACTIVATE scheduled action, which is what the GUI sends:
+                            POST /api/v1/server/Profiles/<moid>
+                            {"ScheduledActions":[{"Action":"Activate","ProceedOnReboot":true}]}
+                          Activate, not Deploy - Deploy stages, Activate restarts the blade and
+                          brings the staged firmware into service. A power cycle of the server is
+                          the fallback if Activate is refused.
            Still going -> prompt RETRY, which re-checks the Intersight task straight away and
-                          power-cycles the moment it reports finished. No cap on retries.
+                          activates the moment it reports finished. No cap on retries.
         4. Once the power cycle lands, hold up to $Global:IntersightActivationHoldMinutes
            (default 40), POLLING Intersight every minute and returning as soon as the profile has
            settled and no firmware task is running.
@@ -222,7 +227,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "20.7.0"
+$ScriptVersion = "21.0.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -2926,6 +2931,55 @@ function Wait-IntersightActivationComplete {
     return $false
 }
 
+function Invoke-IntersightProfileActivate {
+    <#
+    .SYNOPSIS
+        Sends the Activate scheduled action - what the GUI sends to reboot and activate.
+
+    .DESCRIPTION
+        Captured from the Intersight GUI, deploying a profile with Reboot Immediately to Activate
+        ticked. The request is:
+
+            POST /api/v1/server/Profiles/<moid>
+            {"ScheduledActions":[{"Action":"Activate","ProceedOnReboot":true}]}
+
+        which is 67 bytes and matches the captured content-length exactly. Two things in it were
+        wrong in this script until now:
+
+          - The action is "Activate", not "Deploy". Deploy stages; Activate is what restarts the
+            blade and brings the staged firmware into service. GitHub issue #141 - "no longer
+            allows Activate" - is about the profile's own -Action parameter, which accepts only
+            Deploy and Unassign. The SCHEDULED ACTION's Action field is a different field and does
+            accept Activate. Conflating the two cost several runs.
+          - The body carries ONLY ScheduledActions. No top-level Action is sent with it.
+
+        Returns Sent, UpgradeInProgress or Failed, on the same terms as the power action, and never
+        throws.
+    #>
+    param([Parameter(Mandatory=$true)][string]$ProfileMoid)
+
+    if ($null -eq (Get-Command -Name Initialize-IntersightPolicyScheduledAction -ErrorAction SilentlyContinue)) {
+        Write-Host "  Initialize-IntersightPolicyScheduledAction is not available, so Activate cannot be sent." -ForegroundColor Yellow
+        return "Failed"
+    }
+
+    Write-Host "  Sending ScheduledActions: Action=Activate, ProceedOnReboot=true to profile $ProfileMoid." -ForegroundColor Cyan
+    try {
+        $action = Initialize-IntersightPolicyScheduledAction -Action 'Activate' -ProceedOnReboot $true
+        Set-IntersightServerProfile -Moid $ProfileMoid -ScheduledActions @($action) -ErrorAction Stop | Out-Null
+        return "Sent"
+    }
+    catch {
+        $message = [string]$_.Exception.Message
+        if ($message -match '(?i)action_not_allowed_firmware_upgrade_in_progress|firmware upgrade is in progress') {
+            Write-Host "  Activate was refused because a firmware upgrade is still in progress." -ForegroundColor Cyan
+            return "UpgradeInProgress"
+        }
+        Write-Host "  Activate was not accepted: $message" -ForegroundColor Yellow
+        return "Failed"
+    }
+}
+
 function Invoke-IntersightActivationPowerCycle {
     <#
     .SYNOPSIS
@@ -3022,12 +3076,20 @@ function Invoke-IntersightActivationPowerCycle {
             if ($taskState -eq "Finished") { Write-Host "  Check $round : the firmware task has finished. Power-cycling." -ForegroundColor Green }
             else { Write-Host "  Check $round : the firmware task state is not readable. Trying the power cycle - the appliance will say if it is too early." -ForegroundColor Gray }
 
-            $outcome = Invoke-IntersightServerPowerAction -ServerMoid $serverMoid -PowerState $powerState
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result $outcome -Details "$powerState to server $serverMoid on check $round (task state $taskState)."
+            # Activate first - it is what the GUI sends, and it is the profile's own operation rather
+            # than a power action taken against the server underneath it. The power cycle is the
+            # fallback for a module or appliance that will not take it.
+            $outcome = Invoke-IntersightProfileActivate -ProfileMoid ([string]$Row.ProfileMoid)
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Activate" -Result $outcome -Details "ScheduledActions Action=Activate ProceedOnReboot=true on check $round (task state $taskState)."
+
+            if ($outcome -eq "Failed") {
+                $outcome = Invoke-IntersightServerPowerAction -ServerMoid $serverMoid -PowerState $powerState
+                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result $outcome -Details "Fallback $powerState to server $serverMoid on check $round."
+            }
 
             if ($outcome -eq "Sent") {
                 # Step 4. Hold for the reboot, and tell the batch loop not to hold again on top.
-                Write-Host "  Power cycle sent." -ForegroundColor Green
+                Write-Host "  Activation sent." -ForegroundColor Green
                 $completed = Wait-IntersightActivationComplete -ProfileMoid ([string]$Row.ProfileMoid) -ServerMoid $serverMoid -Label "the activation on '$($Row.ServerProfile)'" -MaxMinutes $Global:IntersightActivationHoldMinutes
                 $Global:IntersightActivationHeldForBatch = $true
                 Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result $(if ($completed) { "Activated" } else { "PowerCycled" }) -Details "$powerState landed on server $serverMoid; held up to $($Global:IntersightActivationHoldMinutes) minute(s), completed=$completed."
