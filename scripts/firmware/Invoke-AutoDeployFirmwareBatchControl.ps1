@@ -58,7 +58,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 21.0.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 21.1.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -99,21 +99,26 @@
       still staged. 'PowerCycle' resets the server. The run warns loudly if it is ever configured
       with 'Reboot'.
       THE ORDER, and nothing in vCenter happens until it has finished:
-        1. Check the host and stage the firmware - deploy the server profile.
-        2. Pause $Global:IntersightActivationWaitMinutes (default 40). The deploy starts a firmware
-           task and the appliance will not touch the server while it runs.
-        3. Ask INTERSIGHT - not vCenter - whether that task has finished for this profile's server.
-           Finished    -> send the ACTIVATE scheduled action, which is what the GUI sends:
-                            POST /api/v1/server/Profiles/<moid>
-                            {"ScheduledActions":[{"Action":"Activate","ProceedOnReboot":true}]}
-                          Activate, not Deploy - Deploy stages, Activate restarts the blade and
-                          brings the staged firmware into service. A power cycle of the server is
-                          the fallback if Activate is refused.
-           Still going -> prompt RETRY, which re-checks the Intersight task straight away and
-                          activates the moment it reports finished. No cap on retries.
-        4. Once the power cycle lands, hold up to $Global:IntersightActivationHoldMinutes
-           (default 40), POLLING Intersight every minute and returning as soon as the profile has
-           settled and no firmware task is running.
+        1. ACTIVATE FROM THE START - one call, exactly what the GUI sends:
+             POST /api/v1/server/Profiles/<moid>
+             {"ScheduledActions":[{"Action":"Activate","ProceedOnReboot":true}]}
+           Activate, not Deploy. Deploy stages the firmware and leaves the profile waiting for a
+           restart; Activate stages AND restarts, so there is no stage-then-activate split and no
+           wait wedged between two halves of one operation. Set
+           $Global:IntersightRebootImmediatelyToActivate to $false to stage only and restart the
+           blades by hand - that path still sends -Action Deploy.
+        2. Watch the upgrade, starting immediately. The check is the GUI's own query:
+             GET /api/v1/firmware/Upgrades
+                 ?$filter=(Server.Moid in ('<moid>')) and (Status eq 'IN_PROGRESS')&$select=Server
+           One call, one field, and the appliance does the deciding - rows means running, none
+           means finished. Nothing here interprets a free-text state string.
+        3. Still running -> stand off $Global:IntersightActivationWaitMinutes (default 40) and
+           check again, then prompt RETRY / CONTINUE / EXIT. No cap on retries.
+           Finished but the profile is still staged -> send Activate again, with a server power
+           cycle as the fallback if it is refused.
+        4. Once the activation lands, hold up to $Global:IntersightActivationHoldMinutes
+           (default 40), POLLING every minute and returning as soon as the profile has settled and
+           no upgrade is running.
         5. Only then does the run go back to vCenter - and it skips its own post-reboot wait,
            because this one already served it.
       After the power action the run STANDS OFF for $Global:IntersightActivationWaitMinutes
@@ -227,7 +232,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "21.0.0"
+$ScriptVersion = "21.1.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -2823,10 +2828,9 @@ function Get-IntersightFirmwareTaskState {
     .DESCRIPTION
         Returns Running, Finished or Unknown.
 
-        Read from firmware/UpgradeStatuses for the server - the same objects the Intersight GUI
-        reads on the server profile page. A status whose state still reads as in-flight
-        (in-progress, pending, scheduled, started and the like) means the upgrade this deploy began
-        has not finished, and a power cycle sent now will be refused.
+        Asks firmware/Upgrades for this server with Status eq 'IN_PROGRESS' - the same query the
+        GUI issues while it watches an upgrade. Rows means running, none means finished. The
+        appliance decides; nothing here interprets a state string.
 
         Unknown is a real answer and is not treated as Finished. Where the status cannot be read,
         the caller falls back to the definitive test: attempt the power action and let the appliance
@@ -2837,32 +2841,26 @@ function Get-IntersightFirmwareTaskState {
     #>
     param([Parameter(Mandatory=$true)][string]$ServerMoid)
 
-    if ($null -eq (Get-Command -Name Get-IntersightFirmwareUpgradeStatus -ErrorAction SilentlyContinue)) { return "Unknown" }
+    # The exact query the Intersight GUI issues while it watches an upgrade, taken from a HAR
+    # capture of that page:
+    #
+    #   GET /api/v1/firmware/Upgrades
+    #       ?$filter=(Server.Moid in ('<moid>')) and (Status eq 'IN_PROGRESS')&$select=Server
+    #
+    # One call, one field, and the appliance does the deciding. Rows returned means an upgrade is
+    # running; none means it is not. An earlier version read firmware/UpgradeStatuses and pattern-
+    # matched free-text state strings, which was guesswork against a field that already has a
+    # filterable status.
+    if ($null -eq (Get-Command -Name Get-IntersightFirmwareUpgrade -ErrorAction SilentlyContinue)) { return "Unknown" }
 
-    $rows = @()
     try {
-        $rows = @(Get-IntersightResultList -Response (Get-IntersightFirmwareUpgradeStatus -Filter "Server.Moid eq '$ServerMoid'" -ErrorAction Stop))
+        $rows = @(Get-IntersightResultList -Response (Get-IntersightFirmwareUpgrade -Filter "(Server.Moid in ('$ServerMoid')) and (Status eq 'IN_PROGRESS')" -ErrorAction Stop))
     }
     catch { return "Unknown" }
 
-    if ($rows.Count -eq 0) { return "Finished" }
-
-    foreach ($row in $rows) {
-        $text = ""
-        foreach ($property in @('UpgradeState','OverallStatus','Status')) {
-            try {
-                if ($row.PSObject.Properties.Name -contains $property -and $null -ne $row.$property) {
-                    $value = [string]$row.$property
-                    if (-not [string]::IsNullOrWhiteSpace($value)) { $text = $value; break }
-                }
-            }
-            catch {}
-        }
-        if ([string]::IsNullOrWhiteSpace($text)) { continue }
-        if ($text -match '(?i)progress|pending|scheduled|started|running|downloading|staging|waiting') {
-            Write-Host "    Intersight reports a firmware task in state '$text'." -ForegroundColor DarkGray
-            return "Running"
-        }
+    if ($rows.Count -gt 0) {
+        Write-Host "    Intersight reports $($rows.Count) firmware upgrade(s) IN_PROGRESS for this server." -ForegroundColor DarkGray
+        return "Running"
     }
 
     return "Finished"
@@ -3037,10 +3035,10 @@ function Invoke-IntersightActivationPowerCycle {
 
     $powerState = [string]$Global:IntersightActivationPowerAction
 
-    # Step 1. The firmware task is running right now. Nothing can be done to the server until it
-    # finishes, so wait before asking rather than asking and being told no.
-    Write-Host "  Firmware is staging on '$($Row.ServerProfile)'. Waiting before the power cycle." -ForegroundColor Cyan
-    Wait-IntersightActivationCheckIn -Minutes $Global:IntersightActivationWaitMinutes -Label "the firmware task on '$($Row.ServerProfile)'"
+    # No pre-wait. Activate went out with the deploy, so the upgrade and the restart are already
+    # under way - the job here is to watch them finish, not to wait before starting them. The first
+    # check runs immediately and the stand-off happens between checks instead.
+    Write-Host "  Watching the firmware task on '$($Row.ServerProfile)'." -ForegroundColor Cyan
 
     $round = 0
     while ($true) {
@@ -3097,9 +3095,12 @@ function Invoke-IntersightActivationPowerCycle {
             }
         }
 
+        # Between checks, not before the first one.
+        Wait-IntersightActivationCheckIn -Minutes $Global:IntersightActivationWaitMinutes -Label "the firmware task on '$($Row.ServerProfile)'"
+
         Write-Host "" -ForegroundColor Yellow
-        Write-Host "The firmware task on '$($Row.ServerProfile)' has not finished, so the blade has not been power-cycled." -ForegroundColor Yellow
-        Write-Host "  RETRY    - check the task again now, and power-cycle if it has finished." -ForegroundColor Yellow
+        Write-Host "The firmware task on '$($Row.ServerProfile)' has not finished." -ForegroundColor Yellow
+        Write-Host "  RETRY    - check the task again now, and activate if it has finished." -ForegroundColor Yellow
         Write-Host "  CONTINUE - stop waiting and move on to the vCenter checks." -ForegroundColor Yellow
         Write-Host "  EXIT     - stop the run here." -ForegroundColor Yellow
 
@@ -3180,29 +3181,29 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             # and its -Server takes a ComputePhysicalRelationship (compute.Blade / compute.RackUnit),
             # not the server.Profile that was being passed. It would never have worked as written.
             #
-            # -Action Deploy AND the scheduled action, together.
+            # ACTIVATE FROM THE START. One call, exactly what the GUI sends:
             #
-            # -Action Deploy is what demonstrably starts the Deploy Firmware Policy workflow on the
-            # appliance - a live run with it produced that workflow, and a live run with only
-            # ScheduledActions did not. ProceedOnReboot is the documented acknowledgement that the
-            # server may be restarted to activate. Neither has been observed to be sufficient on
-            # its own against this appliance, so both are sent, and the run does not depend on
-            # either: if the profile is still staged afterwards, the host is rebooted from vCenter,
-            # which is the "install on next reboot" the staged firmware is waiting for.
+            #     POST /api/v1/server/Profiles/<moid>
+            #     {"ScheduledActions":[{"Action":"Activate","ProceedOnReboot":true}]}
+            #
+            # Not Deploy-then-wait-then-Activate. Deploy stages the firmware and leaves the profile
+            # waiting for a restart; Activate does the same staging AND restarts the blade, so
+            # splitting it in two only adds a wait between two halves of one operation. The body
+            # carries ScheduledActions alone - no top-level -Action goes with it.
             $deployParams = @{
                 Moid        = $row.ProfileMoid
-                Action      = 'Deploy'
                 ErrorAction = 'Stop'
             }
 
-            $sentDescription = "Action=Deploy"
             if ($Global:IntersightRebootImmediatelyToActivate) {
-                $scheduledAction = Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot $true
+                $scheduledAction = Initialize-IntersightPolicyScheduledAction -Action 'Activate' -ProceedOnReboot $true
                 $deployParams['ScheduledActions'] = @($scheduledAction)
-                $sentDescription += "; ScheduledActions: Action=Deploy, ProceedOnReboot=true"
+                $sentDescription = "ScheduledActions: Action=Activate, ProceedOnReboot=true"
             }
             else {
-                $sentDescription += "; no reboot acknowledgement"
+                # Staging only, for an operator who wants to restart the blades by hand.
+                $deployParams['Action'] = 'Deploy'
+                $sentDescription = "Action=Deploy (staging only - no reboot acknowledgement)"
             }
 
             if ($Global:IntersightDeployActionParams.Count -gt 0) {

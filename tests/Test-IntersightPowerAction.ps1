@@ -70,10 +70,13 @@ function Get-IntersightComputeServerSetting { param($Moid,$Filter,$ErrorAction)
 # how an older module behaves and must fall back to letting the appliance answer.
 $script:TaskStates = @('Completed')
 $script:TaskReads = 0
-function Get-IntersightFirmwareUpgradeStatus { param($Filter,$ErrorAction)
+# The GUI's query: firmware/Upgrades filtered to this server with Status eq 'IN_PROGRESS'. Rows
+# means running; none means finished. The appliance decides, so the stub just returns rows or not.
+function Get-IntersightFirmwareUpgrade { param($Filter,$ErrorAction)
     $index = [Math]::Min($script:TaskReads, $script:TaskStates.Count - 1)
     $script:TaskReads++
-    return [pscustomobject]@{ UpgradeState = $script:TaskStates[$index] } }
+    if ($script:TaskStates[$index] -eq 'InProgress') { return [pscustomobject]@{ Moid = 'upgrade-1' } }
+    return @() }
 $script:PowerError = ""
 $script:ActivateCalls = New-Object System.Collections.Generic.List[string]
 $script:ActivateThrows = $false
@@ -230,15 +233,16 @@ Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
 Assert-Equal "nothing was activated or power-cycled" $true ($script:PowerCalls.Count -eq 0)
 Assert-Equal "and it is recorded as activated" "Activated" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
 
-Write-Host "`n=== The firmware task state is read, and Unknown is not Finished ===" -ForegroundColor Cyan
+Write-Host "`n=== The firmware task check is the GUI's own query ===" -ForegroundColor Cyan
+# firmware/Upgrades with Status eq 'IN_PROGRESS' for the server. One call, and the appliance
+# decides - no free-text state string is interpreted here.
 $script:TaskStates = @('InProgress'); $script:TaskReads = 0
-Assert-Equal "an in-flight state reads as Running" "Running" (Get-IntersightFirmwareTaskState -ServerMoid 'server-abc' 6>$null)
-foreach ($state in @('Pending','Scheduled','Started','Downloading')) {
-    $script:TaskStates = @($state); $script:TaskReads = 0
-    Assert-Equal "'$state' reads as Running" "Running" (Get-IntersightFirmwareTaskState -ServerMoid 'server-abc' 6>$null)
-}
+Assert-Equal "an upgrade in progress reads as Running" "Running" (Get-IntersightFirmwareTaskState -ServerMoid 'server-abc' 6>$null)
 $script:TaskStates = @('Completed'); $script:TaskReads = 0
-Assert-Equal "a completed state reads as Finished" "Finished" (Get-IntersightFirmwareTaskState -ServerMoid 'server-abc' 6>$null)
+Assert-Equal "no rows reads as Finished" "Finished" (Get-IntersightFirmwareTaskState -ServerMoid 'server-abc' 6>$null)
+$scriptTextTask = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "it filters on Status eq 'IN_PROGRESS'" $true ($scriptTextTask -match "Status eq 'IN_PROGRESS'")
+Assert-Equal "and queries firmware/Upgrades, not UpgradeStatuses" $true ($scriptTextTask -match 'Get-IntersightFirmwareUpgrade -Filter')
 
 Write-Host "`n=== A profile with no assigned server is reported, not guessed at ===" -ForegroundColor Cyan
 $script:ServerMoid = ''
@@ -273,7 +277,7 @@ $activationText = ($activationAst | ForEach-Object { $_.Extent.Text }) -join "`n
 foreach ($viCmdlet in @('Get-VMHost','Set-VMHost','Restart-VMHost','Get-Cluster','Get-Datastore','Move-VM','Test-VMHostProfileCompliance','Get-VMHostProfile')) {
     Assert-Equal "the activation never calls $viCmdlet" $true (-not ($activationText -match "\b$([regex]::Escape($viCmdlet))\b"))
 }
-Assert-Equal "it reads the Intersight firmware task instead" $true ($activationText -match 'Get-IntersightFirmwareUpgradeStatus')
+Assert-Equal "it reads the Intersight firmware task instead" $true ($activationText -match 'Get-IntersightFirmwareUpgrade')
 
 Write-Host "`n=== The default is PowerCycle, not Reboot ===" -ForegroundColor Cyan
 $scriptText = [System.IO.File]::ReadAllText($scriptPath)

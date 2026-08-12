@@ -262,7 +262,8 @@ function Set-IntersightServerProfile { param($Moid,$Action,$ActionParams,$Schedu
     foreach ($sa in @($ScheduledActions)) { if ($sa) { $script:DeployActionParams.Add("$($sa.Action):ProceedOnReboot=$($sa.ProceedOnReboot)") } }
     # Both are required: -Action Deploy is what starts the deploy workflow, ProceedOnReboot is the
     # acknowledgement that the server may be restarted to activate.
-    if ($ScheduledActions -and -not $Action) { throw "-Action Deploy must be sent alongside -ScheduledActions" }
+    # Activate carries the action itself; a top-level -Action alongside it is the old two-step form.
+    if ($ScheduledActions -and $Action) { throw "-Action must not be sent alongside the Activate scheduled action" }
     if ($Moid) { [void]$script:IntersightDeployed.Add([string]$Moid) }
 }
 function Initialize-IntersightPolicyActionParam { param($Name,$Value) return [pscustomobject]@{ Name=$Name; Value=$Value } }
@@ -424,7 +425,7 @@ Assert-True "Intersight profiles were deployed" ($script:Calls.ContainsKey('Set-
 Assert-True "the deploy ran for both Intersight hosts" ($script:Calls['Set-IntersightServerProfile'] -eq 2) "got $($script:Calls['Set-IntersightServerProfile'])"
 # Without the reboot acknowledgement the firmware stages and nothing restarts, and the run then
 # waits out its whole post-reboot window for a reboot that was never scheduled.
-Assert-True "every deploy carried the reboot acknowledgement" (@($script:DeployActionParams | Where-Object { $_ -eq 'Deploy:ProceedOnReboot=True' }).Count -eq 2) "sent: $($script:DeployActionParams -join ' | ')"
+Assert-True "every deploy activated from the start" (@($script:DeployActionParams | Where-Object { $_ -eq 'Activate:ProceedOnReboot=True' }).Count -eq 2) "sent: $($script:DeployActionParams -join ' | ')"
 Assert-True "the deploy was confirmed as accepted, not assumed" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm deploy accepted' -and $_.Result -eq 'Accepted' }).Count -eq 2)
 Assert-True "the pre-reboot safety window was honoured" ($script:Calls.ContainsKey('RebootSafetyWindow'))
 

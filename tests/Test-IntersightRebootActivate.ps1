@@ -8,11 +8,11 @@
     PolicyScheduledAction - "ProceedOnReboot can be used to acknowledge server reboot while
     triggering deploy/activate", in the SDK's own words - sent through -ScheduledActions.
 
-    An earlier build sent it as a PolicyActionParam named RebootImmediatelyToActivate. That is the
-    wrong mechanism, and it failed in the worst possible way: PolicyActionParam takes free-form
-    strings, so the appliance accepted the Deploy, ignored the parameter, staged the firmware and
-    rebooted nothing. Hence the assertions here on how the deploy is composed, not just that one
-    was sent.
+    Two earlier builds got this wrong in ways that both looked like success. One sent it as a
+    PolicyActionParam named RebootImmediatelyToActivate - free-form strings, silently ignored. The
+    other sent Action=Deploy on the scheduled action, which stages the firmware and waits for a
+    restart that never comes. A HAR capture of the GUI settled it: Action=Activate. Hence the
+    assertions here on how the request is composed, not just that one was sent.
 
     The deploy is also not trusted on the strength of the call returning - that is what caught the
     wrong mechanism. A profile still sitting in its staged state afterwards stops the run.
@@ -129,8 +129,10 @@ Assert-Equal "reboot-immediately defaults to enabled" $true ($scriptText -match 
 # while sending it in a form the appliance ignored.
 Assert-Equal "the acknowledgement is built as a scheduled action" $true ($scriptText -match "Initialize-IntersightPolicyScheduledAction -Action 'Deploy' -ProceedOnReboot \`$true")
 Assert-Equal "and sent through -ScheduledActions" $true ($scriptText -match "\`$deployParams\['ScheduledActions'\]")
-# Both. -Action Deploy is what starts the workflow; ProceedOnReboot acknowledges the restart.
-Assert-Equal "-Action Deploy is sent as well" $true ($scriptText -match "Action      = 'Deploy'")
+# Activate carries the action itself, so no top-level -Action rides alongside it - that was the
+# old stage-then-activate shape, and it is exactly what the captured GUI request does not send.
+Assert-Equal "the acknowledgement rides on Activate" $true ($scriptText -match "Initialize-IntersightPolicyScheduledAction -Action 'Activate' -ProceedOnReboot \`$true")
+Assert-Equal "-Action Deploy is only used when the reboot acknowledgement is turned off" $true ($scriptText -match "\`$deployParams\['Action'\] = 'Deploy'")
 # The scheduled action carries the action. Sending -Action as well instructs the profile twice.
 # The QUOTED form only: $Global:IntersightRebootImmediatelyToActivate is the switch that turns the
 # acknowledgement on and legitimately contains the same words, as does the comment recording why

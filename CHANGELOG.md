@@ -12,6 +12,42 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [21.1.0] — 2026-08-12
+
+A HAR capture of the GUI watching an activation. It contained no POST — but its
+GETs were worth more than the POST would have been.
+
+#### Changed
+
+- **Activate from the start.** One call, at the point the run used to send
+  `Deploy`. There is no longer a stage-then-activate split, and no 40-minute
+  wait wedged between two halves of one operation: `Activate` stages the
+  firmware *and* restarts the blade. Setting
+  `$Global:IntersightRebootImmediatelyToActivate` to `$false` still stages only,
+  via `-Action Deploy`, for restarting blades by hand.
+- **The upgrade check is now the GUI's own query**, lifted from the HAR:
+  ```
+  GET /api/v1/firmware/Upgrades
+      ?$filter=(Server.Moid in ('<moid>')) and (Status eq 'IN_PROGRESS')&$select=Server
+  ```
+  One call, one field, and the appliance decides — rows means running, none
+  means finished. It replaces a read of `firmware/UpgradeStatuses` that
+  pattern-matched free-text state strings (`progress|pending|scheduled|…`)
+  against a field that has had a filterable status all along. That was guesswork
+  where an exact answer was available.
+- **No pre-wait before the first check.** The activation is already under way by
+  the time the watcher starts, so the first check runs immediately and the
+  stand-off happens *between* checks. On a blade that activates quickly this
+  removes 40 minutes of dead time per host.
+
+#### Notes
+
+- The HAR also shows the GUI polling `workflow/WorkflowInfos` filtered on
+  `WorkflowCtx.TargetCtxList.TargetMoid` for the profile, and
+  `firmware.UpgradeStatus` carrying `DownloadPercentage` / `DownloadProgress`.
+  Neither is needed for the decision the run makes, but both are there if
+  per-stage progress is ever wanted on screen.
+
 ### [21.0.0] — 2026-08-12
 
 **The captured request settles it.** Deploying from the GUI with *Reboot
@@ -1403,6 +1439,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [21.1.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 21.1.0 — activate from the
+start, and watch the upgrade with the GUI's own `Status eq 'IN_PROGRESS'` query.
+This is the build to run.
 
 ### [21.0.0-preauth] — 2026-08-12
 
