@@ -21,7 +21,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [r
 if ($errors) { throw "parse errors" }
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Get-IntersightFailureKind','Get-ExceptionDetail') } |
+    Where-Object { $_.Name -in @('Get-IntersightFailureKind','Get-ExceptionDetail','Get-IntersightDeployRefusalReason') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0
@@ -76,6 +76,42 @@ $detail = Get-ExceptionDetail -ErrorRecord (New-ErrorRecord -OuterMessage $gener
 Assert-Equal "huge inner message truncated" $true ($detail.Length -lt 1500)
 Assert-Equal "truncation is stated, not silent" $true ($detail -match 'truncated')
 Assert-Equal "original message length reported" $true ($detail -match '\d+ chars total')
+
+Write-Host "`n=== A refused deploy is classified, not flattened to 'deploy failed' ===" -ForegroundColor Cyan
+# Straight from a live run. The blade had dropped off Intersight; nothing about the profile or the
+# firmware policy was wrong, and no amount of retrying from the script would have helped. Telling
+# the operator "deploy failed" would have sent them looking in the wrong place.
+$disconnected = 'Error calling UpdateServerProfile: {"code":"InvalidRequest","message":"Cannot deploy the server profile. The server is disconnected. Check connectivity and try again.","messageId":"gershwin_server_is_not_connected","traceId":"NBfe8772878ef9cb88ded0a76c00ac8e97"}'
+$r = Get-IntersightDeployRefusalReason -Message $disconnected
+Assert-Equal "a disconnected server is named as such" "Server disconnected from Intersight" $r.Reason
+Assert-Equal "and the advice points at connectivity, not configuration" $true ($r.Advice -match 'device connector')
+Assert-Equal "it does not blame the firmware policy" $true (-not ($r.Advice -match '(?i)policy is wrong|re-?stage'))
+
+$notAllowed = 'Error calling UpdateServerProfile: {"code":"InvalidRequest","message":"Action ''Activate'' is not allowed in the current state.","messageId":"gershwin_user_action_is_not_allowed"}'
+Assert-Equal "a state refusal is told apart from a connectivity one" "Deploy not allowed from the profile's current state" (Get-IntersightDeployRefusalReason -Message $notAllowed).Reason
+
+$upgrading = 'Cannot perform power action when a firmware upgrade is in progress. messageId: action_not_allowed_firmware_upgrade_in_progress'
+Assert-Equal "an upgrade already running is its own case" "A firmware upgrade is already running" (Get-IntersightDeployRefusalReason -Message $upgrading).Reason
+
+# Never invent a cause. An unrecognised message keeps the appliance's own words.
+$novel = 'Error calling UpdateServerProfile: something nobody has seen before'
+$u = Get-IntersightDeployRefusalReason -Message $novel
+Assert-Equal "an unrecognised refusal is not guessed at" "Intersight refused the deploy" $u.Reason
+Assert-Equal "and the appliance's own words are kept" $novel $u.Summary
+Assert-Equal "an empty message does not throw" "Intersight refused the deploy" (Get-IntersightDeployRefusalReason -Message '').Reason
+
+Write-Host "`n=== A refused deploy does not end the run ===" -ForegroundColor Cyan
+# The live failure ended the whole run with the rest of the batch already evacuated and in
+# Maintenance mode. One host the appliance will not deploy is one host's problem.
+$deployText = [System.IO.File]::ReadAllText($scriptPath)
+$catchBlock = ""
+if ($deployText -match '(?s)Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch \$BatchNumber -HostName \$row\.Host -Action "Deploy server profile" -Result "Failed".{0,400}') { $catchBlock = $Matches[0] }
+Assert-Equal "the deploy failure path was found" $true (-not [string]::IsNullOrWhiteSpace($catchBlock))
+Assert-Equal "a failed deploy no longer stops the workflow" $true (-not ($deployText -match 'Stop-WithMessage "Intersight server profile deploy failed'))
+Assert-Equal "it is recorded for manual rectification instead" $true ($deployText -match 'Add-ManualAttentionHost -HostName \$row\.Host -Reason \$reason\.Reason')
+# Nothing was sent, so nothing reboots. A stale baseline would have the reconnect gate wait out
+# its whole window for a restart that was never requested, then report the host as not back.
+Assert-Equal "the boot-time baseline is cleared so no reboot is expected" $true ($deployText -match '\$Global:PreRebootBootTimes\.Remove\(\$row\.Host\)')
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

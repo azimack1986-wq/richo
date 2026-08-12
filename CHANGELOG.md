@@ -12,6 +12,63 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [21.9.0] — 2026-08-12
+
+A live run ended with:
+
+```
+Cannot deploy the server profile. The server is disconnected.
+messageId: gershwin_server_is_not_connected
+```
+
+The server was **not** disconnected. Intersight and vCenter both showed it
+healthy. This was a fault in this script.
+
+#### Fixed
+
+- **A server profile name is not unique in Intersight, and the lookup was taking
+  the first match.** `Get-IntersightServerProfileByName` did
+  `Name eq '<name>'` then `Select-Object -First 1`. The same name exists across
+  organizations, and a decommissioned or template-derived copy commonly sits
+  alongside the live one — so the run could resolve to a profile with **no server
+  on it**. Deploying that is refused with the message above, because "no server"
+  and "server disconnected" are the same refusal from the appliance's side. The
+  healthy blade the operator then goes looking at belongs to the *other* profile.
+
+  Now: one match is used; several, and the one **associated with a server** wins,
+  announced with its Moid. If several qualify, or none do, nothing is guessed —
+  the Moids are listed and the caller is told to pin the right one via the `Moid`
+  column of the Intersight CSV. Guessing there is how the wrong blade gets
+  rebooted.
+- **The resolved Moid is now printed, not just the name.** Without it, resolving
+  to the wrong profile of the right name is invisible in the log — which is why
+  this took a live failure to find.
+- **A refused deploy no longer ends the run.** It called `Stop-WithMessage`, so
+  one host killed the whole batch with every other host already evacuated, in
+  Maintenance mode, un-upgraded and unreported. Now the host is set aside, the
+  rest of the batch continues, and it lands in the manual rectification report —
+  the same treatment 21.7.0 gave unreachable hosts. Its boot-time baseline is
+  cleared too, so the reconnect gate does not wait out its window for a restart
+  that was never requested.
+
+#### Added
+
+- **Refusals are classified rather than flattened to "deploy failed".** Each is a
+  different job for a different person: `gershwin_server_is_not_connected`,
+  `gershwin_user_action_is_not_allowed`, and an upgrade already in progress.
+  Anything unrecognised keeps the appliance's own words — no cause is invented.
+- **A pre-flight reads whether the profile has a server before deploying**, and
+  that finding decides how a disconnect refusal is reported: no server found →
+  *"deployed against a profile with no server on it"*, pointing at the CSV `Moid`
+  column; server found → genuine connectivity, pointing at the device connector
+  and Fabric Interconnect.
+
+  The pre-flight is **diagnostic, not blocking**. An unreadable `AssignedServer`
+  relationship is not proof a profile is unassigned — this SDK has hidden that
+  Moid behind wrapper shapes before — so the deploy is still attempted. Skipping
+  a healthy host on that basis would trade one silent fault for another. The
+  workflow simulation caught the first, stricter version doing exactly that.
+
 ### [21.8.1] — 2026-08-12
 
 Housekeeping after an audit of the script's size and hot paths.
@@ -1757,6 +1814,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [21.9.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 21.9.0 — duplicate profile
+names are no longer resolved by guessing, and a refused deploy does not end the
+run. This is the build to run.
 
 ### [21.8.1-preauth] — 2026-08-12
 

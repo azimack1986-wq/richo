@@ -299,7 +299,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "21.8.1"
+$ScriptVersion = "21.9.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -1781,6 +1781,75 @@ function Assert-IntersightPowerShellAvailable {
     }
 }
 
+function Get-IntersightDeployRefusalReason {
+    <#
+    .SYNOPSIS
+        Turns an Intersight deploy refusal into something an operator can act on.
+
+    .DESCRIPTION
+        The appliance is specific about why it will not deploy, and that detail is worth keeping
+        rather than flattening into "deploy failed". Each one is a different job for a different
+        person, and the manual rectification report is only useful if it says which.
+
+        Recognised, from live runs and the appliance's own messageIds:
+
+          gershwin_server_is_not_connected      The blade is not talking to Intersight. Nothing
+                                                about the profile or the firmware policy is wrong -
+                                                the device connector, the FI, or the server itself
+                                                is unreachable. No amount of retrying from here
+                                                helps.
+          gershwin_user_action_is_not_allowed   The action is not valid from the profile's current
+                                                state. Handled earlier by the Activate/Deploy
+                                                fallback; if it reaches here, both forms were
+                                                refused.
+          action_not_allowed_firmware_upgrade   Something is already running against this server.
+
+        Anything unrecognised keeps the appliance's own words. Never invent a cause.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Message,
+        # What the pre-flight found. $true means a server really was assigned to this profile, so a
+        # disconnect message is about connectivity. $false means none could be read, which makes the
+        # wrong-profile explanation far more likely - and that changes where the operator looks.
+        [bool]$ProfileHasServer = $true
+    )
+
+    if ($Message -match '(?i)gershwin_server_is_not_connected|server is disconnected|the server is not connected') {
+        if (-not $ProfileHasServer) {
+            return [pscustomobject]@{
+                Reason  = "Deployed against a profile with no server on it"
+                Summary = "the profile has no server assigned, which the appliance reports as 'the server is disconnected'"
+                Advice  = "The blade is probably fine - this run resolved to the wrong profile. Profile names are NOT unique in Intersight, so a duplicate name can resolve to an unassigned or decommissioned copy. Confirm the profile in Intersight and pin the correct one by putting its Moid in the Moid column of $IntersightCsvPath for this host."
+            }
+        }
+        return [pscustomobject]@{
+            Reason  = "Server disconnected from Intersight"
+            Summary = "the appliance says the server is disconnected, so the profile cannot be deployed"
+            Advice  = "A server WAS assigned to this profile, so this is connectivity - check the blade's device connector and its Fabric Interconnect. If Intersight and vCenter both show the server healthy, re-check that this is the right profile: names are not unique, and the Moid column of $IntersightCsvPath pins it."
+        }
+    }
+    if ($Message -match '(?i)gershwin_user_action_is_not_allowed|not allowed in the current state') {
+        return [pscustomobject]@{
+            Reason  = "Deploy not allowed from the profile's current state"
+            Summary = "the appliance refused both Activate and Deploy from this profile's state"
+            Advice  = "Check the profile in Intersight - it may already have an action running, or be in a state that has to be cleared by hand."
+        }
+    }
+    if ($Message -match '(?i)firmware_upgrade_in_progress|firmware upgrade is in progress') {
+        return [pscustomobject]@{
+            Reason  = "A firmware upgrade is already running"
+            Summary = "Intersight already has a firmware upgrade running against this server"
+            Advice  = "Let the running upgrade finish, then re-run for this host."
+        }
+    }
+
+    return [pscustomobject]@{
+        Reason  = "Intersight refused the deploy"
+        Summary = $Message
+        Advice  = "See the appliance message for the reason."
+    }
+}
+
 function Get-IntersightFailureKind {
     <#
     .SYNOPSIS
@@ -2567,11 +2636,63 @@ function Get-IntersightResultList {
 }
 
 function Get-IntersightServerProfileByName {
+    <#
+    .SYNOPSIS
+        Finds a server profile by name, and does not silently guess when the name is not unique.
+
+    .DESCRIPTION
+        A profile name is NOT unique in Intersight. The same name can exist in more than one
+        organization, and a decommissioned or template-derived copy commonly sits alongside the
+        live one. This used to take Select-Object -First 1 of whatever the appliance returned.
+
+        That is how a run ends up deploying against the wrong object. The live symptom was
+        deceptive: the appliance answered
+
+            "Cannot deploy the server profile. The server is disconnected."
+            messageId: gershwin_server_is_not_connected
+
+        while BOTH Intersight and vCenter showed the server perfectly healthy - because the healthy
+        server belonged to the OTHER profile of the same name. The one the script picked had no
+        server on it at all, and "no server" and "server disconnected" are the same refusal from
+        the appliance's point of view.
+
+        So when several profiles share a name, the one ASSOCIATED WITH A SERVER wins - that is the
+        one an operator means. If exactly one qualifies it is used and the choice is announced. If
+        several do, or none do, nothing is guessed: the caller is told, with the Moids, so the
+        ambiguity can be resolved by putting a Moid in the CSV.
+    #>
     param([Parameter(Mandatory=$true)][string]$Name)
+
     # OData string literals escape a single quote by doubling it.
     $escaped = $Name -replace "'", "''"
     $page = Get-IntersightServerProfile -Filter "Name eq '$escaped'" -ErrorAction Stop
-    return (Get-IntersightResultList -Response $page | Select-Object -First 1)
+    $profileMatches = @(Get-IntersightResultList -Response $page)
+
+    if ($profileMatches.Count -eq 0) { return $null }
+    if ($profileMatches.Count -eq 1) { return $profileMatches[0] }
+
+    Write-Host "  Intersight returned $($profileMatches.Count) server profiles named '$Name'. A profile name is not unique across organizations." -ForegroundColor Yellow
+
+    $assigned = @($profileMatches | Where-Object {
+        -not [string]::IsNullOrWhiteSpace((Get-IntersightAssignedServerMoid -ServerProfile $_ -Quiet))
+    })
+
+    foreach ($candidate in $profileMatches) {
+        $serverMoid = Get-IntersightAssignedServerMoid -ServerProfile $candidate -Quiet
+        $has = if ([string]::IsNullOrWhiteSpace($serverMoid)) { "no server assigned" } else { "server $serverMoid" }
+        Write-Host "    Moid $($candidate.Moid) - $has." -ForegroundColor Yellow
+    }
+
+    if ($assigned.Count -eq 1) {
+        Write-Host "  Using Moid $($assigned[0].Moid) - the only one of them with a server assigned." -ForegroundColor Green
+        return $assigned[0]
+    }
+
+    # Several assigned, or none. Either way this script must not pick one.
+    $detail = if ($assigned.Count -eq 0) { "none of them has a server assigned" } else { "$($assigned.Count) of them have a server assigned" }
+    Write-Host "  Cannot tell which profile named '$Name' is the right one - $detail." -ForegroundColor Red
+    Write-Host "  Put the correct Moid in the Moid column of $IntersightCsvPath for this host." -ForegroundColor Red
+    return $null
 }
 
 function Resolve-IntersightServerProfileForHost {
@@ -2633,7 +2754,9 @@ function Resolve-IntersightServerProfileForHost {
         Stop-WithMessage "No Intersight server profile found for host '$HostName'. Tried: CSV Moid, CSV ServerProfileName, short hostname '$short', CSV Name '$($IntersightCsvRow.Name)'. Add a ServerProfileName or Moid column to $IntersightCsvPath for this row."
     }
 
-    Write-Host "Host '$HostName' resolved to Intersight server profile '$($sp.Name)' via $resolvedBy." -ForegroundColor Cyan
+    # The Moid, not just the name. A name is not unique in Intersight, so without the Moid a run
+    # that resolved to the WRONG profile of the right name looks identical to one that got it right.
+    Write-Host "Host '$HostName' resolved to Intersight server profile '$($sp.Name)' (Moid $($sp.Moid)) via $resolvedBy." -ForegroundColor Cyan
     $Global:IntersightProfileCache[$HostName] = $sp.Moid
     return $sp
 }
@@ -3642,7 +3765,38 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             continue
         }
 
-        Write-Host "Intersight: deploying server profile for '$($row.Host)' (profile '$($row.ServerProfile)', ConfigState $($row.ConfigState))." -ForegroundColor Yellow
+        # PRE-FLIGHT: is this profile actually on a server? A profile with nothing assigned is
+        # refused by the appliance with "The server is disconnected"
+        # (gershwin_server_is_not_connected) - which reads as a connectivity fault and sends the
+        # operator to check a blade that is perfectly healthy. The real cause is usually that the
+        # run resolved to the wrong profile of a duplicated name. Catch it here and say so.
+        $preflightServerMoid = ""
+        try {
+            $preflightProfile = $row.ServerProfileObj
+            if ($null -eq $preflightProfile -and -not [string]::IsNullOrWhiteSpace([string]$row.ProfileMoid)) {
+                $preflightProfile = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $row.ProfileMoid -ErrorAction Stop) | Select-Object -First 1
+            }
+            if ($null -ne $preflightProfile) {
+                $preflightServerMoid = Get-IntersightAssignedServerMoid -ServerProfile $preflightProfile -ProfileMoid ([string]$row.ProfileMoid) -Quiet
+            }
+        }
+        catch {
+            # Unreadable is not the same as unassigned. Fall through and let the deploy answer.
+            $preflightServerMoid = "unreadable"
+        }
+
+        # DIAGNOSTIC, NOT BLOCKING. An unreadable AssignedServer relationship is not proof the
+        # profile is unassigned - this SDK has hidden that Moid behind wrapper shapes before - and
+        # skipping a healthy host on that basis would trade one silent fault for another. So the
+        # deploy is still attempted; the finding is carried forward and only used to explain a
+        # refusal, where it turns a misleading appliance message into the actual cause.
+        $preflightHasServer = -not [string]::IsNullOrWhiteSpace($preflightServerMoid)
+        if (-not $preflightHasServer) {
+            Write-Host "  NOTE: no assigned server could be read on profile '$($row.ServerProfile)' (Moid $($row.ProfileMoid)). Attempting the deploy anyway." -ForegroundColor Yellow
+        }
+
+        $serverText = if ($preflightHasServer) { ", server $preflightServerMoid" } else { ", no assigned server readable" }
+        Write-Host "Intersight: deploying server profile for '$($row.Host)' (profile '$($row.ServerProfile)', Moid $($row.ProfileMoid)$serverText, ConfigState $($row.ConfigState))." -ForegroundColor Yellow
         try {
             # Deploying the server profile is what pushes a staged firmware policy change to the
             # server - the API equivalent of Deploy in the UI, and the action that clears
@@ -3727,8 +3881,28 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
                 Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber $BatchNumber
             }
         } catch {
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Failed" -Details $_.Exception.Message
-            Stop-WithMessage "Intersight server profile deploy failed for '$($row.Host)': $($_.Exception.Message)"
+            # SET ASIDE, NOT STOPPED ON. A deploy the appliance refuses is one host's problem, and
+            # ending the run here strands every other host in the batch - already evacuated, already
+            # in Maintenance mode, and now un-upgraded with no report. The rest of the batch
+            # continues; this host is named in the manual rectification report at the end.
+            $message = [string]$_.Exception.Message
+            $reason = Get-IntersightDeployRefusalReason -Message $message -ProfileHasServer $preflightHasServer
+
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "  Intersight refused the deploy for '$($row.Host)': $($reason.Summary)" -ForegroundColor Yellow
+            if (-not [string]::IsNullOrWhiteSpace($reason.Advice)) {
+                Write-Host "  $($reason.Advice)" -ForegroundColor Yellow
+            }
+            Write-Host "  Setting this host aside and continuing with the rest of the batch." -ForegroundColor Yellow
+
+            # Nothing was sent, so nothing is going to reboot. Leaving a boot-time baseline behind
+            # would have the reconnect gate wait out its whole window for a restart that was never
+            # requested, and then report the host as having failed to come back.
+            if ($Global:PreRebootBootTimes.ContainsKey($row.Host)) { [void]$Global:PreRebootBootTimes.Remove($row.Host) }
+
+            Add-ManualAttentionHost -HostName $row.Host -Reason $reason.Reason -Detail "$($reason.Advice) Profile '$($row.ServerProfile)' was $($row.ConfigState) and remains un-upgraded. Appliance said: $message"
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Failed" -Details "$($reason.Reason). $message"
+            continue
         }
     }
 }

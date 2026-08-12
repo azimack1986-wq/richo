@@ -37,6 +37,7 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
                                  'ConvertTo-IntersightWorkflowStatus','Resolve-IntersightRelationshipObject',
                                  'Get-IntersightProfileWorkflowActivity',
                                  'Get-IntersightProfileDeployState','Get-IntersightResultList',
+                                 'Get-IntersightServerProfileByName',
                                  'Add-ManualAttentionHost',
                                  'Read-ChoiceExit','Read-PendingConsoleKey') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
@@ -466,6 +467,47 @@ Assert-Equal "the timers are documented as ceilings" $true ($pollText -match 'CE
 Assert-Equal "the fixed stand-off function no longer exists" $true (-not ($pollText -match 'function Wait-IntersightActivationCheckIn'))
 Assert-Equal "the wait reads the workflow engine" $true ($pollText -match 'Get-IntersightProfileWorkflowActivity')
 Assert-Equal "through the profile's RunningWorkflows" $true ($pollText -match "Expand 'RunningWorkflows'")
+
+Write-Host "`n=== A duplicated profile name is not silently guessed at ===" -ForegroundColor Cyan
+# THE LIVE FAULT. A profile name is not unique in Intersight - the same name exists across
+# organizations, and decommissioned or template-derived copies sit alongside the live one. This
+# lookup used to take Select-Object -First 1, so a run could deploy against the copy with no server
+# on it. The appliance then answered "the server is disconnected", and BOTH Intersight and vCenter
+# showed the real blade perfectly healthy - because the healthy blade was on the other profile.
+$IntersightCsvPath = 'C:\fixtures\intersight.csv'
+$script:NamedProfiles = @()
+function Get-IntersightServerProfile { param($Moid,$Filter,$Expand,$Top,$Skip,$ErrorAction)
+    return [pscustomobject]@{ Results = $script:NamedProfiles } }
+function New-Profile { param([string]$Moid,[string]$ServerMoid)
+    $p = [pscustomobject]@{ Name = 'siepd24vcp0205'; Moid = $Moid }
+    if ($ServerMoid) { $p | Add-Member -NotePropertyName AssignedServer -NotePropertyValue ([pscustomobject]@{ ActualInstance = [pscustomobject]@{ Moid = $ServerMoid } }) -Force }
+    return $p }
+
+$script:NamedProfiles = @()
+Assert-Equal "no match returns nothing" $true ($null -eq (Get-IntersightServerProfileByName -Name 'siepd24vcp0205' 6>$null))
+
+$script:NamedProfiles = @((New-Profile -Moid 'moid-live' -ServerMoid 'server-1'))
+Assert-Equal "a single match is used as-is" "moid-live" (Get-IntersightServerProfileByName -Name 'siepd24vcp0205' 6>$null).Moid
+
+# The live shape: one real profile on a blade, one leftover with nothing on it.
+$script:NamedProfiles = @((New-Profile -Moid 'moid-stale'), (New-Profile -Moid 'moid-live' -ServerMoid 'server-1'))
+Assert-Equal "with duplicates, the one with a server assigned wins" "moid-live" (Get-IntersightServerProfileByName -Name 'siepd24vcp0205' 6>$null).Moid
+# Order must not decide it - the appliance does not promise one.
+$script:NamedProfiles = @((New-Profile -Moid 'moid-live' -ServerMoid 'server-1'), (New-Profile -Moid 'moid-stale'))
+Assert-Equal "and order does not change the answer" "moid-live" (Get-IntersightServerProfileByName -Name 'siepd24vcp0205' 6>$null).Moid
+
+# Two live candidates is a genuine ambiguity. Guessing here is how the wrong blade gets rebooted.
+$script:NamedProfiles = @((New-Profile -Moid 'moid-a' -ServerMoid 'server-1'), (New-Profile -Moid 'moid-b' -ServerMoid 'server-2'))
+Assert-Equal "two assigned profiles is refused, not guessed" $true ($null -eq (Get-IntersightServerProfileByName -Name 'siepd24vcp0205' 6>$null))
+
+# Neither assigned: also refused. Picking one would reproduce the original fault exactly.
+$script:NamedProfiles = @((New-Profile -Moid 'moid-a'), (New-Profile -Moid 'moid-b'))
+Assert-Equal "no assigned profile among duplicates is refused too" $true ($null -eq (Get-IntersightServerProfileByName -Name 'siepd24vcp0205' 6>$null))
+
+$lookupText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "the lookup no longer takes the first of several" $true (-not ($lookupText -match "Get-IntersightResultList -Response \`$page \| Select-Object -First 1"))
+# Without the Moid on screen, resolving to the wrong profile of the right name is invisible.
+Assert-Equal "the resolved Moid is printed, not just the name" $true ($lookupText -match "resolved to Intersight server profile '\`$\(\`$sp\.Name\)' \(Moid \`$\(\`$sp\.Moid\)\)")
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

@@ -258,19 +258,32 @@ function Get-IntersightServerProfile {
     if ($Filter -and $Filter -match "Name eq '([^']+)'") { $name = $Matches[1] }
     elseif ($Moid -and "$Moid" -match '^moid-(.+)$') { $name = $Matches[1] }
     $state = if ($script:IntersightDeployed.Contains("moid-$name")) { 'Associated' } else { 'Pending-changes' }
-    return [pscustomobject]@{
-        Results = @([pscustomobject]@{
-            Name = $name; Moid = "moid-$name"
-            ConfigContext = [pscustomobject]@{ ConfigState = $state }
-        })
+    # A real profile is associated with a server, and the wrapper shape is the generated oneOf the
+    # SDK actually returns - ActualInstance, not a plain object. $script:ProfilesUnassigned strips
+    # it, which is the wrong-profile case the pre-flight exists to tell apart.
+    $obj = [pscustomobject]@{
+        Name = $name; Moid = "moid-$name"
+        ConfigContext = [pscustomobject]@{ ConfigState = $state }
     }
+    if (-not $script:ProfilesUnassigned) {
+        $obj | Add-Member -NotePropertyName AssignedServer -NotePropertyValue ([pscustomobject]@{
+            ActualInstance = [pscustomobject]@{ Moid = "server-$name" } }) -Force
+    }
+    return [pscustomobject]@{ Results = @($obj) }
 }
+$script:ProfilesUnassigned = $false
 $script:DeployActionParams = New-Object System.Collections.Generic.List[string]
 function Initialize-IntersightPolicyScheduledAction { param($Action,$ProceedOnReboot)
     return [pscustomobject]@{ Action = $Action; ProceedOnReboot = [bool]$ProceedOnReboot } }
 $script:BootCounter = 0
+$script:DeployRefusalMoid = ''
+$script:DeployRefusalMessage = ''
 function Set-IntersightServerProfile { param($Moid,$Action,$ActionParams,$ScheduledActions,$ErrorAction)
     Note-Call 'Set-IntersightServerProfile'
+    # The appliance refusing one profile. Thrown before anything else happens, as it is server-side.
+    if ($script:DeployRefusalMoid -and "$Moid" -match [regex]::Escape($script:DeployRefusalMoid)) {
+        throw $script:DeployRefusalMessage
+    }
     # Activate restarts the blade: every host in the batch comes back with a new boot time.
     $script:BootCounter++
     foreach ($h in $script:HostState.Values) {
@@ -350,6 +363,9 @@ function Reset-Simulation {
     $script:DeployActionParams = New-Object System.Collections.Generic.List[string]
     $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
     $Global:ExcludedFromRunHosts = @{}
+    $script:DeployRefusalMoid = ''
+    $script:DeployRefusalMessage = ''
+    $script:ProfilesUnassigned = $false
 }
 
 Write-Host "`n=== The script loads ===" -ForegroundColor Cyan
@@ -571,6 +587,63 @@ $stale = @($Global:RunSummary | Where-Object { $_.Stage -eq 'PostChangeVerificat
 Assert-True "the mismatch is flagged" ($stale[0].Result -eq 'Attention') "got $($stale[0].Result)"
 Assert-True "and names both versions" ($stale[0].Details -match 'VERSION MISMATCH - running 4\.3\(6h\), expected 6\.0\(2d\)') "got: $($stale[0].Details)"
 $script:UcsRunningVersion = '6.0(2d)'
+
+Write-Host "`n=== A deploy the appliance refuses does not cost the cluster either ===" -ForegroundColor Cyan
+# Live failure: the blade had dropped off Intersight, and the refusal ended the whole run with the
+# rest of the batch already evacuated and sitting in Maintenance mode, un-upgraded and unreported.
+Reset-Simulation -Mode 'LIVE'
+$script:DeployRefusalMoid = 'esx01'
+$script:DeployRefusalMessage = 'Error calling UpdateServerProfile: {"code":"InvalidRequest","message":"Cannot deploy the server profile. The server is disconnected. Check connectivity and try again.","messageId":"gershwin_server_is_not_connected","traceId":"NBfe8772878ef9cb88ded0a76c00ac8e97"}'
+function Read-Host {
+    param([string]$Prompt)
+    $script:PromptLog.Add($Prompt)
+    if ($script:PromptLog.Count -gt $script:MaxPrompts) { throw "Prompt limit exceeded: '$Prompt'" }
+    switch -Regex ($Prompt) {
+        'Select run mode'              { return '1' }
+        'Select upgrade mode'          { return '2' }
+        'Select batch mode'            { return '1' }
+        'Create host firmware package' { return 'CREATE' }
+        'Reconnect incomplete'         { return 'OVERRIDE' }
+        default                        { return 'CONTINUE' }
+    }
+}
+$refusalError = $null
+try { Invoke-ClusterUpgradeWorkflow -Cluster $script:Cluster 6>$null } catch { $refusalError = $_ }
+Assert-True "the run completes despite a refused deploy" ($null -eq $refusalError) "$refusalError"
+Assert-True "the cluster still completed" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
+
+# The whole point: the OTHER hosts still get done.
+$reached = @($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' } | Select-Object -ExpandProperty Host -Unique)
+foreach ($other in @('esx02.dpe.example','esx03.dpe.example','esx04.dpe.example')) {
+    Assert-True "$other was still processed" ($reached -contains $other) "reached: $($reached -join ',')"
+}
+# And the refused host is not abandoned in Maintenance mode - it never rebooted, so it passes
+# compliance and is returned to service, un-upgraded but back in the cluster.
+Assert-True "the refused host was returned to service" ($script:HostState['esx01.dpe.example'].ConnectionState -eq 'Connected') "got $($script:HostState['esx01.dpe.example'].ConnectionState)"
+
+$flagged = $Global:ManualAttentionHosts.ToArray()
+$entry = @($flagged | Where-Object { $_.Host -eq 'esx01.dpe.example' })
+Assert-True "the refused host is on the manual rectification list" ($entry.Count -ge 1) "list: $(($flagged | Select-Object -ExpandProperty Host) -join ',')"
+Assert-True "named as a connectivity problem, not a firmware one" ($entry[0].Reason -eq 'Server disconnected from Intersight') "got: $($entry[0].Reason)"
+Assert-True "the appliance's own message is kept" ($entry[0].Detail -match 'gershwin_server_is_not_connected')
+Assert-True "the failure is on the run summary" (@($Global:RunSummary | Where-Object { $_.Host -eq 'esx01.dpe.example' -and $_.Result -eq 'Failed' }).Count -ge 1)
+$script:DeployRefusalMoid = ''
+
+Write-Host "`n=== The same refusal against an unassigned profile is diagnosed differently ===" -ForegroundColor Cyan
+# This is the live fault. The appliance says "the server is disconnected" for BOTH a genuinely
+# disconnected blade AND a profile with no server on it - and the second is what happens when a
+# duplicated profile name resolves to the wrong object. Reporting connectivity in that case sends
+# the operator to check a blade that is perfectly healthy, which is exactly what happened.
+Reset-Simulation -Mode 'LIVE'
+$script:ProfilesUnassigned = $true
+$script:DeployRefusalMoid = 'esx01'
+$script:DeployRefusalMessage = 'Error calling UpdateServerProfile: {"code":"InvalidRequest","message":"Cannot deploy the server profile. The server is disconnected. Check connectivity and try again.","messageId":"gershwin_server_is_not_connected"}'
+try { Invoke-ClusterUpgradeWorkflow -Cluster $script:Cluster 6>$null } catch {}
+$entry = @($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Host -eq 'esx01.dpe.example' })
+Assert-True "the unassigned profile is diagnosed as the wrong profile" ($entry.Count -ge 1 -and $entry[0].Reason -eq 'Deployed against a profile with no server on it') "got: $($entry[0].Reason)"
+Assert-True "and the advice points at the Moid column, not the device connector" ($entry[0].Detail -match 'Moid column')
+$script:ProfilesUnassigned = $false
+$script:DeployRefusalMoid = ''
 
 Write-Host "`n=== An unreachable host does not cost the cluster ===" -ForegroundColor Cyan
 # The live shape of this: a host is NotResponding, so it returns no CDP/LLDP. It used to fall
