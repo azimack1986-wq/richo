@@ -12,6 +12,64 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [20.5.0] — 2026-08-12
+
+Staging the firmware works. The restart is what the appliance does not reliably
+do on its own, so the run now performs it — through Intersight.
+
+#### Added
+
+- **`Invoke-IntersightActivationPowerCycle`.** Where a deploy leaves the profile
+  staged, the run reads back which server the profile is assigned to
+  (`AssignedServer`, falling back to `AssociatedServer`) and power-cycles **that
+  server** through Intersight:
+  `Set-IntersightComputeServerSetting -Moid <server moid> -AdminPowerState PowerCycle`,
+  which is `POST /api/v1/compute/ServerSettings/<server moid>`. vCenter is not
+  involved and no host is rebooted from the vSphere side.
+- **It stands off rather than polling on a timeout.** After the power action the
+  run waits `$Global:IntersightActivationWaitMinutes` (default **40**) and looks
+  again, up to `$Global:IntersightActivationMaxCheckIns` times (default 3).
+  `C` checks in immediately, `E` exits. An activation takes as long as it takes,
+  and a closed window is not evidence of failure.
+- **Nothing in this path ends the run.** Not a server that cannot be identified,
+  not a power action the appliance declines, not an activation still running
+  when the check-ins run out. Each is announced and written to the run summary,
+  and the batch carries on to the reconnect wait — which is better placed to say
+  whether the host came back. By this point the firmware is staged and the host
+  is in Maintenance mode; ending the run would leave the operator with less than
+  they started with.
+
+#### Notes — `AdminPowerState`
+
+The SDK's own definitions, and one of them is a trap:
+
+| Value | Effect |
+| --- | --- |
+| `PowerCycle` | **Resets the server** — activates staged firmware |
+| `HardReset` | Hard resets the server |
+| `PowerOn` / `PowerOff` | Power on / off |
+| `Shutdown` | Shuts the operating system down |
+| `Reboot` | **Reboots the IMC, not the server** |
+
+`Reboot` is the one that reads correctly and does the wrong thing: it restarts
+the management controller and leaves the blade running with the firmware still
+staged — indistinguishable from the failure this release fixes. The default is
+`PowerCycle`, and the run warns in red if it is ever configured with `Reboot`.
+
+#### Removed
+
+- `$Global:IntersightRebootHostToActivate` and the vCenter-side `Restart-VMHost`
+  activation path. The reboot comes from Intersight.
+
+#### Added — tests
+
+- `tests/Test-IntersightPowerAction.ps1` — 17 assertions: the server is taken
+  from the profile and never inferred, `PowerCycle` goes to the server's own
+  setting Moid, a declined action returns rather than throwing, an activation
+  still running after the check-ins is handed on rather than failed, a profile
+  with no assigned server sends nothing at all, and the configured default is
+  asserted to be `PowerCycle` with the 40-minute stand-off.
+
 ### [20.4.0] — 2026-08-11
 
 #### Fixed
@@ -1165,6 +1223,13 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [20.5.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 20.5.0 — the run power-cycles
+the assigned server through Intersight to activate staged firmware, stands off
+40 minutes between check-ins, and never ends the run over it. This is the build
+to run.
 
 ### [20.4.0-preauth] — 2026-08-11
 

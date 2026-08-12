@@ -71,7 +71,7 @@
     first cmdlet, a bad Intersight connection before any host is touched, a missing CSV at import.
     Verify the environment out of band with scripts\intersight\Test-IntersightApiKey.ps1.
 
-    - Version 20.4.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 20.4.0. Set in $ScriptVersion below and stamped onto every row of the run summary
+    - Version 20.5.0-preauth. Tracks Invoke-AutoDeployFirmwareBatchControl.ps1 20.5.0. Set in $ScriptVersion below and stamped onto every row of the run summary
       and firmware verification CSVs. History is in git and CHANGELOG.md - do not version by
       filename.
     - Credentials/API keys are kept in memory only.
@@ -101,11 +101,23 @@
       trusted either: Confirm-IntersightDeployAccepted re-reads the profile afterwards and stops
       the run if it is still sitting in its staged state, rather than waiting out a post-reboot
       window for a restart that was never scheduled.
-      THE REBOOT MUST COME FROM INTERSIGHT. $Global:IntersightRebootHostToActivate can activate the
-      staged firmware with a vCenter-side Restart-VMHost instead - "install on next reboot" is the
-      documented behaviour, and the host is already evacuated - but it is OFF by default, because
-      it is a different thing from what was asked for and it would hide an appliance that is not
-      acting on the acknowledgement.
+      THE REBOOT COMES FROM INTERSIGHT. Staging the firmware works; the restart is what the
+      appliance does not always do on its own. Where it does not, the run reads back which server
+      the profile is assigned to and power-cycles THAT server through Intersight - vCenter is not
+      involved, and no host is rebooted from the vSphere side:
+          Set-IntersightComputeServerSetting -Moid <server moid> -AdminPowerState PowerCycle
+      which is POST /api/v1/compute/ServerSettings/<server moid>.
+      AdminPowerState 'Reboot' is a trap: the SDK defines it as "Power state of IMC is rebooted",
+      so it restarts the management controller and leaves the server running with the firmware
+      still staged. 'PowerCycle' resets the server. The run warns loudly if it is ever configured
+      with 'Reboot'.
+      After the power action the run STANDS OFF for $Global:IntersightActivationWaitMinutes
+      (default 40) and looks again, up to $Global:IntersightActivationMaxCheckIns times, rather
+      than polling on a timeout - an activation takes as long as it takes.
+      NONE OF THIS ENDS THE RUN. Not a server that cannot be identified, not a declined power
+      action, not an activation still going when the check-ins run out. Each is announced and
+      recorded and the batch carries on to the reconnect wait, which is better placed to say
+      whether the host came back.
     - THIS SCRIPT MIGRATES NOTHING. The batch is sized from live cluster capacity and its hosts go
       straight into Maintenance mode; DRS moves the running VMs, once, as part of that. Two things
       that used to happen first have been removed: a cold migration of every powered-off and
@@ -265,7 +277,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "20.4.0-preauth"
+$ScriptVersion = "20.5.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -333,13 +345,24 @@ $Global:IntersightDeployActionParams = @()
 # upgrade itself.
 $Global:IntersightDeployAcceptedTimeoutSeconds = 180
 
-# FALLBACK ONLY, AND OFF BY DEFAULT: activate by rebooting the host from vCenter.
-# The reboot is meant to come from Intersight, as part of the deploy, which is what Reboot
-# Immediately to Activate does. A vCenter-side Restart-VMHost would also activate the staged
-# firmware - "install on next reboot" is the documented behaviour - but it is a different thing
-# from what the operator asked for and it hides an appliance that is not acting on the
-# acknowledgement. Left off, a deploy that does not take stops the run instead.
-$Global:IntersightRebootHostToActivate = $false
+# ACTIVATION POWER ACTION - INTERSIGHT ONLY.
+# Staging the firmware works. When the appliance does not then restart the blade on its own, the
+# run finds the server the profile is assigned to and power-cycles it through Intersight. vCenter
+# is not involved: the reboot comes from the same place the firmware did.
+#
+# AdminPowerState values, from the SDK: Policy, PowerOn, PowerOff, PowerCycle (reset the server),
+# HardReset, Shutdown, Reboot (reboots the IMC, NOT the server).
+# PowerCycle is the one that activates staged firmware. Reboot is the trap - it restarts the
+# management controller and leaves the server running, so it looks like something happened.
+$Global:IntersightActivationPowerAction = 'PowerCycle'
+
+# After the power action the run stands off for this long and then looks again, rather than
+# polling on a timeout. A firmware activation takes as long as it takes, and a run that treats a
+# closed window as a failure is wrong more often than it is right.
+$Global:IntersightActivationWaitMinutes = 40
+# How many of those stand-offs before the run stops watching and carries on to the reconnect wait.
+# It never ends the run - see Invoke-IntersightActivationPowerCycle.
+$Global:IntersightActivationMaxCheckIns = 3
 $Global:IntersightSession = $null
 $Global:IntersightServerList = @{}
 $Global:IntersightHostMap = @{}
@@ -2143,86 +2166,228 @@ function Confirm-IntersightDeployAccepted {
     return $false
 }
 
-function Invoke-IntersightActivationReboot {
+function Get-IntersightAssignedServerMoid {
     <#
     .SYNOPSIS
-        Reboots a host so that firmware staged against its server profile activates.
+        Returns the Moid of the server a profile is assigned to, or "" if it cannot be read.
 
     .DESCRIPTION
-        The documented behaviour of a firmware policy in IMM is "install on next reboot": deploying
-        the profile stages the firmware and leaves it there until the server restarts. Reboot
-        Immediately to Activate is a way of asking Intersight to perform that restart.
+        Read from AssignedServer, falling back to AssociatedServer - which of the two carries the
+        relationship differs by how the profile was created and by appliance release, and a profile
+        that is deployed always has at least one of them.
 
-        Where the appliance does not act on that acknowledgement, this performs the restart from the
-        vCenter side instead. That is not a workaround for a broken deploy - the deploy did its job,
-        the firmware is staged - it is supplying the reboot the staged firmware is waiting for. It
-        needs no API this script cannot verify, and the run is already in exactly the right state
-        for it: the host is in Maintenance mode, evacuated, with nothing running on it.
+        Never throws. This runs after the firmware is already staged, and a lookup that fails is a
+        reason to say so and leave the blade alone, not a reason to end the run.
+    #>
+    param([Parameter(Mandatory=$true)]$ServerProfile)
 
-        The reboot is issued and left to run. Wait-BatchReconnectAfterReboot already polls for the
-        host coming back, and the host profile compliance gate still stands between it and any
-        workload.
+    foreach ($property in @('AssignedServer','AssociatedServer')) {
+        try {
+            if ($ServerProfile.PSObject.Properties.Name -notcontains $property) { continue }
+            $relationship = $ServerProfile.$property
+            if ($null -eq $relationship) { continue }
+            $moid = [string]$relationship.Moid
+            if (-not [string]::IsNullOrWhiteSpace($moid)) { return $moid }
+        }
+        catch {}
+    }
+    return ""
+}
 
-    .PARAMETER HostName
-        The ESXi host to restart.
+function Invoke-IntersightServerPowerAction {
+    <#
+    .SYNOPSIS
+        Issues a power action against a server through Intersight. Returns $true if it was sent.
 
-    .PARAMETER ServerProfileName
-        The server profile whose firmware is staged, for the messages and the summary.
+    .DESCRIPTION
+        The action goes to compute.ServerSetting, whose AdminPowerState the SDK documents as:
 
-    .PARAMETER BatchNumber
-        The batch, for the summary record.
+            Policy      - the default from the power policy
+            PowerOn     - power the server on
+            PowerOff    - power the server off
+            PowerCycle  - reset the server          <-- what activates staged firmware
+            HardReset   - hard reset the server
+            Shutdown    - shut the operating system down
+            Reboot      - reboot the IMC, NOT the server
+
+        Reboot is the trap in that list. It restarts the management controller and leaves the server
+        running, so it would look like an action was taken while the firmware stayed staged.
+
+        The ServerSetting object is found by filtering on the server's Moid. Some releases give it
+        the same Moid as the server, so that is tried as a fallback rather than giving up.
+
+        NOTHING HERE THROWS. A power action that cannot be sent is reported and returns $false; the
+        caller decides what to do, and by this point the firmware is already staged, so ending the
+        run would leave the operator worse off than telling them plainly.
     #>
     param(
-        [Parameter(Mandatory=$true)][string]$HostName,
-        [Parameter(Mandatory=$true)][string]$ServerProfileName,
+        [Parameter(Mandatory=$true)][string]$ServerMoid,
+        [Parameter(Mandatory=$true)][string]$PowerState
+    )
+
+    if ($null -eq (Get-Command -Name Set-IntersightComputeServerSetting -ErrorAction SilentlyContinue)) {
+        Write-Host "  Set-IntersightComputeServerSetting is not available in this Intersight.PowerShell version, so no power action can be sent." -ForegroundColor Yellow
+        return $false
+    }
+
+    # The GUI addresses /api/v1/compute/ServerSettings/<server moid> directly, so the setting
+    # carries the server's own Moid. That is tried first because it is what the appliance is
+    # observed to accept; the filtered lookup is the fallback for a release that separates them.
+    $settingMoid = $ServerMoid
+    try {
+        $setting = Get-IntersightResultList -Response (Get-IntersightComputeServerSetting -Moid $ServerMoid -ErrorAction Stop) | Select-Object -First 1
+        if ($null -eq $setting) {
+            $setting = Get-IntersightResultList -Response (Get-IntersightComputeServerSetting -Filter "Server.Moid eq '$ServerMoid'" -ErrorAction Stop) | Select-Object -First 1
+            if ($null -ne $setting -and -not [string]::IsNullOrWhiteSpace([string]$setting.Moid)) { $settingMoid = [string]$setting.Moid }
+        }
+    }
+    catch {
+        # Not fatal - the server Moid is still the best address to try.
+        Write-Host "  Server setting lookup for $ServerMoid did not return an object: $($_.Exception.Message)" -ForegroundColor DarkGray
+    }
+
+    if ($PowerState -eq 'Reboot') {
+        Write-Host "  WARNING: AdminPowerState 'Reboot' restarts the IMC, not the server. Staged firmware will NOT activate." -ForegroundColor Red
+        Write-Host "  Set `$Global:IntersightActivationPowerAction to 'PowerCycle' to reset the server." -ForegroundColor Red
+    }
+
+    Write-Host "  Sending $PowerState to server $ServerMoid (setting $settingMoid)." -ForegroundColor Cyan
+    try {
+        Set-IntersightComputeServerSetting -Moid $settingMoid -AdminPowerState $PowerState -ErrorAction Stop | Out-Null
+        return $true
+    }
+    catch {
+        Write-Host "  The power action was not accepted: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+}
+
+function Wait-IntersightActivationCheckIn {
+    <#
+    .SYNOPSIS
+        Pauses for a fixed period, then returns so the caller can check in again.
+
+    .DESCRIPTION
+        A firmware activation takes as long as it takes. Rather than poll on a timeout and then
+        declare failure, the run simply stands off for $Minutes and looks again - which is what an
+        operator does, and it cannot mistake "still going" for "broken".
+
+        Press C to check in immediately, or E to exit the run safely.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][int]$Minutes,
+        [Parameter(Mandatory=$true)][string]$Label
+    )
+
+    if ($Minutes -le 0) { return }
+
+    Write-Host "  Standing off for $Minutes minute(s) before checking $Label again. Press C to check now, E to exit." -ForegroundColor Cyan
+    $endTime = (Get-Date).AddMinutes($Minutes)
+    $lastAnnounced = -1
+    while ((Get-Date) -lt $endTime) {
+        $key = Read-PendingConsoleKey
+        if ($key -eq "E") { Stop-SafeExit -Message "Stopped while waiting for firmware activation." }
+        if ($key -eq "C") { Write-Host "  Checking now." -ForegroundColor Yellow; return }
+        $remaining = [int][math]::Ceiling(($endTime - (Get-Date)).TotalMinutes)
+        if ($remaining -ne $lastAnnounced) {
+            Write-Host "    $remaining minute(s) remaining..." -ForegroundColor DarkGray
+            $lastAnnounced = $remaining
+        }
+        Start-Sleep -Seconds 10
+    }
+}
+
+function Invoke-IntersightActivationPowerCycle {
+    <#
+    .SYNOPSIS
+        Power-cycles the blade through Intersight so staged firmware activates, then checks in.
+
+    .DESCRIPTION
+        Reached when the firmware has been staged - which works - and the appliance has not
+        restarted the blade on its own. Everything here is Intersight-side: the profile says which
+        server it is assigned to, and the power action goes to that server. vCenter is not involved.
+
+        After the action the run stands off for $Global:IntersightActivationWaitMinutes and looks
+        again, up to $Global:IntersightActivationMaxCheckIns times. It does not poll on a timeout
+        and it does not declare failure when the window closes - a firmware activation takes as
+        long as it takes, and "still going" is not "broken".
+
+        NOTHING HERE ENDS THE RUN. Not a server that cannot be identified, not a power action the
+        appliance declines, not an activation that is still running when the check-ins run out.
+        Every one of those is announced and recorded, and the batch carries on to the reconnect
+        wait - where the host either comes back or does not, which is the honest signal. The
+        firmware is already staged by this point; ending the run would leave the operator with a
+        blade in Maintenance mode and less information than they started with.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Row,
         [Parameter(Mandatory=$true)][string]$BatchNumber
     )
 
-    if (-not $Global:IntersightRebootHostToActivate) {
-        Write-Host "" -ForegroundColor Yellow
-        Write-Host "'$ServerProfileName' still has its firmware staged and Intersight has not restarted the blade." -ForegroundColor Yellow
-        Write-Host "This run sent Action=Deploy with ProceedOnReboot = true, which is the documented" -ForegroundColor Yellow
-        Write-Host "acknowledgement, and the appliance has not acted on it." -ForegroundColor Yellow
-        Write-Host "" -ForegroundColor Yellow
-        Write-Host "The Deploy dialog in the GUI ticks THREE boxes, and Cisco publishes the API name of" -ForegroundColor Yellow
-        Write-Host "none of them:" -ForegroundColor Yellow
-        Write-Host "  - Reboot immediately to activate" -ForegroundColor Gray
-        Write-Host "  - Deploy all associated policies whether modified or not" -ForegroundColor Gray
-        Write-Host "  - I understand that potential disruption may occur (mandatory)" -ForegroundColor Gray
-        Write-Host "To settle it, deploy one profile from the GUI with the browser's developer tools open" -ForegroundColor Yellow
-        Write-Host "(F12 > Network) and capture the PATCH to /api/v1/server/Profiles/<moid>. The request" -ForegroundColor Yellow
-        Write-Host "body names those three fields exactly, and this script can then send the same." -ForegroundColor Yellow
-        Write-Host "" -ForegroundColor Yellow
-        Write-Host "The blade is left running and untouched. Nothing has been activated." -ForegroundColor Yellow
-        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $HostName -Action "Reboot to activate" -Result "NotActivated" -Details "Intersight did not restart the blade; firmware staged on '$ServerProfileName' remains inactive."
-        Stop-WithMessage "Intersight staged the firmware for '$ServerProfileName' but did not restart the blade, so nothing activated. Capture the GUI's deploy request as described above before re-running."
-    }
-
-    # Only reached when the operator has deliberately turned the vCenter-side reboot on.
-
-    $hostObj = $null
-    try { $hostObj = Get-VMHost -Name $HostName -ErrorAction Stop } catch {
-        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $HostName -Action "Reboot to activate" -Result "Failed" -Details "Host could not be read from vCenter: $($_.Exception.Message)"
-        Stop-WithMessage "'$HostName' has firmware staged but could not be read from vCenter to reboot it: $($_.Exception.Message)"
-    }
-
-    # Only from Maintenance mode. Rebooting a host with running VMs on it to activate firmware is
-    # not something this script should ever do on its own.
-    if ($hostObj.ConnectionState -ne "Maintenance") {
-        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $HostName -Action "Reboot to activate" -Result "Failed" -Details "ConnectionState was $($hostObj.ConnectionState), not Maintenance."
-        Stop-WithMessage "'$HostName' has firmware staged but is $($hostObj.ConnectionState), not in Maintenance mode, so this run will not reboot it."
-    }
-
-    Write-Host "  Rebooting '$HostName' so the staged firmware activates." -ForegroundColor Cyan
+    $serverMoid = ""
     try {
-        Restart-VMHost -VMHost $hostObj -Confirm:$false -ErrorAction Stop | Out-Null
+        $current = $null
+        if (-not [string]::IsNullOrWhiteSpace([string]$Row.ProfileMoid)) {
+            $current = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $Row.ProfileMoid -ErrorAction Stop) | Select-Object -First 1
+        }
+        if ($null -eq $current) { $current = $Row.ServerProfileObj }
+        if ($null -ne $current) { $serverMoid = Get-IntersightAssignedServerMoid -ServerProfile $current }
     }
     catch {
-        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $HostName -Action "Reboot to activate" -Result "Failed" -Details $_.Exception.Message
-        Stop-WithMessage "Could not reboot '$HostName' to activate the staged firmware: $($_.Exception.Message)"
+        Write-Host "  Could not re-read '$($Row.ServerProfile)' to find its server: $($_.Exception.Message)" -ForegroundColor Yellow
     }
 
-    Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $HostName -Action "Reboot to activate" -Result "Sent" -Details "Rebooted from Maintenance mode so firmware staged on '$ServerProfileName' activates."
+    if ([string]::IsNullOrWhiteSpace($serverMoid)) {
+        Write-Host "  '$($Row.ServerProfile)' has firmware staged, but the server it is assigned to could not be identified." -ForegroundColor Yellow
+        Write-Host "  No power action has been sent. Reboot the blade from Intersight to activate it." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result "NoServer" -Details "AssignedServer/AssociatedServer carried no Moid; firmware staged on '$($Row.ServerProfile)' remains inactive."
+        return
+    }
+
+    $powerState = [string]$Global:IntersightActivationPowerAction
+    $sent = Invoke-IntersightServerPowerAction -ServerMoid $serverMoid -PowerState $powerState
+
+    if (-not $sent) {
+        Write-Host "  '$($Row.ServerProfile)' still has its firmware staged and no power action was accepted." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result "NotSent" -Details "$powerState was declined for server $serverMoid; firmware staged on '$($Row.ServerProfile)' remains inactive."
+        return
+    }
+
+    Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result "Sent" -Details "$powerState sent to server $serverMoid to activate firmware staged on '$($Row.ServerProfile)'."
+
+    $maxCheckIns = [math]::Max(1, [int]$Global:IntersightActivationMaxCheckIns)
+    for ($checkIn = 1; $checkIn -le $maxCheckIns; $checkIn++) {
+        Wait-IntersightActivationCheckIn -Minutes $Global:IntersightActivationWaitMinutes -Label "'$($Row.ServerProfile)'"
+
+        $state = $null
+        try {
+            $profileNow = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $Row.ProfileMoid -ErrorAction Stop) | Select-Object -First 1
+            if ($null -ne $profileNow) { $state = Get-IntersightProfileDeployState -ServerProfile $profileNow }
+        }
+        catch {
+            Write-Host "  Check-in $checkIn of ${maxCheckIns}: could not read the profile - $($_.Exception.Message)" -ForegroundColor Yellow
+            continue
+        }
+
+        if ($null -eq $state -or -not $state.StateKnown) {
+            Write-Host "  Check-in $checkIn of ${maxCheckIns}: ConfigState not readable yet." -ForegroundColor Yellow
+            continue
+        }
+
+        Write-Host "  Check-in $checkIn of ${maxCheckIns}: '$($Row.ServerProfile)' is $($state.ConfigState)." -ForegroundColor Cyan
+        if (-not $state.RequiresDeploy) {
+            Write-Host "  Activation complete - nothing is staged against '$($Row.ServerProfile)' any more." -ForegroundColor Green
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "Activated" -Details "ConfigState is $($state.ConfigState) after $checkIn check-in(s)."
+            return
+        }
+    }
+
+    # Still going, or stuck - and this run is not in a position to tell which. Say so and carry on;
+    # the reconnect wait is the next thing that will find out, and it is better placed to.
+    Write-Host "  '$($Row.ServerProfile)' is still staged after $maxCheckIns check-in(s)." -ForegroundColor Yellow
+    Write-Host "  The power action was sent, so the activation may simply still be running. Continuing" -ForegroundColor Yellow
+    Write-Host "  to the reconnect wait, which will show whether the host comes back." -ForegroundColor Yellow
+    Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "StillStaged" -Details "$powerState was sent to server $serverMoid; profile still staged after $maxCheckIns check-in(s) of $($Global:IntersightActivationWaitMinutes) minute(s)."
 }
 
 function Invoke-IntersightAcceptAndRebootImmediateForBatch {
@@ -2328,7 +2493,7 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             # which this run then supplies, because the host is already evacuated and in
             # Maintenance mode with nothing on it.
             if (-not (Confirm-IntersightDeployAccepted -Row $row -BatchNumber $BatchNumber)) {
-                Invoke-IntersightActivationReboot -HostName $row.Host -ServerProfileName $row.ServerProfile -BatchNumber $BatchNumber
+                Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber $BatchNumber
             }
         } catch {
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Failed" -Details $_.Exception.Message
