@@ -225,7 +225,21 @@
       once it passes, they are taken OUT of Maintenance mode. A host parked deliberately for an
       unrelated reason will be returned to service by this run.
       NotResponding and Disconnected hosts remain out of scope - there is nothing to drive through
-      vCenter on a host it cannot reach.
+      vCenter on a host it cannot reach. They are SET ASIDE, NOT STOPPED ON: the rest of the
+      cluster is still upgraded and the host is named in the closing report. Previously such a host
+      fell through to the manual-UCSM-target prompt and then to a hard stop on the unresolvable
+      service profile, taking every other host in the cluster with it.
+    - NOTHING THAT CANNOT BE DRIVEN ENDS THE RUN ANY MORE. A host that is unreachable, returns no
+      CDP/LLDP identity, or has no UCS service profile is set aside and the cluster carries on. The
+      manual UCSM target prompt takes SKIP as well as an address and EXIT.
+    - WHEN THE CLUSTER COMPLETES, a HOSTS REQUIRING MANUAL RECTIFICATION report is printed, listing
+      every host the run could not finish and why - set aside during discovery, compliance
+      overridden, left in Maintenance mode, firmware activation unconfirmed, still outstanding on
+      the platforms at verification, or not back in service. Hosts that were never batched are
+      called out separately as NOT UPGRADED. The report prints even when it is empty, because
+      "nothing outstanding" is a result worth stating, and every row is written to the run summary
+      CSV under the ManualAttention stage. It closes with the reminder to re-enable the two host
+      profile Security settings.
     - An Intersight profile reporting RequiresDeploy=false is the state the run is trying to reach,
       so it is carried on through rather than asked about. The run only stops for a state it could
       not READ - "nothing staged" and "could not tell" produce the same silence and must not be
@@ -266,7 +280,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "21.6.0"
+$ScriptVersion = "21.7.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -407,6 +421,16 @@ $Global:IntersightUnusable = $false
 $Global:IntersightUnusableReason = ""
 $Global:IntersightSkippedHosts = @{}
 $Global:EsxiDiscoveryCache = @{}
+
+# Hosts this run could not finish by itself, and why. Nothing here stops the run - a host that
+# cannot be driven is set aside so the REST OF THE CLUSTER STILL GETS DONE, and named at the end
+# so it is handed over rather than lost. A run that stops on the first unreachable host leaves an
+# operator with one broken host and a cluster's worth of un-upgraded ones.
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$Global:CurrentClusterName = ""
+# The subset that must not be batched at all - no service profile, no Intersight route, or not
+# reachable from vCenter. Filtered out of the candidate list alongside IntersightSkippedHosts.
+$Global:ExcludedFromRunHosts = @{}
 
 $ResourceSafetyBuffer = 0.85
 $MinimumCpuHeadroomPercentAfterBatch = 10
@@ -731,6 +755,102 @@ function Confirm-RunPrerequisites {
 
     Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "State requirements" -Result "Displayed" -Details "CSV=$IntersightCsvPath; CsvPresent=$(Test-Path $IntersightCsvPath); Intersight configured by the caller."
     $Global:PrerequisitesConfirmed = $true
+}
+
+function Add-ManualAttentionHost {
+    <#
+    .SYNOPSIS
+        Records a host this run could not finish, for the report printed when the cluster completes.
+
+    .DESCRIPTION
+        Called instead of stopping. The run carries on with every other host in the cluster and the
+        entry is printed at the end, so the operator leaves with a list to work through rather than
+        a run that halted on the first problem.
+
+        -ExcludeFromRun additionally keeps the host out of the batches. Use it when there is
+        genuinely nothing that can be driven - no CDP/LLDP identity, no service profile, or the
+        host is not reachable from vCenter. Without it, the host is still processed and the entry
+        is a note against it (an accepted override, firmware left staged, and so on).
+
+        Repeat calls for the same host and reason are collapsed, so a per-batch condition does not
+        print the same line five times.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$HostName,
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [string]$Detail = "",
+        [string]$ClusterName = "",
+        [switch]$ExcludeFromRun
+    )
+
+    # Defaults to the cluster being worked on, so no caller has to thread it through.
+    if ([string]::IsNullOrWhiteSpace($ClusterName)) { $ClusterName = [string]$Global:CurrentClusterName }
+
+    if ($ExcludeFromRun) { $Global:ExcludedFromRunHosts[$HostName] = $Reason }
+
+    $existing = @($Global:ManualAttentionHosts | Where-Object { $_.Host -eq $HostName -and $_.Reason -eq $Reason })
+    if ($existing.Count -gt 0) {
+        # Keep the latest detail - a second occurrence usually carries the more useful message.
+        if (-not [string]::IsNullOrWhiteSpace($Detail)) { $existing[0].Detail = $Detail }
+        return
+    }
+
+    $Global:ManualAttentionHosts.Add([pscustomobject]@{
+        Cluster = $ClusterName
+        Host    = $HostName
+        Reason  = $Reason
+        Detail  = $Detail
+        Excluded = [bool]$ExcludeFromRun
+    })
+}
+
+function Show-ManualAttentionReport {
+    <#
+    .SYNOPSIS
+        Prints the hosts that need a human, once the cluster is complete.
+
+    .DESCRIPTION
+        The closing hand-over. Everything the run set aside rather than stopped for is listed here
+        with the reason, so the change record does not rest on someone having watched the scroll.
+
+        Printed even when the list is empty - "nothing outstanding" is a result worth stating, and
+        a report that only appears on failure is one nobody trusts is running.
+    #>
+    param([string]$ClusterName = "")
+
+    # .ToArray(), not @(...). Wrapping a Generic.List[object] in an array subexpression throws
+    # "Argument types do not match" on this PowerShell build - and it throws AFTER the cluster has
+    # completed, which is the worst possible place to learn it. Caught by the workflow simulation.
+    $rows = $Global:ManualAttentionHosts.ToArray()
+    if (-not [string]::IsNullOrWhiteSpace($ClusterName)) {
+        $rows = @($rows | Where-Object { $_.Cluster -eq $ClusterName -or [string]::IsNullOrWhiteSpace($_.Cluster) })
+    }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "=====================================================================" -ForegroundColor Cyan
+    Write-Host " HOSTS REQUIRING MANUAL RECTIFICATION$(if ($ClusterName) { " - $ClusterName" })" -ForegroundColor Cyan
+    Write-Host "=====================================================================" -ForegroundColor Cyan
+
+    if ($rows.Count -eq 0) {
+        Write-Host "None. Every host in scope was completed by this run." -ForegroundColor Green
+    }
+    else {
+        $rows | Sort-Object Host | Select-Object Host,Reason,Detail | Format-Table -AutoSize -Wrap | Out-Host
+        Write-Host "$($rows.Count) host(s) above need attention before this change can be called complete." -ForegroundColor Yellow
+        $excluded = @($rows | Where-Object { $_.Excluded })
+        if ($excluded.Count -gt 0) {
+            Write-Host "Of those, $($excluded.Count) were never batched and have NOT been upgraded: $(($excluded | Select-Object -ExpandProperty Host | Sort-Object) -join ', ')" -ForegroundColor Yellow
+        }
+        foreach ($row in $rows) {
+            Add-SummaryRecord -Stage "ManualAttention" -Batch "" -HostName $row.Host -Action "Manual rectification required" -Result $(if ($row.Excluded) { "NotUpgraded" } else { "Outstanding" }) -Details "$($row.Reason). $($row.Detail)"
+        }
+    }
+
+    Write-Host "" -ForegroundColor Yellow
+    Write-Host "REMINDER: re-enable 'Authentication Configuration' and 'Active Directory Permission'" -ForegroundColor Yellow
+    Write-Host "under Security in the host profile now the upgrade is done. This run did not change" -ForegroundColor Yellow
+    Write-Host "them and has not put them back." -ForegroundColor Yellow
+    Write-Host "=====================================================================" -ForegroundColor Cyan
 }
 
 function Read-PendingConsoleKey {
@@ -1268,8 +1388,24 @@ function Build-InfrastructureHostMapping {
     Write-Host "STEP: Detecting supporting infrastructure per host (Intersight vs UCS Manager)." -ForegroundColor Cyan
     Write-Host "No management platform is assumed up front - CDP/LLDP identity is checked against the Intersight CSV ($IntersightCsvPath, Name column) first for every host." -ForegroundColor Cyan
 
-    $intersightRoutedRows = New-Object System.Collections.ArrayList
+    # A host vCenter cannot reach has no CDP/LLDP to read, no service profile to resolve, and
+    # nothing that can be driven through it. It is SET ASIDE, not stopped on: the rest of the
+    # cluster is still upgraded and the host is named in the manual rectification report at the end.
+    # Previously it fell through to the manual-UCSM-target prompt and then to a Stop-WithMessage on
+    # the unresolvable service profile, taking every other host in the cluster down with it.
+    $reachable = New-Object System.Collections.ArrayList
     foreach ($hostObj in $Hosts) {
+        if ($hostObj.ConnectionState -eq "Connected" -or $hostObj.ConnectionState -eq "Maintenance") {
+            [void]$reachable.Add($hostObj)
+            continue
+        }
+        Write-Host "  '$($hostObj.Name)' is $($hostObj.ConnectionState) - no CDP/LLDP can be read, so it is set aside for manual rectification. The rest of the cluster continues." -ForegroundColor Yellow
+        Add-ManualAttentionHost -HostName $hostObj.Name -Reason "Not reachable from vCenter" -Detail "ConnectionState is $($hostObj.ConnectionState). No CDP/LLDP identity could be read, so neither Intersight nor UCS Manager could be resolved. Bring the host back into vCenter and upgrade it separately." -ExcludeFromRun
+        Add-SummaryRecord -Stage "InfrastructureDetection" -Batch "" -HostName $hostObj.Name -Action "Detect infrastructure" -Result "Unreachable" -Details "ConnectionState=$($hostObj.ConnectionState); excluded from the run and listed for manual rectification."
+    }
+
+    $intersightRoutedRows = New-Object System.Collections.ArrayList
+    foreach ($hostObj in $reachable) {
         $preferred = Get-EsxiPreferredDiscovery -VMHostObject $hostObj
         $systemName = if ($null -ne $preferred) { $preferred.SystemName } else { "" }
         $match = Resolve-IntersightCsvMatch -CdpSystemName $systemName
@@ -1361,12 +1497,32 @@ function Build-InfrastructureHostMapping {
 
     $missingTargets = @($discoveryRows | Where-Object { [string]::IsNullOrWhiteSpace($_.UcsTarget) })
     if ($missingTargets.Count -gt 0) {
-        Write-Host "One or more hosts did not return a UCSM target from CDP/LLDP. Manual UCSM target is required for those hosts." -ForegroundColor Yellow
+        Write-Host "One or more hosts did not return a UCSM target from CDP/LLDP. Enter one manually, or SKIP to set the host aside and carry on with the rest of the cluster." -ForegroundColor Yellow
         foreach ($row in $missingTargets) {
-            $manual = Read-Host "Enter UCSM FQDN/IP for host $($row.Host), or type EXIT"
-            if ($manual.Trim().ToUpper() -eq "EXIT") { Stop-SafeExit -Message "Stopped during manual UCSM mapping." }
+            $manual = Read-Host "Enter UCSM FQDN/IP for host $($row.Host), or SKIP to leave it out of this run, or EXIT"
+            $answer = $manual.Trim().ToUpper()
+            if ($answer -eq "EXIT") { Stop-SafeExit -Message "Stopped during manual UCSM mapping." }
+            # SKIP sets the host aside without ending the run. One host with no CDP must not cost
+            # the operator the whole cluster.
+            if ($answer -eq "SKIP" -or $answer -eq "") {
+                Write-Host "  '$($row.Host)' set aside - it will not be batched, and is listed for manual rectification at the end." -ForegroundColor Yellow
+                Add-ManualAttentionHost -HostName $row.Host -Reason "No CDP/LLDP, no UCSM target given" -Detail "Neither CDP/LLDP nor the operator supplied a UCS Manager target, so the service profile could not be resolved. Upgrade this host separately." -ExcludeFromRun
+                Add-SummaryRecord -Stage "InfrastructureDetection" -Batch "" -HostName $row.Host -Action "Detect infrastructure" -Result "NoTarget" -Details "No CDP/LLDP and no manual UCSM target; excluded from the run."
+                continue
+            }
             $row.UcsTarget = Remove-UcsTargetDecoration -Value $manual
             $row.Discovery = "MANUAL_NO_CDP"
+        }
+        # Rebuilt rather than filtered in place: New-Object ArrayList with a piped ArgumentList
+        # binds to the wrong constructor overload and throws "Argument types do not match".
+        $keptRows = New-Object System.Collections.ArrayList
+        foreach ($discoveryRow in @($discoveryRows)) {
+            if (-not [string]::IsNullOrWhiteSpace($discoveryRow.UcsTarget)) { [void]$keptRows.Add($discoveryRow) }
+        }
+        $discoveryRows = $keptRows
+        if ($discoveryRows.Count -eq 0) {
+            Write-Host "No UCS Manager-managed host in this cluster could be resolved to a UCSM target. Continuing with the Intersight-managed hosts only." -ForegroundColor Yellow
+            return
         }
     }
 
@@ -1402,7 +1558,13 @@ function Build-InfrastructureHostMapping {
     $mappingRows = New-Object System.Collections.ArrayList
     foreach ($row in $discoveryRows) {
         $sp = Resolve-UcsServiceProfileForHost -HostName $row.Host -UcsTarget $row.UcsTarget
-        if ($null -eq $sp) { Stop-WithMessage "Could not resolve UCS service profile for host $($row.Host) in UCSM $($row.UcsTarget)." }
+        # Set aside, not stopped on. One host UCSM cannot account for must not cost the cluster.
+        if ($null -eq $sp) {
+            Write-Host "  Could not resolve a UCS service profile for '$($row.Host)' in UCSM $($row.UcsTarget) - set aside for manual rectification." -ForegroundColor Yellow
+            Add-ManualAttentionHost -HostName $row.Host -Reason "No UCS service profile" -Detail "UCSM $($row.UcsTarget) returned no service profile for this host, so no firmware policy could be applied. Check the blade's service profile association in UCS Manager." -ExcludeFromRun
+            Add-SummaryRecord -Stage "UcsMapping" -Batch "" -HostName $row.Host -Action "Resolve service profile" -Result "NotFound" -Details "UCSM $($row.UcsTarget) returned no service profile; excluded from the run."
+            continue
+        }
         $currentPolicy = Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $sp
         $mapRow = [pscustomobject]@{
             Host               = $row.Host
@@ -2343,6 +2505,7 @@ function Initialize-IntersightRoutedHosts {
 
         foreach ($hostName in $affected) {
             $Global:IntersightSkippedHosts[$hostName] = $Global:IntersightUnusableReason
+            Add-ManualAttentionHost -HostName $hostName -Reason "Intersight unusable in this session" -Detail $Global:IntersightUnusableReason
             Add-SummaryRecord -Stage "IntersightMapping" -Batch "" -HostName $hostName -Action "Exclude from run" -Result "Skipped" -Details $Global:IntersightUnusableReason
         }
         $Global:IntersightHostMap = @{}
@@ -3090,6 +3253,7 @@ function Invoke-IntersightActivationPowerCycle {
     if ([string]::IsNullOrWhiteSpace($serverMoid)) {
         Write-Host "  '$($Row.ServerProfile)' has firmware staged, but the server it is assigned to could not be identified." -ForegroundColor Yellow
         Write-Host "  No power action has been sent. Power-cycle the blade from Intersight to activate it." -ForegroundColor Yellow
+        Add-ManualAttentionHost -HostName $Row.Host -Reason "Profile not associated with a server" -Detail "Server profile '$($Row.ServerProfile)' reported no assigned server, so the staged firmware could not be activated. Check the profile association in Intersight."
         Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result "NoServer" -Details "AssignedServer/AssociatedServer carried no Moid; firmware staged on '$($Row.ServerProfile)' remains inactive."
         return
     }
@@ -3177,6 +3341,7 @@ function Invoke-IntersightActivationPowerCycle {
         # prompt is a hang, and this one runs on a jump host that may have no console at all.
         if ($choice -ne "RETRY") {
             Write-Host "  Moving on to the vCenter checks. The blade has not been power-cycled by this run." -ForegroundColor Yellow
+            Add-ManualAttentionHost -HostName $Row.Host -Reason "Firmware activation not confirmed" -Detail "Server profile '$($Row.ServerProfile)' still had changes staged when the operator chose to continue. Activate it from Intersight."
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "StillStaged" -Details "Continued after $round check(s); the firmware task had not finished and no power cycle was sent."
             return
         }
@@ -3200,6 +3365,7 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
         Write-Host "WARNING: ConfigState could not be read for $($unknownStateRows.Count) Intersight profile(s) in this batch: $(($unknownStateRows | Select-Object -ExpandProperty Host) -join ', ')" -ForegroundColor Yellow
         Write-Host "These hosts cannot be confirmed as either already-consistent or pending, so skipping them silently is not safe." -ForegroundColor Yellow
         foreach ($row in $unknownStateRows) {
+            Add-ManualAttentionHost -HostName $row.Host -Reason "Intersight ConfigState unreadable" -Detail "ConfigState could not be read on profile '$($row.ServerProfile)', so this host cannot be confirmed as either upgraded or pending."
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Warning" -Details "ConfigState unreadable on profile '$($row.ServerProfile)'."
         }
         if (-not (Test-DryRun)) {
@@ -4130,6 +4296,7 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
 
             if ($complianceChoice -eq "O") {
                 Write-Host "  OVERRIDE: '$hostName' is being returned to service without passing its host profile check." -ForegroundColor Red
+                Add-ManualAttentionHost -HostName $hostName -Reason "Host profile compliance overridden" -Detail "Returned to service reporting '$($state.Status)' against profile '$($state.ProfileName)'. $($state.Details)"
                 Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Overridden" -Details "Operator accepted '$($state.Status)' against profile '$($state.ProfileName)' after $attempt scan(s) and continued. Checked $checkedAt. $($state.Details)"
                 break
             }
@@ -4158,6 +4325,7 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
             }
             else {
                 Write-Host "  AutoExitMaintenanceMode is disabled - leaving '$hostName' in Maintenance mode." -ForegroundColor Yellow
+                Add-ManualAttentionHost -HostName $hostName -Reason "Left in Maintenance mode" -Detail "AutoExitMaintenanceMode is disabled, so this run did not return the host to service. Exit Maintenance mode in vCenter."
                 Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Skipped" -Details "AutoExitMaintenanceMode disabled."
             }
         }
@@ -4462,6 +4630,7 @@ function Reset-ClusterScopedState {
     $Global:IntersightHostMap = @{}
     $Global:IntersightProfileCache = @{}
     $Global:IntersightSkippedHosts = @{}
+    $Global:ExcludedFromRunHosts = @{}
     $Global:EsxiDiscoveryCache = @{}
     $Global:BatchActionsSent = 0
 
@@ -4686,6 +4855,15 @@ function Show-ClusterFirmwareVerification {
     }
     else {
         Write-Host "$($attention.Count) of $($rows.Count) host(s) need attention - see the Outstanding column above." -ForegroundColor Yellow
+        # Anything the platforms still report as outstanding is a manual job, so it joins the
+        # rectification list rather than living only in a table that has scrolled past.
+        foreach ($row in $attention) {
+            Add-ManualAttentionHost -HostName $row.Host -Reason "Outstanding after the change" -Detail "$($row.Platform): $($row.Outstanding). ESXi $($row.EsxiBuild) ($($row.EsxiResult))."
+        }
+    }
+    # ESXi build is checked per host above, but a host that never came back is worth its own line.
+    foreach ($row in @($rows | Where-Object { $_.Connection -ne "Connected" -and $_.Connection -ne "" })) {
+        Add-ManualAttentionHost -HostName $row.Host -Reason "Not back in service" -Detail "vCenter reports ConnectionState $($row.Connection) at the end of the run."
     }
 }
 
@@ -4742,6 +4920,7 @@ function Remove-IntersightHostsAlreadyDeployed {
 function Invoke-ClusterUpgradeWorkflow {
     param([Parameter(Mandatory=$true)]$Cluster)
     Write-Host "Selected cluster: $($Cluster.Name)" -ForegroundColor Green
+    $Global:CurrentClusterName = [string]$Cluster.Name
     Reset-ClusterScopedState
     Select-RunMode
     Select-UpgradeMode
@@ -4784,6 +4963,19 @@ function Invoke-ClusterUpgradeWorkflow {
     else {
         # ESXi-only mode should skip hosts already on the target ESXi build.
         $patchCandidateHosts = @($allClusterHosts | Where-Object { ($_.ConnectionState -eq "Connected" -or $_.ConnectionState -eq "Maintenance") -and ($alreadyTargetHosts.Name -notcontains $_.Name) })
+    }
+
+    # Hosts set aside during discovery - unreachable, no CDP/LLDP target, or no service profile.
+    # They are already recorded for the manual rectification report; here they simply leave the
+    # batches, so the rest of the cluster runs.
+    if ($Global:ExcludedFromRunHosts.Count -gt 0) {
+        $before = $patchCandidateHosts.Count
+        $patchCandidateHosts = @($patchCandidateHosts | Where-Object { -not $Global:ExcludedFromRunHosts.ContainsKey($_.Name) })
+        $removed = $before - $patchCandidateHosts.Count
+        if ($removed -gt 0) {
+            Write-Host "Set aside $removed host(s) that could not be driven by this run: $(($Global:ExcludedFromRunHosts.Keys | Sort-Object) -join ', ')" -ForegroundColor Yellow
+            Write-Host "They are listed for manual rectification when the cluster completes. Every other host continues." -ForegroundColor Yellow
+        }
     }
 
     # Hosts excluded because Intersight is unusable must not fall through to the UCS Manager path -
@@ -4997,6 +5189,7 @@ function Invoke-ClusterUpgradeWorkflow {
         }
     }
     Show-ClusterFirmwareVerification -Cluster $Cluster -HostNames @($patchCandidateHosts | Select-Object -ExpandProperty Name)
+    Show-ManualAttentionReport -ClusterName $Cluster.Name
     Add-SummaryRecord -Stage "ClusterComplete" -Batch "" -HostName "" -Action "Complete cluster" -Result "Completed" -Details $Cluster.Name
 }
 

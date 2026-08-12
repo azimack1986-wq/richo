@@ -12,6 +12,52 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [21.7.0] — 2026-08-12
+
+#### Fixed
+
+- **One host that cannot be driven no longer costs the whole cluster.** A
+  `NotResponding` or `Disconnected` host returns no CDP/LLDP, so it fell through
+  to the manual-UCSM-target prompt and then to a hard stop on the unresolvable
+  service profile — taking every other host in the cluster with it. Such a host
+  is now **set aside**, not stopped on: the rest of the cluster is upgraded and
+  the host is named at the end.
+  The same now applies to the two other dead ends: the manual UCSM target prompt
+  accepts **SKIP** alongside an address and EXIT, and a host UCS Manager returns
+  no service profile for is set aside instead of ending the run.
+
+#### Added
+
+- **A `HOSTS REQUIRING MANUAL RECTIFICATION` report, printed when the cluster
+  completes.** Every host the run could not finish, with the reason:
+  - set aside during discovery — unreachable, no CDP/LLDP target, or no service
+    profile;
+  - host profile compliance overridden;
+  - left in Maintenance mode;
+  - firmware activation not confirmed, or the profile had no associated server;
+  - Intersight `ConfigState` unreadable;
+  - still outstanding on the platforms at post-change verification, or not back
+    in service.
+
+  Hosts that were **never batched** are called out separately as NOT UPGRADED —
+  the distinction between "needs a look" and "did not happen at all". Every row
+  is also written to the run summary CSV under a `ManualAttention` stage, so the
+  change record does not depend on someone having watched the console.
+
+  It prints even when empty — "nothing outstanding" is a result worth stating,
+  and a report that only appears on failure is one nobody trusts is running — and
+  closes with the reminder to re-enable the two host profile Security settings.
+
+#### Fixed (found by the workflow simulation, not by reasoning)
+
+- `@($list)` on a `Generic.List[object]` throws *"Argument types do not match"*
+  on this PowerShell build. The closing report used it, so it would have thrown
+  **after the cluster had completed** — the worst place to learn it. Now
+  `.ToArray()`.
+- `New-Object System.Collections.ArrayList` with a piped `ArgumentList` binds to
+  the wrong constructor overload and throws the same error. The discovery-row
+  rebuild is now an explicit loop.
+
 ### [21.6.0] — 2026-08-12
 
 #### Fixed
@@ -1630,6 +1676,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [21.7.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 21.7.0 — an undrivable host is
+set aside rather than stopping the cluster, and the run closes with a list of
+hosts requiring manual rectification. This is the build to run.
 
 ### [21.6.0-preauth] — 2026-08-12
 

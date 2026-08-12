@@ -88,6 +88,9 @@ $Global:IntersightReadyChecked          = $false
 $Global:IntersightUnusable              = $false
 $Global:IntersightUnusableReason        = ''
 $Global:IntersightSkippedHosts          = @{}
+$Global:ManualAttentionHosts            = New-Object System.Collections.Generic.List[object]
+$Global:ExcludedFromRunHosts            = @{}
+$Global:CurrentClusterName              = 'TestCluster'
 $Global:IntersightServerList            = @{}
 $Global:IntersightHostMap               = @{}
 $Global:IntersightProfileCache          = @{}
@@ -345,6 +348,8 @@ function Reset-Simulation {
     $script:UcsAcked = New-Object System.Collections.Generic.HashSet[string]
     $script:IntersightDeployed = New-Object System.Collections.Generic.HashSet[string]
     $script:DeployActionParams = New-Object System.Collections.Generic.List[string]
+    $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+    $Global:ExcludedFromRunHosts = @{}
 }
 
 Write-Host "`n=== The script loads ===" -ForegroundColor Cyan
@@ -566,6 +571,73 @@ $stale = @($Global:RunSummary | Where-Object { $_.Stage -eq 'PostChangeVerificat
 Assert-True "the mismatch is flagged" ($stale[0].Result -eq 'Attention') "got $($stale[0].Result)"
 Assert-True "and names both versions" ($stale[0].Details -match 'VERSION MISMATCH - running 4\.3\(6h\), expected 6\.0\(2d\)') "got: $($stale[0].Details)"
 $script:UcsRunningVersion = '6.0(2d)'
+
+Write-Host "`n=== An unreachable host does not cost the cluster ===" -ForegroundColor Cyan
+# The live shape of this: a host is NotResponding, so it returns no CDP/LLDP. It used to fall
+# through to the manual-UCSM-target prompt and then to a Stop-WithMessage on the unresolvable
+# service profile - taking every other host in the cluster down with it. It must now be set aside,
+# with the rest of the cluster still upgraded, and named at the end.
+$script:HostState['esx05.dpe.example'] = [pscustomobject]@{
+    Name = 'esx05.dpe.example'; ConnectionState = 'NotResponding'; PowerState = 'PoweredOn'
+    Build = '20000000'; Id = "HostSystem-host-5"
+    CpuTotalMhz = 100000; CpuUsageMhz = 20000
+    MemoryTotalGB = 512;  MemoryUsageGB = 100
+}
+$script:HostState['esx05.dpe.example'] | Add-Member -NotePropertyName ExtensionData -NotePropertyValue ([pscustomobject]@{
+    Runtime = [pscustomobject]@{ BootTime = '2026-08-01T00:00:00Z' } }) -Force
+
+function Read-Host {
+    param([string]$Prompt)
+    $script:PromptLog.Add($Prompt)
+    if ($script:PromptLog.Count -gt $script:MaxPrompts) { throw "Prompt limit exceeded: '$Prompt'" }
+    # A prompt for a manual UCSM target for the unreachable host would mean it reached discovery at
+    # all, which is the defect. Fail loudly rather than answering it.
+    if ($Prompt -match 'esx05') { throw "esx05 is unreachable and must never be asked about: '$Prompt'" }
+    switch -Regex ($Prompt) {
+        'Select run mode'              { return '1' }
+        'Select upgrade mode'          { return '2' }
+        'Select batch mode'            { return '1' }
+        'Create host firmware package' { return 'CREATE' }
+        'Reconnect incomplete'         { return 'OVERRIDE' }
+        default                        { return 'CONTINUE' }
+    }
+}
+Reset-Simulation -Mode 'LIVE'
+# NotResponding must survive the reset that returns every other host to Connected.
+$script:HostState['esx05.dpe.example'].ConnectionState = 'NotResponding'
+$unreachableError = $null
+try { Invoke-ClusterUpgradeWorkflow -Cluster $script:Cluster 6>$null } catch { $unreachableError = $_ }
+Assert-True "the run completes despite an unreachable host" ($null -eq $unreachableError) "$unreachableError"
+Assert-True "the cluster still completed" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
+
+$otherHosts = @('esx01.dpe.example','esx02.dpe.example','esx03.dpe.example','esx04.dpe.example')
+$compliance = @($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' } | Select-Object -ExpandProperty Host -Unique)
+Assert-True "every other host in the cluster was still processed" (@($otherHosts | Where-Object { $compliance -notcontains $_ }).Count -eq 0) "reached: $($compliance -join ',')"
+Assert-True "the unreachable host was never batched" ($compliance -notcontains 'esx05.dpe.example')
+
+$flagged = $Global:ManualAttentionHosts.ToArray()
+Assert-True "the unreachable host is on the manual rectification list" (@($flagged | Where-Object { $_.Host -eq 'esx05.dpe.example' }).Count -ge 1) "list: $(($flagged | Select-Object -ExpandProperty Host) -join ',')"
+Assert-True "and it is marked as never upgraded, not merely noted" (@($flagged | Where-Object { $_.Host -eq 'esx05.dpe.example' -and $_.Excluded }).Count -ge 1)
+Assert-True "the reason names the connection state" (@($flagged | Where-Object { $_.Host -eq 'esx05.dpe.example' })[0].Detail -match 'NotResponding')
+Assert-True "it reached the run summary as an exclusion" (@($Global:RunSummary | Where-Object { $_.Host -eq 'esx05.dpe.example' -and $_.Result -eq 'Unreachable' }).Count -ge 1)
+
+Write-Host "`n=== The closing report lists them, and records them ===" -ForegroundColor Cyan
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+Show-ManualAttentionReport -ClusterName 'TestCluster' 6>$null
+$recorded = @($Global:RunSummary | Where-Object { $_.Stage -eq 'ManualAttention' })
+Assert-True "the report writes a summary row per host" ($recorded.Count -ge 1) "got $($recorded.Count)"
+Assert-True "an excluded host is recorded as NotUpgraded" (@($recorded | Where-Object { $_.Host -eq 'esx05.dpe.example' -and $_.Result -eq 'NotUpgraded' }).Count -eq 1)
+
+# An empty register still prints, and still says so - a report that only appears on failure is one
+# nobody trusts is running.
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+$emptyError = $null
+try { Show-ManualAttentionReport -ClusterName 'TestCluster' 6>$null } catch { $emptyError = $_ }
+Assert-True "an empty report is not an error" ($null -eq $emptyError) "$emptyError"
+Assert-True "and it writes no ManualAttention rows" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ManualAttention' }).Count -eq 0)
+
+$script:HostState.Remove('esx05.dpe.example')
 
 Write-Host "`n=== A state that cannot be read still stops to ask ===" -ForegroundColor Cyan
 # "Nothing staged" and "could not tell" look identical from the outside - no action gets sent either

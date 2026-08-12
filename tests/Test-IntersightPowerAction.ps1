@@ -35,6 +35,7 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
                                  'Get-IntersightFirmwareTaskState','Wait-IntersightActivationComplete',
                                  'Invoke-IntersightProfileActivate',
                                  'Get-IntersightProfileDeployState','Get-IntersightResultList',
+                                 'Add-ManualAttentionHost',
                                  'Read-ChoiceExit','Read-PendingConsoleKey') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
@@ -43,6 +44,11 @@ $Global:IntersightActivationPowerAction = 'PowerCycle'
 $Global:IntersightActivationWaitMinutes = 0
 $Global:IntersightActivationHoldMinutes = 0
 $Global:IntersightActivationHeldForBatch = $false
+# The manual rectification register the activation records into. Real function, real globals - a
+# host whose profile has no server must land on that list, not just fail quietly.
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$Global:ExcludedFromRunHosts = @{}
+$Global:CurrentClusterName = 'TestCluster'
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 function Add-SummaryRecord { param($Stage,$Batch,$HostName,$Action,$Result,$Details)
     $Global:RunSummary.Add([pscustomobject]@{ Stage=$Stage; Batch=$Batch; Host=$HostName; Action=$Action; Result=$Result; Details=$Details }) }
