@@ -31,9 +31,11 @@ if ($errors) { throw "parse errors" }
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in @('Get-IntersightAssignedServerMoid','Invoke-IntersightServerPowerAction',
                                  'Get-IntersightRelationshipMoid','Write-IntersightRelationshipShape',
-                                 'Invoke-IntersightActivationPowerCycle','Wait-IntersightActivationCheckIn',
+                                 'Invoke-IntersightActivationPowerCycle',
                                  'Get-IntersightFirmwareTaskState','Wait-IntersightActivationComplete',
                                  'Invoke-IntersightProfileActivate',
+                                 'ConvertTo-IntersightWorkflowStatus','Resolve-IntersightRelationshipObject',
+                                 'Get-IntersightProfileWorkflowActivity',
                                  'Get-IntersightProfileDeployState','Get-IntersightResultList',
                                  'Add-ManualAttentionHost',
                                  'Read-ChoiceExit','Read-PendingConsoleKey') } |
@@ -43,6 +45,8 @@ $Global:IntersightActionableConfigStates = @('Pending-changes','Inconsistent','O
 $Global:IntersightActivationPowerAction = 'PowerCycle'
 $Global:IntersightActivationWaitMinutes = 0
 $Global:IntersightActivationHoldMinutes = 0
+$Global:IntersightPollIntervalSeconds = 5
+$Global:IntersightActivationLastPhase = ''
 $Global:IntersightActivationHeldForBatch = $false
 # The manual rectification register the activation records into. Real function, real globals - a
 # host whose profile has no server must land on that list, not just fail quietly.
@@ -319,6 +323,149 @@ Assert-Equal "and the post-activation hold is 60 minutes" $true ($scriptText -ma
 # Raised from 40 at the operator's direction, to cover the firmware activity itself.
 Assert-Equal "and the post-reboot reconnect wait matches at 60" $true ($scriptText -match '\$FirmwareReconnectInitialWaitMinutes = 60')
 Assert-Equal "'Reboot' is called out as IMC-only" $true ($scriptText -match 'reboots the IMC, NOT the server')
+
+Write-Host "`n=== Workflow status: both of Intersight's enum families are read ===" -ForegroundColor Cyan
+# workflow.WorkflowInfo carries Status (RUNNING, WAITING, COMPLETED, TIME_OUT, FAILED) on some
+# releases and WorkflowStatus (NotStarted, InProgress, Waiting, Completed, Failed, Terminated,
+# Canceled, Paused) on others. Reading only one family is how a finished workflow reads as never
+# having started.
+foreach ($pair in @(@('RUNNING','Running'), @('WAITING','Running'), @('COMPLETED','Completed'),
+                    @('TIME_OUT','Failed'), @('FAILED','Failed'),
+                    @('NotStarted','Running'), @('InProgress','Running'), @('Paused','Running'),
+                    @('Terminated','Failed'), @('Canceled','Failed'))) {
+    Assert-Equal "'$($pair[0])' normalises to $($pair[1])" $pair[1] (ConvertTo-IntersightWorkflowStatus -Value $pair[0])
+}
+# WAITING is the state this run creates on purpose - a workflow waiting on the reboot
+# acknowledgement. Calling it a failure would abandon a healthy activation.
+Assert-Equal "WAITING is never read as a failure" $true ((ConvertTo-IntersightWorkflowStatus -Value 'WAITING') -ne 'Failed')
+Assert-Equal "an unrecognised status is Unknown, never a pass" "Unknown" (ConvertTo-IntersightWorkflowStatus -Value 'Wibble')
+Assert-Equal "an empty status is Unknown" "Unknown" (ConvertTo-IntersightWorkflowStatus -Value '')
+
+Write-Host "`n=== RunningWorkflows is read through the relationship wrapper ===" -ForegroundColor Cyan
+# Same generated oneOf wrapper that hid the Moids hides the whole WorkflowInfo behind
+# ActualInstance. Reading .Status off the wrapper returns nothing, which is indistinguishable
+# from "no workflow is running" - and that is the failure mode this guards.
+$script:Workflows = @()
+$script:ExpandSupported = $true
+$script:HasWorkflowProperty = $true
+function Get-IntersightServerProfile {
+    param($Moid,$Filter,$Expand,$ErrorAction)
+    $index = [Math]::Min($script:Reads, $script:States.Count - 1)
+    $script:Reads++
+    $obj = [pscustomobject]@{
+        Name = 'sp-esx01'; Moid = 'moid-1'
+        AssignedServer = [pscustomobject]@{ Moid = $script:ServerMoid }
+        ConfigContext = [pscustomobject]@{ ConfigState = $script:States[$index] }
+    }
+    if ($Expand -and -not $script:ExpandSupported) { throw "\$expand is not supported on this release" }
+    if ($script:HasWorkflowProperty) {
+        $value = if ($Expand) { $script:Workflows } else { @($script:Workflows | ForEach-Object { [pscustomobject]@{ Moid = 'wf-1' } }) }
+        $obj | Add-Member -NotePropertyName RunningWorkflows -NotePropertyValue $value -Force
+    }
+    return $obj
+}
+function New-Wf { param($Status,$WorkflowStatus,$Name,$Progress)
+    $inner = [pscustomobject]@{ Name = $Name; Progress = $Progress }
+    if ($null -ne $Status) { $inner | Add-Member -NotePropertyName Status -NotePropertyValue $Status -Force }
+    if ($null -ne $WorkflowStatus) { $inner | Add-Member -NotePropertyName WorkflowStatus -NotePropertyValue $WorkflowStatus -Force }
+    return [pscustomobject]@{ ActualInstance = $inner } }
+
+$script:Workflows = @((New-Wf -Status 'RUNNING' -Name 'Deploy Server Profile' -Progress 45))
+$a = Get-IntersightProfileWorkflowActivity -ProfileMoid 'moid-1'
+Assert-Equal "a running workflow is seen through the wrapper" $true $a.Running
+Assert-Equal "its name is read" "Deploy Server Profile" $a.Name
+Assert-Equal "and its progress" 45 $a.Progress
+
+$script:Workflows = @((New-Wf -WorkflowStatus 'InProgress' -Name 'Activate' -Progress 10))
+Assert-Equal "the WorkflowStatus family is read too" $true (Get-IntersightProfileWorkflowActivity -ProfileMoid 'moid-1').Running
+
+$script:Workflows = @()
+$b = Get-IntersightProfileWorkflowActivity -ProfileMoid 'moid-1'
+Assert-Equal "an empty RunningWorkflows means nothing is running" $false $b.Running
+Assert-Equal "and that is a known answer, not a guess" $true $b.Known
+Assert-Equal "reported as Completed" "Completed" $b.Status
+
+$script:Workflows = @((New-Wf -Status 'FAILED' -Name 'Deploy Server Profile' -Progress 60))
+$c = Get-IntersightProfileWorkflowActivity -ProfileMoid 'moid-1'
+Assert-Equal "a failed workflow is surfaced as Failed" $true $c.Failed
+Assert-Equal "not as still-running" $false $c.Running
+
+# An expanded entry whose status will not read is still IN the RunningWorkflows list, so it is
+# running. Reading it as Unknown and moving on would end the wait early.
+$script:Workflows = @([pscustomobject]@{ ActualInstance = [pscustomobject]@{ Name = 'Mystery' } })
+Assert-Equal "an unreadable status on a listed workflow still counts as running" $true (Get-IntersightProfileWorkflowActivity -ProfileMoid 'moid-1').Running
+
+# Older appliance: no $expand. The MoRefs carry no status, but their presence is the answer.
+$script:ExpandSupported = $false
+$script:Workflows = @((New-Wf -Status 'RUNNING' -Name 'Deploy' -Progress 5))
+$d = Get-IntersightProfileWorkflowActivity -ProfileMoid 'moid-1'
+Assert-Equal "without expand, a non-empty RunningWorkflows still means running" $true $d.Running
+Assert-Equal "and it says the status was not expanded" $true ($d.Detail -match 'not expanded')
+$script:ExpandSupported = $true
+
+# A profile that does not report the property at all is UNKNOWN - never "nothing is running".
+$script:HasWorkflowProperty = $false
+$e = Get-IntersightProfileWorkflowActivity -ProfileMoid 'moid-1'
+Assert-Equal "a profile with no RunningWorkflows property is Unknown, not idle" $false $e.Known
+Assert-Equal "and is not reported as running either" $false $e.Running
+$script:HasWorkflowProperty = $true
+
+Assert-Equal "no profile Moid yields a known-nothing result" $false (Get-IntersightProfileWorkflowActivity -ProfileMoid '').Known
+
+Write-Host "`n=== The wait follows the work, and the timer is only a ceiling ===" -ForegroundColor Cyan
+# A fake clock so the ceiling cases do not sit here for real minutes. Start-Sleep advances it.
+$script:FakeNow = [datetime]'2026-08-12T00:00:00'
+function Get-Date { param($Format,$Date,$UFormat) if ($Format) { return $script:FakeNow.ToString($Format) }; return $script:FakeNow }
+function Start-Sleep { param($Seconds,$Milliseconds) $script:FakeNow = $script:FakeNow.AddSeconds([double]$Seconds) }
+$Global:IntersightPollIntervalSeconds = 30
+
+# THE KEY NEW BEHAVIOUR. The firmware task is finished and the profile has settled - the old logic
+# would have called that complete. A workflow still running means it is not.
+$script:Workflows = @((New-Wf -Status 'RUNNING' -Name 'Deploy Server Profile' -Progress 70))
+$script:States = @('Associated'); $script:Reads = 0
+$script:TaskStates = @('Completed'); $script:TaskReads = 0
+Assert-Equal "a running workflow keeps the wait alive even when everything else is clear" $false (Wait-IntersightActivationComplete -ProfileMoid 'moid-1' -ServerMoid 'server-abc' -Label 'test' -MaxMinutes 2 6>$null)
+Assert-Equal "and the phase names the workflow, not a countdown" $true ($Global:IntersightActivationLastPhase -match "Deploy Server Profile")
+
+# A failed workflow stops the wait at once - there is nothing to be gained from holding an hour
+# for something the engine has given up on.
+$script:Workflows = @((New-Wf -Status 'FAILED' -Name 'Deploy Server Profile' -Progress 70))
+$script:FakeNow = [datetime]'2026-08-12T00:00:00'
+$before = $script:FakeNow
+Assert-Equal "a failed workflow ends the wait immediately" $false (Wait-IntersightActivationComplete -ProfileMoid 'moid-1' -ServerMoid 'server-abc' -Label 'test' -MaxMinutes 60 6>$null)
+Assert-Equal "without burning the ceiling" $true (($script:FakeNow - $before).TotalMinutes -lt 2)
+Assert-Equal "and it says which workflow failed" $true ($Global:IntersightActivationLastPhase -match 'Deploy Server Profile')
+
+# All three clear: complete, straight away, however large the ceiling.
+$script:Workflows = @()
+$script:States = @('Associated'); $script:Reads = 0
+$script:TaskStates = @('Completed'); $script:TaskReads = 0
+$script:FakeNow = [datetime]'2026-08-12T00:00:00'
+$before = $script:FakeNow
+Assert-Equal "all three signals clear means complete" $true (Wait-IntersightActivationComplete -ProfileMoid 'moid-1' -ServerMoid 'server-abc' -Label 'test' -MaxMinutes 60 6>$null)
+Assert-Equal "and it returns without waiting out the ceiling" $true (($script:FakeNow - $before).TotalMinutes -lt 2)
+
+# The firmware upgrade alone is enough to keep waiting.
+$script:Workflows = @()
+$script:States = @('Associated'); $script:Reads = 0
+$script:TaskStates = @('InProgress'); $script:TaskReads = 0
+Assert-Equal "an upgrade in progress keeps the wait alive" $false (Wait-IntersightActivationComplete -ProfileMoid 'moid-1' -ServerMoid 'server-abc' -Label 'test' -MaxMinutes 2 6>$null)
+Assert-Equal "and the phase says so" $true ($Global:IntersightActivationLastPhase -match 'firmware upgrade')
+
+# So is the profile still being staged.
+$script:TaskStates = @('Completed'); $script:TaskReads = 0
+$script:States = @('Pending-changes'); $script:Reads = 0
+Assert-Equal "a profile still pending keeps the wait alive" $false (Wait-IntersightActivationComplete -ProfileMoid 'moid-1' -ServerMoid 'server-abc' -Label 'test' -MaxMinutes 2 6>$null)
+Assert-Equal "and the phase names the ConfigState" $true ($Global:IntersightActivationLastPhase -match 'Pending-changes')
+
+Write-Host "`n=== The settings are ceilings and a poll interval, not a fixed sleep ===" -ForegroundColor Cyan
+$pollText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "a poll interval is configured" $true ($pollText -match '\$Global:IntersightPollIntervalSeconds = \d+')
+Assert-Equal "the timers are documented as ceilings" $true ($pollText -match 'CEILINGS, NOT TIMERS')
+# The fixed stand-off is gone. Its whole purpose was to sleep instead of asking.
+Assert-Equal "the fixed stand-off function no longer exists" $true (-not ($pollText -match 'function Wait-IntersightActivationCheckIn'))
+Assert-Equal "the wait reads the workflow engine" $true ($pollText -match 'Get-IntersightProfileWorkflowActivity')
+Assert-Equal "through the profile's RunningWorkflows" $true ($pollText -match "Expand 'RunningWorkflows'")
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

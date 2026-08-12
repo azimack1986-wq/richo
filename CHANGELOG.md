@@ -12,6 +12,67 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [21.8.0] — 2026-08-12
+
+The 60-minute waits are gone as a *mechanism*. Progress through the activation is
+now driven by what Intersight reports, phase by phase, and the run moves on the
+moment the work is done — five minutes or fifty.
+
+#### Added
+
+- **The workflow engine is polled.** Per the Intersight SDK, `server.Profile`
+  carries `RunningWorkflows` — *"the WorkflowInfos in the workflow engine that are
+  running for this server Profile"*. Read with `-Expand RunningWorkflows`, that
+  gives the deploy/activate workflow by **name, status and percentage complete**,
+  so the console shows `workflow 'Deploy Server Profile' is running - 45%
+  complete` instead of a countdown.
+- **Both of Cisco's status enum families are read.** `workflow.WorkflowInfo`
+  exposes `Status` (`RUNNING`, `WAITING`, `COMPLETED`, `TIME_OUT`, `FAILED`) on
+  some releases and `WorkflowStatus` (`NotStarted`, `InProgress`, `Waiting`,
+  `Completed`, `Failed`, `Terminated`, `Canceled`, `Paused`) on others. Reading
+  one family only is how a finished workflow reads as never having started, so
+  both are normalised, separators stripped — `TIME_OUT` and `TimedOut` land in
+  the same place.
+  `WAITING` and `Paused` normalise to **Running, not Failed**: a workflow waiting
+  on a reboot acknowledgement is the state this run creates on purpose.
+- **A failed workflow stops the wait immediately.** `Failed`, `Terminated` and
+  `TimedOut` end it there and then, naming the workflow. There is nothing to gain
+  from holding another hour for something the engine has given up on.
+- `$Global:IntersightPollIntervalSeconds` (default 30).
+
+#### Changed
+
+- **`Wait-IntersightActivationComplete` now checks three signals**, and names the
+  phase from the first one still busy:
+  1. the workflow engine (`RunningWorkflows`);
+  2. the firmware upgrade (`firmware/Upgrades` with `Status eq 'IN_PROGRESS'`, the
+     GUI's own query);
+  3. the profile's `ConfigState`.
+
+  Complete means **all three** agree. Any one still busy keeps the wait alive —
+  which is the substantive fix: a finished firmware task and a settled profile
+  used to be enough, so a still-running deploy workflow could be walked past.
+- **`IntersightActivationWaitMinutes` and `IntersightActivationHoldMinutes` are
+  ceilings, not sleeps.** Reaching one is not a failure; it hands the decision
+  back to the operator, and the summary records the phase it gave up in rather
+  than a bare "not activated".
+- **The fixed stand-off between retries is gone.** `Wait-IntersightActivationCheckIn`
+  slept 60 minutes and then looked once. It has been deleted; the retry path polls
+  instead. A round where `Activate` is refused now polls anyway — the appliance may
+  already be doing the work, in which case there is nothing to re-send and
+  everything to wait for.
+- **vCenter is polled straight after**, with no fixed pre-wait, because Intersight
+  has already reported the reboot complete. That path already existed
+  (`IntersightActivationHeldForBatch`); it now triggers off a confirmed completion
+  rather than an elapsed timer.
+
+#### Unchanged
+
+An unreadable signal is still never read as completion. If the workflow engine
+will not answer, the firmware task and `ConfigState` must still both agree before
+the wait returns true — and a profile that does not report `RunningWorkflows` at
+all is `Known=$false`, not "nothing is running".
+
 ### [21.7.0] — 2026-08-12
 
 #### Fixed
@@ -1676,6 +1737,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [21.8.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 21.8.0 — the activation is
+driven by polled Intersight workflow, upgrade and profile state; the 60-minute
+values are ceilings, not sleeps. This is the build to run.
 
 ### [21.7.0-preauth] — 2026-08-12
 

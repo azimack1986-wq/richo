@@ -228,6 +228,25 @@
       after accepting the change, and the cluster health check that follows fails on any host still
       in Maintenance - which stopped the run one host in, having actually succeeded. The run now
       waits up to $ExitMaintenanceTimeoutMinutes for the transition to land.
+    - THE ACTIVATION IS DRIVEN BY WHAT INTERSIGHT REPORTS, NOT BY A CLOCK. After the deploy is
+      sent, the run polls three signals every $Global:IntersightPollIntervalSeconds and moves on the
+      moment all three are clear - five minutes or fifty:
+        1. server.Profile.RunningWorkflows, expanded. Per the Intersight SDK this is "the
+           WorkflowInfos in the workflow engine that are running for this server Profile", so the
+           deploy and activation are watched as they happen, by name and percentage complete.
+           Both status enums are read - Status (RUNNING/WAITING/COMPLETED/TIME_OUT/FAILED) and
+           WorkflowStatus (NotStarted/InProgress/Waiting/Completed/Failed/Terminated/Canceled/
+           Paused) - because which one an appliance populates depends on its release.
+        2. firmware/Upgrades for the server with Status eq 'IN_PROGRESS', the GUI's own query.
+        3. The profile's ConfigState no longer requiring a deploy.
+      A workflow that ends Failed, Terminated or TimedOut stops the wait at once - there is nothing
+      to gain from holding an hour for something the engine has given up on. An unreadable signal
+      is never read as completion.
+      $Global:IntersightActivationWaitMinutes and $Global:IntersightActivationHoldMinutes are now
+      CEILINGS on how long it keeps asking before handing the decision back to the operator, not
+      fixed sleeps. Reaching one is not a failure.
+      vCenter is then polled for the host's return, starting immediately, because Intersight has
+      already said the reboot completed - the fixed post-reboot wait is skipped for these hosts.
     - HOSTS ALREADY IN MAINTENANCE MODE ARE IN SCOPE, for both the Intersight and the UCS Manager
       paths. They were previously skipped for being not-Connected, which quietly left them on old
       firmware while the run reported the cluster complete. They are now taken FIRST - being already
@@ -351,7 +370,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "21.7.0-preauth"
+$ScriptVersion = "21.8.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -435,14 +454,22 @@ $Global:IntersightDeployAcceptedTimeoutSeconds = 180
 # management controller and leaves the server running, so it looks like something happened.
 $Global:IntersightActivationPowerAction = 'PowerCycle'
 
-# After the power action the run stands off for this long and then looks again, rather than
-# polling on a timeout. A firmware activation takes as long as it takes, and a run that treats a
-# closed window as a failure is wrong more often than it is right.
-# 60, raised from 40 at the operator's direction to cover the firmware activity.
+# CEILINGS, NOT TIMERS. Progress through the activation is driven by what Intersight reports -
+# the deploy workflow, then the firmware upgrade, then the profile state - and the run moves on the
+# moment all three are clear, whether that is five minutes or fifty. These values only bound how
+# long it will keep asking before handing the decision back to the operator. A firmware activation
+# takes as long as it takes, and a run that treats a closed window as a failure is wrong more often
+# than it is right.
 $Global:IntersightActivationWaitMinutes = 60
-# How long to hold after the power cycle lands, for the activation and POST to complete. The batch
-# skips its own post-reboot wait when this one has been served, so a host is not held twice.
+# The ceiling on following an activation that has been accepted, through to the profile settling.
+# The batch skips its own post-reboot wait once this has run, so a host is not held twice.
 $Global:IntersightActivationHoldMinutes = 60
+# How often to ask Intersight during those windows. The appliance is being asked for three small
+# objects per poll, so this is cheap - but not free, and a whole batch polls in series.
+$Global:IntersightPollIntervalSeconds = 30
+# Set by the poll to whatever it was last waiting on, so a run that gives up says which stage it
+# gave up in rather than just "not activated".
+$Global:IntersightActivationLastPhase = ""
 
 # There is no cap on the number of retries. After each check the operator is asked RETRY or
 # CONTINUE, so the run waits exactly as long as they want it to and never decides on its own that
@@ -2632,39 +2659,199 @@ function Invoke-IntersightServerPowerAction {
     }
 }
 
-function Wait-IntersightActivationCheckIn {
+function ConvertTo-IntersightWorkflowStatus {
     <#
     .SYNOPSIS
-        Pauses for a fixed period, then returns so the caller can check in again.
+        Normalises an Intersight workflow status string to Running, Completed, Failed or Unknown.
 
     .DESCRIPTION
-        A firmware activation takes as long as it takes. Rather than poll on a timeout and then
-        declare failure, the run simply stands off for $Minutes and looks again - which is what an
-        operator does, and it cannot mistake "still going" for "broken".
+        There are TWO enum families in the field, and which one an appliance reports depends on its
+        release. Per the Intersight SDK models:
 
-        Press C to check in immediately, or E to exit the run safely.
+          workflow.WorkflowInfo.Status          RUNNING, WAITING, COMPLETED, TIME_OUT, FAILED
+          workflow.WorkflowInfo.WorkflowStatus  NotStarted, InProgress, Waiting, Completed, Failed,
+                                                Terminated, Canceled, Paused
+
+        Reading only one of them is how a run ends up treating a finished workflow as never having
+        started. Both are accepted here, matched case-insensitively with separators stripped, so
+        TIME_OUT and TimedOut land in the same place.
+
+        WAITING and PAUSED are Running, not Failed. A workflow waiting on a reboot acknowledgement
+        is exactly the state this run creates on purpose - calling it a failure would abandon a
+        perfectly healthy activation.
+
+        Anything unrecognised is Unknown, never a pass. A status this script cannot read must not
+        be allowed to look like completion.
     #>
-    param(
-        [Parameter(Mandatory=$true)][int]$Minutes,
-        [Parameter(Mandatory=$true)][string]$Label
-    )
+    param($Value)
 
-    if ($Minutes -le 0) { return }
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return "Unknown" }
 
-    Write-Host "  Standing off for $Minutes minute(s) before checking $Label again. Press C to check now, E to exit." -ForegroundColor Cyan
-    $endTime = (Get-Date).AddMinutes($Minutes)
-    $lastAnnounced = -1
-    while ((Get-Date) -lt $endTime) {
-        $key = Read-PendingConsoleKey
-        if ($key -eq "E") { Stop-SafeExit -Message "Stopped while waiting for firmware activation." }
-        if ($key -eq "C") { Write-Host "  Checking now." -ForegroundColor Yellow; return }
-        $remaining = [int][math]::Ceiling(($endTime - (Get-Date)).TotalMinutes)
-        if ($remaining -ne $lastAnnounced) {
-            Write-Host "    $remaining minute(s) remaining..." -ForegroundColor DarkGray
-            $lastAnnounced = $remaining
-        }
-        Start-Sleep -Seconds 10
+    # Strip anything that is not a letter so TIME_OUT, Time-Out and TimedOut all collapse together.
+    $key = ($text.ToUpper() -replace '[^A-Z]', '')
+
+    switch ($key) {
+        'RUNNING'    { return "Running" }
+        'INPROGRESS' { return "Running" }
+        'WAITING'    { return "Running" }
+        'PAUSED'     { return "Running" }
+        'NOTSTARTED' { return "Running" }
+        'SCHEDULED'  { return "Running" }
+        'COMPLETED'  { return "Completed" }
+        'SUCCESS'    { return "Completed" }
+        'SUCCESSFUL' { return "Completed" }
+        'OK'         { return "Completed" }
+        'FAILED'     { return "Failed" }
+        'TIMEOUT'    { return "Failed" }
+        'TIMEDOUT'   { return "Failed" }
+        'TERMINATED' { return "Failed" }
+        'CANCELED'   { return "Failed" }
+        'CANCELLED'  { return "Failed" }
+        default      { return "Unknown" }
     }
+}
+
+function Resolve-IntersightRelationshipObject {
+    <#
+    .SYNOPSIS
+        Returns the object inside a relationship wrapper, or the object itself if it is not wrapped.
+
+    .DESCRIPTION
+        The same generated oneOf wrapper that hides Moids behind ActualInstance hides whole objects
+        the same way. An expanded RunningWorkflows entry is a WorkflowWorkflowInfoRelationship, and
+        its Status lives on ActualInstance - reading $_.Status straight off the wrapper returns
+        nothing at all, which is indistinguishable from "no workflow is running".
+    #>
+    param($Relationship)
+
+    $current = $Relationship
+    for ($depth = 0; $depth -lt 3; $depth++) {
+        if ($null -eq $current) { return $null }
+        $hasActual = $false
+        try { $hasActual = ($current.PSObject.Properties.Name -contains 'ActualInstance') -and ($null -ne $current.ActualInstance) } catch {}
+        if (-not $hasActual) { return $current }
+        $current = $current.ActualInstance
+    }
+    return $current
+}
+
+function Get-IntersightProfileWorkflowActivity {
+    <#
+    .SYNOPSIS
+        What the workflow engine is currently doing for a server profile.
+
+    .DESCRIPTION
+        This is the signal that lets the run wait on ACTIONS rather than on a clock. Per the
+        Intersight SDK, server.Profile carries RunningWorkflows - "The WorkflowInfos in the workflow
+        engine that are running for this server Profile" - so the deploy and the activation can be
+        watched as they happen instead of being guessed at from a timer.
+
+        Two routes, in order:
+
+          1. The profile re-read with -Expand RunningWorkflows. Gives the workflow's name, status
+             and percentage complete, so the operator sees "Deploy 45%" rather than "still waiting".
+          2. The profile re-read without -Expand. The relationship is then just a MoRef, but its
+             PRESENCE is still the answer: the field is named RunningWorkflows, so a non-empty list
+             means the engine is busy. Status is reported as Running with no detail.
+
+        Returns Known=$false when neither route answered. That is NOT "nothing is running" - the
+        caller must fall back to the firmware task and ConfigState rather than treating an
+        unreadable engine as an idle one.
+
+        A workflow that ended Failed or TimedOut is surfaced as Failed so the run can stop waiting
+        for something that is never going to finish.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$ProfileMoid)
+
+    $result = [pscustomobject]@{
+        Known = $false; Running = $false; Failed = $false
+        Status = "Unknown"; Name = ""; Progress = $null; Count = 0; Detail = ""
+    }
+
+    if ([string]::IsNullOrWhiteSpace($ProfileMoid)) {
+        $result.Detail = "No profile Moid to read."
+        return $result
+    }
+
+    $entries = @()
+    $expanded = $false
+
+    foreach ($useExpand in @($true, $false)) {
+        try {
+            $response = if ($useExpand) { Get-IntersightServerProfile -Moid $ProfileMoid -Expand 'RunningWorkflows' -ErrorAction Stop }
+                        else            { Get-IntersightServerProfile -Moid $ProfileMoid -ErrorAction Stop }
+            $profileNow = Get-IntersightResultList -Response $response | Select-Object -First 1
+            if ($null -eq $profileNow) { continue }
+            if ($profileNow.PSObject.Properties.Name -notcontains 'RunningWorkflows') { continue }
+
+            $result.Known = $true
+            $expanded = $useExpand
+            $entries = @($profileNow.RunningWorkflows | Where-Object { $null -ne $_ })
+            break
+        }
+        catch {
+            $result.Detail = $_.Exception.Message
+        }
+    }
+
+    if (-not $result.Known) {
+        if ([string]::IsNullOrWhiteSpace($result.Detail)) { $result.Detail = "The profile did not report RunningWorkflows." }
+        return $result
+    }
+
+    $result.Count = $entries.Count
+    if ($entries.Count -eq 0) {
+        $result.Status = "Completed"
+        $result.Detail = "No workflow is running for this profile."
+        return $result
+    }
+
+    # Unexpanded: the list is MoRefs only. Its presence is the answer.
+    if (-not $expanded) {
+        $result.Running = $true
+        $result.Status = "Running"
+        $result.Detail = "$($entries.Count) workflow(s) running (status not expanded)."
+        return $result
+    }
+
+    $statuses = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in $entries) {
+        $workflow = Resolve-IntersightRelationshipObject -Relationship $entry
+        if ($null -eq $workflow) { continue }
+
+        $raw = ""
+        foreach ($property in @('Status','WorkflowStatus')) {
+            try {
+                if ($workflow.PSObject.Properties.Name -contains $property -and -not [string]::IsNullOrWhiteSpace([string]$workflow.$property)) {
+                    $raw = [string]$workflow.$property
+                    break
+                }
+            } catch {}
+        }
+
+        $normalised = ConvertTo-IntersightWorkflowStatus -Value $raw
+        # An expanded entry with no readable status is still a running workflow - it is in the
+        # RunningWorkflows list. Reading it as Unknown and moving on would end the wait early.
+        if ($normalised -eq "Unknown") { $normalised = "Running" }
+        [void]$statuses.Add($normalised)
+
+        if ([string]::IsNullOrWhiteSpace($result.Name)) {
+            try { $result.Name = [string]$workflow.Name } catch {}
+        }
+        try {
+            if ($workflow.PSObject.Properties.Name -contains 'Progress' -and $null -ne $workflow.Progress) {
+                $result.Progress = [double]$workflow.Progress
+            }
+        } catch {}
+    }
+
+    if ($statuses -contains "Failed")  { $result.Failed = $true;  $result.Status = "Failed" }
+    elseif ($statuses -contains "Running") { $result.Running = $true; $result.Status = "Running" }
+    else { $result.Status = "Completed" }
+
+    $result.Detail = "$($entries.Count) workflow(s): $(($statuses | Sort-Object -Unique) -join ', ')."
+    return $result
 }
 
 function Get-IntersightFirmwareTaskState {
@@ -2716,18 +2903,36 @@ function Get-IntersightFirmwareTaskState {
 function Wait-IntersightActivationComplete {
     <#
     .SYNOPSIS
-        Holds after a power cycle, polling Intersight, and returns as soon as the task completes.
+        Follows the deploy and activation through to completion by POLLING INTERSIGHT, not by
+        waiting out a clock.
 
     .DESCRIPTION
-        A fixed sleep is the wrong shape here. The blade restarts, the firmware activates, and the
-        task finishes - and how long that takes varies. So the hold polls: every minute it asks
-        Intersight whether the profile has stopped requiring a deploy and whether the firmware task
-        has finished, and returns the moment both say yes.
+        THE TIMER IS A CEILING, NOT THE MECHANISM. Progress is driven by what Intersight reports,
+        in the order the appliance actually does the work, and the run moves on the moment the work
+        is done - five minutes or fifty.
 
-        $MaxMinutes is a ceiling, not a target. Reaching it is not a failure - the caller carries
-        on to the vCenter checks either way, and the host either comes back or does not.
+        Three signals are read on every poll, and the first one that is still busy names the phase:
 
-        Press C to stop holding and move on, E to exit. Never throws except on E.
+          1. THE WORKFLOW. server.Profile.RunningWorkflows, expanded, gives the deploy/activate
+             workflow's name, status and percentage complete. This is the authoritative "the task
+             is running" answer and it is read first.
+          2. THE FIRMWARE UPGRADE. firmware/Upgrades for this server with Status eq 'IN_PROGRESS' -
+             the same query the GUI issues while it watches an upgrade.
+          3. THE PROFILE STATE. ConfigState no longer requiring a deploy is the end condition; the
+             other two going quiet while the profile is still pending means the work is not done.
+
+        Complete means ALL THREE agree: no workflow running, no upgrade in progress, and nothing
+        staged on the profile. Any one of them still busy keeps the wait alive.
+
+        A workflow that ends Failed, Terminated or TimedOut stops the wait immediately. There is
+        nothing to be gained from holding another 40 minutes for something the engine has already
+        given up on, and the operator is told which workflow it was.
+
+        An unreadable signal is never read as completion. If the workflow engine will not answer,
+        the firmware task and ConfigState still have to agree before this returns true.
+
+        $MaxMinutes is the ceiling. Reaching it is not a failure - the caller decides what to do.
+        Press C to stop polling and move on, E to exit. Never throws except on E.
     #>
     param(
         [Parameter(Mandatory=$true)][string]$ProfileMoid,
@@ -2736,43 +2941,97 @@ function Wait-IntersightActivationComplete {
         [Parameter(Mandatory=$true)][int]$MaxMinutes
     )
 
-    if ($MaxMinutes -le 0) { return $false }
+    $Global:IntersightActivationLastPhase = "not started"
 
-    Write-Host "  Holding up to $MaxMinutes minute(s) for $Label, polling Intersight. Press C to move on, E to exit." -ForegroundColor Cyan
+    if ($MaxMinutes -le 0) {
+        $Global:IntersightActivationLastPhase = "no polling window was allowed"
+        return $false
+    }
+
+    $intervalSeconds = [int]$Global:IntersightPollIntervalSeconds
+    if ($intervalSeconds -lt 5) { $intervalSeconds = 5 }
+
+    Write-Host "  Polling Intersight for $Label every $intervalSeconds second(s), up to $MaxMinutes minute(s). Press C to move on, E to exit." -ForegroundColor Cyan
     $endTime = (Get-Date).AddMinutes($MaxMinutes)
     $nextPoll = Get-Date
+    $lastPhase = ""
 
     while ((Get-Date) -lt $endTime) {
         $key = Read-PendingConsoleKey
-        if ($key -eq "E") { Stop-SafeExit -Message "Stopped while holding for the firmware activation." }
-        if ($key -eq "C") { Write-Host "    Moving on at the operator's request." -ForegroundColor Yellow; return $false }
+        if ($key -eq "E") { Stop-SafeExit -Message "Stopped while polling for the firmware activation." }
+        if ($key -eq "C") {
+            Write-Host "    Moving on at the operator's request." -ForegroundColor Yellow
+            $Global:IntersightActivationLastPhase = "operator moved on during: $lastPhase"
+            return $false
+        }
 
         if ((Get-Date) -ge $nextPoll) {
-            $nextPoll = (Get-Date).AddMinutes(1)
+            $nextPoll = (Get-Date).AddSeconds($intervalSeconds)
 
-            $settled = $false
+            # 1. The workflow engine.
+            $workflow = Get-IntersightProfileWorkflowActivity -ProfileMoid $ProfileMoid
+
+            if ($workflow.Failed) {
+                $failedName = if ($workflow.Name) { "'$($workflow.Name)'" } else { "the deploy workflow" }
+                Write-Host "    Intersight reports $failedName as $($workflow.Status). $($workflow.Detail)" -ForegroundColor Red
+                Write-Host "    Not waiting any longer - the workflow engine has stopped." -ForegroundColor Red
+                $Global:IntersightActivationLastPhase = "workflow $failedName ended $($workflow.Status)"
+                return $false
+            }
+
+            # 2. The firmware upgrade.
+            $taskState = Get-IntersightFirmwareTaskState -ServerMoid $ServerMoid
+
+            # 3. The profile itself.
+            $stillStaged = $false
+            $stateKnown = $false
+            $configState = "unreadable"
             try {
                 $profileNow = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $ProfileMoid -ErrorAction Stop) | Select-Object -First 1
                 if ($null -ne $profileNow) {
                     $state = Get-IntersightProfileDeployState -ServerProfile $profileNow
-                    if ($state.StateKnown -and -not $state.RequiresDeploy) { $settled = $true }
+                    $stateKnown = $state.StateKnown
+                    $configState = [string]$state.ConfigState
+                    $stillStaged = $state.RequiresDeploy
                 }
             }
             catch {}
 
-            if ($settled -and (Get-IntersightFirmwareTaskState -ServerMoid $ServerMoid) -ne "Running") {
-                Write-Host "    Activation complete - the profile has settled and no firmware task is running." -ForegroundColor Green
+            # Name the phase from the first signal that is still busy, so the operator can see
+            # which stage the change is actually in rather than a countdown.
+            $phase = ""
+            if ($workflow.Running) {
+                $progress = if ($null -ne $workflow.Progress) { " - $([int]$workflow.Progress)% complete" } else { "" }
+                $name = if ($workflow.Name) { "'$($workflow.Name)'" } else { "a deploy workflow" }
+                $phase = "workflow $name is running$progress"
+            }
+            elseif ($taskState -eq "Running") { $phase = "the firmware upgrade is in progress" }
+            elseif ($stillStaged)             { $phase = "the profile is still $configState" }
+            elseif (-not $stateKnown)         { $phase = "the profile ConfigState could not be read" }
+
+            if ([string]::IsNullOrWhiteSpace($phase)) {
+                Write-Host "    Activation complete - no workflow running, no firmware upgrade in progress, and the profile is $configState." -ForegroundColor Green
+                $Global:IntersightActivationLastPhase = "completed; profile $configState"
                 return $true
             }
 
-            $remaining = [int][math]::Ceiling(($endTime - (Get-Date)).TotalMinutes)
-            Write-Host "    Still activating. $remaining minute(s) of hold remaining." -ForegroundColor DarkGray
+            # Only announce a CHANGE of phase, plus a heartbeat, so a long deploy does not scroll
+            # the same line hundreds of times.
+            if ($phase -ne $lastPhase) {
+                Write-Host "    $($phase.Substring(0,1).ToUpper())$($phase.Substring(1))." -ForegroundColor Cyan
+                $lastPhase = $phase
+            }
+            else {
+                $remaining = [int][math]::Ceiling(($endTime - (Get-Date)).TotalMinutes)
+                Write-Host "      still going - $remaining minute(s) of the ceiling remaining." -ForegroundColor DarkGray
+            }
         }
 
-        Start-Sleep -Seconds 10
+        Start-Sleep -Seconds 5
     }
 
-    Write-Host "    Hold of $MaxMinutes minute(s) elapsed. Moving on - the vCenter checks will show whether the host came back." -ForegroundColor Yellow
+    Write-Host "    Ceiling of $MaxMinutes minute(s) reached while $lastPhase." -ForegroundColor Yellow
+    $Global:IntersightActivationLastPhase = "ceiling reached while $lastPhase"
     return $false
 }
 
@@ -2943,19 +3202,33 @@ function Invoke-IntersightActivationPowerCycle {
         }
 
         if ($outcome -eq "Sent") {
-            # Step 4. Hold for the reboot, and tell the batch loop not to hold again on top.
+            # Step 4. FOLLOW THE WORK, do not wait out a clock. The poll watches the deploy
+            # workflow, then the firmware upgrade, then the profile state, and returns the moment
+            # all three are clear. The batch loop is told it has already served the post-reboot
+            # wait, so vCenter is asked straight away rather than after another fixed window.
             Write-Host "  Activation sent." -ForegroundColor Green
             $completed = Wait-IntersightActivationComplete -ProfileMoid ([string]$Row.ProfileMoid) -ServerMoid $serverMoid -Label "the activation on '$($Row.ServerProfile)'" -MaxMinutes $Global:IntersightActivationHoldMinutes
             $Global:IntersightActivationHeldForBatch = $true
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result $(if ($completed) { "Activated" } else { "PowerCycled" }) -Details "Activation landed for server $serverMoid; held up to $($Global:IntersightActivationHoldMinutes) minute(s), completed=$completed."
-            return
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result $(if ($completed) { "Activated" } else { "PowerCycled" }) -Details "Activation landed for server $serverMoid; polled up to $($Global:IntersightActivationHoldMinutes) minute(s), completed=$completed. Last phase: $($Global:IntersightActivationLastPhase)."
+            if ($completed) { return }
+
+            # The ceiling was reached, or the workflow failed, without Intersight confirming the
+            # activation. That is the operator's call, not a silent pass.
+            Write-Host "  Intersight did not confirm the activation: $($Global:IntersightActivationLastPhase)." -ForegroundColor Yellow
+        }
+        else {
+            # Nothing was accepted. Poll anyway - the appliance may already be doing the work from
+            # the deploy, in which case there is nothing to re-send and everything to wait for.
+            $completed = Wait-IntersightActivationComplete -ProfileMoid ([string]$Row.ProfileMoid) -ServerMoid $serverMoid -Label "the activation on '$($Row.ServerProfile)'" -MaxMinutes $Global:IntersightActivationWaitMinutes
+            if ($completed) {
+                $Global:IntersightActivationHeldForBatch = $true
+                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "Activated" -Details "Activate was $outcome on check $round, but Intersight completed the work anyway. Last phase: $($Global:IntersightActivationLastPhase)."
+                return
+            }
         }
 
-        # Between checks, not before the first one.
-        Wait-IntersightActivationCheckIn -Minutes $Global:IntersightActivationWaitMinutes -Label "the firmware task on '$($Row.ServerProfile)'"
-
         Write-Host "" -ForegroundColor Yellow
-        Write-Host "'$($Row.ServerProfile)' has not activated yet." -ForegroundColor Yellow
+        Write-Host "'$($Row.ServerProfile)' has not activated yet: $($Global:IntersightActivationLastPhase)." -ForegroundColor Yellow
         Write-Host "  RETRY    - send Activate again now." -ForegroundColor Yellow
         Write-Host "  CONTINUE - stop waiting and move on to the vCenter checks." -ForegroundColor Yellow
         Write-Host "  EXIT     - stop the run here." -ForegroundColor Yellow
@@ -2970,7 +3243,7 @@ function Invoke-IntersightActivationPowerCycle {
         if ($choice -ne "RETRY") {
             Write-Host "  Moving on to the vCenter checks. The blade has not been power-cycled by this run." -ForegroundColor Yellow
             Add-ManualAttentionHost -HostName $Row.Host -Reason "Firmware activation not confirmed" -Detail "Server profile '$($Row.ServerProfile)' still had changes staged when the operator chose to continue. Activate it from Intersight."
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "StillStaged" -Details "Continued after $round check(s); the firmware task had not finished and no power cycle was sent."
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "StillStaged" -Details "Continued after $round check(s). Last phase: $($Global:IntersightActivationLastPhase)."
             return
         }
     }
