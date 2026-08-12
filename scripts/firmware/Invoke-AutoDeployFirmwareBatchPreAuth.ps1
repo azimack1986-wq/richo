@@ -133,7 +133,7 @@
                  ?$filter=(Server.Moid in ('<moid>')) and (Status eq 'IN_PROGRESS')&$select=Server
            One call, one field, and the appliance does the deciding - rows means running, none
            means finished. Nothing here interprets a free-text state string.
-        3. Still running -> stand off $Global:IntersightActivationWaitMinutes (default 40) and
+        3. Still running -> stand off $Global:IntersightActivationWaitMinutes (default 60) and
            check again, then prompt RETRY / CONTINUE / EXIT. No cap on retries.
            Finished but the profile is still staged -> send Activate again, with a server power
            cycle as the fallback if it is refused.
@@ -193,7 +193,7 @@
       the timed pre-reboot safety window (press E to abort) and the host profile compliance check on
       every rebooted host.
     - After each reboot, once the batch is confirmed back in vCenter, the run waits
-      $HostProfileComplianceSettleMinutes (default 2) and then scans every host against its attached
+      $HostProfileComplianceSettleMinutes (default 8) and then scans every host against its attached
       host profile while it is still in Maintenance mode. The wait is there because a host that has
       just re-registered reports differences that clear themselves; scanning through that window
       produces failures that are not real.
@@ -213,6 +213,17 @@
       Unknown means every route declined, and is handled like NonCompliant. It is never inferred
       from anything this script works out for itself, and the detail names each route and what it
       returned so the next run says which one to fix.
+    - COMPLIANT IS THE ONLY STATUS THAT CONTINUES ON ITS OWN. Anything else - NonCompliant,
+      Unknown, or NoProfile - halts the run with the host still in Maintenance mode and the batch
+      not advancing, and tells the operator to resolve the host profile issue manually in vCenter.
+      C continues (the host is re-checked, and once it reports Compliant it comes out of
+      Maintenance mode and the run carries on by itself), O overrides and returns the host to
+      service as it is, E exits safely. Identical in SINGLE and AUTO: SINGLE is a batch of one
+      through the same loop, so an Intersight host is gated the same way in both.
+    - BEFORE STARTING, untick 'Authentication Configuration' and 'Active Directory Permission'
+      under Security in the host profile. Left ticked, the profile does not apply cleanly to a host
+      that has just rebooted and rejoined, and the compliance gate above halts on it.
+      RE-ENABLE BOTH AFTER THE UPGRADE. This run does not change them and does not put them back.
     - Exiting Maintenance mode is confirmed, not assumed. vCenter reports the old state briefly
       after accepting the change, and the cluster health check that follows fails on any host still
       in Maintenance - which stopped the run one host in, having actually succeeded. The run now
@@ -318,7 +329,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "21.4.0-preauth"
+$ScriptVersion = "21.5.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -405,10 +416,11 @@ $Global:IntersightActivationPowerAction = 'PowerCycle'
 # After the power action the run stands off for this long and then looks again, rather than
 # polling on a timeout. A firmware activation takes as long as it takes, and a run that treats a
 # closed window as a failure is wrong more often than it is right.
-$Global:IntersightActivationWaitMinutes = 40
+# 60, raised from 40 at the operator's direction to cover the firmware activity.
+$Global:IntersightActivationWaitMinutes = 60
 # How long to hold after the power cycle lands, for the activation and POST to complete. The batch
 # skips its own post-reboot wait when this one has been served, so a host is not held twice.
-$Global:IntersightActivationHoldMinutes = 40
+$Global:IntersightActivationHoldMinutes = 60
 
 # There is no cap on the number of retries. After each check the operator is asked RETRY or
 # CONTINUE, so the run waits exactly as long as they want it to and never decides on its own that
@@ -447,16 +459,20 @@ $MinimumMemoryHeadroomPercentAfterBatch = 10
 $MaxAbsoluteBatchSize = 6
 $MaintenanceValidationTimeoutMinutes = 60
 $EsxiOnlyReconnectInitialWaitMinutes = 15
-$FirmwareReconnectInitialWaitMinutes = 40
+# Raised from 40 to 60 minutes at the operator's direction, to cover the firmware activity itself.
+$FirmwareReconnectInitialWaitMinutes = 60
 $ReconnectRetryWindowMinutes = 5
 $ReconnectCheckIntervalSeconds = 60
 
 # A host that has just re-registered with vCenter is not settled. hostd and the profile engine are
 # still starting and Auto Deploy may still be applying the answer file, so a compliance scan run in
-# that window reports differences that clear themselves a minute later. Read as real they stop the
-# batch and send an operator hunting a fault that is not there. Waited once per batch, after the
+# that window reports differences that clear themselves a few minutes later. Read as real they stop
+# the batch and send an operator hunting a fault that is not there. Waited once per batch, after the
 # reconnect gate confirms every host is back, before the first scan.
-$HostProfileComplianceSettleMinutes = 2
+#
+# Raised from 2 to 8 minutes at the operator's direction: two minutes was not covering the profile
+# engine's own work on a freshly rebooted host, so the first scan was answering too early.
+$HostProfileComplianceSettleMinutes = 8
 # Bound on waiting for a compliance check vCenter or Auto Deploy started itself to finish before
 # this run starts its own, so the scan that answers is the one whose result is acted on.
 $HostProfileComplianceScanTimeoutMinutes = 10
@@ -611,7 +627,16 @@ function Confirm-RunPrerequisites {
     Write-Host "4. Credentials to hand" -ForegroundColor Yellow
     Write-Host "     vCenter and UCS Manager, for the prompts that follow." -ForegroundColor Gray
 
-    Write-Host "5. Manual health checks and change gates" -ForegroundColor Yellow
+    Write-Host "5. Host profile - Security settings to untick BEFORE starting" -ForegroundColor Yellow
+    Write-Host "     In the host profile attached to the hosts in scope, under Security, UNTICK:" -ForegroundColor Gray
+    Write-Host "       - Authentication Configuration" -ForegroundColor Gray
+    Write-Host "       - Active Directory Permission" -ForegroundColor Gray
+    Write-Host "     Left ticked, the profile will not apply cleanly to a host that has just" -ForegroundColor Gray
+    Write-Host "     rebooted and rejoined, and the compliance gate in this run will halt on it." -ForegroundColor Gray
+    Write-Host "     RE-ENABLE BOTH AFTER THE UPGRADE IS COMPLETE. This run does not change them" -ForegroundColor Red
+    Write-Host "     and does not put them back - that is a manual step at the end of the change." -ForegroundColor Red
+
+    Write-Host "6. Manual health checks and change gates" -ForegroundColor Yellow
     Write-Host "     Completed and accepted BEFORE starting. The run does not ask again." -ForegroundColor Gray
     Write-Host "     Everything it can check itself it checks per batch - cluster health, capacity," -ForegroundColor Gray
     Write-Host "     datastore free space, host profile compliance - and stops if any of them fail." -ForegroundColor Gray
@@ -2648,10 +2673,10 @@ function Invoke-IntersightActivationPowerCycle {
           3. If Activate is refused AND no firmware task is running, fall back to a power cycle.
              A power action is genuinely refused while an upgrade is in progress, so it is only
              worth trying when one is not.
-          4. Once something lands, hold $Global:IntersightActivationHoldMinutes (default 40) for
+          4. Once something lands, hold $Global:IntersightActivationHoldMinutes (default 60) for
              the activation and POST to complete, and tell the batch loop it has already served
              that wait so the host is not held for it twice.
-          5. Otherwise stand off $Global:IntersightActivationWaitMinutes (default 40) and offer
+          5. Otherwise stand off $Global:IntersightActivationWaitMinutes (default 60) and offer
              RETRY / CONTINUE / EXIT. There is no cap: the run waits as long as the operator
              wants it to.
 
@@ -3600,14 +3625,21 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
         compliance scan is run to completion - not read from vCenter's cache - and the resulting
         status decides what happens:
 
-          Compliant    - the host is taken out of Maintenance mode and the run moves on.
-          NonCompliant - the operator is told to remediate (Auto Deploy or vCenter host profile
-                         remediation) and chooses C to re-scan, O to override, or E to exit.
-                         On C the host stays in Maintenance mode and the batch does not advance.
-          NoProfile    - nothing to test; the operator chooses SKIP or exits.
-          Unknown      - treated like NonCompliant, because an unreadable result is not a pass.
-                         A scan that could not be completed lands here too, so it can never be
-                         mistaken for a pass.
+          Compliant - the host is taken out of Maintenance mode and the run moves on by itself.
+                      This is the ONLY status that continues without asking.
+
+          ANYTHING ELSE - NonCompliant, Unknown, or NoProfile - halts the run. The host stays in
+          Maintenance mode, the batch does not advance, and the operator is told to resolve the
+          host profile issue manually in vCenter before continuing. Then:
+
+            C - continue: the issue has been resolved. The host is re-checked, and once it reports
+                Compliant it comes out of Maintenance mode and the run carries on automatically.
+                If it still is not compliant, the halt repeats.
+            O - override: accept the host as it is and return it to service.
+            E - exit safely, leaving the host in Maintenance mode.
+
+        Unknown halts for the same reason NonCompliant does: an unreadable result is not a pass,
+        and a scan that could not be completed lands there too.
 
         The override exists because a host can be held back by a difference the operator has already
         assessed and accepted, and stalling a change window on it helps nobody. It is a deliberate
@@ -3616,7 +3648,10 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
         the status that was accepted.
 
         Applies to every reboot path - UCS Manager, Intersight, and ESXi-only - since all three
-        return the host through the same Maintenance mode cycle.
+        return the host through the same Maintenance mode cycle. It also applies identically to
+        both batch modes: SINGLE is a batch of one through this same loop, and AUTO runs the same
+        per-host gate over every host in the batch, so an Intersight host is gated the same way
+        whichever mode selected it.
     #>
     param(
         [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,
@@ -3649,28 +3684,41 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
                 Write-Host "  Detail: $($state.Details)" -ForegroundColor Yellow
             }
 
+            # ANYTHING other than Compliant halts. Compliant is the only status that lets the run
+            # carry on by itself - NonCompliant, Unknown and NoProfile are all "stop and have the
+            # engineer look at it", because none of them is evidence that the profile applied.
             if ($state.Status -eq "Compliant") {
-                Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Compliant" -Details "Profile '$($state.ProfileName)' compliant after $attempt scan(s); checked $checkedAt."
+                if ($attempt -gt 1) {
+                    Write-Host "  RESOLVED: '$hostName' is now compliant with host profile '$($state.ProfileName)'." -ForegroundColor Green
+                }
+                Write-Host "  Compliant - continuing automatically." -ForegroundColor Green
+                Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Compliant" -Details "Profile '$($state.ProfileName)' compliant after $attempt scan(s); checked $checkedAt. Continued automatically."
                 break
             }
 
+            # The halt. The host stays in Maintenance mode and the batch does not advance while the
+            # engineer works on it - so nothing takes load against a profile that has not applied.
+            Write-Host "" -ForegroundColor Red
+            Write-Host "  HOST PROFILE NOT COMPLIANT - THE RUN IS PAUSED." -ForegroundColor Red
             if ($state.Status -eq "NoProfile") {
-                Write-Host "  No host profile is attached, so compliance cannot be confirmed for this host." -ForegroundColor Yellow
-                $choice = Read-ChoiceExit -Message "No host profile attached to '$hostName'. Choose SKIP to accept and continue, or EXIT" -AllowedChoices @("SKIP") -ExitMessage "Stopped at host profile compliance - no profile attached to '$hostName'."
-                if ($choice -eq "SKIP") {
-                    Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Skipped" -Details "No host profile attached; operator chose to continue."
-                    break
-                }
+                Write-Host "  No host profile is attached to '$hostName', so compliance cannot be confirmed." -ForegroundColor Yellow
+                Write-Host "  Attach the host profile in vCenter and remediate the host." -ForegroundColor Yellow
             }
-
-            Write-Host "  '$hostName' is NOT compliant with host profile '$($state.ProfileName)'." -ForegroundColor Yellow
-            Write-Host "  Remediate the host now (vCenter host profile remediation, or re-provision via Auto Deploy)." -ForegroundColor Yellow
-            Write-Host "    C - re-scan compliance once the host has been remediated. It stays in Maintenance" -ForegroundColor Yellow
-            Write-Host "        mode and this batch does not advance." -ForegroundColor Yellow
+            else {
+                Write-Host "  '$hostName' reports '$($state.Status)' against host profile '$($state.ProfileName)'." -ForegroundColor Yellow
+                Write-Host "  RESOLVE THE HOST PROFILE ISSUE MANUALLY IN vCENTER BEFORE CONTINUING:" -ForegroundColor Yellow
+                Write-Host "    - Remediate the host against its profile, or re-provision it via Auto Deploy." -ForegroundColor Yellow
+                Write-Host "    - Check the Security settings the pre-requisites asked you to untick -" -ForegroundColor Yellow
+                Write-Host "      Authentication Configuration and Active Directory Permission are the" -ForegroundColor Yellow
+                Write-Host "      usual reason a profile will not apply cleanly on a rebooted host." -ForegroundColor Yellow
+            }
+            Write-Host "  '$hostName' stays in Maintenance mode and this batch does not advance until you answer." -ForegroundColor Yellow
+            Write-Host "    C - continue: you have resolved it. The host is re-checked, and once it reports" -ForegroundColor Yellow
+            Write-Host "        Compliant it comes out of Maintenance mode and the run carries on by itself." -ForegroundColor Yellow
             Write-Host "    O - override: accept the host as it is, take it out of Maintenance mode and carry" -ForegroundColor Yellow
             Write-Host "        on. Recorded in the run summary as an override." -ForegroundColor Yellow
             Write-Host "    E - exit the run safely, leaving the host in Maintenance mode." -ForegroundColor Yellow
-            $complianceChoice = Read-ChoiceExit -Message "'$hostName' is not compliant. C to re-check, O to override and continue, E to exit" -AllowedChoices @("C","O") -ExitMessage "Stopped at host profile compliance for '$hostName'."
+            $complianceChoice = Read-ChoiceExit -Message "'$hostName' is not compliant. Resolve the host profile issue, then C to continue, O to override, E to exit" -AllowedChoices @("C","O") -ExitMessage "Stopped at host profile compliance for '$hostName'."
 
             if ($complianceChoice -eq "O") {
                 Write-Host "  OVERRIDE: '$hostName' is being returned to service without passing its host profile check." -ForegroundColor Red
@@ -3678,7 +3726,8 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
                 break
             }
 
-            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result $state.Status -Details "Attempt $attempt not compliant; operator chose to re-check."
+            Write-Host "  Re-checking '$hostName' against its host profile." -ForegroundColor Cyan
+            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result $state.Status -Details "Attempt $attempt reported '$($state.Status)'; run paused for the engineer, who chose C to continue. Re-checking."
         }
 
         # Only reached once the host is compliant, explicitly accepted with no profile attached, or

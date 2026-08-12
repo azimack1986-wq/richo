@@ -12,6 +12,52 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [21.5.0] — 2026-08-12
+
+Operator-directed changes after a clean 21.4.0 run.
+
+#### Changed
+
+- **The 40-minute waits are now 60 minutes**, to cover the firmware activity
+  itself: `IntersightActivationWaitMinutes` (the stand-off between activation
+  checks), `IntersightActivationHoldMinutes` (the hold after the activation
+  lands) and `FirmwareReconnectInitialWaitMinutes` (the post-reboot wait before
+  vCenter is asked). The third was not named in the request but is the same
+  40-minute wait on the same firmware activity, and leaving it behind would have
+  had the run start looking for a host 20 minutes before the activation window
+  it was just told to allow.
+- **The host profile compliance settle is 8 minutes, up from 2.** Two minutes
+  was not covering the profile engine's own work on a freshly rebooted host, so
+  the first scan was answering too early.
+
+#### Added
+
+- **Compliant is now the only status that continues on its own.** Anything else
+  — `NonCompliant`, `Unknown`, or `NoProfile` — halts the run with the host still
+  in Maintenance mode and the batch not advancing, and tells the operator to
+  resolve the host profile issue manually in vCenter before continuing. `C`
+  continues: the host is re-checked, and **once it reports Compliant it comes
+  out of Maintenance mode and the run carries on by itself**, with no further
+  prompts. `O` overrides and returns the host to service as it is. `E` exits
+  safely.
+  `NoProfile` previously took a `SKIP` prompt of its own; it is on the same gate
+  now, since "no profile attached" is no more evidence the profile applied than
+  `NonCompliant` is — and the engineer may simply need to attach it, which `C`
+  then re-checks.
+  Identical in SINGLE and AUTO. SINGLE is a batch of one through the same loop,
+  so an Intersight host is gated the same way whichever mode selected it — no
+  separate code path, and none needed.
+- **A pre-requisite to untick two host profile Security settings** before
+  starting: **Authentication Configuration** and **Active Directory
+  Permission**. Left ticked, the profile does not apply cleanly to a host that
+  has just rebooted and rejoined, and the compliance gate halts on it. Stated in
+  the script header and in the on-screen requirements, both of which say in as
+  many words that **both must be re-enabled after the upgrade** — the run does
+  not change them and does not put them back.
+  The compliance halt itself names the same two settings, so the engineer is not
+  left to remember a pre-requisite from the start of the run while looking at a
+  profile that will not apply.
+
 ### [21.4.0] — 2026-08-12
 
 21.3.0 deployed but never activated. A live run sat in this loop indefinitely,
@@ -1548,6 +1594,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [21.5.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 21.5.0 — 60-minute firmware
+waits, an 8-minute compliance settle, and a halt on any host profile status
+other than Compliant. This is the build to run.
 
 ### [21.4.0-preauth] — 2026-08-12
 

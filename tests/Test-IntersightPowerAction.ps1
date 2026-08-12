@@ -308,8 +308,10 @@ Assert-Equal "it reads the Intersight firmware task instead" $true ($activationT
 Write-Host "`n=== The default is PowerCycle, not Reboot ===" -ForegroundColor Cyan
 $scriptText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "the configured action resets the server" $true ($scriptText -match "\`$Global:IntersightActivationPowerAction = 'PowerCycle'")
-Assert-Equal "the stand-off is 40 minutes" $true ($scriptText -match '\$Global:IntersightActivationWaitMinutes = 40')
-Assert-Equal "and the post-power-cycle hold is 40 minutes" $true ($scriptText -match '\$Global:IntersightActivationHoldMinutes = 40')
+Assert-Equal "the stand-off is 60 minutes" $true ($scriptText -match '\$Global:IntersightActivationWaitMinutes = 60')
+Assert-Equal "and the post-activation hold is 60 minutes" $true ($scriptText -match '\$Global:IntersightActivationHoldMinutes = 60')
+# Raised from 40 at the operator's direction, to cover the firmware activity itself.
+Assert-Equal "and the post-reboot reconnect wait matches at 60" $true ($scriptText -match '\$FirmwareReconnectInitialWaitMinutes = 60')
 Assert-Equal "'Reboot' is called out as IMC-only" $true ($scriptText -match 'reboots the IMC, NOT the server')
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })

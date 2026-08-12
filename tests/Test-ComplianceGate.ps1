@@ -321,6 +321,60 @@ catch { $exited = "$_" -match 'EXIT:' }
 Assert-Equal "E stops the run" $true $exited
 Assert-Equal "and leaves the host in Maintenance mode" "Maintenance" $script:HostConnectionState
 
+Write-Host "`n=== Anything other than Compliant halts, including NoProfile ===" -ForegroundColor Cyan
+# NoProfile used to take a SKIP prompt of its own. It halts on the same C/O/E gate now, because
+# "no profile attached" is no more evidence the profile applied than NonCompliant is - and the
+# engineer may simply need to attach it, which C then re-checks.
+function Get-VMHostProfile { param($Entity,$ErrorAction) return $null }
+$script:HostConnectionState = 'Maintenance'
+$script:PromptCount = 0
+$script:StateAtPrompt = @()
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+function Read-Host { param($Prompt)
+    $script:PromptCount++
+    if ($script:PromptCount -gt 5) { throw "the NoProfile halt did not settle" }
+    $script:StateAtPrompt += $script:HostConnectionState
+    return 'O' }
+Confirm-HostProfileComplianceAndExitMaintenance -HostNames @('esx1.example') -BatchNumber '1' 6>$null
+Assert-Equal "NoProfile stops to ask rather than carrying on" 1 $script:PromptCount
+Assert-Equal "and the host was still in Maintenance mode when it asked" "Maintenance" $script:StateAtPrompt[0]
+Assert-Equal "the override releases it" "Connected" $script:HostConnectionState
+Assert-Equal "and it is recorded as an override, not a pass" "Overridden" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' })[0].Result)
+function Get-VMHostProfile { param($Entity,$ErrorAction) return [pscustomobject]@{ Name = 'HP-Prod' } }
+
+Write-Host "`n=== Unknown halts too - an unreadable result is not a pass ===" -ForegroundColor Cyan
+$script:ManagerResults = $null
+function Test-VMHostProfileCompliance { param($VMHost,$Profile,[switch]$UseCache,$ErrorAction) return $null }
+$script:HostConnectionState = 'Maintenance'
+$script:PromptCount = 0
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+function Read-Host { param($Prompt)
+    $script:PromptCount++
+    if ($script:PromptCount -gt 5) { throw "the Unknown halt did not settle" }
+    return 'O' }
+Confirm-HostProfileComplianceAndExitMaintenance -HostNames @('esx1.example') -BatchNumber '1' 6>$null
+Assert-Equal "Unknown stops to ask" 1 $script:PromptCount
+Assert-Equal "the accepted status is named as Unknown, not Compliant" $true ((@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' })[0].Details) -match 'Unknown')
+
+Write-Host "`n=== The halt names the AD settings the pre-requisites ask to untick ===" -ForegroundColor Cyan
+# A profile that will not apply on a rebooted host is nearly always these two, so the halt says so
+# rather than leaving the engineer to remember the pre-requisite from the start of the run.
+$gateText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "the halt points at Authentication Configuration" $true ($gateText -match 'Authentication Configuration')
+Assert-Equal "and at Active Directory Permission" $true ($gateText -match 'Active Directory Permission')
+Assert-Equal "the requirements say to re-enable them afterwards" $true ($gateText -match '(?i)RE-ENABLE BOTH AFTER THE UPGRADE')
+
+Write-Host "`n=== The settle is 8 minutes, and the activation waits are 60 ===" -ForegroundColor Cyan
+Assert-Equal "the compliance settle is 8 minutes" $true ($gateText -match '\$HostProfileComplianceSettleMinutes = 8')
+Assert-Equal "the activation stand-off is 60 minutes" $true ($gateText -match '\$Global:IntersightActivationWaitMinutes = 60')
+Assert-Equal "the activation hold is 60 minutes" $true ($gateText -match '\$Global:IntersightActivationHoldMinutes = 60')
+
+# Restore the compliant stub the remaining cases assume.
+function Test-VMHostProfileCompliance {
+    param($VMHost,$Profile,[switch]$UseCache,$ErrorAction)
+    return [pscustomobject]@{ ComplianceStatus = 'Compliant'; CheckTime = (Get-Date) }
+}
+
 Write-Host "`n=== The settle wait runs before the first scan ===" -ForegroundColor Cyan
 $HostProfileComplianceSettleMinutes = 0.001
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
