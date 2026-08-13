@@ -29,7 +29,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [r
 if ($errors) { throw "parse errors" }
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Confirm-IntersightDeployAccepted','Get-IntersightProfileDeployState','Get-IntersightResultList','Get-IntersightServerProfileByName') } |
+    Where-Object { $_.Name -in @('Confirm-IntersightDeployAccepted','Confirm-IntersightDeployAcceptedForBatch','Get-IntersightProfileDeployState','Get-IntersightResultList','Get-IntersightServerProfileByName','Get-IntersightAssignedServerMoid','Get-IntersightRelationshipMoid') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $Global:IntersightActionableConfigStates = @('Pending-changes','Inconsistent','Out-of-sync','Not-deployed')
@@ -143,6 +143,65 @@ Assert-Equal "-Action Deploy is only used when the reboot acknowledgement is tur
 # the old mechanism was wrong.
 Assert-Equal "no string literal is passed as an action parameter name" $true (-not ($scriptText -match "'RebootImmediatelyToActivate'"))
 Assert-Equal "the acknowledgement is not built from an ActionParam" $true (-not ($scriptText -match 'Initialize-IntersightPolicyActionParam[^\r\n]*Reboot'))
+
+Write-Host "`n=== The batch is confirmed in ONE window, not one per host ===" -ForegroundColor Cyan
+# The live symptom: six hosts resolved and all six showed Pending-changes, then the deploys crawled
+# out one at a time. Confirming inside the deploy loop meant host 2's deploy was not even SENT
+# until host 1's confirmation window had closed - up to 180 seconds each, so six hosts serialised
+# into six windows before the last blade had been touched.
+$script:ConfirmReads = New-Object System.Collections.Generic.List[string]
+$script:SettleAfter = @{}
+$script:ConfirmRound = 0
+function Get-IntersightServerProfile { param($Moid,$Filter,$Top,$Skip,$Expand,$ErrorAction)
+    $name = if ($Moid) { "$Moid" } else { 'unknown' }
+    $script:ConfirmReads.Add($name)
+    # Each profile settles after its own number of rounds, so they finish out of order.
+    $rounds = if ($script:SettleAfter.ContainsKey($name)) { $script:SettleAfter[$name] } else { 1 }
+    $seen = @($script:ConfirmReads | Where-Object { $_ -eq $name }).Count
+    $state = if ($seen -ge $rounds) { 'Associated' } else { 'Pending-changes' }
+    return [pscustomobject]@{ Results = @([pscustomobject]@{ Name = $name; Moid = $name
+        ConfigContext = [pscustomobject]@{ ConfigState = $state } }) } }
+
+$Global:IntersightDeployAcceptedTimeoutSeconds = 180
+$script:SettleAfter = @{ 'moid-a' = 3; 'moid-b' = 1; 'moid-c' = 2 }
+$rows = @(
+    [pscustomobject]@{ Host='esx-a'; ServerProfile='sp-a'; ProfileMoid='moid-a'; ConfigState='Pending-changes' }
+    [pscustomobject]@{ Host='esx-b'; ServerProfile='sp-b'; ProfileMoid='moid-b'; ConfigState='Pending-changes' }
+    [pscustomobject]@{ Host='esx-c'; ServerProfile='sp-c'; ProfileMoid='moid-c'; ConfigState='Pending-changes' }
+)
+$script:ConfirmReads.Clear()
+$outcome = Confirm-IntersightDeployAcceptedForBatch -Rows $rows -BatchNumber '1' 6>$null
+Assert-Equal "all three were confirmed" 3 (@($outcome.Keys).Count)
+foreach ($h in @('esx-a','esx-b','esx-c')) { Assert-Equal "$h was accepted" $true $outcome[$h] }
+# Every profile is read on the FIRST round - that is what proves they share one window rather than
+# each waiting for the one before it.
+$firstThree = @($script:ConfirmReads | Select-Object -First 3 | Sort-Object)
+Assert-Equal "every profile is polled in the first round" "moid-a,moid-b,moid-c" ($firstThree -join ',')
+# The fastest drops out first and is not polled again.
+Assert-Equal "a profile that settled early stops being polled" 1 (@($script:ConfirmReads | Where-Object { $_ -eq 'moid-b' }).Count)
+
+# One that never settles is reported as awaiting a reboot, and does not hold up the others.
+$script:NeverSettles = @('moid-b')
+function Get-IntersightServerProfile { param($Moid,$Filter,$Top,$Skip,$Expand,$ErrorAction)
+    $name = "$Moid"
+    $script:ConfirmReads.Add($name)
+    $state = if ($script:NeverSettles -contains $name) { 'Pending-changes' } else { 'Associated' }
+    return [pscustomobject]@{ Results = @([pscustomobject]@{ Name = $name; Moid = $name
+        ConfigContext = [pscustomobject]@{ ConfigState = $state } }) } }
+$script:ConfirmReads.Clear()
+$Global:IntersightDeployAcceptedTimeoutSeconds = 20
+$outcome2 = Confirm-IntersightDeployAcceptedForBatch -BatchNumber '1' -Rows @(
+    [pscustomobject]@{ Host='esx-a'; ServerProfile='sp-a'; ProfileMoid='moid-a'; ConfigState='Pending-changes' },
+    [pscustomobject]@{ Host='esx-b'; ServerProfile='sp-b'; ProfileMoid='moid-b'; ConfigState='Pending-changes' }) 6>$null
+Assert-Equal "the one that settled is accepted" $true $outcome2['esx-a']
+Assert-Equal "the one that did not is awaiting a reboot, not a failure" $false $outcome2['esx-b']
+Assert-Equal "and the stuck one is recorded as awaiting a reboot" $true (@($Global:RunSummary | Where-Object { $_.Host -eq 'esx-b' -and $_.Result -eq 'AwaitingReboot' }).Count -ge 1)
+
+# And the deploy loop must SEND everything before it confirms anything.
+$deployText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "the deploy loop collects rows rather than confirming inline" $true ($deployText -match '\[void\]\$sentRows\.Add\(\$row\)')
+Assert-Equal "and confirms the whole batch after the loop" $true ($deployText -match 'Confirm-IntersightDeployAcceptedForBatch -Rows \$sentRows\.ToArray\(\)')
+Assert-Equal "no per-row confirm remains inside the deploy loop" $true (-not ($deployText -match 'if \(-not \(Confirm-IntersightDeployAccepted -Row \$row'))
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

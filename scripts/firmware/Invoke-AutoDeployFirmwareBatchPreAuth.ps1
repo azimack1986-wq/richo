@@ -397,7 +397,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.0.0-preauth"
+$ScriptVersion = "23.1.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -2490,82 +2490,111 @@ function Get-IntersightPendingInconsistencyForBatch {
     return @($rows)
 }
 
-function Confirm-IntersightDeployAccepted {
+function Confirm-IntersightDeployAcceptedForBatch {
     <#
     .SYNOPSIS
-        Re-reads a server profile after a Deploy. Returns $true if the appliance picked it up.
+        Re-reads EVERY profile in the batch after their deploys, in one shared window.
 
     .DESCRIPTION
         The reboot acknowledgement is sent as a PolicyActionParam whose identifier Cisco does not
         publish. A wrong identifier has two possible outcomes and only one of them is loud: the
         appliance either rejects the call - which throws, and the caller stops - or it ignores the
         parameter, accepts the Deploy, and leaves the firmware staged with nothing rebooting. The
-        second is the dangerous one. The run would then sit out its whole post-reboot window
-        waiting for a restart that was never scheduled, and report the batch as done.
+        second is the dangerous one, so a deploy is never trusted on the strength of the call
+        returning: each profile is re-read until it leaves the state it was staged in.
 
-        So the deploy is not trusted on the strength of the call returning. The profile is re-read
-        until it leaves the state it was staged in - Pending-changes, Inconsistent and the rest of
-        $Global:IntersightActionableConfigStates - which is the appliance confirming it has picked
-        the change up. If it is still sitting there when the window closes, the run stops and names
-        the setting to correct.
+        ONE WINDOW FOR THE WHOLE BATCH. Doing this per host inside the deploy loop meant host 2's
+        deploy was not even SENT until host 1's confirmation window had closed - up to
+        $Global:IntersightDeployAcceptedTimeoutSeconds each, so six hosts serialised into six
+        windows before the last blade had been touched. Every deploy now goes out first and they
+        are confirmed together, so the batch costs one window regardless of its size.
 
-        This is deliberately a short window. It is checking that the deploy was ACCEPTED, not that
-        the upgrade finished - the reconnect wait covers the upgrade.
+        Returns a hashtable keyed by host name: $true where the appliance visibly picked the change
+        up, $false where it is still sitting in the staged state when the window closes. $false is
+        not a failure - it means the firmware is staged and waiting for a restart, which is what
+        the activation then supplies.
 
-    .PARAMETER Row
-        The row for this host from Get-IntersightPendingInconsistencyForBatch.
+        Deliberately a SHORT window. It checks that the deploy was ACCEPTED, not that the upgrade
+        finished; the rolling return check covers the upgrade.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Rows,
+        [Parameter(Mandatory=$true)][string]$BatchNumber
+    )
 
-    .PARAMETER BatchNumber
-        The batch, for the summary record.
+    $result = @{}
+    foreach ($row in $Rows) { $result[$row.Host] = $false }
+    if ($Rows.Count -eq 0) { return $result }
+
+    $timeoutSeconds = [int]$Global:IntersightDeployAcceptedTimeoutSeconds
+    if ($timeoutSeconds -le 0) {
+        foreach ($row in $Rows) { $result[$row.Host] = $true }
+        return $result
+    }
+
+    Write-Host "  Confirming the appliance accepted $($Rows.Count) deploy(s), up to $timeoutSeconds second(s) for the batch..." -ForegroundColor Gray
+
+    $endTime = (Get-Date).AddSeconds($timeoutSeconds)
+    $pending = New-Object System.Collections.Generic.List[object]
+    foreach ($row in $Rows) { [void]$pending.Add($row) }
+    $lastState = @{}
+    foreach ($row in $Rows) { $lastState[$row.Host] = $row.ConfigState }
+
+    while ((Get-Date) -lt $endTime -and $pending.Count -gt 0) {
+        Start-Sleep -Seconds 15
+
+        foreach ($row in $pending.ToArray()) {
+            # By Moid where there is one - it identifies the profile exactly - falling back to the
+            # name so a profile the mapping resolved without a Moid is still re-read rather than
+            # skipped.
+            $current = $null
+            try {
+                if (-not [string]::IsNullOrWhiteSpace([string]$row.ProfileMoid)) {
+                    $current = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $row.ProfileMoid -ErrorAction Stop) | Select-Object -First 1
+                }
+                else {
+                    $current = Get-IntersightServerProfileByName -Name $row.ServerProfile
+                }
+            }
+            catch { }
+            if ($null -eq $current) { continue }
+
+            $state = Get-IntersightProfileDeployState -ServerProfile $current
+            if (-not $state.StateKnown) { continue }
+            $lastState[$row.Host] = $state.ConfigState
+
+            if (-not $state.RequiresDeploy) {
+                Write-Host "    Accepted - '$($row.ServerProfile)' is now $($state.ConfigState)." -ForegroundColor Green
+                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Confirm deploy accepted" -Result "Accepted" -Details "ConfigState moved from $($row.ConfigState) to $($state.ConfigState)."
+                $result[$row.Host] = $true
+                [void]$pending.Remove($row)
+            }
+        }
+    }
+
+    foreach ($row in $pending.ToArray()) {
+        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Confirm deploy accepted" -Result "AwaitingReboot" -Details "Still $($lastState[$row.Host]) after $timeoutSeconds second(s); the firmware is staged and waiting for a restart."
+        Write-Host "    '$($row.ServerProfile)' is still $($lastState[$row.Host]). The firmware is staged and waiting for a reboot." -ForegroundColor Yellow
+    }
+
+    return $result
+}
+
+function Confirm-IntersightDeployAccepted {
+    <#
+    .SYNOPSIS
+        Single-profile wrapper over the batch confirmation.
+
+    .DESCRIPTION
+        One implementation of "did the appliance pick the deploy up", so a change to how that is
+        decided cannot land in one path and miss the other.
     #>
     param(
         [Parameter(Mandatory=$true)]$Row,
         [Parameter(Mandatory=$true)][string]$BatchNumber
     )
-
-    $timeoutSeconds = [int]$Global:IntersightDeployAcceptedTimeoutSeconds
-    if ($timeoutSeconds -le 0) { return $true }
-
-    Write-Host "  Confirming the appliance accepted the deploy for '$($Row.ServerProfile)'..." -ForegroundColor Gray
-
-    $endTime = (Get-Date).AddSeconds($timeoutSeconds)
-    $lastState = $Row.ConfigState
-
-    while ((Get-Date) -lt $endTime) {
-        Start-Sleep -Seconds 15
-
-        # By Moid where there is one - it identifies the profile exactly - falling back to the name
-        # so a profile the mapping resolved without a Moid is still re-read rather than skipped.
-        $current = $null
-        try {
-            if (-not [string]::IsNullOrWhiteSpace([string]$Row.ProfileMoid)) {
-                # Through Get-IntersightResultList like every other query. A Moid lookup usually
-                # returns the object itself rather than a page, but "usually" is what produced the
-                # null-Moid bug this helper exists to prevent, and it handles both shapes.
-                $current = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $Row.ProfileMoid -ErrorAction Stop) | Select-Object -First 1
-            }
-            else {
-                $current = Get-IntersightServerProfileByName -Name $Row.ServerProfile
-            }
-        }
-        catch { }
-        if ($null -eq $current) { continue }
-
-        $state = Get-IntersightProfileDeployState -ServerProfile $current
-        if (-not $state.StateKnown) { continue }
-        $lastState = $state.ConfigState
-
-        if (-not $state.RequiresDeploy) {
-            Write-Host "  Accepted - '$($Row.ServerProfile)' is now $($state.ConfigState)." -ForegroundColor Green
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm deploy accepted" -Result "Accepted" -Details "ConfigState moved from $($Row.ConfigState) to $($state.ConfigState)."
-            return $true
-        }
-    }
-
-    Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm deploy accepted" -Result "AwaitingReboot" -Details "Still $lastState after $timeoutSeconds second(s); the firmware is staged and waiting for a restart."
-
-    Write-Host "  '$($Row.ServerProfile)' is still $lastState. The firmware is staged and waiting for a reboot." -ForegroundColor Yellow
-    return $false
+    $outcome = Confirm-IntersightDeployAcceptedForBatch -Rows @($Row) -BatchNumber $BatchNumber
+    return [bool]$outcome[$Row.Host]
 }
 
 function Get-IntersightRelationshipMoid {
@@ -3614,8 +3643,9 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
         Assert-IntersightUpgradeCmdletSurface
     }
 
-    # Rows whose deploy landed but which still need an explicit activation. Filled by the loop
-    # below, then actioned CONCURRENTLY once every deploy in the batch has been sent.
+    # Rows whose deploy was sent, and then those still needing an explicit activation. Both are
+    # actioned CONCURRENTLY once every deploy in the batch has gone out.
+    $sentRows = New-Object System.Collections.Generic.List[object]
     $needActivation = New-Object System.Collections.Generic.List[object]
 
     foreach ($row in $pendingRows) {
@@ -3737,12 +3767,11 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             # which this run then supplies, because the host is already evacuated and in
             # Maintenance mode with nothing on it.
             #
-            # COLLECTED, NOT ACTIONED HERE. Every deploy in the batch goes out first, and the
-            # activations then run together - see the call after this loop. Activating inside the
-            # loop meant host 2's deploy waited for host 1's entire activation window.
-            if (-not (Confirm-IntersightDeployAccepted -Row $row -BatchNumber $BatchNumber)) {
-                [void]$needActivation.Add($row)
-            }
+            # COLLECTED, NOT CONFIRMED HERE. Confirming inside the loop meant host 2's deploy was
+            # not even SENT until host 1's confirmation window had closed - up to
+            # $Global:IntersightDeployAcceptedTimeoutSeconds each. Every deploy goes out first and
+            # they are confirmed together after the loop, so the batch costs one window.
+            [void]$sentRows.Add($row)
         } catch {
             # SET ASIDE, NOT STOPPED ON. A deploy the appliance refuses is one host's problem, and
             # ending the run here strands every other host in the batch - already evacuated, already
@@ -3769,9 +3798,17 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
         }
     }
 
-    # EVERY deploy in the batch has now been sent. Activate them together and watch them together,
-    # so the blades restart within seconds of each other and the batch takes as long as its slowest
-    # host rather than the sum of all of them.
+    # EVERY deploy in the batch has now been sent, back to back. Confirm them in ONE shared window
+    # rather than one window each.
+    if ($sentRows.Count -gt 0) {
+        $accepted = Confirm-IntersightDeployAcceptedForBatch -Rows $sentRows.ToArray() -BatchNumber $BatchNumber
+        foreach ($row in $sentRows.ToArray()) {
+            if (-not $accepted[$row.Host]) { [void]$needActivation.Add($row) }
+        }
+    }
+
+    # Activate what is left together, so the blades restart within seconds of each other and the
+    # batch takes as long as its slowest host rather than the sum of all of them.
     if ($needActivation.Count -gt 0) {
         Write-Host "" -ForegroundColor Cyan
         Write-Host "Activating $($needActivation.Count) server profile(s) concurrently for Batch ${BatchNumber}." -ForegroundColor Cyan

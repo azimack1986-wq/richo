@@ -12,6 +12,28 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.1.0] — 2026-08-12
+
+#### Fixed
+
+- **The deploys were still going out one host at a time.** 22.0.0 made the
+  *activation* concurrent, but the deploy loop still called
+  `Confirm-IntersightDeployAccepted` per host **inside** the loop — a blocking
+  poll of up to `IntersightDeployAcceptedTimeoutSeconds` (180 by default). So
+  host 2's deploy was not even *sent* until host 1's confirmation window had
+  closed. Six hosts serialised into six windows — up to 18 minutes — before the
+  last blade had been touched.
+
+  Now the loop **sends every deploy back to back**, and the whole batch is
+  confirmed afterwards in **one shared window** by
+  `Confirm-IntersightDeployAcceptedForBatch`. Each profile drops out of the poll
+  as it settles, so a fast one is not re-read while a slow one finishes, and the
+  batch costs one window regardless of its size.
+
+  `Confirm-IntersightDeployAccepted` is retained as a single-row wrapper over the
+  batch version, so there is one implementation of "did the appliance pick the
+  deploy up".
+
 ### [23.0.0] — 2026-08-12
 
 #### Changed
@@ -1957,6 +1979,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.1.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.1.0 — every deploy in the
+batch goes out back to back, and they are confirmed in one shared window. This is
+the build to run.
 
 ### [23.0.0-preauth] — 2026-08-12
 
