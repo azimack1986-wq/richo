@@ -39,7 +39,8 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
                                  'ConvertTo-IntersightWorkflowStatus','Resolve-IntersightRelationshipObject',
                                  'Get-IntersightProfileWorkflowActivity',
                                  'Get-IntersightProfileDeployState','Get-IntersightResultList',
-                                 'Get-IntersightServerProfileByName',
+                                 'Get-IntersightServerProfileByName','Test-VMHostRejoinedAfterReboot',
+                                 'Get-VMHostBootTime',
                                  'Add-ManualAttentionHost',
                                  'Read-ChoiceExit','Read-PendingConsoleKey') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
@@ -572,6 +573,96 @@ $lookupText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "the lookup no longer takes the first of several" $true (-not ($lookupText -match "Get-IntersightResultList -Response \`$page \| Select-Object -First 1"))
 # Without the Moid on screen, resolving to the wrong profile of the right name is invisible.
 Assert-Equal "the resolved Moid is printed, not just the name" $true ($lookupText -match "resolved to Intersight server profile '\`$\(\`$sp\.Name\)' \(Moid \`$\(\`$sp\.Moid\)\)")
+
+Write-Host "`n=== An unreadable ConfigState falls back to asking vCenter ===" -ForegroundColor Cyan
+# The live symptom: Intersight would not report the profile state, so the run sat out the whole
+# ceiling on a host that was already back and healthy. Twenty minutes of "still going" before the
+# operator gave up on it. If the host has restarted and rejoined, the activation happened -
+# whatever the appliance will or will not say about it.
+$Global:PreRebootBootTimes = @{}
+$script:HostInventory = @{}
+function Get-VMHost { param($Name,$Location,$ErrorAction)
+    if ($script:HostInventory.ContainsKey($Name)) { return $script:HostInventory[$Name] }
+    return $null }
+function New-InvHost { param($Name,$State,$Boot)
+    [pscustomobject]@{ Name=$Name; ConnectionState=$State
+        ExtensionData=[pscustomobject]@{ Runtime=[pscustomobject]@{ BootTime=$Boot } } } }
+
+$Global:PreRebootBootTimes = @{ 'esx01.example' = '2026-08-01T00:00:00Z' }
+$script:HostInventory = @{ 'esx01.example' = (New-InvHost -Name 'esx01.example' -State 'Maintenance' -Boot '2026-08-12T03:00:00Z') }
+Assert-Equal "a host back with a NEW boot time counts as rejoined" $true (Test-VMHostRejoinedAfterReboot -HostName 'esx01.example')
+
+# The boot time is the point. "Connected" alone cannot tell came-back from never-left, and on a
+# firmware run that is the difference between upgraded and not.
+$script:HostInventory['esx01.example'] = New-InvHost -Name 'esx01.example' -State 'Connected' -Boot '2026-08-01T00:00:00Z'
+Assert-Equal "the same boot time is NOT a reboot" $false (Test-VMHostRejoinedAfterReboot -HostName 'esx01.example')
+
+$script:HostInventory['esx01.example'] = New-InvHost -Name 'esx01.example' -State 'NotResponding' -Boot '2026-08-12T03:00:00Z'
+Assert-Equal "a host not in a usable state has not rejoined" $false (Test-VMHostRejoinedAfterReboot -HostName 'esx01.example')
+
+$script:HostInventory = @{}
+Assert-Equal "a host missing from inventory has not rejoined" $false (Test-VMHostRejoinedAfterReboot -HostName 'esx01.example')
+Assert-Equal "an empty host name never claims a rejoin" $false (Test-VMHostRejoinedAfterReboot -HostName '')
+
+# No baseline means nothing was ever sent for this host, so there is no restart to prove.
+$Global:PreRebootBootTimes = @{}
+$script:HostInventory = @{ 'esx01.example' = (New-InvHost -Name 'esx01.example' -State 'Connected' -Boot 'x') }
+Assert-Equal "with no baseline, presence is accepted" $true (Test-VMHostRejoinedAfterReboot -HostName 'esx01.example')
+
+# Now the same through the activation progress read: ConfigState unreadable, host back -> complete.
+$script:Workflows = @()
+$script:MoidState = @{}
+function Get-IntersightServerProfile { param($Moid,$Filter,$Expand,$ErrorAction)
+    # No ConfigContext at all: the profile is there, its state is not.
+    $obj = [pscustomobject]@{ Name = 'sp-esx01'; Moid = [string]$Moid }
+    $obj | Add-Member -NotePropertyName RunningWorkflows -NotePropertyValue @() -Force
+    return $obj }
+$script:TaskStates = @('Completed'); $script:TaskReads = 0
+$Global:PreRebootBootTimes = @{ 'esx01.example' = '2026-08-01T00:00:00Z' }
+$script:HostInventory = @{ 'esx01.example' = (New-InvHost -Name 'esx01.example' -State 'Maintenance' -Boot '2026-08-12T03:00:00Z') }
+$p = Get-IntersightActivationProgress -ProfileMoid 'moid-1' -ServerMoid 'server-abc' -HostName 'esx01.example'
+Assert-Equal "an unreadable ConfigState with the host back is complete" $true $p.Complete
+Assert-Equal "and it says why it decided that" $true ($p.Phase -match 'back in vCenter')
+
+# Host not back: still waiting, and the phase says both halves of the reason.
+$script:HostInventory = @{}
+$p2 = Get-IntersightActivationProgress -ProfileMoid 'moid-1' -ServerMoid 'server-abc' -HostName 'esx01.example'
+Assert-Equal "an unreadable ConfigState with no host back is not complete" $false $p2.Complete
+Assert-Equal "and the phase names both halves" $true ($p2.Phase -match 'could not be read' -and $p2.Phase -match 'not back in vCenter')
+
+# Without a host name the fallback is simply unavailable - it must not invent a pass.
+$p3 = Get-IntersightActivationProgress -ProfileMoid 'moid-1' -ServerMoid 'server-abc'
+Assert-Equal "no host name means no fallback, and no pass" $false $p3.Complete
+
+# The fallback is a READ. Nothing in the activation path may change anything in vCenter.
+$activationText2 = ($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+    Where-Object { $_.Name -in @('Invoke-IntersightActivationForBatch','Wait-IntersightActivationCompleteForBatch',
+                                 'Get-IntersightActivationProgress','Test-VMHostRejoinedAfterReboot') } |
+    ForEach-Object { $_.Extent.Text }) -join "`n"
+foreach ($mutator in @('Set-VMHost','Restart-VMHost','Move-VM','Remove-VMHost')) {
+    Assert-Equal "the activation path never calls $mutator" $true (-not ($activationText2 -match "\b$([regex]::Escape($mutator))\b"))
+}
+$Global:PreRebootBootTimes = @{}
+
+Write-Host "`n=== Prompts are single keys, and the old words still work ===" -ForegroundColor Cyan
+# Every choice is one letter now. The words are kept as aliases so an operator with the old
+# muscle memory is not told they are wrong halfway through a change window.
+$script:Typed = ''
+function Read-Host { param($Prompt) $script:PromptLog2 = $Prompt; return $script:Typed }
+foreach ($pair in @(@('C','C'), @('CONTINUE','C'), @('R','R'), @('RETRY','R'), @('continue','C'))) {
+    $script:Typed = $pair[0]
+    Assert-Equal "'$($pair[0])' is accepted as $($pair[1])" $pair[1] (Read-ChoiceExit -Message 'x' -AllowedChoices @('R','C'))
+}
+$script:Typed = 'STOP'
+Assert-Equal "'STOP' maps to X where X is offered" "X" (Read-ChoiceExit -Message 'x' -AllowedChoices @('C','X'))
+# The prompt itself must show the keys, not the words.
+Assert-Equal "the prompt offers the keys and E to exit" $true ($script:PromptLog2 -match '\[C/X or E to exit\]')
+# E always exits, and is never swallowed by an alias.
+$script:Typed = 'E'
+$exited = $false
+try { [void](Read-ChoiceExit -Message 'x' -AllowedChoices @('R','C')) } catch { $exited = "$_" -match 'EXIT' }
+Assert-Equal "E exits from any prompt that does not itself offer E" $true $exited
+function Read-Host { param($Prompt) return 'CONTINUE' }
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

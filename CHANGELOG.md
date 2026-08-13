@@ -12,6 +12,43 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [22.1.0] — 2026-08-12
+
+#### Added
+
+- **When Intersight will not report a ConfigState, vCenter is asked instead.** A
+  live run sat out twenty minutes of its ceiling on `the profile ConfigState
+  could not be read` for a host that was already back and healthy, then had to be
+  moved on by hand. Intersight staying silent is not evidence of anything — but
+  the **host being back** is. If it is in inventory, `Connected` or in
+  `Maintenance`, and its **boot time differs from the baseline** captured before
+  any action, the activation plainly happened and the run moves on.
+
+  The boot time is the part that matters: "the host is Connected" cannot tell
+  *came back* from *never left*, and on a firmware run that is the difference
+  between upgraded and not. Where no baseline exists — nothing was ever sent for
+  that host — presence is accepted, because there is no restart to prove.
+
+  This is a **read**, and the only vCenter call anywhere in the activation path.
+  Nothing is changed there: no Maintenance mode transition, no reboot, no
+  migration. A test asserts that `Set-VMHost`, `Restart-VMHost` and `Move-VM`
+  appear nowhere in it.
+
+#### Changed
+
+- **Every prompt is now a single key.** `C` continue, `R` retry/recheck, `S`
+  skip, `X` stop, `O` override, `Y`/`N`, `E` exit — consistently, everywhere,
+  replacing `RETRY`/`CONTINUE`/`RECHECK`/`OVERRIDE`/`SKIP`/`STOP`/`CREATE`/`YES`/
+  `NO`. Prompts read `[R/C or E to exit]`.
+
+  The full words are still accepted as aliases, so an operator typing `CONTINUE`
+  out of habit is not told they are wrong halfway through a change window — but
+  the screen only ever asks for one letter. The free-text prompts (UCSM FQDN,
+  service profile name) keep taking a value, with `E` and `S` as their escapes.
+- **The heartbeat only prints when the minute changes.** At a 30-second poll
+  interval it printed the same `still going - 20 minute(s) remaining` line twice
+  a minute for the length of the ceiling.
+
 ### [22.0.0] — 2026-08-12
 
 #### Changed
@@ -1869,6 +1906,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [22.1.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 22.1.0 — an unreadable
+ConfigState falls back to checking vCenter for the host's return, and every
+prompt is a single key. This is the build to run.
 
 ### [22.0.0-preauth] — 2026-08-12
 

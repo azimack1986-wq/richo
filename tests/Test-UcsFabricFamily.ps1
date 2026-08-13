@@ -56,7 +56,8 @@ function Assert-Equal {
 $script:Models = @('UCS-FI-6454','UCS-FI-6454')
 $script:Packs = @()
 $script:Created = @()
-$script:Answer = 'CREATE'
+# Single-key answers, as the real prompts now offer: C to create, X to stop.
+$script:Answer = 'C'
 function Get-UcsNetworkElement { param($Ucs,$ErrorAction)
     if ($script:Models -eq 'THROW') { throw "connection lost" }
     return @($script:Models | ForEach-Object { [pscustomobject]@{ Dn='sys/switch'; Model=$_ } }) }
@@ -115,13 +116,13 @@ Assert-Equal "a second call reuses the resolved policy" "global-436h" (Resolve-U
 Assert-Equal "and creates nothing further" 0 $script:Created.Count
 
 Write-Host "`n=== Declining creation stops the run ===" -ForegroundColor Cyan
-$script:Models = @('UCS-FI-6332'); $script:Packs = @(); $script:Created = @(); $script:Answer = 'STOP'
+$script:Models = @('UCS-FI-6332'); $script:Packs = @(); $script:Created = @(); $script:Answer = 'X'
 $Global:UcsFirmwarePolicyByTarget = @{}
 $stopped = $false
 try { [void](Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-c' -UcsSession 'x' 6>$null) } catch { $stopped = "$_" -match 'creation was declined' }
 Assert-Equal "STOP prevents creation and stops" $true $stopped
 Assert-Equal "nothing was created after declining" 0 $script:Created.Count
-$script:Answer = 'CREATE'
+$script:Answer = 'C'
 
 Write-Host "`n=== An unmapped family stops rather than picking something ===" -ForegroundColor Cyan
 $script:Models = @('UCS-FI-6248UP'); $script:Packs = @(); $Global:UcsFirmwarePolicyByTarget = @{}

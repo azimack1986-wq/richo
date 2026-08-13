@@ -228,6 +228,9 @@
       after accepting the change, and the cluster health check that follows fails on any host still
       in Maintenance - which stopped the run one host in, having actually succeeded. The run now
       waits up to $ExitMaintenanceTimeoutMinutes for the transition to land.
+    - EVERY PROMPT IS A SINGLE KEY: C continue, R retry/recheck, S skip, X stop, O override,
+      Y/N yes-no, E exit. The full words are still accepted as aliases so old habits are not
+      punished mid-change, but the screen only ever asks for one letter.
     - THE WHOLE BATCH IS ACTIVATED AT ONCE. The hosts are evacuated together, so they are upgraded
       together: every deploy in the batch is sent, then every activation, then all of them are
       watched in ONE polling loop. A batch takes as long as its SLOWEST host, not the sum of them.
@@ -245,6 +248,12 @@
            Paused) - because which one an appliance populates depends on its release.
         2. firmware/Upgrades for the server with Status eq 'IN_PROGRESS', the GUI's own query.
         3. The profile's ConfigState no longer requiring a deploy.
+      WHERE INTERSIGHT WILL NOT REPORT A ConfigState AT ALL, vCENTER IS ASKED INSTEAD: if the host
+      has restarted and rejoined - present in inventory, Connected or in Maintenance, and with a
+      boot time DIFFERENT from the baseline captured before any action - the activation plainly
+      happened, and the run moves on. That is a read, and the only vCenter call in the activation
+      path; nothing is changed there. Without it a run sat out its whole ceiling on a host that was
+      already back and healthy.
       A workflow that ends Failed, Terminated or TimedOut stops the wait at once - there is nothing
       to gain from holding an hour for something the engine has given up on. An unreadable signal
       is never read as completion.
@@ -376,7 +385,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "22.0.0-preauth"
+$ScriptVersion = "22.1.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -619,9 +628,20 @@ function Read-ChoiceExit {
         own, so the alias cannot shadow a real answer.
     #>
     param([Parameter(Mandatory=$true)][string]$Message,[Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$AllowedChoices,[string]$ExitMessage="Script stopped at a safe checkpoint by implementor.")
+    # Every choice in this script is a SINGLE KEY. The words are still accepted as aliases so an
+    # operator who types CONTINUE out of habit is not told they are wrong, but the prompt asks for
+    # one letter and that is what the screen offers.
+    $wordAliases = @{
+        CONTINUE = "C"; RETRY = "R"; RECHECK = "R"; SKIP = "S"; STOP = "X"
+        OVERRIDE = "O"; CREATE = "C"; YES = "Y"; NO = "N"
+    }
+
     $normalizedAllowed = @($AllowedChoices | ForEach-Object { $_.ToString().ToUpper() })
     do {
-        $answer = (Read-Host "$Message Type one of: $($AllowedChoices -join ', '), or EXIT").Trim().ToUpper()
+        $answer = (Read-Host "$Message [$($normalizedAllowed -join '/') or E to exit]").Trim().ToUpper()
+        if ($wordAliases.ContainsKey($answer) -and $normalizedAllowed -contains $wordAliases[$answer]) {
+            $answer = $wordAliases[$answer]
+        }
         if ($answer -eq "E" -and $normalizedAllowed -notcontains "E") { $answer = "EXIT" }
         if ($answer -eq "EXIT") { Stop-SafeExit -Message $ExitMessage }
     } until ($normalizedAllowed -contains $answer)
@@ -931,8 +951,8 @@ function Read-ManualUcsTargetForHost {
         Write-Host "Suggested UCSM target without Fabric suffix: $SuggestedUcsTarget" -ForegroundColor Yellow
     }
 
-    $manual = Read-Host "Enter UCSM FQDN/IP for host $($VMHostObject.Name), or type EXIT"
-    if ($manual.Trim().ToUpper() -eq "EXIT") { Stop-SafeExit -Message "Stopped during manual UCSM mapping." }
+    $manual = Read-Host "Enter UCSM FQDN/IP for host $($VMHostObject.Name), or E to exit"
+    if ($manual.Trim().ToUpper() -in @("E","EXIT")) { Stop-SafeExit -Message "Stopped during manual UCSM mapping." }
     $manualTarget = Remove-UcsTargetDecoration -Value $manual
     $session = Connect-UcsCached -UcsTarget $manualTarget
     if ($null -eq $session) { Stop-WithMessage "Manual UCSM login failed for $manualTarget." }
@@ -996,8 +1016,8 @@ function Connect-UcsCached {
         }
 
         Write-Host "Because manual 'Connect-Ucs '$target'' works in your environment, you can try an interactive UCS login now." -ForegroundColor Yellow
-        $choice = Read-ChoiceExit -Message "Try interactive Connect-Ucs '$target'?" -AllowedChoices @("YES","NO") -ExitMessage "Stopped during UCSM login."
-        if ($choice -eq "YES") {
+        $choice = Read-ChoiceExit -Message "Try interactive Connect-Ucs '$target'? Y for yes, N for no, E to exit" -AllowedChoices @("Y","N") -ExitMessage "Stopped during UCSM login."
+        if ($choice -eq "Y") {
             try {
                 $session = Connect-UcsOneAttempt -UcsTarget $target -Interactive
                 $Global:UcsSessions[$target] = $session
@@ -1251,10 +1271,10 @@ function Resolve-UcsFirmwarePolicyForTarget {
     Write-Host "  The service profiles are then pointed at this package, and everything else follows from that setting." -ForegroundColor Yellow
 
     $choice = Read-ChoiceExit `
-        -Message "Create host firmware package '$policyName' in $UcsTarget?" `
-        -AllowedChoices @("CREATE","STOP") `
+        -Message "Create host firmware package '$policyName' in $UcsTarget? C to create, X to stop, E to exit" `
+        -AllowedChoices @("C","X") `
         -ExitMessage "Stopped before creating a UCS host firmware package."
-    if ($choice -eq "STOP") {
+    if ($choice -eq "X") {
         Stop-WithMessage "Host firmware package '$policyName' is missing from $UcsTarget and creation was declined."
     }
 
@@ -1413,12 +1433,12 @@ function Build-InfrastructureHostMapping {
     if ($missingTargets.Count -gt 0) {
         Write-Host "One or more hosts did not return a UCSM target from CDP/LLDP. Enter one manually, or SKIP to set the host aside and carry on with the rest of the cluster." -ForegroundColor Yellow
         foreach ($row in $missingTargets) {
-            $manual = Read-Host "Enter UCSM FQDN/IP for host $($row.Host), or SKIP to leave it out of this run, or EXIT"
+            $manual = Read-Host "Enter UCSM FQDN/IP for host $($row.Host), or S to leave it out of this run, or E to exit"
             $answer = $manual.Trim().ToUpper()
-            if ($answer -eq "EXIT") { Stop-SafeExit -Message "Stopped during manual UCSM mapping." }
+            if ($answer -in @("E","EXIT")) { Stop-SafeExit -Message "Stopped during manual UCSM mapping." }
             # SKIP sets the host aside without ending the run. One host with no CDP must not cost
             # the operator the whole cluster.
-            if ($answer -eq "SKIP" -or $answer -eq "") {
+            if ($answer -in @("S","SKIP") -or $answer -eq "") {
                 Write-Host "  '$($row.Host)' set aside - it will not be batched, and is listed for manual rectification at the end." -ForegroundColor Yellow
                 Add-ManualAttentionHost -HostName $row.Host -Reason "No CDP/LLDP, no UCSM target given" -Detail "Neither CDP/LLDP nor the operator supplied a UCS Manager target, so the service profile could not be resolved. Upgrade this host separately." -ExcludeFromRun
                 Add-SummaryRecord -Stage "InfrastructureDetection" -Batch "" -HostName $row.Host -Action "Detect infrastructure" -Result "NoTarget" -Details "No CDP/LLDP and no manual UCSM target; excluded from the run."
@@ -1454,8 +1474,8 @@ function Build-InfrastructureHostMapping {
         $session = Connect-UcsCached -UcsTarget $targetName
         if ($null -eq $session) {
             Write-Host "Auto UCSM login failed for discovered target '$targetName'. Manual UCSM target is required for hosts mapped to this target." -ForegroundColor Yellow
-            $manualTarget = Read-Host "Enter replacement UCSM FQDN/IP for discovered target '$targetName', or type EXIT"
-            if ($manualTarget.Trim().ToUpper() -eq "EXIT") { Stop-SafeExit -Message "Stopped during manual UCSM mapping." }
+            $manualTarget = Read-Host "Enter replacement UCSM FQDN/IP for discovered target '$targetName', or E to exit"
+            if ($manualTarget.Trim().ToUpper() -in @("E","EXIT")) { Stop-SafeExit -Message "Stopped during manual UCSM mapping." }
             $manualTarget = Remove-UcsTargetDecoration -Value $manualTarget
             $session = Connect-UcsCached -UcsTarget $manualTarget
             if ($null -eq $session) { Stop-WithMessage "Manual UCSM login failed for $manualTarget." }
@@ -1625,9 +1645,9 @@ function Set-UcsFirmwarePolicyForBatch {
             if ($Attempt -ge $MaxAttempts) {
                 Stop-WithMessage "Firmware policy verification still failing after $MaxAttempts attempts for Batch $BatchNumber. Resolve in UCSM before continuing."
             }
-            $choice = Read-ChoiceExit -Message "Firmware policy verification failed for one or more hosts (attempt $Attempt of $MaxAttempts). Choose RECHECK or STOP" -AllowedChoices @("RECHECK","STOP")
-            if ($choice -eq "STOP") { Stop-WithMessage "Firmware policy verification failed after set command." }
-            if ($choice -eq "RECHECK") { return Set-UcsFirmwarePolicyForBatch -HostNames $HostNames -BatchNumber $BatchNumber -Attempt ($Attempt + 1) -MaxAttempts $MaxAttempts }
+            $choice = Read-ChoiceExit -Message "Firmware policy verification failed for one or more hosts (attempt $Attempt of $MaxAttempts). R to recheck, X to stop, E to exit" -AllowedChoices @("R","X")
+            if ($choice -eq "X") { Stop-WithMessage "Firmware policy verification failed after set command." }
+            if ($choice -eq "R") { return Set-UcsFirmwarePolicyForBatch -HostNames $HostNames -BatchNumber $BatchNumber -Attempt ($Attempt + 1) -MaxAttempts $MaxAttempts }
         }
     }
 }
@@ -2186,11 +2206,11 @@ function Initialize-IntersightRoutedHosts {
         Write-Host "exclude these hosts and continue with the UCS Manager-managed hosts only." -ForegroundColor Yellow
 
         $choice = Read-ChoiceExit `
-            -Message "Choose SKIP to exclude the Intersight-managed hosts and continue with the rest, or STOP" `
-            -AllowedChoices @("SKIP","STOP") `
+            -Message "S to skip the Intersight-managed hosts and continue with the rest, X to stop, E to exit" `
+            -AllowedChoices @("S","X") `
             -ExitMessage "Stopped because Intersight is unusable in this session."
 
-        if ($choice -eq "STOP") {
+        if ($choice -eq "X") {
             Stop-WithMessage "Intersight module cannot parse responses. Credentials are valid - align the Intersight.PowerShell version with the appliance before re-running."
         }
 
@@ -2995,6 +3015,50 @@ function Get-IntersightFirmwareTaskState {
     return "Finished"
 }
 
+function Test-VMHostRejoinedAfterReboot {
+    <#
+    .SYNOPSIS
+        Has vCenter got this host back? Used only when Intersight cannot answer.
+
+    .DESCRIPTION
+        The fallback for an unreadable ConfigState. Intersight not reporting a profile's state is
+        not evidence of anything - but the HOST being back in vCenter is. If the blade has restarted
+        and rejoined, the activation plainly happened, whatever the appliance will or will not say
+        about it.
+
+        This is a READ, and the only vCenter call anywhere in the activation path. Nothing is
+        changed here: no Maintenance mode transition, no reboot, no migration. Those all stay
+        behind the reconnect gate that runs after the activation returns.
+
+        Evidence required:
+          - the host is in vCenter's inventory, and
+          - its ConnectionState is Connected or Maintenance, and
+          - its boot time has CHANGED from the baseline this run captured before it acted.
+
+        The boot time is the part that matters. "The host is Connected" cannot tell "came back"
+        from "never left", and on a firmware run the difference is whether the host was upgraded.
+        Where no baseline exists - nothing was ever sent for this host - presence is accepted,
+        because there is no restart to prove.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$HostName)
+
+    if ([string]::IsNullOrWhiteSpace($HostName)) { return $false }
+
+    try {
+        $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
+        if ($null -eq $hostObj) { return $false }
+        $state = [string]$hostObj.ConnectionState
+        if ($state -ne "Connected" -and $state -ne "Maintenance") { return $false }
+
+        if (-not $Global:PreRebootBootTimes.ContainsKey($HostName)) { return $true }
+        $before = [string]$Global:PreRebootBootTimes[$HostName]
+        $now = Get-VMHostBootTime -VMHostObject $hostObj
+        if ([string]::IsNullOrWhiteSpace($before) -or [string]::IsNullOrWhiteSpace($now)) { return $true }
+        return ($now -ne $before)
+    }
+    catch { return $false }
+}
+
 function Get-IntersightActivationProgress {
     <#
     .SYNOPSIS
@@ -3016,7 +3080,9 @@ function Get-IntersightActivationProgress {
     #>
     param(
         [Parameter(Mandatory=$true)][string]$ProfileMoid,
-        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$ServerMoid
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$ServerMoid,
+        # Only used for the unreadable-ConfigState fallback below. Empty disables it.
+        [string]$HostName = ""
     )
 
     $workflow = Get-IntersightProfileWorkflowActivity -ProfileMoid $ProfileMoid
@@ -3057,7 +3123,21 @@ function Get-IntersightActivationProgress {
     }
     elseif ($taskState -eq "Running") { $phase = "the firmware upgrade is in progress" }
     elseif ($stillStaged)             { $phase = "the profile is still $configState" }
-    elseif (-not $stateKnown)         { $phase = "the profile ConfigState could not be read" }
+    elseif (-not $stateKnown) {
+        # INTERSIGHT CANNOT ANSWER. Ask vCenter instead: if the host has restarted and rejoined,
+        # the activation happened, whatever the appliance will say about it. Without this the run
+        # sat out the whole ceiling on a host that was already back and healthy - which is exactly
+        # what it did on a live run, for twenty minutes, before the operator gave up on it.
+        if (Test-VMHostRejoinedAfterReboot -HostName $HostName) {
+            return [pscustomobject]@{
+                Complete    = $true
+                Failed      = $false
+                ConfigState = $configState
+                Phase       = "complete; ConfigState unreadable, but the host is back in vCenter with a new boot time"
+            }
+        }
+        $phase = "the profile ConfigState could not be read, and the host is not back in vCenter yet"
+    }
 
     return [pscustomobject]@{
         Complete    = [string]::IsNullOrWhiteSpace($phase)
@@ -3107,6 +3187,7 @@ function Wait-IntersightActivationCompleteForBatch {
     $pending = New-Object System.Collections.Generic.List[object]
     foreach ($target in $Targets) { [void]$pending.Add($target) }
     $lastPhase = @{}
+    $lastRemaining = -1
 
     while ((Get-Date) -lt $endTime -and $pending.Count -gt 0) {
         $key = Read-PendingConsoleKey
@@ -3125,7 +3206,7 @@ function Wait-IntersightActivationCompleteForBatch {
             # same trap as the closing report in 21.7.0. A snapshot is still required, because the
             # loop removes from $pending as hosts finish. Test-ScriptLint now enforces this.
             foreach ($target in $pending.ToArray()) {
-                $progress = Get-IntersightActivationProgress -ProfileMoid ([string]$target.ProfileMoid) -ServerMoid ([string]$target.ServerMoid)
+                $progress = Get-IntersightActivationProgress -ProfileMoid ([string]$target.ProfileMoid) -ServerMoid ([string]$target.ServerMoid) -HostName ([string]$target.Host)
                 $result[$target.Host].Phase = $progress.Phase
 
                 if ($progress.Failed) {
@@ -3147,9 +3228,14 @@ function Wait-IntersightActivationCompleteForBatch {
                 }
             }
 
+            # Heartbeat only when the minute actually ticks over. At a 30-second interval this
+            # printed the same line twice a minute for the length of the ceiling.
             if ($pending.Count -gt 0) {
                 $remaining = [int][math]::Ceiling(($endTime - (Get-Date)).TotalMinutes)
-                Write-Host "      $($pending.Count) of $($Targets.Count) still going - $remaining minute(s) of the ceiling remaining." -ForegroundColor DarkGray
+                if ($remaining -ne $lastRemaining) {
+                    Write-Host "      $($pending.Count) of $($Targets.Count) still going - $remaining minute(s) of the ceiling remaining." -ForegroundColor DarkGray
+                    $lastRemaining = $remaining
+                }
             }
         }
 
@@ -3402,18 +3488,18 @@ function Invoke-IntersightActivationForBatch {
         foreach ($target in $stillGoing.ToArray()) {
             Write-Host "    $($target.Label) - $($progress[$target.Host].Phase)" -ForegroundColor Yellow
         }
-        Write-Host "  RETRY    - send Activate again to those profiles and keep watching." -ForegroundColor Yellow
-        Write-Host "  CONTINUE - stop waiting and move on to the vCenter checks." -ForegroundColor Yellow
-        Write-Host "  EXIT     - stop the run here." -ForegroundColor Yellow
+        Write-Host "  R - retry: send Activate again to those profiles and keep watching." -ForegroundColor Yellow
+        Write-Host "  C - continue: stop waiting and move on to the vCenter checks." -ForegroundColor Yellow
+        Write-Host "  E - exit the run here." -ForegroundColor Yellow
 
         $choice = Read-ChoiceExit `
-            -Message "$($stillGoing.Count) profile(s) have not activated yet. Choose RETRY or CONTINUE" `
-            -AllowedChoices @("RETRY","CONTINUE") `
+            -Message "$($stillGoing.Count) profile(s) have not activated yet. R to retry, C to continue, E to exit" `
+            -AllowedChoices @("R","C") `
             -ExitMessage "Stopped while waiting for the activation of $($stillGoing.Count) profile(s)."
 
         # Anything that is not an explicit RETRY moves on. A loop whose only exit is a successful
         # prompt is a hang, and this one runs on a jump host that may have no console at all.
-        if ($choice -ne "RETRY") {
+        if ($choice -ne "R") {
             Write-Host "  Moving on to the vCenter checks." -ForegroundColor Yellow
             foreach ($target in $stillGoing.ToArray()) {
                 Add-ManualAttentionHost -HostName $target.Host -Reason "Firmware activation not confirmed" -Detail "Server profile '$($target.Row.ServerProfile)' still had changes staged when the operator chose to continue: $($progress[$target.Host].Phase). Activate it from Intersight."
@@ -3463,8 +3549,8 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Warning" -Details "ConfigState unreadable on profile '$($row.ServerProfile)'."
         }
         if (-not (Test-DryRun)) {
-            $choice = Read-ChoiceExit -Message "Intersight ConfigState unreadable for one or more hosts. Choose SKIP to leave them untouched and continue, or STOP" -AllowedChoices @("SKIP","STOP") -ExitMessage "Stopped on unreadable Intersight ConfigState."
-            if ($choice -eq "STOP") { Stop-WithMessage "Intersight ConfigState could not be read for: $(($unknownStateRows | Select-Object -ExpandProperty Host) -join ', ')." }
+            $choice = Read-ChoiceExit -Message "Intersight ConfigState unreadable for one or more hosts. S to skip them and continue, X to stop, E to exit" -AllowedChoices @("S","X") -ExitMessage "Stopped on unreadable Intersight ConfigState."
+            if ($choice -eq "X") { Stop-WithMessage "Intersight ConfigState could not be read for: $(($unknownStateRows | Select-Object -ExpandProperty Host) -join ', ')." }
         }
     }
 
@@ -4771,9 +4857,9 @@ function Wait-BatchReconnectAfterReboot {
         if ($notRebooted.Count -gt 0) {
             Write-Host "Still waiting for these host(s) to actually restart - vCenter reports the same boot time as before: $(($notRebooted | Select-Object -ExpandProperty Host) -join ', ')" -ForegroundColor Yellow
         }
-        $choice = Read-ChoiceExit -Message "Reconnect incomplete. Choose RECHECK, OVERRIDE, or STOP" -AllowedChoices @("RECHECK","OVERRIDE","STOP")
-        if ($choice -eq "STOP") { return $null }
-        if ($choice -eq "OVERRIDE") { return $summary }
+        $choice = Read-ChoiceExit -Message "Reconnect incomplete. R to recheck, O to override, X to stop, E to exit" -AllowedChoices @("R","O","X")
+        if ($choice -eq "X") { return $null }
+        if ($choice -eq "O") { return $summary }
     } while ($true)
 }
 
@@ -5323,10 +5409,10 @@ function Invoke-ClusterUpgradeWorkflow {
                     Add-SummaryRecord -Stage "BatchAction" -Batch $batchNumber -HostName "" -Action "Send firmware action" -Result "None" -Details "No action sent and $($unresolved.Count) host(s) unconfirmed: $($unresolved -join '; ')"
 
                     $choice = Read-ChoiceExit `
-                        -Message "Nothing to reboot for Batch $batchNumber, and $($unresolved.Count) host(s) could not be confirmed as current. Choose CONTINUE to move on, or STOP" `
-                        -AllowedChoices @("CONTINUE","STOP") `
+                        -Message "Nothing to reboot for Batch $batchNumber, and $($unresolved.Count) host(s) could not be confirmed as current. C to continue, X to stop, E to exit" `
+                        -AllowedChoices @("C","X") `
                         -ExitMessage "Stopped because Batch $batchNumber had no firmware action to send."
-                    if ($choice -eq "STOP") {
+                    if ($choice -eq "X") {
                         Stop-WithMessage "Batch $batchNumber had no firmware action to send. Confirm the firmware policy is staged against these profiles before re-running."
                     }
                 }
