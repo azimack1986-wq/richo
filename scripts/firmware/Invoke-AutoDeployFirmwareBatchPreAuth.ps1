@@ -231,6 +231,18 @@
     - EVERY PROMPT IS A SINGLE KEY: C continue, R retry/recheck, S skip, X stop, O override,
       Y/N yes-no, E exit. The full words are still accepted as aliases so old habits are not
       punished mid-change, but the screen only ever asks for one letter.
+    - THE CLUSTER IS UPGRADED AS A ROLLING WINDOW, NOT IN DISCRETE BATCHES. Each host is tracked
+      on its own through AwaitingReturn -> Settling -> Compliance -> Done, and the moment one is
+      back in service its slot is refilled from the front of the remaining hosts. The old shape did
+      not start host N+1 until the SLOWEST of the first N had finished, so a host back in twenty
+      minutes sat idle while its neighbour took fifty.
+      How many may be out AT ONCE is re-read from live capacity on every pass - the same
+      capacity arithmetic as before, now used as a concurrency limit rather than a batch size.
+      Each host settles from ITS OWN return time, so the settle windows overlap instead of costing
+      $HostProfileComplianceSettleMinutes once per host in series.
+      The firmware phase does NOT block: the deploy and activation are sent and the loop moves on,
+      because the signal the vCenter work actually waits on is the host reappearing in vCenter.
+      SINGLE mode is the same engine with the limit fixed at one, so the two modes cannot drift.
     - THE WHOLE BATCH IS ACTIVATED AT ONCE. The hosts are evacuated together, so they are upgraded
       together: every deploy in the batch is sent, then every activation, then all of them are
       watched in ONE polling loop. A batch takes as long as its SLOWEST host, not the sum of them.
@@ -385,7 +397,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "22.1.0-preauth"
+$ScriptVersion = "23.0.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -3050,7 +3062,10 @@ function Test-VMHostRejoinedAfterReboot {
         $state = [string]$hostObj.ConnectionState
         if ($state -ne "Connected" -and $state -ne "Maintenance") { return $false }
 
-        if (-not $Global:PreRebootBootTimes.ContainsKey($HostName)) { return $true }
+        # A null map is "no baseline", not an error. Swallowed into $false by the catch below it
+        # turns a missing global into a host that can never be seen to return - an infinite wait
+        # from a one-line omission, which is exactly how it was found.
+        if ($null -eq $Global:PreRebootBootTimes -or -not $Global:PreRebootBootTimes.ContainsKey($HostName)) { return $true }
         $before = [string]$Global:PreRebootBootTimes[$HostName]
         $now = Get-VMHostBootTime -VMHostObject $hostObj
         if ([string]::IsNullOrWhiteSpace($before) -or [string]::IsNullOrWhiteSpace($now)) { return $true }
@@ -3364,7 +3379,10 @@ function Invoke-IntersightActivationForBatch {
     #>
     param(
         [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Rows,
-        [Parameter(Mandatory=$true)][string]$BatchNumber
+        [Parameter(Mandatory=$true)][string]$BatchNumber,
+        # Send and return. The caller watches for the result some other way - the rolling upgrade
+        # watches vCenter for the host's return, which is what its next step needs anyway.
+        [switch]$NoWait
     )
 
     if ($Rows.Count -eq 0) { return }
@@ -3456,6 +3474,14 @@ function Invoke-IntersightActivationForBatch {
 
         if ($outstanding.Count -eq 0) { return }
 
+        if ($NoWait) {
+            Write-Host "  Sent for $($outstanding.Count) profile(s). Not waiting - the rolling upgrade watches for each host's return." -ForegroundColor Green
+            foreach ($target in $outstanding.ToArray()) {
+                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $target.Host -Action "Confirm activation" -Result "Sent" -Details "Activation sent for server $($target.ServerMoid); the host's return to vCenter is the completion signal."
+            }
+            return
+        }
+
         # --- 3. Watch them all at once ------------------------------------------------------------
         Write-Host "  Sent for $($outstanding.Count) profile(s). Watching them together." -ForegroundColor Green
         $ceiling = if ($round -eq 1) { $Global:IntersightActivationHoldMinutes } else { $Global:IntersightActivationWaitMinutes }
@@ -3529,7 +3555,21 @@ function Invoke-IntersightActivationPowerCycle {
 }
 
 function Invoke-IntersightAcceptAndRebootImmediateForBatch {
-    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,[Parameter(Mandatory=$true)][string]$BatchNumber)
+    <#
+    .SYNOPSIS
+        Deploys and activates every Intersight-routed profile in the set.
+
+    .DESCRIPTION
+        -NoWait sends the deploy and the activation and returns WITHOUT watching them finish. The
+        rolling upgrade needs that: blocking here is what would stop the next host being admitted,
+        and the signal it actually waits on is the host reappearing in vCenter. Without -NoWait the
+        activation is watched through to completion, which is what the single-shot path wants.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,
+        [Parameter(Mandatory=$true)][string]$BatchNumber,
+        [switch]$NoWait
+    )
 
     if ($HostNames.Count -eq 0) { return }
 
@@ -3735,7 +3775,12 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
     if ($needActivation.Count -gt 0) {
         Write-Host "" -ForegroundColor Cyan
         Write-Host "Activating $($needActivation.Count) server profile(s) concurrently for Batch ${BatchNumber}." -ForegroundColor Cyan
-        Invoke-IntersightActivationForBatch -Rows $needActivation.ToArray() -BatchNumber $BatchNumber
+        if ($NoWait) {
+            Invoke-IntersightActivationForBatch -Rows $needActivation.ToArray() -BatchNumber $BatchNumber -NoWait
+        }
+        else {
+            Invoke-IntersightActivationForBatch -Rows $needActivation.ToArray() -BatchNumber $BatchNumber
+        }
     }
 }
 
@@ -4448,6 +4493,120 @@ function Get-ComplianceFailureDetail {
 
     return ""
 }
+function Confirm-SingleHostComplianceAndExit {
+    <#
+    .SYNOPSIS
+        One host: verify host profile compliance, then take it out of Maintenance mode.
+
+    .DESCRIPTION
+        The per-host half of the compliance gate, split out so the rolling upgrade can advance
+        hosts INDIVIDUALLY as each one comes back rather than waiting for a whole batch.
+
+        DOES NOT SETTLE. The caller owns the settle wait, because in a rolling run each host
+        settles from its own return time and those windows overlap - serialising them would cost
+        the settle period once per host instead of once. Confirm-HostProfileComplianceAndExitMaintenance
+        still settles once for its batch and then calls this per host, so the batch path is
+        unchanged.
+
+        Everything else is as it was: Compliant is the only status that continues on its own,
+        anything else halts with C to continue, O to override, E to exit, and the exit from
+        Maintenance mode is confirmed rather than assumed.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$HostName,
+        [Parameter(Mandatory=$true)][string]$BatchNumber
+    )
+
+    $hostName = $HostName
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Host profile compliance check for '$hostName' (Batch $BatchNumber)..." -ForegroundColor Cyan
+
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
+        $state = Get-VMHostProfileComplianceState -VMHostObject $hostObj
+
+        $checkedAt = if ($state.CheckTime) { $state.CheckTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "<not reported>" }
+        Write-Host ("  Host: {0}  ConnectionState: {1}  Profile: {2}  Compliance: {3}  Checked: {4}" -f $hostObj.Name, $hostObj.ConnectionState, $(if($state.ProfileName){$state.ProfileName}else{"<none>"}), $state.Status, $checkedAt) -ForegroundColor Cyan
+        if (-not [string]::IsNullOrWhiteSpace($state.Details)) {
+            Write-Host "  Detail: $($state.Details)" -ForegroundColor Yellow
+        }
+
+        # ANYTHING other than Compliant halts. Compliant is the only status that lets the run
+        # carry on by itself - NonCompliant, Unknown and NoProfile are all "stop and have the
+        # engineer look at it", because none of them is evidence that the profile applied.
+        if ($state.Status -eq "Compliant") {
+            if ($attempt -gt 1) {
+                Write-Host "  RESOLVED: '$hostName' is now compliant with host profile '$($state.ProfileName)'." -ForegroundColor Green
+            }
+            Write-Host "  Compliant - continuing automatically." -ForegroundColor Green
+            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Compliant" -Details "Profile '$($state.ProfileName)' compliant after $attempt scan(s); checked $checkedAt. Continued automatically."
+            break
+        }
+
+        # The halt. The host stays in Maintenance mode and the batch does not advance while the
+        # engineer works on it - so nothing takes load against a profile that has not applied.
+        Write-Host "" -ForegroundColor Red
+        Write-Host "  HOST PROFILE NOT COMPLIANT - THE RUN IS PAUSED." -ForegroundColor Red
+        if ($state.Status -eq "NoProfile") {
+            Write-Host "  No host profile is attached to '$hostName', so compliance cannot be confirmed." -ForegroundColor Yellow
+            Write-Host "  Attach the host profile in vCenter and remediate the host." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "  '$hostName' reports '$($state.Status)' against host profile '$($state.ProfileName)'." -ForegroundColor Yellow
+            Write-Host "  RESOLVE THE HOST PROFILE ISSUE MANUALLY IN vCENTER BEFORE CONTINUING:" -ForegroundColor Yellow
+            Write-Host "    - Remediate the host against its profile, or re-provision it via Auto Deploy." -ForegroundColor Yellow
+            Write-Host "    - Check the Security settings the pre-requisites asked you to untick -" -ForegroundColor Yellow
+            Write-Host "      Authentication Configuration and Active Directory Permission are the" -ForegroundColor Yellow
+            Write-Host "      usual reason a profile will not apply cleanly on a rebooted host." -ForegroundColor Yellow
+        }
+        Write-Host "  '$hostName' stays in Maintenance mode and this batch does not advance until you answer." -ForegroundColor Yellow
+        Write-Host "    C - continue: you have resolved it. The host is re-checked, and once it reports" -ForegroundColor Yellow
+        Write-Host "        Compliant it comes out of Maintenance mode and the run carries on by itself." -ForegroundColor Yellow
+        Write-Host "    O - override: accept the host as it is, take it out of Maintenance mode and carry" -ForegroundColor Yellow
+        Write-Host "        on. Recorded in the run summary as an override." -ForegroundColor Yellow
+        Write-Host "    E - exit the run safely, leaving the host in Maintenance mode." -ForegroundColor Yellow
+        $complianceChoice = Read-ChoiceExit -Message "'$hostName' is not compliant. Resolve the host profile issue, then C to continue, O to override, E to exit" -AllowedChoices @("C","O") -ExitMessage "Stopped at host profile compliance for '$hostName'."
+
+        if ($complianceChoice -eq "O") {
+            Write-Host "  OVERRIDE: '$hostName' is being returned to service without passing its host profile check." -ForegroundColor Red
+            Add-ManualAttentionHost -HostName $hostName -Reason "Host profile compliance overridden" -Detail "Returned to service reporting '$($state.Status)' against profile '$($state.ProfileName)'. $($state.Details)"
+            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Overridden" -Details "Operator accepted '$($state.Status)' against profile '$($state.ProfileName)' after $attempt scan(s) and continued. Checked $checkedAt. $($state.Details)"
+            break
+        }
+
+        Write-Host "  Re-checking '$hostName' against its host profile." -ForegroundColor Cyan
+        Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result $state.Status -Details "Attempt $attempt reported '$($state.Status)'; run paused for the engineer, who chose C to continue. Re-checking."
+    }
+
+    # Only reached once the host is compliant, explicitly accepted with no profile attached, or
+    # explicitly overridden by the operator.
+    $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
+    if ($hostObj.ConnectionState -eq "Maintenance") {
+        if ($Global:AutoExitMaintenanceMode) {
+            Write-Host "  Taking '$hostName' out of Maintenance mode." -ForegroundColor Green
+            Set-VMHost -VMHost $hostObj -State Connected -Confirm:$false -ErrorAction Stop | Out-Null
+
+            # vCenter reports the old state for a moment after the exit is accepted. The very
+            # next thing the batch loop does is a cluster health check that fails on any host in
+            # Maintenance mode, so returning before the transition lands stops the run one host
+            # in - which reads as "the override didn't continue".
+            if (-not (Wait-VMHostOutOfMaintenance -HostName $hostName -TimeoutMinutes $ExitMaintenanceTimeoutMinutes)) {
+                Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Timeout" -Details "Still in Maintenance mode $ExitMaintenanceTimeoutMinutes minute(s) after the exit was sent."
+                Stop-WithMessage "'$hostName' is still in Maintenance mode $ExitMaintenanceTimeoutMinutes minute(s) after being told to exit. Check for a stuck task or a DRS/vMotion problem in vCenter before continuing."
+            }
+            Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Sent" -Details "Confirmed Connected after host profile compliance was accepted."
+        }
+        else {
+            Write-Host "  AutoExitMaintenanceMode is disabled - leaving '$hostName' in Maintenance mode." -ForegroundColor Yellow
+            Add-ManualAttentionHost -HostName $hostName -Reason "Left in Maintenance mode" -Detail "AutoExitMaintenanceMode is disabled, so this run did not return the host to service. Exit Maintenance mode in vCenter."
+            Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Skipped" -Details "AutoExitMaintenanceMode disabled."
+        }
+    }
+
+}
+
 function Confirm-HostProfileComplianceAndExitMaintenance {
     <#
     .SYNOPSIS
@@ -4504,92 +4663,7 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
     Wait-HostProfileComplianceSettle -HostNames $HostNames -BatchNumber $BatchNumber
 
     foreach ($hostName in $HostNames) {
-        Write-Host "" -ForegroundColor Cyan
-        Write-Host "Host profile compliance check for '$hostName' (Batch $BatchNumber)..." -ForegroundColor Cyan
-
-        $attempt = 0
-        while ($true) {
-            $attempt++
-            $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
-            $state = Get-VMHostProfileComplianceState -VMHostObject $hostObj
-
-            $checkedAt = if ($state.CheckTime) { $state.CheckTime.ToString("yyyy-MM-dd HH:mm:ss") } else { "<not reported>" }
-            Write-Host ("  Host: {0}  ConnectionState: {1}  Profile: {2}  Compliance: {3}  Checked: {4}" -f $hostObj.Name, $hostObj.ConnectionState, $(if($state.ProfileName){$state.ProfileName}else{"<none>"}), $state.Status, $checkedAt) -ForegroundColor Cyan
-            if (-not [string]::IsNullOrWhiteSpace($state.Details)) {
-                Write-Host "  Detail: $($state.Details)" -ForegroundColor Yellow
-            }
-
-            # ANYTHING other than Compliant halts. Compliant is the only status that lets the run
-            # carry on by itself - NonCompliant, Unknown and NoProfile are all "stop and have the
-            # engineer look at it", because none of them is evidence that the profile applied.
-            if ($state.Status -eq "Compliant") {
-                if ($attempt -gt 1) {
-                    Write-Host "  RESOLVED: '$hostName' is now compliant with host profile '$($state.ProfileName)'." -ForegroundColor Green
-                }
-                Write-Host "  Compliant - continuing automatically." -ForegroundColor Green
-                Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Compliant" -Details "Profile '$($state.ProfileName)' compliant after $attempt scan(s); checked $checkedAt. Continued automatically."
-                break
-            }
-
-            # The halt. The host stays in Maintenance mode and the batch does not advance while the
-            # engineer works on it - so nothing takes load against a profile that has not applied.
-            Write-Host "" -ForegroundColor Red
-            Write-Host "  HOST PROFILE NOT COMPLIANT - THE RUN IS PAUSED." -ForegroundColor Red
-            if ($state.Status -eq "NoProfile") {
-                Write-Host "  No host profile is attached to '$hostName', so compliance cannot be confirmed." -ForegroundColor Yellow
-                Write-Host "  Attach the host profile in vCenter and remediate the host." -ForegroundColor Yellow
-            }
-            else {
-                Write-Host "  '$hostName' reports '$($state.Status)' against host profile '$($state.ProfileName)'." -ForegroundColor Yellow
-                Write-Host "  RESOLVE THE HOST PROFILE ISSUE MANUALLY IN vCENTER BEFORE CONTINUING:" -ForegroundColor Yellow
-                Write-Host "    - Remediate the host against its profile, or re-provision it via Auto Deploy." -ForegroundColor Yellow
-                Write-Host "    - Check the Security settings the pre-requisites asked you to untick -" -ForegroundColor Yellow
-                Write-Host "      Authentication Configuration and Active Directory Permission are the" -ForegroundColor Yellow
-                Write-Host "      usual reason a profile will not apply cleanly on a rebooted host." -ForegroundColor Yellow
-            }
-            Write-Host "  '$hostName' stays in Maintenance mode and this batch does not advance until you answer." -ForegroundColor Yellow
-            Write-Host "    C - continue: you have resolved it. The host is re-checked, and once it reports" -ForegroundColor Yellow
-            Write-Host "        Compliant it comes out of Maintenance mode and the run carries on by itself." -ForegroundColor Yellow
-            Write-Host "    O - override: accept the host as it is, take it out of Maintenance mode and carry" -ForegroundColor Yellow
-            Write-Host "        on. Recorded in the run summary as an override." -ForegroundColor Yellow
-            Write-Host "    E - exit the run safely, leaving the host in Maintenance mode." -ForegroundColor Yellow
-            $complianceChoice = Read-ChoiceExit -Message "'$hostName' is not compliant. Resolve the host profile issue, then C to continue, O to override, E to exit" -AllowedChoices @("C","O") -ExitMessage "Stopped at host profile compliance for '$hostName'."
-
-            if ($complianceChoice -eq "O") {
-                Write-Host "  OVERRIDE: '$hostName' is being returned to service without passing its host profile check." -ForegroundColor Red
-                Add-ManualAttentionHost -HostName $hostName -Reason "Host profile compliance overridden" -Detail "Returned to service reporting '$($state.Status)' against profile '$($state.ProfileName)'. $($state.Details)"
-                Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "Overridden" -Details "Operator accepted '$($state.Status)' against profile '$($state.ProfileName)' after $attempt scan(s) and continued. Checked $checkedAt. $($state.Details)"
-                break
-            }
-
-            Write-Host "  Re-checking '$hostName' against its host profile." -ForegroundColor Cyan
-            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result $state.Status -Details "Attempt $attempt reported '$($state.Status)'; run paused for the engineer, who chose C to continue. Re-checking."
-        }
-
-        # Only reached once the host is compliant, explicitly accepted with no profile attached, or
-        # explicitly overridden by the operator.
-        $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
-        if ($hostObj.ConnectionState -eq "Maintenance") {
-            if ($Global:AutoExitMaintenanceMode) {
-                Write-Host "  Taking '$hostName' out of Maintenance mode." -ForegroundColor Green
-                Set-VMHost -VMHost $hostObj -State Connected -Confirm:$false -ErrorAction Stop | Out-Null
-
-                # vCenter reports the old state for a moment after the exit is accepted. The very
-                # next thing the batch loop does is a cluster health check that fails on any host in
-                # Maintenance mode, so returning before the transition lands stops the run one host
-                # in - which reads as "the override didn't continue".
-                if (-not (Wait-VMHostOutOfMaintenance -HostName $hostName -TimeoutMinutes $ExitMaintenanceTimeoutMinutes)) {
-                    Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Timeout" -Details "Still in Maintenance mode $ExitMaintenanceTimeoutMinutes minute(s) after the exit was sent."
-                    Stop-WithMessage "'$hostName' is still in Maintenance mode $ExitMaintenanceTimeoutMinutes minute(s) after being told to exit. Check for a stuck task or a DRS/vMotion problem in vCenter before continuing."
-                }
-                Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Sent" -Details "Confirmed Connected after host profile compliance was accepted."
-            }
-            else {
-                Write-Host "  AutoExitMaintenanceMode is disabled - leaving '$hostName' in Maintenance mode." -ForegroundColor Yellow
-                Add-ManualAttentionHost -HostName $hostName -Reason "Left in Maintenance mode" -Detail "AutoExitMaintenanceMode is disabled, so this run did not return the host to service. Exit Maintenance mode in vCenter."
-                Add-SummaryRecord -Stage "ExitMaintenance" -Batch $BatchNumber -HostName $hostName -Action "Exit Maintenance mode" -Result "Skipped" -Details "AutoExitMaintenanceMode disabled."
-            }
-        }
+        Confirm-SingleHostComplianceAndExit -HostName $hostName -BatchNumber $BatchNumber
     }
 }
 
@@ -4786,6 +4860,306 @@ function Get-VMHostBootTime {
     try { return [string]$VMHostObject.ExtensionData.Runtime.BootTime } catch { return "" }
 }
 
+function Get-RollingConcurrencyLimit {
+    <#
+    .SYNOPSIS
+        How many hosts may be out of service AT ONCE, from live cluster capacity.
+
+    .DESCRIPTION
+        The rolling upgrade's admission control. Get-CapacityBasedBatchSize already answers exactly
+        this question: it sizes from the CONNECTED hosts' live CPU and memory - which already carry
+        the load of anything evacuated - and adds the hosts already in Maintenance mode on top,
+        because those cost nothing further to have out. The number it returns is therefore the total
+        that may be out simultaneously, not an increment.
+
+        Read against the WHOLE cluster, not just the hosts still waiting. Sizing from the remaining
+        candidates alone understates capacity as the run progresses: a host finished an hour ago is
+        carrying load and contributing capacity, and leaving it out of the arithmetic makes the
+        cluster look smaller and busier than it is.
+
+        SINGLE mode is a limit of one. That is the same thing the old batch-of-one path did, so the
+        two modes are one code path with one number changed.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Cluster,
+        [Parameter(Mandatory=$true)][string]$BatchMode
+    )
+
+    if ($BatchMode -ne "AUTO") {
+        return [pscustomobject]@{ Limit = 1; Reason = "SINGLE mode - one host at a time."; Diagnostics = @() }
+    }
+
+    $live = @(Get-VMHost -Location $Cluster -ErrorAction SilentlyContinue)
+    $sizing = Get-CapacityBasedBatchSize -CandidateHosts $live -Cluster $Cluster
+    return [pscustomobject]@{
+        Limit       = [int]$sizing.SafeBatchSize
+        Reason      = $sizing.Reason
+        Diagnostics = $sizing.Diagnostics
+    }
+}
+
+function Invoke-RollingClusterUpgrade {
+    <#
+    .SYNOPSIS
+        Upgrades the cluster as a ROLLING WINDOW: as each host returns healthy, the next one starts.
+
+    .DESCRIPTION
+        Replaces the discrete-batch loop. The old shape took N hosts, put them all through, and did
+        not start host N+1 until the SLOWEST of the first N had finished - so a host that came back
+        in twenty minutes sat idle while its neighbour took fifty. This keeps the cluster working
+        the whole time instead.
+
+        Every host is tracked independently through four stages:
+
+          AwaitingReturn - firmware sent, waiting for it to come back into vCenter with a boot time
+                           different from the baseline captured before anything was sent.
+          Settling       - back in vCenter. Held for $HostProfileComplianceSettleMinutes from ITS
+                           OWN return, so hosts settle in parallel rather than one after another.
+          Compliance     - the host profile gate, then out of Maintenance mode. This is the only
+                           stage that can prompt, and a halt here deliberately pauses everything:
+                           a profile that will not apply is a reason to stop admitting more hosts.
+          Done           - back in service. Its slot is released immediately.
+
+        ADMISSION is re-evaluated on every pass against live capacity. Get-RollingConcurrencyLimit
+        returns the total that may be out at once; any spare slots are filled from the front of the
+        pending list, so cluster order is preserved. A slot freed by a host finishing is refilled on
+        the next pass - which is the whole point.
+
+        THE FIRMWARE PHASE DOES NOT BLOCK. The deploy and activation are sent and this loop moves
+        on; the readiness signal is the host being back in vCenter, which is what the vCenter work
+        actually waits on. Intersight progress is still read each pass, for the log and to catch a
+        workflow that has failed rather than waiting out a ceiling for it.
+
+        NOTHING HERE ENDS THE RUN except an explicit E, a host that cannot be evacuated, or a
+        cluster with no capacity to take even one host.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Cluster,
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$OrderedHostNames,
+        [Parameter(Mandatory=$true)][string]$BatchMode
+    )
+
+    $pending = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $OrderedHostNames) { [void]$pending.Add($name) }
+    $inFlight = New-Object System.Collections.Generic.List[object]
+    $total = $pending.Count
+    $completed = 0
+    $wave = 0
+
+    $intervalSeconds = [int]$Global:IntersightPollIntervalSeconds
+    if ($intervalSeconds -lt 5) { $intervalSeconds = 5 }
+    # How long a single host may sit in AwaitingReturn before the operator is asked about it.
+    # Floored: an unset or zeroed setting would otherwise make the ceiling 0 and put the question
+    # on screen before the host has had any chance at all to come back.
+    $returnCeilingMinutes = [int]$FirmwareReconnectInitialWaitMinutes + [int]$Global:IntersightActivationHoldMinutes
+    if ($returnCeilingMinutes -lt 5) { $returnCeilingMinutes = 5 }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "ROLLING UPGRADE of '$($Cluster.Name)': $total host(s), $BatchMode mode." -ForegroundColor Cyan
+    Write-Host "As each host comes back healthy its slot is refilled from the remaining hosts, within live capacity." -ForegroundColor Cyan
+
+    $nextPoll = Get-Date
+
+    while ($pending.Count -gt 0 -or $inFlight.Count -gt 0) {
+
+        # ------------------------------------------------------------------ ADMIT
+        if ($pending.Count -gt 0) {
+            $sizing = Get-RollingConcurrencyLimit -Cluster $Cluster -BatchMode $BatchMode
+            $room = $sizing.Limit - $inFlight.Count
+
+            if ($sizing.Limit -lt 1 -and $inFlight.Count -eq 0) {
+                $sizing.Diagnostics | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+                Add-SummaryRecord -Stage "ClusterHealth" -Batch "" -HostName "" -Action "Capacity sizing" -Result "Failed" -Details $sizing.Reason
+                Stop-WithMessage "Cluster '$($Cluster.Name)' has insufficient capacity to remove even one host: $($sizing.Reason)"
+            }
+
+            if ($room -gt 0) {
+                $wave++
+                $admit = @($pending | Select-Object -First $room)
+                foreach ($name in $admit) { [void]$pending.Remove($name) }
+
+                $sizing.Diagnostics | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+                Write-Host "" -ForegroundColor Cyan
+                Write-Host "WAVE ${wave}: starting $($admit.Count) host(s) - $($admit -join ', ')" -ForegroundColor Cyan
+                Write-Host "  Capacity allows $($sizing.Limit) host(s) out at once; $($inFlight.Count) already in flight. $($sizing.Reason)" -ForegroundColor DarkGray
+                Add-SummaryRecord -Stage "BatchSizing" -Batch "$wave" -HostName "" -Action "Admit hosts" -Result "$($admit.Count)" -Details "Limit $($sizing.Limit), in flight $($inFlight.Count), waiting $($pending.Count). $($sizing.Reason)"
+
+                Start-RollingHostWave -HostNames $admit -Wave $wave
+
+                foreach ($name in $admit) {
+                    [void]$inFlight.Add([pscustomobject]@{
+                        Host = $name; Wave = "$wave"; Stage = "AwaitingReturn"
+                        StartedAt = Get-Date; ReturnedAt = $null; Announced = ""
+                    })
+                }
+
+                # DRY RUN never reboots anything, so nothing will ever "come back". Take these
+                # straight to the gate, which reports its own intent and changes nothing.
+                if ((Test-DryRun) -or (Test-StageNoAck)) {
+                    foreach ($tracker in $inFlight.ToArray()) { $tracker.Stage = "Compliance" }
+                }
+            }
+        }
+
+        # ---------------------------------------------------------------- ADVANCE
+        foreach ($tracker in $inFlight.ToArray()) {
+
+            if ($tracker.Stage -eq "AwaitingReturn") {
+                if (Test-VMHostRejoinedAfterReboot -HostName $tracker.Host) {
+                    $tracker.Stage = "Settling"
+                    $tracker.ReturnedAt = Get-Date
+                    Write-Host "  '$($tracker.Host)' is back in vCenter. Settling $HostProfileComplianceSettleMinutes minute(s) before its compliance scan." -ForegroundColor Green
+                    Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Confirm host returned" -Result "Returned" -Details "Back in vCenter with a changed boot time."
+                }
+                elseif (((Get-Date) - $tracker.StartedAt).TotalMinutes -ge $returnCeilingMinutes) {
+                    $progress = Get-RollingHostDiagnostic -HostName $tracker.Host
+                    Write-Host "" -ForegroundColor Yellow
+                    Write-Host "'$($tracker.Host)' has not come back after $returnCeilingMinutes minute(s). $progress" -ForegroundColor Yellow
+                    Write-Host "  R - recheck: keep waiting for it." -ForegroundColor Yellow
+                    Write-Host "  O - override: treat it as returned and run its host profile check now." -ForegroundColor Yellow
+                    Write-Host "  E - exit the run here." -ForegroundColor Yellow
+                    $choice = Read-ChoiceExit -Message "'$($tracker.Host)' has not returned. R to recheck, O to override, E to exit" -AllowedChoices @("R","O") -ExitMessage "Stopped waiting for '$($tracker.Host)' to return."
+                    if ($choice -eq "O") {
+                        Add-ManualAttentionHost -HostName $tracker.Host -Reason "Did not return within the expected window" -Detail "Operator overrode the return check after $returnCeilingMinutes minute(s). $progress"
+                        $tracker.Stage = "Settling"; $tracker.ReturnedAt = Get-Date
+                    }
+                    else { $tracker.StartedAt = Get-Date }
+                }
+                continue
+            }
+
+            if ($tracker.Stage -eq "Settling") {
+                $waited = if ($null -eq $tracker.ReturnedAt) { [double]$HostProfileComplianceSettleMinutes } else { ((Get-Date) - $tracker.ReturnedAt).TotalMinutes }
+                if ($waited -ge [double]$HostProfileComplianceSettleMinutes) {
+                    $tracker.Stage = "Compliance"
+                    Add-SummaryRecord -Stage "HostProfileComplianceSettle" -Batch $tracker.Wave -HostName $tracker.Host -Action "Settle before compliance scan" -Result "Completed" -Details "Waited $([int]$waited) minute(s) from this host's own return before scanning."
+                }
+                continue
+            }
+
+            if ($tracker.Stage -eq "Compliance") {
+                Confirm-SingleHostComplianceAndExit -HostName $tracker.Host -BatchNumber $tracker.Wave
+                [void]$inFlight.Remove($tracker)
+                $completed++
+                Write-Host "  '$($tracker.Host)' complete. $completed of $total done, $($inFlight.Count) in flight, $($pending.Count) waiting." -ForegroundColor Green
+                Add-SummaryRecord -Stage "RollingProgress" -Batch $tracker.Wave -HostName $tracker.Host -Action "Host complete" -Result "Completed" -Details "$completed of $total complete; $($inFlight.Count) in flight; $($pending.Count) waiting."
+            }
+        }
+
+        if ($pending.Count -eq 0 -and $inFlight.Count -eq 0) { break }
+
+        # Nothing advanced this pass. Wait, watching for E, then look again.
+        $key = Read-PendingConsoleKey
+        if ($key -eq "E") { Stop-SafeExit -Message "Stopped during the rolling upgrade." }
+
+        if ((Get-Date) -ge $nextPoll) {
+            $nextPoll = (Get-Date).AddSeconds($intervalSeconds)
+            $awaiting = @($inFlight.ToArray() | Where-Object { $_.Stage -eq "AwaitingReturn" })
+            foreach ($tracker in $awaiting) {
+                $note = Get-RollingHostDiagnostic -HostName $tracker.Host
+                if ($note -ne $tracker.Announced) {
+                    Write-Host "    '$($tracker.Host)': $note" -ForegroundColor DarkGray
+                    $tracker.Announced = $note
+                }
+            }
+        }
+
+        Start-Sleep -Seconds 5
+    }
+
+    Write-Host "" -ForegroundColor Green
+    Write-Host "Rolling upgrade of '$($Cluster.Name)' finished: $completed of $total host(s) completed." -ForegroundColor Green
+}
+
+function Get-RollingHostDiagnostic {
+    <#
+    .SYNOPSIS
+        A short line describing what a host in flight is currently doing. Log only.
+
+    .DESCRIPTION
+        Best effort and never throws. For an Intersight-routed host it reports the activation phase
+        so a stalled workflow is visible while the run is still waiting on vCenter; for anything
+        else it reports the connection state. Purely informational - no decision is made from it.
+    #>
+    param([Parameter(Mandatory=$true)][string]$HostName)
+
+    try {
+        if ($Global:IntersightHostMap.ContainsKey($HostName)) {
+            $map = $Global:IntersightHostMap[$HostName]
+            $sp = Resolve-IntersightServerProfileForHost -HostName $HostName -IntersightCsvRow $map.IntersightCsvRow
+            $serverMoid = Get-IntersightAssignedServerMoid -ServerProfile $sp -ProfileMoid ([string]$sp.Moid) -Quiet
+            $progress = Get-IntersightActivationProgress -ProfileMoid ([string]$sp.Moid) -ServerMoid $serverMoid -HostName $HostName
+            return $progress.Phase
+        }
+    }
+    catch { return "state not readable - $($_.Exception.Message)" }
+
+    try {
+        $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
+        if ($null -eq $hostObj) { return "not in vCenter inventory yet" }
+        return "vCenter reports $($hostObj.ConnectionState)"
+    }
+    catch { return "state not readable" }
+}
+
+function Start-RollingHostWave {
+    <#
+    .SYNOPSIS
+        Puts a set of hosts into Maintenance mode and sends their firmware action. Does not wait.
+
+    .DESCRIPTION
+        Everything up to and including "the reboot has been asked for". The rolling loop takes it
+        from there, so this must not block on the activation completing - blocking here is what
+        would stop the next host being admitted, which is the entire point of the rolling shape.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,
+        [Parameter(Mandatory=$true)][int]$Wave
+    )
+
+    if ($HostNames.Count -eq 0) { return }
+
+    $Global:BatchActionsSent = 0
+
+    # Baselines BEFORE any action, and APPENDED - earlier waves are still in flight and their
+    # baselines must survive, or their return check has nothing to compare against.
+    Save-BatchBootTimes -HostNames $HostNames -Append
+
+    Request-MaintenanceModeForBatch -HostNames $HostNames
+    $inMaintenance = Wait-BatchMaintenanceMode -HostNames $HostNames -TimeoutMinutes $MaintenanceValidationTimeoutMinutes
+    if ($null -eq $inMaintenance) { Stop-WithMessage "Wave $Wave is not fully in Maintenance mode within timeout." }
+
+    if ($Global:UpgradeMode -ne "ESXI_UCS_FIRMWARE") {
+        # ESXi-only: the reboot comes from vCenter and nothing else is involved.
+        if (-not (Test-DryRun)) {
+            Invoke-RebootSafetyWindow -TimeoutSeconds 90 -HostNames $HostNames -BatchNumber "$Wave" | Out-Null
+            foreach ($hostName in $HostNames) {
+                $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
+                Restart-VMHost -VMHost $hostObj -Confirm:$false -ErrorAction Stop | Out-Null
+                $Global:BatchActionsSent++
+            }
+        }
+        return
+    }
+
+    $ucsNames = @($HostNames | Where-Object { -not $Global:IntersightHostMap.ContainsKey($_) })
+    $intersightNames = @($HostNames | Where-Object { $Global:IntersightHostMap.ContainsKey($_) })
+
+    if ($ucsNames.Count -gt 0) { Set-UcsFirmwarePolicyForBatch -HostNames $ucsNames -BatchNumber "$Wave" }
+    if (-not (Test-DryRun)) { Invoke-RebootSafetyWindow -TimeoutSeconds 90 -HostNames $HostNames -BatchNumber "$Wave" | Out-Null }
+    if ($ucsNames.Count -gt 0) { Invoke-UcsPendingAckForBatch -HostNames $ucsNames -BatchNumber "$Wave" }
+    if ($intersightNames.Count -gt 0) { Invoke-IntersightAcceptAndRebootImmediateForBatch -HostNames $intersightNames -BatchNumber "$Wave" -NoWait }
+
+    if ($Global:BatchActionsSent -eq 0 -and -not (Test-DryRun)) {
+        Write-Host "  No firmware action was sent for wave $Wave - nothing in it is rebooting." -ForegroundColor Yellow
+        Write-Host "  Those hosts will be checked against their host profile and returned to service." -ForegroundColor Yellow
+        foreach ($hostName in $HostNames) {
+            if ($Global:PreRebootBootTimes.ContainsKey($hostName)) { [void]$Global:PreRebootBootTimes.Remove($hostName) }
+        }
+        Add-SummaryRecord -Stage "BatchAction" -Batch "$Wave" -HostName "" -Action "Send firmware action" -Result "NoneNeeded" -Details "Nothing staged for $($HostNames -join ', '); continued without prompting."
+    }
+}
+
 function Save-BatchBootTimes {
     <#
     .SYNOPSIS
@@ -4794,10 +5168,15 @@ function Save-BatchBootTimes {
     .DESCRIPTION
         Taken immediately before the Intersight activation, so the reconnect gate afterwards has
         something to compare against and can require the host to have genuinely restarted.
-    #>
-    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames)
 
-    $Global:PreRebootBootTimes = @{}
+        -Append keeps the baselines already recorded. The rolling upgrade needs it: earlier waves
+        are still in flight, and clearing the map would leave their return checks with nothing to
+        compare against - so they would read as "no baseline" and pass on presence alone, which is
+        exactly the mistake the boot time exists to prevent.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,[switch]$Append)
+
+    if (-not $Append -or $null -eq $Global:PreRebootBootTimes) { $Global:PreRebootBootTimes = @{} }
     foreach ($hostName in $HostNames) {
         try {
             $hostObj = Get-VMHost -Name $hostName -ErrorAction SilentlyContinue
@@ -5272,183 +5651,13 @@ function Invoke-ClusterUpgradeWorkflow {
     $pendingHosts = New-Object System.Collections.ArrayList
     foreach ($hostObj in @($patchCandidateHosts | Where-Object { $_.ConnectionState -eq "Maintenance" })) { [void]$pendingHosts.Add($hostObj.Name) }
     foreach ($hostObj in @($patchCandidateHosts | Where-Object { $_.ConnectionState -ne "Maintenance" })) { [void]$pendingHosts.Add($hostObj.Name) }
-    $batchNumber = 0
+    # ROLLING, NOT BATCHED. The old loop took N hosts, put them all through, and did not start
+    # host N+1 until the SLOWEST of the first N had finished - so a host back in twenty minutes sat
+    # idle while its neighbour took fifty. Invoke-RollingClusterUpgrade tracks each host on its own
+    # and refills its slot the moment it is back in service, within whatever live capacity allows.
+    # SINGLE mode is the same engine with the limit fixed at one.
+    Invoke-RollingClusterUpgrade -Cluster $Cluster -OrderedHostNames @($pendingHosts) -BatchMode $batchMode
 
-    while ($pendingHosts.Count -gt 0) {
-        $batchNumber++
-
-        # Capacity is re-evaluated for every batch, not once up front, so hosts returning to
-        # service are reflected in the next batch's size.
-        $batchSize = 1
-        if ($batchMode -eq "AUTO" -and -not (Test-StageNoAck)) {
-            $remainingCandidates = @($pendingHosts | ForEach-Object { Get-VMHost -Name $_ -ErrorAction SilentlyContinue } | Where-Object { $null -ne $_ })
-            $sizing = Get-CapacityBasedBatchSize -CandidateHosts $remainingCandidates -Cluster $Cluster
-            $sizing.Diagnostics | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
-
-            if ($sizing.SafeBatchSize -lt 1) {
-                Add-SummaryRecord -Stage "ClusterHealth" -Batch $batchNumber -HostName "" -Action "Capacity sizing" -Result "Failed" -Details $sizing.Reason
-                Stop-WithMessage "Cluster '$($Cluster.Name)' has insufficient capacity to remove even one host: $($sizing.Reason)"
-            }
-            $batchSize = [int]$sizing.SafeBatchSize
-            Write-Host "Batch ${batchNumber} sized at $batchSize host(s) from live capacity. $($sizing.Reason)" -ForegroundColor Green
-            Add-SummaryRecord -Stage "BatchSizing" -Batch $batchNumber -HostName "" -Action "Calculate batch size" -Result "$batchSize" -Details $sizing.Reason
-        }
-        elseif ($batchMode -eq "AUTO") {
-            # STAGE_NO_ACK never reboots, so capacity is not a constraint there.
-            $batchSize = [Math]::Min($pendingHosts.Count, [int]$MaxAbsoluteBatchSize)
-        }
-
-        # Cluster list order, first hosts first. $pendingHosts was built from the cluster's hosts
-        # sorted by name, and taking from the front keeps each batch - and the order hosts are
-        # evacuated within it - predictable and repeatable rather than whatever DRS finishes first.
-        $currentBatchNames = @($pendingHosts | Select-Object -First $batchSize)
-        $Global:BatchActionsSent = 0
-        $Global:IntersightActivationHeldForBatch = $false
-
-        # Before ANY action - the UCS acknowledgement restarts a host just as an Intersight
-        # activation does, so a baseline taken after either is the post-reboot value and the gate
-        # would then wait for a restart that had already happened.
-        Save-BatchBootTimes -HostNames $currentBatchNames
-        Write-Host "`nBATCH ${batchNumber} ($batchMode, $($currentBatchNames.Count) host(s)): $($currentBatchNames -join ', ')" -ForegroundColor Cyan
-
-        if (Test-StageNoAck) {
-            $currentBatchUcsNames = @($currentBatchNames | Where-Object { -not $Global:IntersightHostMap.ContainsKey($_) })
-            $currentBatchIntersightNames = @($currentBatchNames | Where-Object { $Global:IntersightHostMap.ContainsKey($_) })
-            if ($currentBatchUcsNames.Count -gt 0) {
-                Set-UcsFirmwarePolicyForBatch -HostNames $currentBatchUcsNames -BatchNumber $batchNumber
-                Get-UcsPendingRebootObjectsForBatch -HostNames $currentBatchUcsNames | Select-Object Host,UcsTarget,ServiceProfileDn,PendingAckFound,AckDn | Format-Table -AutoSize | Out-Host
-            }
-            if ($currentBatchIntersightNames.Count -gt 0) {
-                # STAGE_NO_ACK never acknowledges/reboots - see the Test-StageNoAck branch inside
-                # Invoke-IntersightAcceptAndRebootImmediateForBatch.
-                Invoke-IntersightAcceptAndRebootImmediateForBatch -HostNames $currentBatchIntersightNames -BatchNumber $batchNumber
-            }
-            foreach ($hostName in $currentBatchNames) { [void]$pendingHosts.Remove($hostName) }
-            continue
-        }
-
-        # Straight into Maintenance mode. Nothing is migrated by this script first - see
-        # Request-MaintenanceModeForBatch.
-        Request-MaintenanceModeForBatch -HostNames $currentBatchNames
-        $batchMaintenanceHosts = Wait-BatchMaintenanceMode -HostNames $currentBatchNames -TimeoutMinutes $MaintenanceValidationTimeoutMinutes
-        if ($null -eq $batchMaintenanceHosts) { Stop-WithMessage "Batch is not fully in Maintenance mode within timeout." }
-
-        if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") {
-            $currentBatchUcsNames = @($currentBatchNames | Where-Object { -not $Global:IntersightHostMap.ContainsKey($_) })
-            $currentBatchIntersightNames = @($currentBatchNames | Where-Object { $Global:IntersightHostMap.ContainsKey($_) })
-
-            if ($currentBatchUcsNames.Count -gt 0) { Set-UcsFirmwarePolicyForBatch -HostNames $currentBatchUcsNames -BatchNumber $batchNumber }
-            if (-not (Test-DryRun)) { Invoke-RebootSafetyWindow -TimeoutSeconds 90 -HostNames $currentBatchNames -BatchNumber $batchNumber | Out-Null }
-            if ($currentBatchUcsNames.Count -gt 0) { Invoke-UcsPendingAckForBatch -HostNames $currentBatchUcsNames -BatchNumber $batchNumber }
-
-            # Intersight-routed hosts: detect the "Inconsistent" server profile caused by the firmware
-            # policy update, accept it, tick the compulsory disruption acknowledgement, and reboot the
-            # blade immediately - no separate typed confirmation gate for this subset, per how this
-            # batch was requested. The pre-reboot safety window above still applies to the whole batch.
-            if ($currentBatchIntersightNames.Count -gt 0) { Invoke-IntersightAcceptAndRebootImmediateForBatch -HostNames $currentBatchIntersightNames -BatchNumber $batchNumber }
-
-            $initialWait = $FirmwareReconnectInitialWaitMinutes
-            $modeLabel = "Firmware mode"
-
-            # The Intersight activation already power-cycled the blade and held for it. Holding the
-            # full post-reboot window again on top would double the wait for every Intersight host,
-            # so the reconnect check starts straight away instead - it still polls until the host is
-            # actually back, so nothing is skipped, only the fixed wait in front of it.
-            if ($Global:IntersightActivationHeldForBatch) {
-                $initialWait = 0
-                $modeLabel = "Firmware mode (Intersight already held for the activation)"
-            }
-
-            # Nothing was actually sent, so nothing is rebooting. Waiting out the post-reboot
-            # window here would burn the change window and then check compliance on a host that
-            # never restarted. Surface it and let the operator decide instead.
-            if ($Global:BatchActionsSent -eq 0 -and -not (Test-DryRun)) {
-                Write-Host "" -ForegroundColor Yellow
-                Write-Host "No firmware action was sent for Batch ${batchNumber}. Nothing is rebooting." -ForegroundColor Yellow
-
-                # A host that reports RequiresDeploy=false is already where the run is trying to put
-                # it. That is a result, not a problem, and stopping to ask about it strands an
-                # unattended cluster on a host that needed nothing doing. So the ask is reserved for
-                # the case that genuinely warrants it: a state the run could not read. An unreadable
-                # state is not the same as "nothing to do" and must never be treated as one.
-                $unresolved = New-Object System.Collections.Generic.List[string]
-                Write-Host "Batch state:" -ForegroundColor Yellow
-                foreach ($hostName in $currentBatchNames) {
-                    $stateText = "unknown"
-                    if ($Global:IntersightHostMap.ContainsKey($hostName)) {
-                        try {
-                            $sp = Resolve-IntersightServerProfileForHost -HostName $hostName -IntersightCsvRow $Global:IntersightHostMap[$hostName].IntersightCsvRow
-                            $deployState = Get-IntersightProfileDeployState -ServerProfile $sp
-                            $stateText = "Intersight ConfigState=$($deployState.ConfigState), RequiresDeploy=$($deployState.RequiresDeploy)"
-                            if (-not $deployState.StateKnown) { [void]$unresolved.Add("$hostName (Intersight state not readable)") }
-                            elseif ($deployState.RequiresDeploy) { [void]$unresolved.Add("$hostName (Intersight still has changes staged)") }
-                        }
-                        catch {
-                            $stateText = "Intersight state unreadable - $($_.Exception.Message)"
-                            [void]$unresolved.Add("$hostName (Intersight state unreadable)")
-                        }
-                    }
-                    else {
-                        $stateText = "UCSM - no pending activity found on the service profile"
-                    }
-                    Write-Host "  $hostName - $stateText" -ForegroundColor Yellow
-                }
-
-                if ($unresolved.Count -eq 0) {
-                    Write-Host "Nothing is staged anywhere in this batch, so there is nothing to reboot. Continuing." -ForegroundColor Green
-                    # No action was sent, so no host is going to restart. Clearing the baseline makes
-                    # the reconnect gate report Rebooted=Unknown instead of blocking on a reboot that
-                    # was never asked for.
-                    $Global:PreRebootBootTimes = @{}
-                    Add-SummaryRecord -Stage "BatchAction" -Batch $batchNumber -HostName "" -Action "Send firmware action" -Result "NoneNeeded" -Details "Every host reported no staged changes (Intersight RequiresDeploy=false, no UCSM pending activity); continued without prompting."
-                }
-                else {
-                    Write-Host "These host(s) could not be confirmed as already current:" -ForegroundColor Yellow
-                    $unresolved | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
-                    Write-Host "The policy change may not have been staged against those profiles." -ForegroundColor Yellow
-                    Add-SummaryRecord -Stage "BatchAction" -Batch $batchNumber -HostName "" -Action "Send firmware action" -Result "None" -Details "No action sent and $($unresolved.Count) host(s) unconfirmed: $($unresolved -join '; ')"
-
-                    $choice = Read-ChoiceExit `
-                        -Message "Nothing to reboot for Batch $batchNumber, and $($unresolved.Count) host(s) could not be confirmed as current. C to continue, X to stop, E to exit" `
-                        -AllowedChoices @("C","X") `
-                        -ExitMessage "Stopped because Batch $batchNumber had no firmware action to send."
-                    if ($choice -eq "X") {
-                        Stop-WithMessage "Batch $batchNumber had no firmware action to send. Confirm the firmware policy is staged against these profiles before re-running."
-                    }
-                }
-
-                # Skip the reboot wait entirely, then let the normal compliance and health path run.
-                $initialWait = 0
-                $modeLabel = "Firmware mode (no reboot triggered)"
-            }
-        } else {
-            Invoke-RebootSafetyWindow -TimeoutSeconds 90 -HostNames $currentBatchNames -BatchNumber $batchNumber | Out-Null
-            foreach ($hostObj in $batchMaintenanceHosts) { if (-not (Test-DryRun)) { Restart-VMHost -VMHost $hostObj -Confirm:$false -ErrorAction Stop | Out-Null } }
-            $initialWait = $EsxiOnlyReconnectInitialWaitMinutes
-            $modeLabel = "ESXi-only mode"
-        }
-
-        $connectedBatchHosts = Wait-BatchReconnectAfterReboot -HostNames $currentBatchNames -InitialWaitMinutes $initialWait -ModeLabel $modeLabel
-        if ($null -eq $connectedBatchHosts) { Stop-WithMessage "Batch is not confirmed back in vCenter. Stopping before next batch." }
-
-        # The host is back in vCenter and still in Maintenance mode. Check it against its host
-        # profile before it is allowed to take load again, and do not advance while any host in
-        # the batch is non-compliant.
-        Confirm-HostProfileComplianceAndExitMaintenance -HostNames $currentBatchNames -BatchNumber $batchNumber
-
-        foreach ($hostName in $currentBatchNames) { [void]$pendingHosts.Remove($hostName) }
-
-        # No post-batch cluster health gate. Host profile compliance is the gate: a host that
-        # passes it and comes out of Maintenance mode is back in service, and the run moves on.
-        # The cluster-wide checks that used to sit here - datastore free space, triggered alarms,
-        # hosts in Maintenance mode elsewhere - were removed at the operator's direction after
-        # they repeatedly failed a cluster with nothing wrong with it and stopped the run.
-
-        Write-Host "Batch $batchNumber completed. Remaining hosts: $($pendingHosts.Count)" -ForegroundColor Green
-        if ($pendingHosts.Count -gt 0) {
-            Write-Host "Continuing automatically to Batch $($batchNumber + 1)." -ForegroundColor Green
-        }
-    }
     Show-ClusterFirmwareVerification -Cluster $Cluster -HostNames @($patchCandidateHosts | Select-Object -ExpandProperty Name)
     Show-ManualAttentionReport -ClusterName $Cluster.Name
     Add-SummaryRecord -Stage "ClusterComplete" -Batch "" -HostName "" -Action "Complete cluster" -Result "Completed" -Details $Cluster.Name

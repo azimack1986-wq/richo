@@ -59,7 +59,9 @@ $MinimumDatastoreFreePercent            = 10
 $MaxAbsoluteBatchSize                   = 6
 $MaintenanceValidationTimeoutMinutes    = 60
 $EsxiOnlyReconnectInitialWaitMinutes    = 1
-$FirmwareReconnectInitialWaitMinutes    = 1
+$FirmwareReconnectInitialWaitMinutes    = 30
+$Global:IntersightActivationHoldMinutes  = 30
+$Global:IntersightPollIntervalSeconds    = 30
 $PowerCliWebOperationTimeoutSeconds     = 3600
 # 0.01 minutes rather than 0: the settle wait must actually run so its summary row is produced and
 # the batch loop is proven to go through it, but Start-Sleep is stubbed here, so the real two
@@ -88,6 +90,7 @@ $Global:IntersightReadyChecked          = $false
 $Global:IntersightUnusable              = $false
 $Global:IntersightUnusableReason        = ''
 $Global:IntersightSkippedHosts          = @{}
+$Global:PreRebootBootTimes              = @{}
 $Global:ManualAttentionHosts            = New-Object System.Collections.Generic.List[object]
 $Global:ExcludedFromRunHosts            = @{}
 $Global:CurrentClusterName              = 'TestCluster'
@@ -135,7 +138,12 @@ function Note-Call { param([string]$Name) if (-not $script:Calls.ContainsKey($Na
 # ---------------------------------------------------------------------------
 # Stubs. Vendor cmdlets only - the script's own logic is exercised for real.
 # ---------------------------------------------------------------------------
-function Start-Sleep { param($Seconds,$Milliseconds) }
+# The rolling engine measures its waits in wall-clock minutes and advances by sleeping, so a
+# no-op Start-Sleep would leave it spinning in real time. The clock is faked instead: sleeping
+# moves it, which is what makes settle windows and ceilings testable in milliseconds.
+$script:SimNow = [datetime]'2026-08-12T00:00:00'
+function Get-Date { param($Format,$Date,$UFormat) if ($Format) { return $script:SimNow.ToString($Format) }; return $script:SimNow }
+function Start-Sleep { param($Seconds,$Milliseconds) $script:SimNow = $script:SimNow.AddSeconds([double]$Seconds) }
 function Out-GridView { param([Parameter(ValueFromPipeline=$true)]$InputObject,$Title,[switch]$PassThru) begin{} process{} end{ return $null } }
 function Get-Credential { param($Message) return $Global:UcsCredential }
 
@@ -168,7 +176,12 @@ function Set-VMHost {
 function Get-Datastore { param($Location,$ErrorAction) return @([pscustomobject]@{ Name='ds1'; CapacityGB=1000; FreeSpaceGB=500 }) }
 function Get-VM { param($ErrorAction) return @() }
 function Move-VM { param($VM,$Destination,$Confirm,$ErrorAction) Note-Call 'Move-VM' }
-function Restart-VMHost { param($VMHost,$Confirm,$ErrorAction) Note-Call 'Restart-VMHost' }
+function Restart-VMHost { param($VMHost,$Confirm,$ErrorAction)
+    Note-Call 'Restart-VMHost'
+    # A restarted host comes back with a NEW boot time. Without this the return check can never
+    # fire, and ESXi-only mode would wait forever for something the fixture never simulated.
+    $script:BootCounter++
+    $script:HostState[$VMHost.Name].ExtensionData.Runtime.BootTime = "2026-08-12T2$($script:BootCounter):00:00Z" }
 function Get-VMHostProfile { param($Entity,$ErrorAction) return [pscustomobject]@{ Name = 'HP-Prod' } }
 function Get-Task { param($Status,$Id,$ErrorAction) return @() }
 # The scan itself must never read the cache. The stored result is only a legitimate second read
@@ -425,7 +438,7 @@ Assert-True "no row has a blank stage" (@($Global:RunSummary | Where-Object { [s
 # would spin for their full duration. Replaced so the batch loop runs at full speed.
 function Invoke-RebootSafetyWindow { param($TimeoutSeconds,$HostNames,$BatchNumber) Note-Call 'RebootSafetyWindow'; return $true }
 $EsxiOnlyReconnectInitialWaitMinutes = 0
-$FirmwareReconnectInitialWaitMinutes = 0
+# (the rolling engine has no fixed pre-wait; the ceiling stays at its configured value)
 
 Write-Host "`n=== A full LIVE RUN cluster workflow completes ===" -ForegroundColor Cyan
 Reset-Simulation -Mode 'LIVE'
@@ -480,11 +493,15 @@ Assert-True "the cluster completed" (@($Global:RunSummary | Where-Object { $_.St
 Assert-True "no cluster health gate runs" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterHealth' }).Count -eq 0) "found: $(($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterHealth' } | ForEach-Object { $_.Details }) -join ' | ')"
 
 Write-Host "`n=== Compliance was scanned, not read from cache ===" -ForegroundColor Cyan
-# The settle wait sits between the reconnect gate and the first scan of each batch. If it stops
-# running, a batch scans a host that is still starting up and reports differences that are not real.
+# The settle sits between a host's return and its first scan. If it stops running, a host is
+# scanned while it is still starting up and reports differences that are not real.
+#
+# PER HOST now, not per batch: in the rolling shape each host settles from ITS OWN return time, so
+# the windows overlap instead of costing the settle period once per host in series.
 $settleRows = @($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileComplianceSettle' })
-$batchesWithCompliance = @($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' } | Select-Object -ExpandProperty Batch -Unique)
-Assert-True "the settle wait ran before every batch's compliance scan" ($settleRows.Count -eq $batchesWithCompliance.Count) "settles: $($settleRows.Count), batches: $($batchesWithCompliance.Count)"
+$hostsWithCompliance = @($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' } | Select-Object -ExpandProperty Host -Unique)
+Assert-True "every host settled before its own compliance scan" ($settleRows.Count -eq $hostsWithCompliance.Count) "settles: $($settleRows.Count), hosts: $($hostsWithCompliance.Count)"
+Assert-True "each settle names the host it belongs to" (@($settleRows | Where-Object { [string]::IsNullOrWhiteSpace($_.Host) }).Count -eq 0)
 Assert-True "every settle ran to completion" (@($settleRows | Where-Object { $_.Result -eq 'Completed' }).Count -eq $settleRows.Count)
 # The stub throws on -UseCache, so reaching here at all proves a real scan was requested each time.
 Assert-True "a compliance scan was issued for every host" ($script:Calls['Test-VMHostProfileCompliance'] -ge 4) "got $($script:Calls['Test-VMHostProfileCompliance'])"

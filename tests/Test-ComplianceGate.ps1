@@ -40,6 +40,7 @@ $wanted = @(
     'Wait-VMHostProfileComplianceTask'
     'Wait-HostProfileComplianceSettle'
     'Confirm-HostProfileComplianceAndExitMaintenance'
+    'Confirm-SingleHostComplianceAndExit'
     'Read-ChoiceExit'
     'Read-PendingConsoleKey'
     'Test-DryRun'

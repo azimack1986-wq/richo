@@ -12,6 +12,57 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.0.0] — 2026-08-12
+
+#### Changed
+
+- **The cluster is upgraded as a ROLLING WINDOW, not in discrete batches.** As
+  each host comes back healthy, its slot is refilled from the remaining hosts —
+  within whatever live capacity allows.
+
+  The batch loop did not start host N+1 until the **slowest** of the first N had
+  finished, so a host back in twenty minutes sat idle while its neighbour took
+  fifty. Every host is now tracked on its own through
+  `AwaitingReturn → Settling → Compliance → Done`, and a freed slot is refilled
+  on the next pass.
+
+  - **Admission is re-read from live capacity every pass.** The same arithmetic
+    as before — `Get-CapacityBasedBatchSize` already counts hosts in Maintenance
+    as free and sizes from the connected hosts' live load — now used as a
+    *concurrency limit* rather than a batch size. It reads the **whole cluster**,
+    not just the hosts still waiting: sizing from the remainder understates
+    capacity as the run progresses, because a host finished an hour ago is
+    carrying load and contributing capacity again.
+  - **Each host settles from its own return time**, so the settle windows overlap
+    instead of costing `HostProfileComplianceSettleMinutes` once per host in
+    series.
+  - **The firmware phase no longer blocks.** The deploy and activation are sent
+    (`-NoWait`) and the loop moves on; the readiness signal is the host
+    reappearing in vCenter, which is what the vCenter work waits on anyway.
+    Blocking there is precisely what would stop the next host being admitted.
+  - **A halt still halts everything.** A host profile that will not apply pauses
+    admission as well — that is a reason to stop feeding hosts in, not to carry
+    on regardless.
+  - **SINGLE mode is the same engine with the limit fixed at one**, so the two
+    modes cannot drift. Its behaviour is unchanged: one host, complete, next.
+
+- `Confirm-HostProfileComplianceAndExitMaintenance` split: the per-host half is
+  now `Confirm-SingleHostComplianceAndExit`, which does **not** settle (its caller
+  owns that). The batch entry point still settles once and then calls it per host,
+  so that path is unchanged.
+
+#### Fixed
+
+- **A null `PreRebootBootTimes` map was swallowed into "the host has not
+  returned".** `.ContainsKey` on `$null` threw inside a `try`, the `catch`
+  returned `$false`, and the host could never be seen to come back — an infinite
+  wait from a one-line omission. A null map now reads as "no baseline", which is
+  what it means. Found by the rolling engine hitting it.
+- **The return ceiling is floored at 5 minutes.** Built from
+  `FirmwareReconnectInitialWaitMinutes + IntersightActivationHoldMinutes`, it
+  would be `0` if either were unset — putting "this host has not returned" on
+  screen before the host had any chance to.
+
 ### [22.1.0] — 2026-08-12
 
 #### Added
@@ -1906,6 +1957,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.0.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.0.0 — the cluster rolls
+through host by host, refilling each slot as it frees, within live capacity. This
+is the build to run.
 
 ### [22.1.0-preauth] — 2026-08-12
 
