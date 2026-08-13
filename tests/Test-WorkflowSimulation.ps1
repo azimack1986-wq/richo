@@ -588,6 +588,46 @@ Assert-True "the mismatch is flagged" ($stale[0].Result -eq 'Attention') "got $(
 Assert-True "and names both versions" ($stale[0].Details -match 'VERSION MISMATCH - running 4\.3\(6h\), expected 6\.0\(2d\)') "got: $($stale[0].Details)"
 $script:UcsRunningVersion = '6.0(2d)'
 
+Write-Host "`n=== ESXi-only mode touches neither UCS Manager nor Intersight ===" -ForegroundColor Cyan
+# "ESXi upgrade only" has to mean exactly that: evacuate, reboot from vCenter, check the host
+# profile, put it back. Any UCSM login or Intersight call in that path is a prompt, a credential,
+# or a change the operator did not ask for.
+Reset-Simulation -Mode 'LIVE'
+$script:Calls = @{}
+function Read-Host {
+    param([string]$Prompt)
+    $script:PromptLog.Add($Prompt)
+    if ($script:PromptLog.Count -gt $script:MaxPrompts) { throw "Prompt limit exceeded: '$Prompt'" }
+    # A UCSM or Intersight prompt in ESXi-only mode is itself the failure.
+    if ($Prompt -match '(?i)ucs|intersight|firmware package|api key') { throw "ESXi-only mode must not ask about firmware infrastructure: '$Prompt'" }
+    switch -Regex ($Prompt) {
+        'Select run mode'      { return '1' }
+        'Select upgrade mode'  { return '1' }   # ESXi upgrade only
+        'Select batch mode'    { return '1' }
+        'Reconnect incomplete' { return 'OVERRIDE' }
+        default                { return 'CONTINUE' }
+    }
+}
+$esxiOnlyError = $null
+try { Invoke-ClusterUpgradeWorkflow -Cluster $script:Cluster 6>$null } catch { $esxiOnlyError = $_ }
+Assert-True "the ESXi-only workflow ran to completion" ($null -eq $esxiOnlyError) "$esxiOnlyError"
+
+foreach ($forbidden in @('Connect-Ucs','Set-UcsServiceProfile','Set-UcsLsmaintAck','Get-UcsServiceProfile',
+                         'Add-UcsFirmwareComputeHostPack','Set-IntersightServerProfile',
+                         'Set-IntersightComputeServerSetting','Set-IntersightConfiguration')) {
+    Assert-True "ESXi-only mode never called $forbidden" (-not $script:Calls.ContainsKey($forbidden)) "called $($script:Calls[$forbidden]) time(s)"
+}
+# And it DOES do the ESXi work: evacuate, reboot from vCenter, then the compliance gate.
+Assert-True "the hosts were put into Maintenance mode" ($script:Calls.ContainsKey('Set-VMHost'))
+Assert-True "and rebooted from vCenter, not from the fabric" ($script:Calls.ContainsKey('Restart-VMHost'))
+Assert-True "every host still went through the host profile gate" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' } | Select-Object -ExpandProperty Host -Unique).Count -eq 4)
+Assert-True "and the cluster completed" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
+
+Write-Host "`n=== SAVE ONLY / NO ACKNOWLEDGEMENT is no longer selectable ===" -ForegroundColor Cyan
+$menuText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-True "the run mode menu offers only LIVE, DRY RUN and Exit" ($menuText -match "Select run mode:``n  1\. LIVE RUN``n  2\. DRY RUN / VALIDATION ONLY``n  3\. Exit")
+Assert-True "nothing can set RunMode to STAGE_NO_ACK" (-not ($menuText -match '\$Global:RunMode = "STAGE_NO_ACK"'))
+
 Write-Host "`n=== A deploy the appliance refuses does not cost the cluster either ===" -ForegroundColor Cyan
 # Live failure: the blade had dropped off Intersight, and the refusal ended the whole run with the
 # rest of the batch already evacuated and sitting in Maintenance mode, un-upgraded and unreported.

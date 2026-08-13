@@ -12,6 +12,61 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [22.0.0] — 2026-08-12
+
+#### Changed
+
+- **The whole batch is now activated at once.** The hosts are evacuated together,
+  so they are upgraded together: every deploy in the batch is sent, then every
+  activation, then all of them are watched in **one** polling loop. A batch takes
+  as long as its **slowest** host instead of the sum of them.
+
+  Host-by-host meant a batch of six gave up six hosts' capacity up front and then
+  got them back one at a time — the worst of both arrangements, and up to six
+  activation windows end to end.
+
+  Whatever has not finished at the ceiling is put to the operator **once for the
+  batch**, listing each outstanding profile and its phase. Not once per host: six
+  prompts for one decision is how an operator ends up answering without reading.
+  `RETRY` re-sends `Activate` to only the profiles still outstanding.
+
+  SINGLE mode is a batch of one through the same function, so the two modes cannot
+  drift.
+- **`SAVE ONLY / NO ACKNOWLEDGEMENT` removed from the run mode menu.** LIVE and
+  DRY RUN only. It staged firmware without ever restarting anything, leaving every
+  host carrying a pending change for someone to finish by hand — a half-done state
+  this run had no way to report on afterwards. `Test-StageNoAck` is retained and
+  returns `$false` everywhere, so the branches that guarded against it stay
+  harmless; nothing can select the mode.
+
+#### Fixed
+
+- **`@($list)` on a `Generic.List[object]` again**, this time in the batch
+  activation poll — the same trap as 21.7.0's closing report, and it would have
+  thrown on the first poll of every Intersight batch. **A lint rule now enforces
+  it.** Only `List[object]` is affected (`List[string]` and `List[int]` wrap
+  fine — verified directly), so the rule targets that type only, scoped to each
+  variable's own enclosing function; a file-wide match flagged an unrelated
+  `ArrayList` of the same name. Verified to bite by reintroducing the fault.
+- **No speculative outcome record.** A host that had not finished when the ceiling
+  was reached was recorded as `PowerCycled` *before* the operator decided, putting
+  a guess ahead of the real outcome for the same host. The decision now writes the
+  single record.
+- **`IntersightActivationHeldForBatch` is only claimed when something was actually
+  sent or completed.** Setting it after a refused activation would have vCenter
+  polled for a host that never restarted.
+
+#### Verified
+
+- **ESXi-only mode touches neither UCS Manager nor Intersight.** It was already
+  gated correctly; there was no test saying so. The simulation now runs a full
+  ESXi-only cluster and asserts that `Connect-Ucs`, `Set-UcsServiceProfile`,
+  `Set-UcsLsmaintAck`, `Add-UcsFirmwareComputeHostPack`,
+  `Set-IntersightServerProfile`, `Set-IntersightComputeServerSetting` and
+  `Set-IntersightConfiguration` are never called, that any UCSM/Intersight prompt
+  fails the test outright, and that the hosts are still evacuated, rebooted from
+  vCenter, and taken through the host profile gate.
+
 ### [21.9.0] — 2026-08-12
 
 A live run ended with:
@@ -1814,6 +1869,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [22.0.0-preauth] — 2026-08-12
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 22.0.0 — the batch is activated
+and watched concurrently, and the run mode menu is LIVE or DRY RUN only. This is
+the build to run.
 
 ### [21.9.0-preauth] — 2026-08-12
 

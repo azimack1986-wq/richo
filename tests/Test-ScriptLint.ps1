@@ -142,7 +142,62 @@ foreach ($path in $targets) {
     )
     Assert-NoFindings "no Import-Module - not called, and not suggested in a message" $imports
 
-    # --- 6. Uncached module enumeration -------------------------------------------------------
+    # --- 6. @() around a Generic.List[object] variable ------------------------------------------
+    # Wrapping a System.Collections.Generic.List[object] in an array subexpression throws
+    # "Argument types do not match" on this PowerShell build. Nothing warns at parse time, and the
+    # throw lands wherever the list is read - which twice has been AFTER the work was done: once in
+    # the closing manual-rectification report, once in the batch activation poll.
+    #
+    # ONLY List[object] is affected. List[string] and List[int] wrap fine, verified directly, so
+    # flagging those would be a false alarm on working code - and a lint rule that cries wolf gets
+    # switched off. $list.ToArray() is the portable form and also makes a snapshot that is safe to
+    # enumerate while the list is modified.
+    #
+    # Each @(...) is judged against its OWN enclosing function. The same variable name is commonly
+    # an ArrayList in one function and a List[object] in another, so anything wider than the
+    # innermost scope reports the innocent one.
+    $allFunctions = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))
+
+    function Get-EnclosingScope {
+        param($Node, $Functions, $Root)
+        $inner = $null
+        foreach ($fn in $Functions) {
+            if ($Node.Extent.StartOffset -ge $fn.Extent.StartOffset -and $Node.Extent.EndOffset -le $fn.Extent.EndOffset) {
+                if ($null -eq $inner -or $fn.Extent.StartOffset -gt $inner.Extent.StartOffset) { $inner = $fn }
+            }
+        }
+        if ($null -eq $inner) { return $Root }
+        return $inner
+    }
+
+    $listWraps = @(
+        $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ArrayExpressionAst] }, $true) |
+            ForEach-Object {
+                $wrap = $_
+                $inner = $wrap.SubExpression.Statements
+                if ($inner.Count -ne 1) { return }
+                $pipeline = $inner[0] -as [System.Management.Automation.Language.PipelineAst]
+                if ($null -eq $pipeline -or $pipeline.PipelineElements.Count -ne 1) { return }
+                $expression = $pipeline.PipelineElements[0] -as [System.Management.Automation.Language.CommandExpressionAst]
+                if ($null -eq $expression) { return }
+                $variable = $expression.Expression -as [System.Management.Automation.Language.VariableExpressionAst]
+                if ($null -eq $variable) { return }
+
+                $scope = Get-EnclosingScope -Node $wrap -Functions $allFunctions -Root $ast
+                $name = $variable.VariablePath.UserPath.ToLower()
+                $declared = @($scope.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+                    Where-Object {
+                        $target = $_.Left -as [System.Management.Automation.Language.VariableExpressionAst]
+                        $null -ne $target -and $target.VariablePath.UserPath.ToLower() -eq $name -and
+                        $_.Right.Extent.Text -match '(?i)Collections\.Generic\.List\s*\[\s*(System\.)?Object\s*\]'
+                    })
+                if ($declared.Count -eq 0) { return }
+                "line $($wrap.Extent.StartLineNumber): @(`$$($variable.VariablePath.UserPath)) wraps a Generic.List[object] - use .ToArray()"
+            }
+    )
+    Assert-NoFindings "no array subexpression wrapping a Generic.List[object]" @($listWraps | Select-Object -Unique)
+
+    # --- 7. Uncached module enumeration -------------------------------------------------------
     $cacheFunction = @($ast.FindAll({ param($n)
         $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-AvailableModuleVersion' }, $true))
     $enumerations = @(

@@ -215,6 +215,12 @@
       after accepting the change, and the cluster health check that follows fails on any host still
       in Maintenance - which stopped the run one host in, having actually succeeded. The run now
       waits up to $ExitMaintenanceTimeoutMinutes for the transition to land.
+    - THE WHOLE BATCH IS ACTIVATED AT ONCE. The hosts are evacuated together, so they are upgraded
+      together: every deploy in the batch is sent, then every activation, then all of them are
+      watched in ONE polling loop. A batch takes as long as its SLOWEST host, not the sum of them.
+      Doing it host by host meant a batch of six gave up six hosts' capacity up front and then got
+      them back one at a time. Whatever has not finished at the ceiling is put to the operator ONCE
+      for the batch, not once per host. SINGLE mode is a batch of one through the same code.
     - THE ACTIVATION IS DRIVEN BY WHAT INTERSIGHT REPORTS, NOT BY A CLOCK. After the deploy is
       sent, the run polls three signals every $Global:IntersightPollIntervalSeconds and moves on the
       moment all three are clear - five minutes or fifty:
@@ -299,7 +305,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "21.9.0"
+$ScriptVersion = "22.0.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -496,7 +502,9 @@ $RunTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $SummaryPath = Join-Path $RunDirectory "AutoDeploy-UCSM-Firmware-Batch-Summary-$RunTimestamp.csv"
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 
-$Global:RunMode = "DRYRUN"              # DRYRUN, LIVE, or STAGE_NO_ACK
+# DRYRUN or LIVE. STAGE_NO_ACK is retained as a constant only so the guards that reference it stay
+# valid; nothing can select it - see Select-RunMode.
+$Global:RunMode = "DRYRUN"
 $Global:UpgradeMode = "ESXI_UCS_FIRMWARE" # ESXI_ONLY or ESXI_UCS_FIRMWARE
 $Global:UcsCredential = $null
 $Global:UcsSessions = @{}
@@ -3359,39 +3367,186 @@ function Get-IntersightFirmwareTaskState {
     return "Finished"
 }
 
+function Get-IntersightActivationProgress {
+    <#
+    .SYNOPSIS
+        One round of the three activation signals for one server profile.
+
+    .DESCRIPTION
+        Factored out so a whole batch can be watched in a single polling loop rather than one host
+        after another. Reads, in the order the appliance does the work:
+
+          1. server.Profile.RunningWorkflows, expanded - the deploy/activate workflow by name,
+             status and percentage complete.
+          2. firmware/Upgrades for the server with Status eq 'IN_PROGRESS'.
+          3. The profile's ConfigState.
+
+        Complete means ALL THREE are clear. Any one still busy names the phase.
+
+        Two Intersight calls per profile per round: the expanded profile read serves both the
+        workflow and the ConfigState, and the firmware upgrade query is the second.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$ProfileMoid,
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$ServerMoid
+    )
+
+    $workflow = Get-IntersightProfileWorkflowActivity -ProfileMoid $ProfileMoid
+
+    if ($workflow.Failed) {
+        $failedName = if ($workflow.Name) { "'$($workflow.Name)'" } else { "the deploy workflow" }
+        return [pscustomobject]@{
+            Complete = $false; Failed = $true; ConfigState = "unknown"
+            Phase = "workflow $failedName ended $($workflow.Status)"
+        }
+    }
+
+    $taskState = if ([string]::IsNullOrWhiteSpace($ServerMoid)) { "Unknown" } else { Get-IntersightFirmwareTaskState -ServerMoid $ServerMoid }
+
+    # Reuse the profile the workflow read already returned - it is the same GET.
+    $stillStaged = $false
+    $stateKnown = $false
+    $configState = "unreadable"
+    try {
+        $profileNow = $workflow.Profile
+        if ($null -eq $profileNow) {
+            $profileNow = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $ProfileMoid -ErrorAction Stop) | Select-Object -First 1
+        }
+        if ($null -ne $profileNow) {
+            $state = Get-IntersightProfileDeployState -ServerProfile $profileNow
+            $stateKnown = $state.StateKnown
+            $configState = [string]$state.ConfigState
+            $stillStaged = $state.RequiresDeploy
+        }
+    }
+    catch {}
+
+    $phase = ""
+    if ($workflow.Running) {
+        $progress = if ($null -ne $workflow.Progress) { " - $([int]$workflow.Progress)% complete" } else { "" }
+        $name = if ($workflow.Name) { "'$($workflow.Name)'" } else { "a deploy workflow" }
+        $phase = "workflow $name is running$progress"
+    }
+    elseif ($taskState -eq "Running") { $phase = "the firmware upgrade is in progress" }
+    elseif ($stillStaged)             { $phase = "the profile is still $configState" }
+    elseif (-not $stateKnown)         { $phase = "the profile ConfigState could not be read" }
+
+    return [pscustomobject]@{
+        Complete    = [string]::IsNullOrWhiteSpace($phase)
+        Failed      = $false
+        ConfigState = $configState
+        Phase       = if ([string]::IsNullOrWhiteSpace($phase)) { "complete; profile $configState" } else { $phase }
+    }
+}
+
+function Wait-IntersightActivationCompleteForBatch {
+    <#
+    .SYNOPSIS
+        Watches EVERY profile in the batch at once, and returns as each one finishes.
+
+    .DESCRIPTION
+        THIS IS WHY THE BATCH IS CONCURRENT. Watching one host through to completion before even
+        looking at the next made a batch of six take six activation windows end to end - the hosts
+        were evacuated together and then upgraded one at a time, which is the worst of both. Every
+        profile is now polled in the same loop, so the batch takes as long as its SLOWEST host, not
+        the sum of all of them.
+
+        Targets are objects carrying Host, ProfileMoid, ServerMoid and Label. Returns a hashtable
+        keyed by Host, each entry { Completed; Phase }, so the caller can tell which hosts finished
+        and which need a decision.
+
+        A profile whose workflow FAILS is dropped from the poll immediately - there is nothing to
+        wait for - but the rest of the batch carries on being watched.
+
+        $MaxMinutes is the ceiling for the WHOLE batch, not per host, because they run at the same
+        time. Press C to stop polling and move on, E to exit.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Targets,
+        [Parameter(Mandatory=$true)][int]$MaxMinutes
+    )
+
+    $result = @{}
+    foreach ($target in $Targets) { $result[$target.Host] = [pscustomobject]@{ Completed = $false; Phase = "not started" } }
+    if ($Targets.Count -eq 0 -or $MaxMinutes -le 0) { return $result }
+
+    $intervalSeconds = [int]$Global:IntersightPollIntervalSeconds
+    if ($intervalSeconds -lt 5) { $intervalSeconds = 5 }
+
+    Write-Host "  Polling Intersight for $($Targets.Count) profile(s) at once, every $intervalSeconds second(s), up to $MaxMinutes minute(s). Press C to move on, E to exit." -ForegroundColor Cyan
+    $endTime = (Get-Date).AddMinutes($MaxMinutes)
+    $nextPoll = Get-Date
+    $pending = New-Object System.Collections.Generic.List[object]
+    foreach ($target in $Targets) { [void]$pending.Add($target) }
+    $lastPhase = @{}
+
+    while ((Get-Date) -lt $endTime -and $pending.Count -gt 0) {
+        $key = Read-PendingConsoleKey
+        if ($key -eq "E") { Stop-SafeExit -Message "Stopped while polling for the firmware activation." }
+        if ($key -eq "C") {
+            Write-Host "    Moving on at the operator's request. $($pending.Count) profile(s) not confirmed." -ForegroundColor Yellow
+            foreach ($target in $pending) { $result[$target.Host].Phase = "operator moved on during: $($result[$target.Host].Phase)" }
+            return $result
+        }
+
+        if ((Get-Date) -ge $nextPoll) {
+            $nextPoll = (Get-Date).AddSeconds($intervalSeconds)
+
+            # .ToArray(), not @($pending). Wrapping a Generic.List[object] in an array
+            # subexpression throws "Argument types do not match" on this PowerShell build - the
+            # same trap as the closing report in 21.7.0. A snapshot is still required, because the
+            # loop removes from $pending as hosts finish. Test-ScriptLint now enforces this.
+            foreach ($target in $pending.ToArray()) {
+                $progress = Get-IntersightActivationProgress -ProfileMoid ([string]$target.ProfileMoid) -ServerMoid ([string]$target.ServerMoid)
+                $result[$target.Host].Phase = $progress.Phase
+
+                if ($progress.Failed) {
+                    Write-Host "    $($target.Label): $($progress.Phase). Not waiting any longer." -ForegroundColor Red
+                    [void]$pending.Remove($target)
+                    continue
+                }
+                if ($progress.Complete) {
+                    $result[$target.Host].Completed = $true
+                    Write-Host "    $($target.Label): activation complete - profile is $($progress.ConfigState)." -ForegroundColor Green
+                    [void]$pending.Remove($target)
+                    continue
+                }
+                # Announce only a CHANGE of phase per host, so a batch of six does not print six
+                # identical lines every poll for an hour.
+                if ($lastPhase[$target.Host] -ne $progress.Phase) {
+                    Write-Host "    $($target.Label): $($progress.Phase)." -ForegroundColor Cyan
+                    $lastPhase[$target.Host] = $progress.Phase
+                }
+            }
+
+            if ($pending.Count -gt 0) {
+                $remaining = [int][math]::Ceiling(($endTime - (Get-Date)).TotalMinutes)
+                Write-Host "      $($pending.Count) of $($Targets.Count) still going - $remaining minute(s) of the ceiling remaining." -ForegroundColor DarkGray
+            }
+        }
+
+        Start-Sleep -Seconds 5
+    }
+
+    foreach ($target in $pending) {
+        Write-Host "    Ceiling of $MaxMinutes minute(s) reached for $($target.Label) while $($result[$target.Host].Phase)." -ForegroundColor Yellow
+        $result[$target.Host].Phase = "ceiling reached while $($result[$target.Host].Phase)"
+    }
+    return $result
+}
+
 function Wait-IntersightActivationComplete {
     <#
     .SYNOPSIS
-        Follows the deploy and activation through to completion by POLLING INTERSIGHT, not by
-        waiting out a clock.
+        Single-profile wrapper over the batch poll. Returns $true when the activation completed.
 
     .DESCRIPTION
-        THE TIMER IS A CEILING, NOT THE MECHANISM. Progress is driven by what Intersight reports,
-        in the order the appliance actually does the work, and the run moves on the moment the work
-        is done - five minutes or fifty.
+        SINGLE mode, and any caller with one profile in hand. There is one implementation of the
+        polling - Wait-IntersightActivationCompleteForBatch - so a fix to how completion is decided
+        cannot land in one path and miss the other.
 
-        Three signals are read on every poll, and the first one that is still busy names the phase:
-
-          1. THE WORKFLOW. server.Profile.RunningWorkflows, expanded, gives the deploy/activate
-             workflow's name, status and percentage complete. This is the authoritative "the task
-             is running" answer and it is read first.
-          2. THE FIRMWARE UPGRADE. firmware/Upgrades for this server with Status eq 'IN_PROGRESS' -
-             the same query the GUI issues while it watches an upgrade.
-          3. THE PROFILE STATE. ConfigState no longer requiring a deploy is the end condition; the
-             other two going quiet while the profile is still pending means the work is not done.
-
-        Complete means ALL THREE agree: no workflow running, no upgrade in progress, and nothing
-        staged on the profile. Any one of them still busy keeps the wait alive.
-
-        A workflow that ends Failed, Terminated or TimedOut stops the wait immediately. There is
-        nothing to be gained from holding another 40 minutes for something the engine has already
-        given up on, and the operator is told which workflow it was.
-
-        An unreadable signal is never read as completion. If the workflow engine will not answer,
-        the firmware task and ConfigState still have to agree before this returns true.
-
-        $MaxMinutes is the ceiling. Reaching it is not a failure - the caller decides what to do.
-        Press C to stop polling and move on, E to exit. Never throws except on E.
+        Sets $Global:IntersightActivationLastPhase to whatever it was last waiting on, so a caller
+        that gives up says which stage it gave up in rather than just "not activated".
     #>
     param(
         [Parameter(Mandatory=$true)][string]$ProfileMoid,
@@ -3401,102 +3556,18 @@ function Wait-IntersightActivationComplete {
     )
 
     $Global:IntersightActivationLastPhase = "not started"
-
     if ($MaxMinutes -le 0) {
         $Global:IntersightActivationLastPhase = "no polling window was allowed"
         return $false
     }
 
-    $intervalSeconds = [int]$Global:IntersightPollIntervalSeconds
-    if ($intervalSeconds -lt 5) { $intervalSeconds = 5 }
+    $key = "single"
+    $outcome = Wait-IntersightActivationCompleteForBatch -MaxMinutes $MaxMinutes -Targets @(
+        [pscustomobject]@{ Host = $key; ProfileMoid = $ProfileMoid; ServerMoid = $ServerMoid; Label = $Label }
+    )
 
-    Write-Host "  Polling Intersight for $Label every $intervalSeconds second(s), up to $MaxMinutes minute(s). Press C to move on, E to exit." -ForegroundColor Cyan
-    $endTime = (Get-Date).AddMinutes($MaxMinutes)
-    $nextPoll = Get-Date
-    $lastPhase = ""
-
-    while ((Get-Date) -lt $endTime) {
-        $key = Read-PendingConsoleKey
-        if ($key -eq "E") { Stop-SafeExit -Message "Stopped while polling for the firmware activation." }
-        if ($key -eq "C") {
-            Write-Host "    Moving on at the operator's request." -ForegroundColor Yellow
-            $Global:IntersightActivationLastPhase = "operator moved on during: $lastPhase"
-            return $false
-        }
-
-        if ((Get-Date) -ge $nextPoll) {
-            $nextPoll = (Get-Date).AddSeconds($intervalSeconds)
-
-            # 1. The workflow engine.
-            $workflow = Get-IntersightProfileWorkflowActivity -ProfileMoid $ProfileMoid
-
-            if ($workflow.Failed) {
-                $failedName = if ($workflow.Name) { "'$($workflow.Name)'" } else { "the deploy workflow" }
-                Write-Host "    Intersight reports $failedName as $($workflow.Status). $($workflow.Detail)" -ForegroundColor Red
-                Write-Host "    Not waiting any longer - the workflow engine has stopped." -ForegroundColor Red
-                $Global:IntersightActivationLastPhase = "workflow $failedName ended $($workflow.Status)"
-                return $false
-            }
-
-            # 2. The firmware upgrade.
-            $taskState = Get-IntersightFirmwareTaskState -ServerMoid $ServerMoid
-
-            # 3. The profile itself. Reuse the object the workflow read already returned - it is
-            # the same GET, and asking twice per poll costs a round trip per host per 30 seconds
-            # for nothing. Only fetch it when that read did not answer.
-            $stillStaged = $false
-            $stateKnown = $false
-            $configState = "unreadable"
-            try {
-                $profileNow = $workflow.Profile
-                if ($null -eq $profileNow) {
-                    $profileNow = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $ProfileMoid -ErrorAction Stop) | Select-Object -First 1
-                }
-                if ($null -ne $profileNow) {
-                    $state = Get-IntersightProfileDeployState -ServerProfile $profileNow
-                    $stateKnown = $state.StateKnown
-                    $configState = [string]$state.ConfigState
-                    $stillStaged = $state.RequiresDeploy
-                }
-            }
-            catch {}
-
-            # Name the phase from the first signal that is still busy, so the operator can see
-            # which stage the change is actually in rather than a countdown.
-            $phase = ""
-            if ($workflow.Running) {
-                $progress = if ($null -ne $workflow.Progress) { " - $([int]$workflow.Progress)% complete" } else { "" }
-                $name = if ($workflow.Name) { "'$($workflow.Name)'" } else { "a deploy workflow" }
-                $phase = "workflow $name is running$progress"
-            }
-            elseif ($taskState -eq "Running") { $phase = "the firmware upgrade is in progress" }
-            elseif ($stillStaged)             { $phase = "the profile is still $configState" }
-            elseif (-not $stateKnown)         { $phase = "the profile ConfigState could not be read" }
-
-            if ([string]::IsNullOrWhiteSpace($phase)) {
-                Write-Host "    Activation complete - no workflow running, no firmware upgrade in progress, and the profile is $configState." -ForegroundColor Green
-                $Global:IntersightActivationLastPhase = "completed; profile $configState"
-                return $true
-            }
-
-            # Only announce a CHANGE of phase, plus a heartbeat, so a long deploy does not scroll
-            # the same line hundreds of times.
-            if ($phase -ne $lastPhase) {
-                Write-Host "    $($phase.Substring(0,1).ToUpper())$($phase.Substring(1))." -ForegroundColor Cyan
-                $lastPhase = $phase
-            }
-            else {
-                $remaining = [int][math]::Ceiling(($endTime - (Get-Date)).TotalMinutes)
-                Write-Host "      still going - $remaining minute(s) of the ceiling remaining." -ForegroundColor DarkGray
-            }
-        }
-
-        Start-Sleep -Seconds 5
-    }
-
-    Write-Host "    Ceiling of $MaxMinutes minute(s) reached while $lastPhase." -ForegroundColor Yellow
-    $Global:IntersightActivationLastPhase = "ceiling reached while $lastPhase"
-    return $false
+    $Global:IntersightActivationLastPhase = [string]$outcome[$key].Phase
+    return [bool]$outcome[$key].Completed
 }
 
 function Invoke-IntersightProfileActivate {
@@ -3548,169 +3619,199 @@ function Invoke-IntersightProfileActivate {
     }
 }
 
+function Invoke-IntersightActivationForBatch {
+    <#
+    .SYNOPSIS
+        Activates EVERY profile in the batch at the same time, then watches them all together.
+
+    .DESCRIPTION
+        CONCURRENT BY DESIGN. The hosts were evacuated together, so they are upgraded together.
+        Doing this one host at a time meant a batch of six took six activation windows end to end -
+        the cluster gave up six hosts' capacity up front and then got them back one at a time,
+        which is the worst of both arrangements. A batch now takes as long as its SLOWEST host.
+
+        Three phases, each across the whole batch before the next begins:
+
+          1. RESOLVE. Find the server each profile is assigned to. A profile with no server cannot
+             be activated; it is recorded and dropped, and the others carry on.
+          2. SEND. Activate every profile - ScheduledActions Action=Activate, ProceedOnReboot=true.
+             These are quick API calls, so they all go out within seconds of each other and the
+             blades restart together. Where Activate is refused and no firmware upgrade is running,
+             the power-cycle fallback is tried for that profile only.
+          3. WATCH. One polling loop over every profile at once, each finishing when its workflow,
+             firmware upgrade and ConfigState are all clear.
+
+        Whatever has not finished when the ceiling is reached is put to the operator ONCE for the
+        batch - RETRY re-sends Activate to only those profiles and watches again, CONTINUE moves to
+        the vCenter checks, EXIT stops safely. Not once per host: six prompts for one decision is
+        how an operator ends up answering without reading.
+
+        NOTHING HERE ENDS THE RUN except an explicit EXIT.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Rows,
+        [Parameter(Mandatory=$true)][string]$BatchNumber
+    )
+
+    if ($Rows.Count -eq 0) { return }
+
+    # --- 1. Resolve the server behind each profile ------------------------------------------------
+    $targets = New-Object System.Collections.Generic.List[object]
+    foreach ($row in $Rows) {
+        $serverMoid = ""
+        try {
+            $current = $null
+            if (-not [string]::IsNullOrWhiteSpace([string]$row.ProfileMoid)) {
+                $current = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $row.ProfileMoid -ErrorAction Stop) | Select-Object -First 1
+            }
+            if ($null -eq $current) { $current = $row.ServerProfileObj }
+            if ($null -ne $current) { $serverMoid = Get-IntersightAssignedServerMoid -ServerProfile $current -ProfileMoid ([string]$row.ProfileMoid) }
+        }
+        catch {
+            Write-Host "  Could not re-read '$($row.ServerProfile)' to find its server: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+
+        if ([string]::IsNullOrWhiteSpace($serverMoid)) {
+            Write-Host "  '$($row.ServerProfile)' has firmware staged, but the server it is assigned to could not be identified." -ForegroundColor Yellow
+            Write-Host "  No power action has been sent. Power-cycle the blade from Intersight to activate it." -ForegroundColor Yellow
+            Add-ManualAttentionHost -HostName $row.Host -Reason "Profile not associated with a server" -Detail "Server profile '$($row.ServerProfile)' reported no assigned server, so the staged firmware could not be activated. Check the profile association in Intersight."
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Power action" -Result "NoServer" -Details "AssignedServer/AssociatedServer carried no Moid; firmware staged on '$($row.ServerProfile)' remains inactive."
+            continue
+        }
+
+        [void]$targets.Add([pscustomobject]@{
+            Host        = $row.Host
+            Row         = $row
+            ProfileMoid = [string]$row.ProfileMoid
+            ServerMoid  = $serverMoid
+            Label       = "'$($row.ServerProfile)'"
+        })
+    }
+
+    if ($targets.Count -eq 0) { return }
+
+    $powerState = [string]$Global:IntersightActivationPowerAction
+    $round = 0
+    # Whether anything was actually accepted. The batch loop skips its own fixed post-reboot wait
+    # when this activation has held for it - but only if something really was sent or completed.
+    # Claiming the wait after a refused activation would have vCenter checked for a host that never
+    # restarted.
+    $anySent = $false
+
+    while ($true) {
+        $round++
+
+        # --- 2. Send to everything that still needs it --------------------------------------------
+        $outstanding = New-Object System.Collections.Generic.List[object]
+        foreach ($target in $targets.ToArray()) {
+            # Has it settled on its own? The appliance may have completed the work already.
+            $settled = $false
+            try {
+                $profileNow = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $target.ProfileMoid -ErrorAction Stop) | Select-Object -First 1
+                if ($null -ne $profileNow) {
+                    $state = Get-IntersightProfileDeployState -ServerProfile $profileNow
+                    if ($state.StateKnown -and -not $state.RequiresDeploy) {
+                        Write-Host "  $($target.Label) is $($state.ConfigState) - Intersight completed the activation itself." -ForegroundColor Green
+                        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $target.Host -Action "Confirm activation" -Result "Activated" -Details "ConfigState is $($state.ConfigState) on round $round; no action was needed."
+                        $settled = $true
+                    }
+                }
+            }
+            catch {
+                Write-Host "  Round $round : could not read $($target.Label) - $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+            if ($settled) { continue }
+
+            # ACTIVATE. Never gated on the firmware task finishing - the upgrade sits at
+            # IN_PROGRESS precisely BECAUSE it is waiting for this acknowledgement.
+            $taskState = Get-IntersightFirmwareTaskState -ServerMoid $target.ServerMoid
+            $outcome = Invoke-IntersightProfileActivate -ProfileMoid $target.ProfileMoid
+            Write-Host "  $($target.Label): Activate $outcome (firmware task $taskState)." -ForegroundColor Cyan
+            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $target.Host -Action "Activate" -Result $outcome -Details "ScheduledActions Action=Activate ProceedOnReboot=true on round $round (task state $taskState)."
+
+            # A power action is genuinely refused mid-upgrade, so it is only worth trying when no
+            # upgrade is running.
+            if ($outcome -eq "Failed" -and $taskState -ne "Running") {
+                $outcome = Invoke-IntersightServerPowerAction -ServerMoid $target.ServerMoid -PowerState $powerState
+                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $target.Host -Action "Power action" -Result $outcome -Details "Fallback $powerState to server $($target.ServerMoid) on round $round."
+            }
+
+            if ($outcome -eq "Sent") { $anySent = $true }
+            [void]$outstanding.Add($target)
+        }
+
+        if ($outstanding.Count -eq 0) { return }
+
+        # --- 3. Watch them all at once ------------------------------------------------------------
+        Write-Host "  Sent for $($outstanding.Count) profile(s). Watching them together." -ForegroundColor Green
+        $ceiling = if ($round -eq 1) { $Global:IntersightActivationHoldMinutes } else { $Global:IntersightActivationWaitMinutes }
+        $progress = Wait-IntersightActivationCompleteForBatch -Targets $outstanding.ToArray() -MaxMinutes $ceiling
+
+        $stillGoing = New-Object System.Collections.Generic.List[object]
+        foreach ($target in $outstanding.ToArray()) {
+            $entry = $progress[$target.Host]
+            if ($entry.Completed) {
+                $anySent = $true
+                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $target.Host -Action "Confirm activation" -Result "Activated" -Details "Activation confirmed for server $($target.ServerMoid) on round $round. $($entry.Phase)."
+            }
+            else {
+                # Deliberately NO record here. This host has not reached an outcome yet - the
+                # operator is about to decide, and whichever way they go writes the single record
+                # that describes what actually happened to it. Writing one now would put a
+                # speculative result ahead of the real one for the same host.
+                [void]$stillGoing.Add($target)
+            }
+        }
+
+        # Only claim the post-reboot wait if something genuinely went out or completed.
+        if ($anySent) { $Global:IntersightActivationHeldForBatch = $true }
+
+        if ($stillGoing.Count -eq 0) { return }
+
+        # --- One decision for the batch, not one per host -----------------------------------------
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "$($stillGoing.Count) profile(s) have not activated yet:" -ForegroundColor Yellow
+        foreach ($target in $stillGoing.ToArray()) {
+            Write-Host "    $($target.Label) - $($progress[$target.Host].Phase)" -ForegroundColor Yellow
+        }
+        Write-Host "  RETRY    - send Activate again to those profiles and keep watching." -ForegroundColor Yellow
+        Write-Host "  CONTINUE - stop waiting and move on to the vCenter checks." -ForegroundColor Yellow
+        Write-Host "  EXIT     - stop the run here." -ForegroundColor Yellow
+
+        $choice = Read-ChoiceExit `
+            -Message "$($stillGoing.Count) profile(s) have not activated yet. Choose RETRY or CONTINUE" `
+            -AllowedChoices @("RETRY","CONTINUE") `
+            -ExitMessage "Stopped while waiting for the activation of $($stillGoing.Count) profile(s)."
+
+        # Anything that is not an explicit RETRY moves on. A loop whose only exit is a successful
+        # prompt is a hang, and this one runs on a jump host that may have no console at all.
+        if ($choice -ne "RETRY") {
+            Write-Host "  Moving on to the vCenter checks." -ForegroundColor Yellow
+            foreach ($target in $stillGoing.ToArray()) {
+                Add-ManualAttentionHost -HostName $target.Host -Reason "Firmware activation not confirmed" -Detail "Server profile '$($target.Row.ServerProfile)' still had changes staged when the operator chose to continue: $($progress[$target.Host].Phase). Activate it from Intersight."
+                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $target.Host -Action "Confirm activation" -Result "StillStaged" -Details "Continued after $round round(s). $($progress[$target.Host].Phase)."
+            }
+            return
+        }
+
+        $targets = $stillGoing
+    }
+}
+
 function Invoke-IntersightActivationPowerCycle {
     <#
     .SYNOPSIS
-        Drives the activation on Intersight until the profile is no longer pending, then holds
-        for the reboot.
+        Single-profile wrapper over the concurrent batch activation.
 
     .DESCRIPTION
-        Runs entirely against Intersight. NO vCENTER ACTION HAPPENS UNTIL THIS RETURNS - the batch
-        loop's post-reboot wait and the host profile compliance gate both come after it.
-
-        Each round:
-
-          1. Re-read the profile. If it is no longer pending, Intersight completed the activation
-             itself and there is nothing left to send.
-          2. Send Activate - ScheduledActions Action=Activate, ProceedOnReboot=true, the same
-             request the GUI's "Reboot immediately to activate" sends.
-          3. If Activate is refused AND no firmware task is running, fall back to a power cycle.
-             A power action is genuinely refused while an upgrade is in progress, so it is only
-             worth trying when one is not.
-          4. Once something lands, hold $Global:IntersightActivationHoldMinutes (default 60) for
-             the activation and POST to complete, and tell the batch loop it has already served
-             that wait so the host is not held for it twice.
-          5. Otherwise stand off $Global:IntersightActivationWaitMinutes (default 60) and offer
-             RETRY / CONTINUE / EXIT. There is no cap: the run waits as long as the operator
-             wants it to.
-
-        ACTIVATE IS NEVER GATED ON THE FIRMWARE TASK FINISHING. An earlier build waited for the
-        firmware.Upgrade to leave IN_PROGRESS before sending Activate, and deadlocked: the upgrade
-        sits at IN_PROGRESS precisely because it is waiting for the reboot acknowledgement, and
-        Activate is that acknowledgement. A live run looped on "1 firmware upgrade(s) IN_PROGRESS"
-        indefinitely while the deploy had in fact completed.
-
-        NOTHING HERE ENDS THE RUN. Not a server that cannot be identified, not a refused power
-        action, not a task that is still going. Each is announced and recorded.
+        SINGLE mode is a batch of one, so it runs the same code as AUTO. There is one implementation
+        of the activation, which is what keeps the two modes honest about behaving identically.
     #>
     param(
         [Parameter(Mandatory=$true)]$Row,
         [Parameter(Mandatory=$true)][string]$BatchNumber
     )
-
-    $serverMoid = ""
-    try {
-        $current = $null
-        if (-not [string]::IsNullOrWhiteSpace([string]$Row.ProfileMoid)) {
-            $current = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $Row.ProfileMoid -ErrorAction Stop) | Select-Object -First 1
-        }
-        if ($null -eq $current) { $current = $Row.ServerProfileObj }
-        if ($null -ne $current) { $serverMoid = Get-IntersightAssignedServerMoid -ServerProfile $current -ProfileMoid ([string]$Row.ProfileMoid) }
-    }
-    catch {
-        Write-Host "  Could not re-read '$($Row.ServerProfile)' to find its server: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-
-    if ([string]::IsNullOrWhiteSpace($serverMoid)) {
-        Write-Host "  '$($Row.ServerProfile)' has firmware staged, but the server it is assigned to could not be identified." -ForegroundColor Yellow
-        Write-Host "  No power action has been sent. Power-cycle the blade from Intersight to activate it." -ForegroundColor Yellow
-        Add-ManualAttentionHost -HostName $Row.Host -Reason "Profile not associated with a server" -Detail "Server profile '$($Row.ServerProfile)' reported no assigned server, so the staged firmware could not be activated. Check the profile association in Intersight."
-        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result "NoServer" -Details "AssignedServer/AssociatedServer carried no Moid; firmware staged on '$($Row.ServerProfile)' remains inactive."
-        return
-    }
-
-    $powerState = [string]$Global:IntersightActivationPowerAction
-
-    # No pre-wait. Activate went out with the deploy, so the upgrade and the restart are already
-    # under way - the job here is to watch them finish, not to wait before starting them. The first
-    # check runs immediately and the stand-off happens between checks instead.
-    Write-Host "  Watching the firmware task on '$($Row.ServerProfile)'." -ForegroundColor Cyan
-
-    $round = 0
-    while ($true) {
-        $round++
-
-        # Step 2. Has the profile settled on its own? The appliance may have rebooted the blade
-        # itself, in which case there is nothing left to do.
-        try {
-            $profileNow = Get-IntersightResultList -Response (Get-IntersightServerProfile -Moid $Row.ProfileMoid -ErrorAction Stop) | Select-Object -First 1
-            if ($null -ne $profileNow) {
-                $state = Get-IntersightProfileDeployState -ServerProfile $profileNow
-                if ($state.StateKnown) {
-                    Write-Host "  Check $round : '$($Row.ServerProfile)' is $($state.ConfigState)." -ForegroundColor Cyan
-                    if (-not $state.RequiresDeploy) {
-                        Write-Host "  Nothing is staged against '$($Row.ServerProfile)' any more - Intersight completed the activation itself." -ForegroundColor Green
-                        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "Activated" -Details "ConfigState is $($state.ConfigState) after $round check(s); no power action was needed."
-                        return
-                    }
-                }
-            }
-        }
-        catch {
-            Write-Host "  Check $round : could not read the profile - $($_.Exception.Message)" -ForegroundColor Yellow
-        }
-
-        # Step 3. ACTIVATE. Never gated on the firmware task finishing.
-        #
-        # The firmware.Upgrade sits at IN_PROGRESS precisely BECAUSE it is waiting for the reboot
-        # acknowledgement. Waiting for it to finish before activating is a deadlock: the only thing
-        # that ends it is the activation being withheld. A live run sat in exactly that loop,
-        # reporting "1 firmware upgrade(s) IN_PROGRESS" on every check while the deploy had in fact
-        # completed and was waiting to be acknowledged.
-        #
-        # The task state still matters, but only for the POWER CYCLE fallback - the appliance
-        # genuinely does refuse a power action mid-upgrade ("Cannot perform power action when a
-        # firmware upgrade is in progress"). Activate is the acknowledgement, so it is exactly what
-        # an in-progress upgrade is waiting to receive.
-        $taskState = Get-IntersightFirmwareTaskState -ServerMoid $serverMoid
-        Write-Host "  Check $round : firmware task is $taskState. Sending Activate - an upgrade waiting on the acknowledgement is what Activate is for." -ForegroundColor Cyan
-
-        $outcome = Invoke-IntersightProfileActivate -ProfileMoid ([string]$Row.ProfileMoid)
-        Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Activate" -Result $outcome -Details "ScheduledActions Action=Activate ProceedOnReboot=true on check $round (task state $taskState)."
-
-        # The power cycle is only worth trying when no upgrade is running - it is refused otherwise,
-        # and a refusal there tells us nothing we do not already know.
-        if ($outcome -eq "Failed" -and $taskState -ne "Running") {
-            $outcome = Invoke-IntersightServerPowerAction -ServerMoid $serverMoid -PowerState $powerState
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Power action" -Result $outcome -Details "Fallback $powerState to server $serverMoid on check $round."
-        }
-
-        if ($outcome -eq "Sent") {
-            # Step 4. FOLLOW THE WORK, do not wait out a clock. The poll watches the deploy
-            # workflow, then the firmware upgrade, then the profile state, and returns the moment
-            # all three are clear. The batch loop is told it has already served the post-reboot
-            # wait, so vCenter is asked straight away rather than after another fixed window.
-            Write-Host "  Activation sent." -ForegroundColor Green
-            $completed = Wait-IntersightActivationComplete -ProfileMoid ([string]$Row.ProfileMoid) -ServerMoid $serverMoid -Label "the activation on '$($Row.ServerProfile)'" -MaxMinutes $Global:IntersightActivationHoldMinutes
-            $Global:IntersightActivationHeldForBatch = $true
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result $(if ($completed) { "Activated" } else { "PowerCycled" }) -Details "Activation landed for server $serverMoid; polled up to $($Global:IntersightActivationHoldMinutes) minute(s), completed=$completed. Last phase: $($Global:IntersightActivationLastPhase)."
-            if ($completed) { return }
-
-            # The ceiling was reached, or the workflow failed, without Intersight confirming the
-            # activation. That is the operator's call, not a silent pass.
-            Write-Host "  Intersight did not confirm the activation: $($Global:IntersightActivationLastPhase)." -ForegroundColor Yellow
-        }
-        else {
-            # Nothing was accepted. Poll anyway - the appliance may already be doing the work from
-            # the deploy, in which case there is nothing to re-send and everything to wait for.
-            $completed = Wait-IntersightActivationComplete -ProfileMoid ([string]$Row.ProfileMoid) -ServerMoid $serverMoid -Label "the activation on '$($Row.ServerProfile)'" -MaxMinutes $Global:IntersightActivationWaitMinutes
-            if ($completed) {
-                $Global:IntersightActivationHeldForBatch = $true
-                Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "Activated" -Details "Activate was $outcome on check $round, but Intersight completed the work anyway. Last phase: $($Global:IntersightActivationLastPhase)."
-                return
-            }
-        }
-
-        Write-Host "" -ForegroundColor Yellow
-        Write-Host "'$($Row.ServerProfile)' has not activated yet: $($Global:IntersightActivationLastPhase)." -ForegroundColor Yellow
-        Write-Host "  RETRY    - send Activate again now." -ForegroundColor Yellow
-        Write-Host "  CONTINUE - stop waiting and move on to the vCenter checks." -ForegroundColor Yellow
-        Write-Host "  EXIT     - stop the run here." -ForegroundColor Yellow
-
-        $choice = Read-ChoiceExit `
-            -Message "'$($Row.ServerProfile)' has not activated yet. Choose RETRY or CONTINUE" `
-            -AllowedChoices @("RETRY","CONTINUE") `
-            -ExitMessage "Stopped while waiting for the activation of '$($Row.ServerProfile)'."
-
-        # Anything that is not an explicit RETRY moves on. A loop whose only exit is a successful
-        # prompt is a hang, and this one runs on a jump host that may have no console at all.
-        if ($choice -ne "RETRY") {
-            Write-Host "  Moving on to the vCenter checks. The blade has not been power-cycled by this run." -ForegroundColor Yellow
-            Add-ManualAttentionHost -HostName $Row.Host -Reason "Firmware activation not confirmed" -Detail "Server profile '$($Row.ServerProfile)' still had changes staged when the operator chose to continue. Activate it from Intersight."
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $Row.Host -Action "Confirm activation" -Result "StillStaged" -Details "Continued after $round check(s). Last phase: $($Global:IntersightActivationLastPhase)."
-            return
-        }
-    }
+    Invoke-IntersightActivationForBatch -Rows @($Row) -BatchNumber $BatchNumber
 }
 
 function Invoke-IntersightAcceptAndRebootImmediateForBatch {
@@ -3758,6 +3859,10 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
     if (@($pendingRows | Where-Object { $_.RequiresDeploy }).Count -gt 0) {
         Assert-IntersightUpgradeCmdletSurface
     }
+
+    # Rows whose deploy landed but which still need an explicit activation. Filled by the loop
+    # below, then actioned CONCURRENTLY once every deploy in the batch has been sent.
+    $needActivation = New-Object System.Collections.Generic.List[object]
 
     foreach ($row in $pendingRows) {
         if (-not $row.RequiresDeploy) {
@@ -3877,8 +3982,12 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             # IMM installs on next reboot, so the firmware is staged and waiting for a restart -
             # which this run then supplies, because the host is already evacuated and in
             # Maintenance mode with nothing on it.
+            #
+            # COLLECTED, NOT ACTIONED HERE. Every deploy in the batch goes out first, and the
+            # activations then run together - see the call after this loop. Activating inside the
+            # loop meant host 2's deploy waited for host 1's entire activation window.
             if (-not (Confirm-IntersightDeployAccepted -Row $row -BatchNumber $BatchNumber)) {
-                Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber $BatchNumber
+                [void]$needActivation.Add($row)
             }
         } catch {
             # SET ASIDE, NOT STOPPED ON. A deploy the appliance refuses is one host's problem, and
@@ -3904,6 +4013,15 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
             Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Failed" -Details "$($reason.Reason). $message"
             continue
         }
+    }
+
+    # EVERY deploy in the batch has now been sent. Activate them together and watch them together,
+    # so the blades restart within seconds of each other and the batch takes as long as its slowest
+    # host rather than the sum of all of them.
+    if ($needActivation.Count -gt 0) {
+        Write-Host "" -ForegroundColor Cyan
+        Write-Host "Activating $($needActivation.Count) server profile(s) concurrently for Batch ${BatchNumber}." -ForegroundColor Cyan
+        Invoke-IntersightActivationForBatch -Rows $needActivation.ToArray() -BatchNumber $BatchNumber
     }
 }
 
@@ -3995,12 +4113,25 @@ function Select-ClusterInteractive {
 }
 
 function Select-RunMode {
-    Write-Host "`nSelect run mode:`n  1. LIVE RUN`n  2. DRY RUN / VALIDATION ONLY`n  3. SAVE ONLY / NO ACKNOWLEDGEMENT (UCSM policy save or Intersight staging - no reboot)`n  4. Exit" -ForegroundColor Cyan
-    $choice = Read-ChoiceExit -Message "Select run mode" -AllowedChoices @("1","2","3","4")
-    if ($choice -eq "4") { Stop-SafeExit -Message "Stopped during run mode selection." }
+    <#
+    .SYNOPSIS
+        LIVE or DRY RUN. Those are the only two.
+
+    .DESCRIPTION
+        SAVE ONLY / NO ACKNOWLEDGEMENT was removed at the operator's direction. It staged firmware
+        without ever restarting anything, which left every host in the cluster carrying a pending
+        change for someone else to finish by hand - a half-done state this run had no way to
+        report on afterwards. If staging without rebooting is genuinely wanted, it is a change of
+        its own, made deliberately in the platform.
+
+        Test-StageNoAck is kept and still returns $false everywhere, so the branches that guarded
+        against it remain harmless. Nothing can select the mode.
+    #>
+    Write-Host "`nSelect run mode:`n  1. LIVE RUN`n  2. DRY RUN / VALIDATION ONLY`n  3. Exit" -ForegroundColor Cyan
+    $choice = Read-ChoiceExit -Message "Select run mode" -AllowedChoices @("1","2","3")
+    if ($choice -eq "3") { Stop-SafeExit -Message "Stopped during run mode selection." }
     if ($choice -eq "1") { $Global:RunMode = "LIVE" }
     if ($choice -eq "2") { $Global:RunMode = "DRYRUN" }
-    if ($choice -eq "3") { $Global:RunMode = "STAGE_NO_ACK" }
 }
 
 function Select-UpgradeMode {
