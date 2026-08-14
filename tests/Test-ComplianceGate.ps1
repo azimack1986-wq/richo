@@ -37,6 +37,8 @@ $wanted = @(
     'Select-ComplianceResultForHost'
     'Get-ComplianceStatusFromComplianceManager'
     'Wait-VMHostOutOfMaintenance'
+    'Get-VMHostMaintenanceState'
+    'Test-VMHostObjectInMaintenance'
     'Wait-VMHostProfileComplianceTask'
     'Wait-HostProfileComplianceSettle'
     'Confirm-HostProfileComplianceAndExitMaintenance'

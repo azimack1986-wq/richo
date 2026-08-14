@@ -20,7 +20,8 @@ if ($errors) { throw "parse errors" }
 $wanted = @('Get-CapacityBasedBatchSize','Get-VMHostProfileComplianceState',
             'Get-ComplianceCheckTime','Get-ComplianceStatusValue','ConvertTo-ComplianceStatus',
             'Get-ComplianceFailureDetail','Select-ComplianceResultForHost',
-            'Get-ComplianceStatusFromComplianceManager','Wait-VMHostProfileComplianceTask')
+            'Get-ComplianceStatusFromComplianceManager','Wait-VMHostProfileComplianceTask',
+            'Test-VMHostObjectInMaintenance')
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $wanted -contains $_.Name } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
@@ -140,9 +141,21 @@ Assert-Equal "NotResponding is still excluded, not treated as free" 1 $r.SafeBat
 
 Write-Host "`n=== The workflow puts parked hosts in scope, and takes them first ===" -ForegroundColor Cyan
 $workflowText = [System.IO.File]::ReadAllText($scriptPath)
-Assert-Equal "the firmware candidate filter admits Maintenance" $true ($workflowText -match '\$patchCandidateHosts = @\(\$allClusterHosts \| Where-Object \{ \$_\.ConnectionState -eq "Connected" -or \$_\.ConnectionState -eq "Maintenance" \}\)')
-Assert-Equal "the ESXi-only filter admits Maintenance too" $true ($workflowText -match 'ConnectionState -eq "Connected" -or \$_\.ConnectionState -eq "Maintenance"\) -and \(\$alreadyTargetHosts')
-Assert-Equal "parked hosts are queued ahead of the rest" $true ($workflowText -match '(?s)Where-Object \{ \$_\.ConnectionState -eq "Maintenance" \}\)\) \{ \[void\]\$pendingHosts\.Add.*Where-Object \{ \$_\.ConnectionState -ne "Maintenance" \}\)\) \{ \[void\]\$pendingHosts\.Add')
+# Parked is asked of inMaintenanceMode, never of ConnectionState. In the vSphere API the two are
+# independent, and a parked host whose heartbeat is missed reads NotResponding - which under the
+# old ConnectionState test fell out of both the candidate list and the parked list at once.
+Assert-Equal "the firmware candidate filter admits Maintenance" $true ($workflowText -match '\$patchCandidateHosts = @\(\$allClusterHosts \| Where-Object \{ \$_\.ConnectionState -eq "Connected" -or \(Test-VMHostObjectInMaintenance -VMHostObject \$_\) \}\)')
+Assert-Equal "the ESXi-only filter admits Maintenance too" $true ($workflowText -match 'ConnectionState -eq "Connected" -or \(Test-VMHostObjectInMaintenance -VMHostObject \$_\)\) -and \(\$alreadyTargetHosts')
+Assert-Equal "parked hosts are queued ahead of the rest" $true ($workflowText -match '(?s)Where-Object \{ Test-VMHostObjectInMaintenance -VMHostObject \$_ \}\)\) \{ \[void\]\$pendingHosts\.Add.*Where-Object \{ -not \(Test-VMHostObjectInMaintenance -VMHostObject \$_\) \}\)\) \{ \[void\]\$pendingHosts\.Add')
+# ConnectionState may still be asked "can this host be reached at all" - Connected OR Maintenance -
+# because on a host that genuinely is NotResponding there is nothing to read either way. What it
+# must never do again is decide maintenance mode on its own.
+$maintenanceDecisions = @(($workflowText -split "`n") | Where-Object {
+    $_ -match 'ConnectionState -(eq|ne) "Maintenance"' -and
+    $_.TrimStart() -notmatch '^#' -and
+    $_ -notmatch 'ConnectionState -(eq|ne) "Connected"' -and
+    $_ -notmatch '\[string\]\$VMHostObject\.ConnectionState' })
+Assert-Equal "ConnectionState no longer decides Maintenance mode on its own" 0 $maintenanceDecisions.Count
 Assert-Equal "and they are recorded as in scope, not excluded" $true ($workflowText -match '-Action "Pre-existing Maintenance mode" -Result "InScope"')
 
 Write-Host "`n=== The ceiling is a TOTAL, and hosts in flight count against it ===" -ForegroundColor Cyan

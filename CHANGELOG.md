@@ -12,6 +12,82 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.7.0] — 2026-08-14
+
+#### Fixed
+
+- **A host sitting in Maintenance mode reported "still evacuating" until its
+  60 minute timeout ran out.** Seen live on `siepd85vcp0737`, with vCenter
+  showing the host in Maintenance Mode the whole time.
+
+  The wait tested `ConnectionState -eq "Maintenance"`. In the vSphere API those
+  are two independent properties of `HostRuntimeInfo`: `connectionState` is only
+  `connected`, `disconnected` or `notResponding` — there is no `maintenance`
+  member — and `inMaintenanceMode` is a separate boolean, set once the host has
+  entered Maintenance mode and left set regardless of what the connection state
+  does. PowerCLI folds the two into one `ConnectionState` property that can read
+  `Maintenance`, but the connection value wins.
+
+  vCenter calls a host `NotResponding` after roughly ten seconds without a
+  heartbeat on UDP 902, and a host evacuating a few hundred VMs is exactly where
+  that heartbeat gets missed. So the host was in Maintenance mode,
+  `inMaintenanceMode` was `$true`, and the equality test against `"Maintenance"`
+  was false and stayed false.
+
+  Maintenance mode is now read from `Runtime.InMaintenanceMode` through
+  `Test-VMHostObjectInMaintenance`, with `ConnectionState` used only as the
+  fallback for when `ExtensionData` cannot be read at all. Applied everywhere the
+  question is asked: entering, leaving, batch sizing, parked-host scoping and
+  ordering.
+
+- **The same misreading in the other direction released a host that was still
+  parked.** `Wait-VMHostOutOfMaintenance` accepted `ConnectionState -ne
+  "Maintenance"` as "it has left", so one missed heartbeat declared a host back in
+  service while it was still in Maintenance mode. It now requires the flag clear.
+
+- **A parked host with a blipping heartbeat stopped the whole run.**
+  `Request-MaintenanceModeForBatch` failed the "already in Maintenance mode" test,
+  then failed the "is it Connected" test immediately after, and halted — over a
+  missed heartbeat on a host that was already exactly where the run wanted it.
+
+- **"Could not read the host" was counted as "the host is still evacuating."**
+  `Get-VMHost -ErrorAction SilentlyContinue` inside a `try`/`catch` returns
+  `$null` for a dropped vCenter session just as it does for a host that has not
+  arrived yet. A dead session therefore burned the full hour with the operator
+  told the evacuation was progressing. `Get-VMHostMaintenanceState` now returns
+  `Readable = $false` for that case; the wait says so on every line and again on
+  timeout, and `Request-MaintenanceModeForBatch` stops rather than evacuating
+  blind.
+
+#### Added
+
+- **O to force past a hanging evacuation.** The wait watches the keyboard
+  continuously rather than only between polls, so the key is picked up within a
+  quarter of a second. It is deliberately not automatic: overriding leaves running
+  VMs on a host that is about to be rebooted for firmware, so the warning says so
+  plainly, the host is listed in the closing manual rectification report, and the
+  run summary records `Overridden`. `E` still exits the run safely from the same
+  prompt.
+
+- Every line of the wait now reports what it is actually looking at — the
+  connection state, whether `inMaintenanceMode` is set, and the minutes elapsed
+  against the timeout — instead of a bare `still evacuating`.
+
+#### Changed
+
+- **A UCS Manager host whose assigned firmware policy already equals the target is
+  simply reported compliant.** Nothing else is consulted and no note is raised.
+
+  An earlier build also compared the running firmware version against the version
+  the policy name encodes. On the live domain that read `5.4(0.260050)` against a
+  policy-derived `4.3(6h)` — different numbering schemes entirely, so the
+  comparison could never match and warned on every compliant host. A check that is
+  wrong on every host is worse than no check, so it is gone rather than softened.
+
+- `Get-UcsUpgradeProgress` no longer gates completion on that same version
+  comparison. The pending acknowledgement clearing is the completion signal; the
+  running version is reported as information only.
+
 ### [23.6.1] — 2026-08-14
 
 #### Changed
@@ -2243,6 +2319,14 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.7.0-preauth] — 2026-08-14
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.7.0 — Maintenance mode is
+read from the vSphere API's `inMaintenanceMode` flag rather than from
+`ConnectionState`, a hanging evacuation can be forced past with `O`, and a UCS
+Manager host already on the target policy is reported compliant. This is the
+build to run.
 
 ### [23.6.1-preauth] — 2026-08-14
 

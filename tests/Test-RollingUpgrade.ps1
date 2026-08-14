@@ -32,6 +32,7 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
                                  'Test-VMHostDisconnected','Restore-DisconnectedVMHost',
                                  'Get-CapacityBasedBatchSize','Test-VMHostRejoinedAfterReboot',
                                  'Get-VMHostBootTime','Read-ChoiceExit','Read-PendingConsoleKey',
+                                 'Test-VMHostObjectInMaintenance','Get-VMHostMaintenanceState',
                                  'Test-DryRun','Test-StageNoAck') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 

@@ -536,7 +536,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.6.1-preauth"
+$ScriptVersion = "23.7.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -4341,8 +4341,11 @@ function Get-CapacityBasedBatchSize {
         [Parameter(Mandatory=$true)]$Cluster
     )
 
-    $connected = @($CandidateHosts | Where-Object { $_.ConnectionState -eq "Connected" })
-    $parked    = @($CandidateHosts | Where-Object { $_.ConnectionState -eq "Maintenance" })
+    # Parked is decided by inMaintenanceMode, not by ConnectionState - a parked host whose heartbeat
+    # is blipping reads NotResponding and would otherwise be counted in neither list, shrinking the
+    # cluster size the ceiling is derived from. See Test-VMHostObjectInMaintenance.
+    $parked    = @($CandidateHosts | Where-Object { Test-VMHostObjectInMaintenance -VMHostObject $_ })
+    $connected = @($CandidateHosts | Where-Object { $_.ConnectionState -eq "Connected" -and -not (Test-VMHostObjectInMaintenance -VMHostObject $_) })
     $diagnostics = New-Object System.Collections.Generic.List[string]
 
     # The ceiling is HALF THE CLUSTER, not a fixed number. Capacity is still the primary constraint
@@ -5010,7 +5013,7 @@ function Confirm-SingleHostComplianceAndExit {
     # Only reached once the host is compliant, explicitly accepted with no profile attached, or
     # explicitly overridden by the operator.
     $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
-    if ($hostObj.ConnectionState -eq "Maintenance") {
+    if (Test-VMHostObjectInMaintenance -VMHostObject $hostObj) {
         if ($Global:AutoExitMaintenanceMode) {
             Write-Host "  Taking '$hostName' out of Maintenance mode." -ForegroundColor Green
             Set-VMHost -VMHost $hostObj -State Connected -Confirm:$false -ErrorAction Stop | Out-Null
@@ -5094,6 +5097,85 @@ function Confirm-HostProfileComplianceAndExitMaintenance {
     }
 }
 
+function Test-VMHostObjectInMaintenance {
+    <#
+    .SYNOPSIS
+        Is this already-fetched host object in Maintenance mode? Reads the vSphere API's own flag.
+
+    .DESCRIPTION
+        ConnectionState alone is NOT the answer, and reading it alone is what made a host that was
+        sitting in Maintenance mode in vCenter poll as "still evacuating" until its timeout ran out.
+
+        In the vSphere API these are two independent properties of HostRuntimeInfo:
+
+          runtime.connectionState   - connected, disconnected or notResponding. There is no
+                                      "maintenance" member: maintenance is not a connection state.
+          runtime.inMaintenanceMode - a boolean, set once the host has ENTERED Maintenance mode and
+                                      not while it is entering, and it stays set regardless of what
+                                      the connection state does.
+
+        PowerCLI folds the two into one ConnectionState property that can read Maintenance - but the
+        connection value wins. vCenter calls a host NotResponding after roughly ten seconds without a
+        heartbeat on UDP 902, and a host evacuating a few hundred VMs is exactly where that heartbeat
+        gets missed. The host is in Maintenance mode, the vCenter UI says Maintenance Mode,
+        runtime.inMaintenanceMode is $true - and PowerCLI's ConnectionState reads NotResponding, so
+        an equality test against "Maintenance" is false and stays false for as long as the blip
+        lasts. The same reading is wrong in both directions: it also declares a host that is still
+        parked to be out of Maintenance mode.
+
+        So the boolean is the authority. ConnectionState is only the fallback for when ExtensionData
+        cannot be read at all.
+    #>
+    param($VMHostObject)
+
+    if ($null -eq $VMHostObject) { return $false }
+
+    try {
+        $flag = $VMHostObject.ExtensionData.Runtime.InMaintenanceMode
+        if ($null -ne $flag) { return [bool]$flag }
+    }
+    catch { }
+
+    return ([string]$VMHostObject.ConnectionState -eq "Maintenance")
+}
+
+function Get-VMHostMaintenanceState {
+    <#
+    .SYNOPSIS
+        Reads one host's Maintenance mode state, telling "not in it" apart from "could not read it".
+
+    .DESCRIPTION
+        The second half is the point. Get-VMHost -ErrorAction SilentlyContinue inside a try/catch
+        returns $null both when the host is genuinely not in Maintenance mode and when the vCenter
+        session has dropped, the name has stopped resolving, or the call simply failed. A poll loop
+        that reads $null as "not there yet" then waits out its whole timeout without once saying it
+        has been blind the entire time.
+
+        Readable=$false is that case, kept separate so a caller can report it rather than count it
+        as progress. VMHost carries the object through so a caller that needs to act on the host
+        does not have to fetch it a second time.
+    #>
+    param([Parameter(Mandatory=$true)][string]$HostName)
+
+    $hostObj = $null
+    $detail = ""
+    try { $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue }
+    catch { $detail = $_.Exception.Message }
+
+    if ($null -eq $hostObj) {
+        if ([string]::IsNullOrWhiteSpace($detail)) { $detail = "vCenter returned no host for this name" }
+        return [pscustomobject]@{ Readable = $false; InMaintenance = $false; ConnectionState = "Unreadable"; Detail = $detail; VMHost = $null }
+    }
+
+    return [pscustomobject]@{
+        Readable        = $true
+        InMaintenance   = (Test-VMHostObjectInMaintenance -VMHostObject $hostObj)
+        ConnectionState = [string]$hostObj.ConnectionState
+        Detail          = ""
+        VMHost          = $hostObj
+    }
+}
+
 function Wait-VMHostOutOfMaintenance {
     <#
     .SYNOPSIS
@@ -5119,10 +5201,12 @@ function Wait-VMHostOutOfMaintenance {
     $endTime = (Get-Date).AddMinutes($TimeoutMinutes)
     $announced = $false
     while ((Get-Date) -lt $endTime) {
-        $current = $null
-        try { $current = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue } catch {}
-        if ($null -ne $current -and $current.ConnectionState -ne "Maintenance") {
-            Write-Host "  '$HostName' is out of Maintenance mode (ConnectionState: $($current.ConnectionState))." -ForegroundColor Green
+        # Readable AND out. An unreadable host is not evidence it has left Maintenance mode, and the
+        # old test - ConnectionState -ne "Maintenance" - called a host out the moment its heartbeat
+        # blipped to NotResponding while it was still parked. See Test-VMHostObjectInMaintenance.
+        $state = Get-VMHostMaintenanceState -HostName $HostName
+        if ($state.Readable -and -not $state.InMaintenance) {
+            Write-Host "  '$HostName' is out of Maintenance mode (ConnectionState: $($state.ConnectionState))." -ForegroundColor Green
             return $true
         }
         if (-not $announced) {
@@ -5151,7 +5235,7 @@ function Invoke-RebootSafetyWindow {
 function Wait-VMHostInMaintenance {
     <#
     .SYNOPSIS
-        Waits for one host to reach Maintenance mode. Returns $true if it does.
+        Waits for one host to reach Maintenance mode. Returns Entered, Overridden or Timeout.
 
     .DESCRIPTION
         Polls rather than holding a request open. A blocking Set-VMHost keeps one HTTP request
@@ -5159,23 +5243,76 @@ function Wait-VMHostInMaintenance {
         shorter than a production host takes, so the request is torn down mid-evacuation and
         surfaces as "An error occurred while sending the request" with the host left partway in.
 
-        Returns $false on timeout rather than throwing, so the caller decides what a host that will
-        not evacuate means.
+        The poll asks Test-VMHostObjectInMaintenance, not ConnectionState. Reading ConnectionState
+        was the fault behind a host that WAS in Maintenance mode in vCenter reporting "still
+        evacuating" for the full hour: while it evacuates it is also the busiest it will ever be on
+        the management network, its heartbeat is missed, PowerCLI reports NotResponding rather than
+        Maintenance, and an equality test against "Maintenance" can never come true.
+
+        Every line of the wait now says what it is actually looking at - the connection state and
+        the minutes elapsed - and a host that cannot be READ is called out as unreadable rather than
+        reported as still evacuating, because those are not the same thing and only one of them is
+        about the host. Waiting out a timeout blind, with the operator told the evacuation was
+        progressing, is the outcome this exists to prevent.
+
+        The operator can force past a hanging evacuation with O, and the wait watches for the key
+        the whole time rather than only between polls. That exists because the alternative, when an
+        evacuation will not finish, is an hour of watching a counter and then a stopped run - and
+        the engineer standing in front of vCenter usually knows within a minute whether the host is
+        going to arrive. It is deliberately NOT automatic: overriding leaves running VMs on a host
+        that is about to be rebooted for firmware, so it is recorded as an override, the host is
+        listed for manual attention, and the warning says plainly what is being accepted.
+
+        Returns Timeout rather than throwing, so the caller decides what a host that will not
+        evacuate means.
     #>
     param(
         [Parameter(Mandatory=$true)][string]$HostName,
         [int]$TimeoutMinutes = 60
     )
 
-    $endTime = (Get-Date).AddMinutes($TimeoutMinutes)
+    $startTime = Get-Date
+    $endTime = $startTime.AddMinutes($TimeoutMinutes)
+    $blindChecks = 0
+    $announced = $false
     while ((Get-Date) -lt $endTime) {
-        $current = $null
-        try { $current = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue } catch {}
-        if ($null -ne $current -and $current.ConnectionState -eq "Maintenance") { return $true }
-        Write-Host "    still evacuating '$HostName'..." -ForegroundColor Gray
-        Start-Sleep -Seconds 30
+        $state = Get-VMHostMaintenanceState -HostName $HostName
+        if ($state.InMaintenance) { return "Entered" }
+
+        $elapsed = [int]((Get-Date) - $startTime).TotalMinutes
+        if (-not $state.Readable) {
+            $blindChecks++
+            Write-Host "    cannot read '$HostName' from vCenter - $($state.Detail) - $elapsed of $TimeoutMinutes min. This is not evidence that it is still evacuating." -ForegroundColor Yellow
+        }
+        else {
+            Write-Host "    still evacuating '$HostName' - vCenter reports $($state.ConnectionState) and inMaintenanceMode is not set - $elapsed of $TimeoutMinutes min." -ForegroundColor Gray
+        }
+
+        if (-not $announced) {
+            Write-Host "    O - force past this host and carry on. Its running VMs are NOT evacuated and it is about to be rebooted." -ForegroundColor Yellow
+            Write-Host "    E - exit the run safely, leaving the cluster as it is." -ForegroundColor Yellow
+            $announced = $true
+        }
+
+        # The 30 second gap between polls is spent watching for the key, in quarter-second slices,
+        # rather than asleep. An override the operator has to hold a key down for is not an override.
+        # Counted slices, not wall-clock, so the loop is bounded even where Start-Sleep is stubbed.
+        for ($slice = 0; $slice -lt 120; $slice++) {
+            $key = Read-PendingConsoleKey
+            if ($key -eq "O") {
+                Write-Host "    OVERRIDE: continuing with '$HostName' still evacuating, at the operator's instruction." -ForegroundColor Red
+                return "Overridden"
+            }
+            if ($key -eq "E") { Stop-SafeExit -Message "Exited while waiting for '$HostName' to enter Maintenance mode." }
+            Start-Sleep -Milliseconds 250
+            if ((Get-Date) -ge $endTime) { break }
+        }
     }
-    return $false
+
+    if ($blindChecks -gt 0) {
+        Write-Host "    '$HostName' could not be read from vCenter on $blindChecks check(s) in that window, so this timeout may be a vCenter session problem rather than a host that would not evacuate." -ForegroundColor Yellow
+    }
+    return "Timeout"
 }
 
 function Request-EsxiRootCredential {
@@ -5275,17 +5412,25 @@ function Request-MaintenanceModeForBatch {
     $position = 0
     foreach ($hostName in $HostNames) {
         $position++
-        $hostObj = Get-VMHost -Name $hostName -ErrorAction Stop
+        # inMaintenanceMode, not ConnectionState. A host already parked but momentarily NotResponding
+        # used to fail the "already in" test and then fail the "is it Connected" test straight after,
+        # stopping the whole run over a missed heartbeat. See Test-VMHostObjectInMaintenance.
+        $entry = Get-VMHostMaintenanceState -HostName $hostName
+        if (-not $entry.Readable) {
+            Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "Failed" -Details "vCenter could not be asked about this host: $($entry.Detail)"
+            Stop-WithMessage "'$hostName' could not be read from vCenter ($($entry.Detail)), so this run cannot tell what state it is in. Check the vCenter connection and the host's presence in inventory before continuing."
+        }
+        $hostObj = $entry.VMHost
 
-        if ($hostObj.ConnectionState -eq "Maintenance") {
+        if ($entry.InMaintenance) {
             Write-Host "  [$position of $($HostNames.Count)] '$hostName' is already in Maintenance mode." -ForegroundColor Green
-            Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "AlreadyIn" -Details "Host was already in Maintenance mode."
+            Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "AlreadyIn" -Details "Host was already in Maintenance mode (ConnectionState $($entry.ConnectionState))."
             continue
         }
 
-        if ($hostObj.ConnectionState -ne "Connected") {
-            Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "Failed" -Details "ConnectionState was $($hostObj.ConnectionState)."
-            Stop-WithMessage "'$hostName' is $($hostObj.ConnectionState), not Connected, so it cannot be evacuated. Resolve in vCenter before continuing."
+        if ($entry.ConnectionState -ne "Connected") {
+            Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "Failed" -Details "ConnectionState was $($entry.ConnectionState)."
+            Stop-WithMessage "'$hostName' is $($entry.ConnectionState), not Connected, so it cannot be evacuated. Resolve in vCenter before continuing."
         }
 
         Write-Host "  [$position of $($HostNames.Count)] Requesting Maintenance mode for '$hostName'." -ForegroundColor Cyan
@@ -5298,9 +5443,18 @@ function Request-MaintenanceModeForBatch {
         # -RunAsync and then poll: see Wait-VMHostInMaintenance for why a blocking call fails.
         Set-VMHost -VMHost $hostObj -State Maintenance -RunAsync -Confirm:$false -ErrorAction Stop | Out-Null
 
-        if (-not (Wait-VMHostInMaintenance -HostName $hostName -TimeoutMinutes $MaintenanceValidationTimeoutMinutes)) {
+        $arrival = Wait-VMHostInMaintenance -HostName $hostName -TimeoutMinutes $MaintenanceValidationTimeoutMinutes
+        if ($arrival -eq "Timeout") {
             Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "Timeout" -Details "Did not reach Maintenance mode within $MaintenanceValidationTimeoutMinutes minute(s)."
             Stop-WithMessage "'$hostName' did not reach Maintenance mode within $MaintenanceValidationTimeoutMinutes minute(s). The rest of this batch has not been touched. Check DRS, VM affinity rules, and VMs that cannot be migrated (attached media, no shared storage) in vCenter."
+        }
+
+        if ($arrival -eq "Overridden") {
+            Write-Host "  [$position of $($HostNames.Count)] '$hostName' was FORCED PAST while still evacuating." -ForegroundColor Red
+            Write-Host "  Anything still running on it will go down when it reboots. Move or shut those VMs down now if that is not intended." -ForegroundColor Red
+            Add-ManualAttentionHost -HostName $hostName -Reason "Evacuation overridden" -Detail "The operator forced the run past this host's evacuation, so it was not confirmed empty before firmware work began. Check its VMs."
+            Add-SummaryRecord -Stage "EnterMaintenance" -Batch "" -HostName $hostName -Action "Enter Maintenance mode" -Result "Overridden" -Details "Operator pressed O to continue with the host still evacuating."
+            continue
         }
 
         Write-Host "  [$position of $($HostNames.Count)] '$hostName' is in Maintenance mode." -ForegroundColor Green
@@ -5315,7 +5469,7 @@ function Wait-BatchMaintenanceMode {
     if ((Test-DryRun) -or (Test-StageNoAck)) { return @(foreach ($name in $HostNames) { Get-VMHost -Name $name -ErrorAction SilentlyContinue }) }
     $timeout = (Get-Date).AddMinutes($TimeoutMinutes)
     do {
-        $notReady = @($HostNames | Where-Object { (Get-VMHost -Name $_ -ErrorAction SilentlyContinue).ConnectionState -ne "Maintenance" })
+        $notReady = @($HostNames | Where-Object { -not (Get-VMHostMaintenanceState -HostName $_).InMaintenance })
         if ($notReady.Count -eq 0) { return @(foreach ($name in $HostNames) { Get-VMHost -Name $name }) }
         Write-Host "Waiting for Maintenance mode. Not ready: $($notReady -join ', ')" -ForegroundColor Yellow
         Start-Sleep -Seconds 30
@@ -6034,18 +6188,16 @@ function Get-UcsUpgradeProgress {
         Get-IntersightActivationProgress.
 
     .DESCRIPTION
-        Two signals, read in the order UCSM works through them:
+        THE PENDING ACKNOWLEDGEMENT IS THE SIGNAL. While an lsmaintAck is outstanding against the
+        service profile the reboot has been asked for but not taken, and UCSM will not touch the
+        blade until it clears. Once it clears, UCSM has done its part - whether the HOST is back is
+        vCenter's answer, and the rolling loop already waits for that separately.
 
-          1. THE PENDING ACKNOWLEDGEMENT. While an lsmaintAck is still outstanding against the
-             service profile, the reboot has been asked for but not taken. UCSM will not touch the
-             blade until it clears.
-          2. THE RUNNING FIRMWARE. Read from the physical server the profile is associated with and
-             compared against the version the target policy name encodes - global-436h is 4.3(6h).
-             Until it matches, the activation has not finished.
-
-        Complete means both are clear. UNREADABLE IS NEVER COMPLETE: a running version that cannot
-        be read leaves the phase saying so rather than being taken for a match, exactly as an
-        unreadable Intersight ConfigState is.
+        The running firmware version is reported alongside as INFORMATION ONLY. An earlier build
+        gated completion on it, comparing what the server reports against the version the policy
+        name encodes. On a live domain that read 5.4(0.260050) against a policy-derived 4.3(6h) -
+        different numbering schemes entirely - so the comparison could never match and every UCS
+        host would have reported "activating" forever. It is shown, not trusted.
 
         Purely a read. Nothing here changes anything, and it never throws - it runs on the rolling
         loop's critical path, where an exception would stall every host in flight, not just this one.
@@ -6068,33 +6220,20 @@ function Get-UcsUpgradeProgress {
             return $result
         }
 
-        # 2. Has the firmware actually changed?
-        $sp = Resolve-UcsServiceProfileForHost -HostName $HostName -UcsTarget $map.UcsTarget
-        if ($null -eq $sp) { $result.Phase = "the service profile could not be re-read"; return $result }
-
-        $targetPolicy = [string]$map.TargetPolicy
-        if ([string]::IsNullOrWhiteSpace($targetPolicy)) { $targetPolicy = Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $sp }
-        $expected = ConvertTo-UcsBundleVersionFromPolicyName -PolicyName $targetPolicy
-        $running  = Get-UcsRunningFirmwareVersion -UcsSession $session -ServiceProfile $sp
-
-        if ([string]::IsNullOrWhiteSpace($expected)) {
-            # The policy name does not encode a version, so there is nothing honest to compare.
-            # The acknowledgement having cleared is all that can be said.
-            $result.Complete = $true
-            $result.Phase = "the acknowledgement has cleared; '$targetPolicy' encodes no version to verify against"
-            return $result
+        # 2. What is it running? Reported, not used to decide - see the description above.
+        $running = ""
+        try {
+            $sp = Resolve-UcsServiceProfileForHost -HostName $HostName -UcsTarget $map.UcsTarget
+            if ($null -ne $sp) { $running = Get-UcsRunningFirmwareVersion -UcsSession $session -ServiceProfile $sp }
         }
-        if ([string]::IsNullOrWhiteSpace($running)) {
-            $result.Phase = "the running firmware version could not be read from UCS Manager"
-            return $result
-        }
-        if ($running -like "$expected*") {
-            $result.Complete = $true
-            $result.Phase = "running $running, which matches the target"
-            return $result
-        }
+        catch { }
 
-        $result.Phase = "running $running, activating to $expected"
+        $result.Complete = $true
+        $result.Phase = if ([string]::IsNullOrWhiteSpace($running)) {
+            "UCS Manager has no pending acknowledgement for this profile"
+        } else {
+            "UCS Manager has no pending acknowledgement; the server reports firmware $running"
+        }
         return $result
     }
     catch {
@@ -6154,40 +6293,26 @@ function Remove-UcsHostsAlreadyOnTargetFirmware {
             $currentPolicy = Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $sp
             if ($currentPolicy -ne $targetPolicy) { continue }
 
-            # The running version and any pending acknowledgement no longer decide whether to skip -
-            # they are still READ, and anything that disagrees is carried into the closing report.
-            # A profile can carry the new package and not yet have rebooted onto it, and that host is
-            # now excluded by policy; saying so is what stops it being lost rather than blocking on it.
-            $note = ""
-            $running = ""
-            try { $running = Get-UcsRunningFirmwareVersion -UcsSession $session -ServiceProfile $sp } catch {}
-            $expected = ConvertTo-UcsBundleVersionFromPolicyName -PolicyName $targetPolicy
-            if (-not [string]::IsNullOrWhiteSpace($expected) -and -not [string]::IsNullOrWhiteSpace($running) -and -not ($running -like "$expected*")) {
-                $note = "still running $running, not $expected - the package is set but the server has not rebooted onto it"
-            }
-
-            $pendingAck = @()
-            try { $pendingAck = @(Get-UcsLsmaintAck -Ucs $session -ErrorAction SilentlyContinue | Where-Object { [string]$_.Dn -like "$($map.ServiceProfileDn)/*" }) } catch {}
-            if ($pendingAck.Count -gt 0) {
-                $note = "a reboot acknowledgement is still pending on $($map.ServiceProfileDn)"
-            }
-
-            [void]$done.Add([pscustomobject]@{ Host = $hostName; Policy = $currentPolicy; Running = $(if ($running) { $running } else { "unreadable" }); Note = $note; ServiceProfileDn = [string]$map.ServiceProfileDn })
+            # NOTHING ELSE IS CONSULTED. The policy carries the version, so a profile already on the
+            # target policy is compliant and the run moves past it.
+            #
+            # An earlier build also compared the RUNNING firmware version against the version the
+            # policy name encodes, and warned when they differed. On a live domain that read
+            # 5.4(0.260050) against a policy-derived 4.3(6h) - different numbering schemes entirely,
+            # so the comparison could never match and warned on every compliant host. A check that
+            # is wrong on every host is worse than no check, so it is gone rather than softened.
+            [void]$done.Add([pscustomobject]@{ Host = $hostName; Policy = $currentPolicy })
         }
         catch { continue }
     }
 
     if ($done.Count -eq 0) { return @($CandidateHosts) }
 
-    Write-Host "" -ForegroundColor Yellow
-    Write-Host "Excluding $($done.Count) UCS Manager host(s) whose firmware policy is already the target:" -ForegroundColor Yellow
+    Write-Host "" -ForegroundColor Green
+    Write-Host "$($done.Count) UCS Manager host(s) are already on the target firmware policy - compliant, nothing to do:" -ForegroundColor Green
     foreach ($row in $done.ToArray()) {
-        Write-Host "  $($row.Host) - policy '$($row.Policy)', running $($row.Running)." -ForegroundColor Yellow
-        Add-SummaryRecord -Stage "Scope" -Batch "" -HostName $row.Host -Action "Exclude from run" -Result "AlreadyOnTarget" -Details "Service profile already carries '$($row.Policy)'; running $($row.Running). $($row.Note)"
-        if (-not [string]::IsNullOrWhiteSpace($row.Note)) {
-            Write-Host "      NOTE: $($row.Note)." -ForegroundColor Yellow
-            Add-ManualAttentionHost -HostName $row.Host -Reason "Excluded on policy, but not confirmed upgraded" -Detail "Service profile '$($row.ServiceProfileDn)' already carries '$($row.Policy)', so this run did not batch it - but $($row.Note). Confirm it in UCS Manager."
-        }
+        Write-Host "  $($row.Host) - policy '$($row.Policy)' - compliant." -ForegroundColor Green
+        Add-SummaryRecord -Stage "Scope" -Batch "" -HostName $row.Host -Action "Exclude from run" -Result "Compliant" -Details "Service profile already carries the target host firmware package '$($row.Policy)'."
     }
     Write-Host "They are already where this run would put them, so there is nothing to do to them." -ForegroundColor Yellow
 
@@ -6273,7 +6398,7 @@ function Invoke-ClusterUpgradeWorkflow {
     # compliance gate as every other host and, once it passes, they are taken OUT of Maintenance
     # mode. A host parked deliberately for something unrelated will be returned to service by this
     # run. It is called out here rather than buried, so it can be stopped now if that is wrong.
-    $parkedHosts = @($allClusterHosts | Where-Object { $_.ConnectionState -eq "Maintenance" } | Select-Object -ExpandProperty Name)
+    $parkedHosts = @($allClusterHosts | Where-Object { Test-VMHostObjectInMaintenance -VMHostObject $_ } | Select-Object -ExpandProperty Name)
     if ($parkedHosts.Count -gt 0) {
         Write-Host "" -ForegroundColor Yellow
         Write-Host "Host(s) already in Maintenance mode, IN SCOPE and taken first: $($parkedHosts -join ', ')" -ForegroundColor Yellow
@@ -6291,11 +6416,11 @@ function Invoke-ClusterUpgradeWorkflow {
         # These hosts still need to be eligible for UCSM firmware policy staging/acknowledgement.
         # Maintenance counts as in scope - see the note above. NotResponding and Disconnected do
         # not: there is nothing to drive through vCenter on a host it cannot reach.
-        $patchCandidateHosts = @($allClusterHosts | Where-Object { $_.ConnectionState -eq "Connected" -or $_.ConnectionState -eq "Maintenance" })
+        $patchCandidateHosts = @($allClusterHosts | Where-Object { $_.ConnectionState -eq "Connected" -or (Test-VMHostObjectInMaintenance -VMHostObject $_) })
     }
     else {
         # ESXi-only mode should skip hosts already on the target ESXi build.
-        $patchCandidateHosts = @($allClusterHosts | Where-Object { ($_.ConnectionState -eq "Connected" -or $_.ConnectionState -eq "Maintenance") -and ($alreadyTargetHosts.Name -notcontains $_.Name) })
+        $patchCandidateHosts = @($allClusterHosts | Where-Object { ($_.ConnectionState -eq "Connected" -or (Test-VMHostObjectInMaintenance -VMHostObject $_)) -and ($alreadyTargetHosts.Name -notcontains $_.Name) })
     }
 
     # Hosts set aside during discovery - unreachable, no CDP/LLDP target, or no service profile.
@@ -6346,8 +6471,8 @@ function Invoke-ClusterUpgradeWorkflow {
     # capacity and there is nothing to wait for before acting on them. Everything after them keeps
     # the cluster order the operator asked for.
     $pendingHosts = New-Object System.Collections.ArrayList
-    foreach ($hostObj in @($patchCandidateHosts | Where-Object { $_.ConnectionState -eq "Maintenance" })) { [void]$pendingHosts.Add($hostObj.Name) }
-    foreach ($hostObj in @($patchCandidateHosts | Where-Object { $_.ConnectionState -ne "Maintenance" })) { [void]$pendingHosts.Add($hostObj.Name) }
+    foreach ($hostObj in @($patchCandidateHosts | Where-Object { Test-VMHostObjectInMaintenance -VMHostObject $_ })) { [void]$pendingHosts.Add($hostObj.Name) }
+    foreach ($hostObj in @($patchCandidateHosts | Where-Object { -not (Test-VMHostObjectInMaintenance -VMHostObject $_) })) { [void]$pendingHosts.Add($hostObj.Name) }
     # ROLLING, NOT BATCHED. The old loop took N hosts, put them all through, and did not start
     # host N+1 until the SLOWEST of the first N had finished - so a host back in twenty minutes sat
     # idle while its neighbour took fifty. Invoke-RollingClusterUpgrade tracks each host on its own

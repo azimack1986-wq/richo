@@ -41,7 +41,7 @@ $Global:UcsFirmwarePolicyByFabricFamily = @{
 }
 
 function Add-SummaryRecord { param($Stage,$Batch,$HostName,$Action,$Result,$Details)
-    $Global:RunSummary.Add([pscustomobject]@{ Stage=$Stage; Action=$Action; Result=$Result; Details=$Details }) }
+    $Global:RunSummary.Add([pscustomobject]@{ Stage=$Stage; Host=$HostName; Action=$Action; Result=$Result; Details=$Details }) }
 function Stop-WithMessage { param($Message) throw "STOP: $Message" }
 $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
 $Global:ExcludedFromRunHosts = @{}
@@ -229,75 +229,66 @@ $policyText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "creation hands the policy straight to UCS Central" $true ($policyText -match 'Set-UcsFirmwarePolicyGlobal -PolicyName \$policyName')
 Assert-Equal "and the only owner value written is 'policy'" $true ($policyText -match '-PolicyOwner "policy"')
 
-Write-Host "`n=== A policy already on target is not redone ===" -ForegroundColor Cyan
+Write-Host "`n=== A policy already on target is compliant, and nothing else is consulted ===" -ForegroundColor Cyan
 # Straight from a live run: eleven hosts showed CurrentPolicy global-436h against TargetPolicy
 # global-436h and were batched anyway - evacuated, put into Maintenance mode, given a policy they
 # already had, and returned to service. A maintenance window each, for nothing.
 #
-# CurrentPolicy equal to TargetPolicy is now the whole test, at the operator's direction. The
-# running version is still read, but it reports rather than decides.
+# CurrentPolicy equal to TargetPolicy is the whole test. The policy carries the version, so a
+# profile already on it is compliant.
 $Global:IntersightHostMap = @{}
 $Global:UcsHostMap = @{}
 $script:SpPolicy = @{}
-$script:SpRunning = @{}
 $script:SpAcks = @{}
+$script:RunningReads = 0
 function Get-UcsSessionForTarget { param($UcsTarget) return 'session' }
 function Resolve-UcsServiceProfileForHost { param($HostName,$UcsTarget) return [pscustomobject]@{ Name = $HostName } }
 function Get-UcsServiceProfileFirmwarePolicyName { param($ServiceProfile) return $script:SpPolicy[$ServiceProfile.Name] }
-function Get-UcsRunningFirmwareVersion { param($UcsSession,$ServiceProfile) return $script:SpRunning[$ServiceProfile.Name] }
+function Get-UcsRunningFirmwareVersion { param($UcsSession,$ServiceProfile) $script:RunningReads++; return '5.4(0.260050)' }
 function Get-UcsLsmaintAck { param($Ucs,$ErrorAction)
     return @($script:SpAcks.Keys | ForEach-Object { [pscustomobject]@{ Dn = "org-root/ls-$_/ack" } }) }
 function New-UcsCandidate { param([string]$Name) [pscustomobject]@{ Name = $Name } }
-function Register-UcsHost { param([string]$Name,[string]$Current,[string]$Target,[string]$Running)
+function Register-UcsHost { param([string]$Name,[string]$Current,[string]$Target)
     $Global:UcsHostMap[$Name] = [pscustomobject]@{ UcsTarget='ucsm-a'; ServiceProfileDn="org-root/ls-$Name"; TargetPolicy=$Target }
-    $script:SpPolicy[$Name] = $Current
-    $script:SpRunning[$Name] = $Running }
+    $script:SpPolicy[$Name] = $Current }
 
-# The live shape: some already on target, some not.
-$script:SpAcks = @{}
-Register-UcsHost -Name 'esx21' -Current 'global-436h' -Target 'global-436h' -Running '4.3(6h)'
-Register-UcsHost -Name 'esx32' -Current 'global-435c' -Target 'global-436h' -Running '4.3(5c)'
+Register-UcsHost -Name 'esx21' -Current 'global-436h' -Target 'global-436h'
+Register-UcsHost -Name 'esx32' -Current 'global-435c' -Target 'global-436h'
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+$script:RunningReads = 0
 $kept = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts @((New-UcsCandidate 'esx21'), (New-UcsCandidate 'esx32')) 6>$null)
 Assert-Equal "the host already on target is excluded" $true ($kept.Name -notcontains 'esx21')
 Assert-Equal "and the one that needs the change is kept" $true ($kept.Name -contains 'esx32')
+Assert-Equal "it is recorded as Compliant" "Compliant" (@($Global:RunSummary | Where-Object { $_.Host -eq 'esx21' })[0].Result)
 
-# THE CHANGE: the policy matching is enough on its own. A host whose package is set but which has
-# not rebooted onto it is still excluded - it is not re-evacuated to redo work already scheduled.
-$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
-$Global:UcsHostMap = @{}; $script:SpPolicy = @{}; $script:SpRunning = @{}
-Register-UcsHost -Name 'esx40' -Current 'global-436h' -Target 'global-436h' -Running '4.3(5c)'
-$kept = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts @((New-UcsCandidate 'esx40')) 6>$null)
-Assert-Equal "a matching policy excludes even when the running version lags" 0 $kept.Count
-# ...but it is NOT lost: it is named in the closing report so the gap is visible.
-$flagged = @($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Host -eq 'esx40' })
-Assert-Equal "the version gap is carried into the manual rectification report" 1 $flagged.Count
-Assert-Equal "and the report says the server has not rebooted onto it" $true ($flagged[0].Detail -match 'has not rebooted onto it')
-Assert-Equal "naming that host's own service profile" $true ($flagged[0].Detail -match 'ls-esx40')
+# THE FIX. A live domain reported running 5.4(0.260050) against a policy-derived 4.3(6h) - different
+# numbering schemes entirely - so the old version comparison could never match and warned on every
+# compliant host. The version is no longer read here at all, and nothing is flagged.
+Assert-Equal "the running version is not consulted" 0 $script:RunningReads
+Assert-Equal "and no host is flagged for manual rectification" 0 $Global:ManualAttentionHosts.Count
 
-# An unreadable running version no longer blocks the exclusion either - the policy decides.
+# A pending acknowledgement does not change the answer either - the policy decides, quietly.
+$script:SpAcks = @{ 'esx21' = $true }
 $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
-$Global:UcsHostMap = @{}; $script:SpPolicy = @{}; $script:SpRunning = @{}
-Register-UcsHost -Name 'esx41' -Current 'global-436h' -Target 'global-436h' -Running ''
-$kept = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts @((New-UcsCandidate 'esx41')) 6>$null)
-Assert-Equal "an unreadable running version does not keep a matching policy in scope" 0 $kept.Count
-Assert-Equal "and nothing is invented about it" 0 (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Host -eq 'esx41' }).Count)
-
-# A pending acknowledgement is reported, not used to re-batch.
-$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
-$Global:UcsHostMap = @{}; $script:SpPolicy = @{}; $script:SpRunning = @{}
-Register-UcsHost -Name 'esx42' -Current 'global-436h' -Target 'global-436h' -Running '4.3(6h)'
-$script:SpAcks = @{ 'esx42' = $true }
-$kept = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts @((New-UcsCandidate 'esx42')) 6>$null)
-Assert-Equal "a pending acknowledgement does not re-batch a matching policy" 0 $kept.Count
-Assert-Equal "but it is reported" $true ((@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Host -eq 'esx42' })[0].Detail) -match 'acknowledgement is still pending')
+$kept = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts @((New-UcsCandidate 'esx21')) 6>$null)
+Assert-Equal "a pending acknowledgement does not re-batch a compliant host" 0 $kept.Count
+Assert-Equal "and it raises no note" 0 $Global:ManualAttentionHosts.Count
 $script:SpAcks = @{}
 
 # An Intersight-routed host is not this filter's business.
 $Global:IntersightHostMap = @{ 'esx50' = $true }
-$Global:UcsHostMap = @{}; $script:SpPolicy = @{}; $script:SpRunning = @{}
+$Global:UcsHostMap = @{}; $script:SpPolicy = @{}
 $kept = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts @((New-UcsCandidate 'esx50')) 6>$null)
 Assert-Equal "an Intersight-routed host is left alone by the UCS filter" $true ($kept.Name -contains 'esx50')
 $Global:IntersightHostMap = @{}
+
+# The progress read must not gate on the version either, or every UCS host reports "activating"
+# forever on a domain whose running version does not resemble the policy name.
+$progressText = ($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+    Where-Object { $_.Name -eq 'Get-UcsUpgradeProgress' } | ForEach-Object { $_.Extent.Text }) -join "`n"
+Assert-Equal "progress is decided by the acknowledgement, not the version" $true ($progressText -match 'no pending acknowledgement')
+Assert-Equal "and the version is not compared to the policy name there" $true (-not ($progressText -match 'ConvertTo-UcsBundleVersionFromPolicyName'))
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }
