@@ -493,7 +493,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.3.0-preauth"
+$ScriptVersion = "23.4.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -1422,10 +1422,98 @@ function Resolve-UcsFirmwarePolicyForTarget {
         Stop-WithMessage "Host firmware package '$policyName' was created in $UcsTarget but cannot be read back. Check it in UCSM before continuing."
     }
 
+    Set-UcsFirmwarePolicyGlobal -PolicyName $policyName -UcsTarget $UcsTarget -UcsSession $UcsSession
+
     Write-Host "  Created and verified '$policyName' in $UcsTarget." -ForegroundColor Green
     Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "Created" -Details "$UcsTarget - $policyName created by name only for fabric family $($fabric.Family); bundle versions come from the global setting."
     $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
     return $policyName
+}
+
+function Set-UcsFirmwarePolicyGlobal {
+    <#
+    .SYNOPSIS
+        Hands a newly created host firmware package to UCS Central - the API equivalent of
+        "Use Global" in UCSM.
+
+    .DESCRIPTION
+        THIS IS THE WHOLE POINT OF THE POLICY. The package is created by name only, with no bundle
+        versions, because the versions are meant to come from the global policy. Left LOCAL it is an
+        empty package: it applies cleanly, changes no firmware, and the run reports success having
+        upgraded nothing. That is what was seen in UCSM - the package created, Owner "local".
+
+        policyOwner is a read-write property of firmwareComputeHostPack. Per Cisco's own ucsmsdk
+        metadata its allowed values are exactly:
+
+            "local"           owned by this UCS domain
+            "pending-policy"  handed over, UCS Central has not taken it yet - UCSM shows
+                              Owner: "Pending Global"
+            "policy"          controlled by UCS Central - Owner: "Global"
+
+        So "Use Global" is a write of policyOwner, and the GUI's "Do you want to make this policy
+        controlled by UCS Central?" confirmation is the write itself - there is no separate
+        acknowledgement object to set afterwards.
+
+        Both "policy" and "pending-policy" are accepted here. Pending is the normal intermediate
+        state while UCS Central picks the change up, not a failure - the handover has been made and
+        the domain is waiting on Central.
+
+        Still "local" afterwards means the handover did not take, which leaves an empty package
+        about to be attached to service profiles. That is put to the operator rather than carried
+        on through.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$PolicyName,
+        [Parameter(Mandatory=$true)][string]$UcsTarget,
+        [Parameter(Mandatory=$true)]$UcsSession
+    )
+
+    if (Test-DryRun) {
+        Write-Host "DRY RUN: would set host firmware package '$PolicyName' in $UcsTarget to Global (policyOwner = policy)." -ForegroundColor Green
+        return
+    }
+
+    Write-Host "  Setting '$PolicyName' to Global (controlled by UCS Central)." -ForegroundColor Yellow
+
+    try {
+        Get-UcsFirmwareComputeHostPack -Ucs $UcsSession -Org "org-root" -Name $PolicyName -ErrorAction Stop |
+            Set-UcsFirmwareComputeHostPack -PolicyOwner "policy" -Force -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Write-Host "  Could not set '$PolicyName' to Global: $($_.Exception.Message)" -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Set policy to Global" -Result "Failed" -Details "$UcsTarget - $PolicyName - $($_.Exception.Message)"
+    }
+
+    # Read the owner back. The write returning is not proof the domain accepted the handover.
+    $owner = ""
+    try {
+        $policy = Get-UcsFirmwareComputeHostPack -Ucs $UcsSession -Org "org-root" -Name $PolicyName -ErrorAction Stop | Select-Object -First 1
+        if ($null -ne $policy) { $owner = [string]$policy.PolicyOwner }
+    }
+    catch { }
+
+    if ($owner -eq "policy" -or $owner -eq "pending-policy") {
+        $label = if ($owner -eq "policy") { "Global" } else { "Pending Global - UCS Central has not taken it yet" }
+        Write-Host "  '$PolicyName' is now $label." -ForegroundColor Green
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Set policy to Global" -Result "Global" -Details "$UcsTarget - $PolicyName - policyOwner=$owner."
+        return
+    }
+
+    # Still local: the package carries no bundle versions, so attaching it would change no firmware
+    # while the run reported success.
+    Write-Host "" -ForegroundColor Yellow
+    Write-Host "  '$PolicyName' is still owned locally (policyOwner=$(if ($owner) { $owner } else { 'unreadable' }))." -ForegroundColor Yellow
+    Write-Host "  This package has NO bundle versions of its own - they are meant to come from the global" -ForegroundColor Yellow
+    Write-Host "  policy. Left local it will apply cleanly and upgrade nothing." -ForegroundColor Yellow
+    Write-Host "  Check that $UcsTarget is registered with UCS Central and that global policy resolution" -ForegroundColor Yellow
+    Write-Host "  is enabled for host firmware packages." -ForegroundColor Yellow
+    Add-ManualAttentionHost -HostName $UcsTarget -Reason "Host firmware package is not Global" -Detail "'$PolicyName' in $UcsTarget has policyOwner=$(if ($owner) { $owner } else { 'unreadable' }). It carries no bundle versions, so as a local policy it will not change any firmware. Set it to Use Global in UCSM, or confirm the domain is registered with UCS Central."
+    Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Set policy to Global" -Result "StillLocal" -Details "$UcsTarget - $PolicyName - policyOwner=$owner; the package has no bundle versions of its own."
+
+    $choice = Read-ChoiceExit -Message "'$PolicyName' could not be made Global and would upgrade nothing. C to continue anyway, X to stop, E to exit" -AllowedChoices @("C","X") -ExitMessage "Stopped because '$PolicyName' is not Global."
+    if ($choice -eq "X") {
+        Stop-WithMessage "Host firmware package '$PolicyName' in $UcsTarget is not Global and carries no bundle versions."
+    }
 }
 
 function Test-UcsFirmwarePolicyExists {
@@ -5072,15 +5160,10 @@ function Request-EsxiRootCredential {
     Write-Host "  Used only to reconnect a host that reboots and comes back Disconnected in vCenter" -ForegroundColor Gray
     Write-Host "  because the password vCenter holds for it no longer works. Held in memory for this" -ForegroundColor Gray
     Write-Host "  run only, never written to the summary or the log." -ForegroundColor Gray
-    Write-Host "  S to skip - a disconnected host will then be reported for manual rectification." -ForegroundColor Gray
 
-    $choice = Read-ChoiceExit -Message "Provide the ESXi root password for '$ClusterName'? Y to enter it, S to skip, E to exit" -AllowedChoices @("Y","S") -ExitMessage "Stopped at the ESXi root password prompt."
-    if ($choice -eq "S") {
-        Write-Host "  Skipped. A host that comes back disconnected will be reported, not reconnected." -ForegroundColor Yellow
-        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "ESXi root credential" -Result "Skipped" -Details "Operator declined; automatic reconnect of a disconnected host is unavailable for '$ClusterName'."
-        return
-    }
-
+    # Straight to the credential prompt - no "do you want to provide it?" step in front of it. The
+    # answer is always yes, and asking first only adds a keystroke to every run. Cancelling the
+    # credential dialog is the way out, and is handled below.
     try {
         $credential = Get-Credential -UserName "root" -Message "ESXi root password for hosts in cluster '$ClusterName'"
     }

@@ -146,7 +146,10 @@ $script:SimNow = [datetime]'2026-08-12T00:00:00'
 function Get-Date { param($Format,$Date,$UFormat) if ($Format) { return $script:SimNow.ToString($Format) }; return $script:SimNow }
 function Start-Sleep { param($Seconds,$Milliseconds) $script:SimNow = $script:SimNow.AddSeconds([double]$Seconds) }
 function Out-GridView { param([Parameter(ValueFromPipeline=$true)]$InputObject,$Title,[switch]$PassThru) begin{} process{} end{ return $null } }
-function Get-Credential { param($Message) return $Global:UcsCredential }
+function Get-Credential { param($Message,$UserName)
+    # The ESXi root prompt is declined in these runs; the credential path has its own test.
+    if ($UserName -eq 'root') { return $null }
+    return $Global:UcsCredential }
 
 function Connect-VIServer { param($Server,$ErrorAction) Note-Call 'Connect-VIServer'; return [pscustomobject]@{ Name = $Server } }
 function Disconnect-VIServer { param($Server,$Confirm) Note-Call 'Disconnect-VIServer' }
@@ -339,7 +342,6 @@ function Read-Host {
         throw "Prompt limit exceeded - the scripted operator cannot answer '$Prompt', so Read-ChoiceExit is looping. Add a matching answer."
     }
     switch -Regex ($Prompt) {
-        'ESXi root password'           { return 'S' }   # declined; covered separately
         'Select run mode'            { return '2' }    # DRY RUN
         'Select upgrade mode'        { return '2' }    # ESXi + firmware
         'Select batch mode'          { return '1' }    # AUTO
@@ -450,7 +452,6 @@ function Read-Host { param([string]$Prompt)
         throw "Prompt limit exceeded - the scripted operator cannot answer '$Prompt', so Read-ChoiceExit is looping. Add a matching answer."
     }
     switch -Regex ($Prompt) {
-        'ESXi root password'           { return 'S' }   # declined; covered separately
         'Select run mode'          { return '1' }    # LIVE
         'Select upgrade mode'      { return '2' }
         'Select batch mode'        { return '1' }
@@ -519,7 +520,6 @@ Reset-Simulation -Mode 'LIVE'
 # Only the questions the operator agreed to answer. Anything else is a regression: the run is meant
 # to walk the cluster on its own once it has started, and a stray prompt strands it mid-change.
 $AgreedPrompts = @(
-    'ESXi root password',
     'Select run mode'
     'Select upgrade mode'
     'Select batch mode'
@@ -538,7 +538,6 @@ function Read-Host {
         [void]$script:UnexpectedPrompts.Add($Prompt)
     }
     switch -Regex ($Prompt) {
-        'ESXi root password'           { return 'S' }   # declined; covered separately
         'Select run mode'              { return '1' }    # LIVE
         'Select upgrade mode'          { return '2' }
         'Select batch mode'            { return '2' }    # SINGLE
@@ -623,7 +622,6 @@ function Read-Host {
     # A UCSM or Intersight prompt in ESXi-only mode is itself the failure.
     if ($Prompt -match '(?i)ucs|intersight|firmware package|api key') { throw "ESXi-only mode must not ask about firmware infrastructure: '$Prompt'" }
     switch -Regex ($Prompt) {
-        'ESXi root password'           { return 'S' }   # declined; covered separately
         'Select run mode'      { return '1' }
         'Select upgrade mode'  { return '1' }   # ESXi upgrade only
         'Select batch mode'    { return '1' }
@@ -662,7 +660,6 @@ function Read-Host {
     $script:PromptLog.Add($Prompt)
     if ($script:PromptLog.Count -gt $script:MaxPrompts) { throw "Prompt limit exceeded: '$Prompt'" }
     switch -Regex ($Prompt) {
-        'ESXi root password'           { return 'S' }   # declined; covered separately
         'Select run mode'              { return '1' }
         'Select upgrade mode'          { return '2' }
         'Select batch mode'            { return '1' }
@@ -731,7 +728,6 @@ function Read-Host {
     # all, which is the defect. Fail loudly rather than answering it.
     if ($Prompt -match 'esx05') { throw "esx05 is unreachable and must never be asked about: '$Prompt'" }
     switch -Regex ($Prompt) {
-        'ESXi root password'           { return 'S' }   # declined; covered separately
         'Select run mode'              { return '1' }
         'Select upgrade mode'          { return '2' }
         'Select batch mode'            { return '1' }
@@ -799,7 +795,6 @@ function Read-Host {
     if ($script:PromptLog.Count -gt $script:MaxPrompts) { throw "Prompt limit exceeded: '$Prompt'" }
     if ($Prompt -match 'could not be confirmed as current|ConfigState|state could not be read') { $script:AskedAboutState = $true }
     switch -Regex ($Prompt) {
-        'ESXi root password'           { return 'S' }   # declined; covered separately
         'Select run mode'              { return '1' }
         'Select upgrade mode'          { return '2' }
         'Select batch mode'            { return '2' }

@@ -12,6 +12,45 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.4.0] — 2026-08-13
+
+#### Fixed
+
+- **A host firmware package created by the run is now handed to UCS Central
+  instead of being left local.** UCSM created the package correctly and left
+  `Owner: local`. That matters more than it looks: the package is created **by
+  name only, with no bundle versions**, because the versions are meant to come
+  from the global policy. Left local it is an empty package — it applies cleanly,
+  changes no firmware, and the run reports success having upgraded nothing.
+
+  Verified against Cisco's own `ucsmsdk` metadata for `firmwareComputeHostPack`:
+
+  ```
+  "policy_owner": MoPropertyMeta(..., MoPropertyMeta.READ_WRITE, ...,
+                                 ["local", "pending-policy", "policy"], [])
+  ```
+
+  So `policyOwner` is a read-write property with exactly three values — `local`
+  (owned by the domain), `pending-policy` (handed over, UCS Central has not taken
+  it yet — UCSM's *"Pending Global"*), and `policy` (controlled by UCS Central).
+  **"Use Global" is a write of that property**, and the GUI's *"Do you want to make
+  this policy controlled by UCS Central?"* confirmation is the write itself; there
+  is no separate acknowledgement object to set afterwards.
+
+  The run now writes `policyOwner = "policy"` immediately after creating the
+  package, then **reads the owner back**. `policy` and `pending-policy` are both
+  accepted — pending is the normal intermediate state, not a failure. Still
+  `local` means an empty package is about to be attached to service profiles, so
+  that is put to the operator (`C` to continue anyway, `X` to stop) and recorded
+  for manual rectification rather than carried on through silently.
+
+#### Changed
+
+- **The ESXi root password prompt is no longer gated behind a review step.** It
+  went straight to a `Y`/`S` question before the credential dialog; the answer is
+  always yes, so it only added a keystroke to every run. The credential dialog
+  appears directly, and cancelling it is the way out.
+
 ### [23.3.0] — 2026-08-13
 
 #### Added
@@ -2060,6 +2099,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.4.0-preauth] — 2026-08-13
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.4.0 — a created host
+firmware package is set to Global, and the root password prompt goes straight to
+the credential dialog. This is the build to run.
 
 ### [23.3.0-preauth] — 2026-08-13
 

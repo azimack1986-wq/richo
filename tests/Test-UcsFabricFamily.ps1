@@ -27,7 +27,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [r
 if ($errors) { throw "parse errors" }
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Get-UcsFabricFamily','Resolve-UcsFirmwarePolicyForTarget','Get-UcsFirmwarePolicyRows','Test-UcsFirmwarePolicyExists','Test-DryRun') } |
+    Where-Object { $_.Name -in @('Get-UcsFabricFamily','Resolve-UcsFirmwarePolicyForTarget','Set-UcsFirmwarePolicyGlobal','Get-UcsFirmwarePolicyRows','Test-UcsFirmwarePolicyExists','Test-DryRun') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $Global:RunMode = 'LIVE'
@@ -43,6 +43,11 @@ $Global:UcsFirmwarePolicyByFabricFamily = @{
 function Add-SummaryRecord { param($Stage,$Batch,$HostName,$Action,$Result,$Details)
     $Global:RunSummary.Add([pscustomobject]@{ Stage=$Stage; Action=$Action; Result=$Result; Details=$Details }) }
 function Stop-WithMessage { param($Message) throw "STOP: $Message" }
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$Global:ExcludedFromRunHosts = @{}
+$Global:CurrentClusterName = 'TestCluster'
+function Add-ManualAttentionHost { param($HostName,$Reason,$Detail,$ClusterName,[switch]$ExcludeFromRun)
+    $Global:ManualAttentionHosts.Add([pscustomobject]@{ Host=$HostName; Reason=$Reason; Detail=$Detail; Excluded=[bool]$ExcludeFromRun }) }
 function Stop-SafeExit { param($Message) throw "EXIT: $Message" }
 
 $script:pass = 0; $script:fail = 0
@@ -68,7 +73,7 @@ function Get-UcsFirmwareComputeHostPack { param($Ucs,$ErrorAction)
 function Add-UcsFirmwareComputeHostPack { param($Ucs,$Org,$Name,$BladeBundleVersion,$RackBundleVersion,$Descr,$ErrorAction)
     $script:Created += [pscustomobject]@{ Org=$Org; Name=$Name; Blade=$BladeBundleVersion; Rack=$RackBundleVersion; Descr=$Descr }
     $script:Packs += $Name }
-function Read-ChoiceExit { param($Message,$AllowedChoices,$ExitMessage) return $script:Answer }
+function Read-ChoiceExit { param($Message,$AllowedChoices,$ExitMessage) $script:LastPrompt = $Message; return $script:Answer }
 
 Write-Host "`n=== Model strings map to the right family ===" -ForegroundColor Cyan
 foreach ($case in @(
@@ -160,6 +165,69 @@ Write-Host "`n=== The script contains no hard-coded bundle versions ===" -Foregr
 $scriptText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "no -BladeBundleVersion anywhere in the script" $true (-not ($scriptText -match '-BladeBundleVersion'))
 Assert-Equal "no -RackBundleVersion anywhere in the script"  $true (-not ($scriptText -match '-RackBundleVersion'))
+
+Write-Host "`n=== A created policy is handed to UCS Central, not left local ===" -ForegroundColor Cyan
+# The live miss: UCSM created the package and left Owner "local". The package is created by NAME
+# ONLY, with no bundle versions - they are meant to come from the global policy - so a local
+# package applies cleanly and upgrades nothing while the run reports success.
+#
+# Per Cisco's ucsmsdk metadata, firmwareComputeHostPack.policyOwner is READ_WRITE with exactly
+# three values: "local", "pending-policy", "policy".
+$script:OwnerState = 'local'
+$script:OwnerWrites = New-Object System.Collections.Generic.List[string]
+function Get-UcsFirmwareComputeHostPack { param($Ucs,$Org,$Name,$ErrorAction)
+    return [pscustomobject]@{ Name = $Name; PolicyOwner = $script:OwnerState } }
+# No [Parameter()] attributes: they make this an advanced function, which adds the common
+# parameters and then collides with the explicit $ErrorAction the script passes. Pipeline input is
+# taken through $input instead, which a simple function supports.
+function Set-UcsFirmwareComputeHostPack { param($PolicyOwner,[switch]$Force,$ErrorAction)
+    $null = @($input)
+    $script:OwnerWrites.Add("$PolicyOwner|Force=$Force")
+    if ($script:AcceptOwnerWrite) { $script:OwnerState = $PolicyOwner } }
+
+$script:AcceptOwnerWrite = $true
+$script:OwnerState = 'local'; $script:OwnerWrites.Clear()
+Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null
+Assert-Equal "policyOwner is written once" 1 $script:OwnerWrites.Count
+Assert-Equal "to 'policy' - controlled by UCS Central - with -Force" "policy|Force=True" $script:OwnerWrites[0]
+Assert-Equal "and the owner is read back as global" "policy" $script:OwnerState
+
+# Pending Global is the normal intermediate state, not a failure: the handover was made and the
+# domain is waiting on UCS Central to take it.
+$script:AcceptOwnerWrite = $false
+$script:OwnerState = 'pending-policy'; $script:OwnerWrites.Clear(); $script:Answer = 'X'
+$stoppedPending = $false
+try { Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null } catch { $stoppedPending = $true }
+Assert-Equal "'pending-policy' is accepted, not treated as a failure" $false $stoppedPending
+
+# Still local afterwards means an empty package is about to be attached - that is put to the
+# operator rather than carried on through.
+$script:OwnerState = 'local'; $script:OwnerWrites.Clear(); $script:Answer = 'X'
+$stoppedLocal = $false
+try { Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null }
+catch { $stoppedLocal = "$_" -match 'not Global' }
+Assert-Equal "a policy still local stops the run when the operator says so" $true $stoppedLocal
+Assert-Equal "and the operator is told it would upgrade nothing" $true ($script:LastPrompt -match 'upgrade nothing')
+
+# C continues, deliberately, with the host flagged for manual rectification.
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$script:OwnerState = 'local'; $script:Answer = 'C'
+$continued = $true
+try { Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null } catch { $continued = $false }
+Assert-Equal "C carries on rather than ending the run" $true $continued
+Assert-Equal "and it is recorded for manual rectification" $true (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Reason -eq 'Host firmware package is not Global' }).Count -ge 1)
+
+# DRY RUN changes no ownership.
+$Global:RunMode = 'DRYRUN'
+$script:OwnerWrites.Clear()
+Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null
+Assert-Equal "DRY RUN writes no policyOwner" 0 $script:OwnerWrites.Count
+$Global:RunMode = 'LIVE'
+
+# It runs as part of creating the policy, not as a separate thing to remember.
+$policyText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "creation hands the policy straight to UCS Central" $true ($policyText -match 'Set-UcsFirmwarePolicyGlobal -PolicyName \$policyName')
+Assert-Equal "and the only owner value written is 'policy'" $true ($policyText -match '-PolicyOwner "policy"')
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }
