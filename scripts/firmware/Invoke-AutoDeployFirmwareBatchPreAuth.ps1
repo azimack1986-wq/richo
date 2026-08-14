@@ -274,6 +274,19 @@
       fixed sleeps. Reaching one is not a failure.
       vCenter is then polled for the host's return, starting immediately, because Intersight has
       already said the reboot completed - the fixed post-reboot wait is skipped for these hosts.
+    - THE ESXi ROOT PASSWORD IS ASKED FOR WHEN THE CLUSTER IS SELECTED, and used for one thing: a
+      host that reboots and comes back DISCONNECTED in vCenter because the password vCenter holds
+      for it no longer works. vCenter cannot recover that on its own, so the run would otherwise
+      wait out its whole window for something that never resolves.
+      A host seen Disconnected or NotResponding for $HostReconnectAfterDisconnectMinutes (5) is
+      reconnected: first with vCenter's own stored credentials, then - if that fails, which is the
+      stale-password case - with ReconnectHost_Task carrying the root credential. NOT a remove and
+      re-add, which would take the host's VMs out of inventory with it.
+      Once reconnected the host goes through the SAME return check as every other host, so it earns
+      its way through settle and compliance rather than being waved past them.
+      Declining the prompt is allowed; a disconnected host is then reported for manual
+      rectification instead. The credential is held in memory only, cleared per cluster, and never
+      written to the log or the run summary.
     - HOSTS ALREADY IN MAINTENANCE MODE ARE IN SCOPE, for both the Intersight and the UCS Manager
       paths. They were previously skipped for being not-Connected, which quietly left them on old
       firmware while the run reported the cluster complete. They are now taken FIRST - being already
@@ -480,7 +493,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.2.0-preauth"
+$ScriptVersion = "23.3.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -677,8 +690,18 @@ $Global:UcsSessions = @{}
 $Global:UcsHostMap = @{}
 $Global:UcsCandidateCache = @{}
 $Global:UcsServiceProfileCache = @{}
-$Global:ReconnectCredential = $null
-$Global:PromptForReconnectPasswordWhenNeeded = $false
+# ESXi root credential for the cluster being worked on. Collected once when the cluster is
+# selected, held only in memory for the run, and cleared per cluster.
+#
+# It exists for one job: a host that reboots but comes back DISCONNECTED in vCenter because
+# vCenter's stored password for it no longer works. vCenter cannot reconnect it on its own, the
+# host sits there disconnected, and the run waits out its whole window for something that will
+# never resolve itself. With the root password to hand the run reconnects it and carries on.
+$Global:EsxiRootCredential = $null
+# How long a host must be seen DISCONNECTED before the root credential is used to reconnect it.
+# Short enough not to waste the change window, long enough not to fight a host that is simply
+# still coming up - vCenter reports Disconnected briefly during a normal boot.
+$HostReconnectAfterDisconnectMinutes = 5
 $Global:AutoExitMaintenanceMode = $true
 $Global:PrerequisitesConfirmed = $false
 
@@ -3148,6 +3171,131 @@ function Get-IntersightFirmwareTaskState {
     return "Finished"
 }
 
+function New-VMHostConnectSpec {
+    <#
+    .SYNOPSIS
+        Builds the HostConnectSpec used to reconnect a host with explicit credentials.
+
+    .DESCRIPTION
+        Separated so the reconnect can be tested without PowerCLI's types being present. The
+        password is taken out of the PSCredential only here, at the moment it is handed to the API,
+        and is never stored, logged or written to the run summary.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$HostName,
+        [Parameter(Mandatory=$true)][pscredential]$Credential
+    )
+
+    $spec = New-Object VMware.Vim.HostConnectSpec
+    $spec.HostName = $HostName
+    $spec.UserName = $Credential.UserName
+    $spec.Password = $Credential.GetNetworkCredential().Password
+    $spec.Force    = $true
+    return $spec
+}
+
+function Test-VMHostDisconnected {
+    <#
+    .SYNOPSIS
+        Is this host in vCenter's inventory but not usable? Disconnected or NotResponding.
+
+    .DESCRIPTION
+        Told apart from "not back yet" deliberately. A host still rebooting is absent or briefly
+        NotResponding and will resolve itself; a host vCenter has DISCONNECTED because it cannot
+        authenticate to it will sit there indefinitely. Only the second is worth spending a root
+        password on, and the caller waits $HostReconnectAfterDisconnectMinutes before deciding
+        which it is looking at.
+    #>
+    param([Parameter(Mandatory=$true)][string]$HostName)
+
+    try {
+        $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
+        if ($null -eq $hostObj) { return $false }
+        $state = [string]$hostObj.ConnectionState
+        return ($state -eq "Disconnected" -or $state -eq "NotResponding")
+    }
+    catch { return $false }
+}
+
+function Restore-DisconnectedVMHost {
+    <#
+    .SYNOPSIS
+        Reconnects a host that vCenter has dropped, using the ESXi root credential.
+
+    .DESCRIPTION
+        The failure this exists for: the host reboots, comes back, and vCenter cannot re-establish
+        its connection because the password it holds for the host no longer works. vCenter shows it
+        Disconnected and will not recover on its own, so the run waits out its whole window for
+        something that is never going to resolve itself.
+
+        Two attempts, cheapest first:
+
+          1. Set-VMHost -State Connected. Reconnects using the credentials vCenter already holds,
+             which is enough for a transient drop and costs nothing to try.
+          2. ReconnectHost_Task with an explicit HostConnectSpec carrying the root credential. This
+             is the one that fixes a stale password, and it is the vSphere API's own operation for
+             it - NOT a remove-and-re-add, which would take the host's VMs out of inventory with it.
+
+        Returns $true only when vCenter reports the host Connected or in Maintenance afterwards.
+        Never throws: a host that cannot be reconnected is the caller's decision, not a reason to
+        end a run that has other hosts in flight.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$HostName,
+        [int]$TimeoutMinutes = 10
+    )
+
+    if ($null -eq $Global:EsxiRootCredential) {
+        Write-Host "  '$HostName' is disconnected, but no ESXi root credential was provided for this cluster - cannot reconnect it automatically." -ForegroundColor Yellow
+        return $false
+    }
+
+    Write-Host "  Reconnecting '$HostName' with the ESXi root credential." -ForegroundColor Yellow
+
+    try {
+        $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
+        if ($null -eq $hostObj) {
+            Write-Host "  '$HostName' is not in vCenter's inventory at all - it has to be added back by hand." -ForegroundColor Yellow
+            return $false
+        }
+
+        # 1. The cheap attempt: vCenter's own stored credentials.
+        try { Set-VMHost -VMHost $hostObj -State Connected -Confirm:$false -ErrorAction Stop | Out-Null }
+        catch { Write-Host "  Reconnect with vCenter's stored credentials failed: $($_.Exception.Message)" -ForegroundColor DarkGray }
+
+        $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
+        if ($null -ne $hostObj -and ($hostObj.ConnectionState -eq "Connected" -or $hostObj.ConnectionState -eq "Maintenance")) {
+            Write-Host "  '$HostName' reconnected without needing the root password." -ForegroundColor Green
+            return $true
+        }
+
+        # 2. The one that fixes a stale password.
+        $spec = New-VMHostConnectSpec -HostName $HostName -Credential $Global:EsxiRootCredential
+        [void]$hostObj.ExtensionData.ReconnectHost_Task($spec, $null, $null)
+    }
+    catch {
+        Write-Host "  Reconnecting '$HostName' failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+
+    # vCenter accepts the task and reports the old state for a while, so wait for the transition.
+    $endTime = (Get-Date).AddMinutes($TimeoutMinutes)
+    while ((Get-Date) -lt $endTime) {
+        Start-Sleep -Seconds 15
+        try {
+            $current = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
+            if ($null -ne $current -and ($current.ConnectionState -eq "Connected" -or $current.ConnectionState -eq "Maintenance")) {
+                Write-Host "  '$HostName' is reconnected (ConnectionState: $($current.ConnectionState))." -ForegroundColor Green
+                return $true
+            }
+        }
+        catch { }
+    }
+
+    Write-Host "  '$HostName' is still not connected $TimeoutMinutes minute(s) after the reconnect was sent." -ForegroundColor Yellow
+    return $false
+}
+
 function Test-VMHostRejoinedAfterReboot {
     <#
     .SYNOPSIS
@@ -4893,6 +5041,62 @@ function Wait-VMHostInMaintenance {
     return $false
 }
 
+function Request-EsxiRootCredential {
+    <#
+    .SYNOPSIS
+        Asks for the ESXi root password for the cluster being worked on.
+
+    .DESCRIPTION
+        Collected when the cluster is selected, not when it is first needed - by the time it is
+        needed a host is already down, already evacuated, and stopping to hunt for a password is
+        the worst moment to do it.
+
+        Used for exactly one thing: reconnecting a host that reboots and comes back DISCONNECTED
+        because the password vCenter holds for it no longer works. Nothing else in the run touches
+        it, it is held only in memory, and it is cleared when the cluster changes.
+
+        Declining is allowed. The run continues without it and a disconnected host is reported for
+        manual rectification instead of being reconnected automatically - which is what happened
+        before this existed, so it is no worse than the old behaviour.
+    #>
+    param([Parameter(Mandatory=$true)][string]$ClusterName)
+
+    if ($null -ne $Global:EsxiRootCredential) { return }
+    if (Test-DryRun) {
+        Write-Host "DRY RUN: would ask for the ESXi root password for '$ClusterName'." -ForegroundColor Green
+        return
+    }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "ESXi root password for '$ClusterName'" -ForegroundColor Cyan
+    Write-Host "  Used only to reconnect a host that reboots and comes back Disconnected in vCenter" -ForegroundColor Gray
+    Write-Host "  because the password vCenter holds for it no longer works. Held in memory for this" -ForegroundColor Gray
+    Write-Host "  run only, never written to the summary or the log." -ForegroundColor Gray
+    Write-Host "  S to skip - a disconnected host will then be reported for manual rectification." -ForegroundColor Gray
+
+    $choice = Read-ChoiceExit -Message "Provide the ESXi root password for '$ClusterName'? Y to enter it, S to skip, E to exit" -AllowedChoices @("Y","S") -ExitMessage "Stopped at the ESXi root password prompt."
+    if ($choice -eq "S") {
+        Write-Host "  Skipped. A host that comes back disconnected will be reported, not reconnected." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "ESXi root credential" -Result "Skipped" -Details "Operator declined; automatic reconnect of a disconnected host is unavailable for '$ClusterName'."
+        return
+    }
+
+    try {
+        $credential = Get-Credential -UserName "root" -Message "ESXi root password for hosts in cluster '$ClusterName'"
+    }
+    catch { $credential = $null }
+
+    if ($null -eq $credential -or [string]::IsNullOrWhiteSpace($credential.GetNetworkCredential().Password)) {
+        Write-Host "  No password entered. A host that comes back disconnected will be reported, not reconnected." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "ESXi root credential" -Result "NotProvided" -Details "No password entered; automatic reconnect is unavailable for '$ClusterName'."
+        return
+    }
+
+    $Global:EsxiRootCredential = $credential
+    Write-Host "  Captured for this run." -ForegroundColor Green
+    Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "ESXi root credential" -Result "Captured" -Details "Held in memory for '$ClusterName'; used only to reconnect a disconnected host."
+}
+
 function Request-MaintenanceModeForBatch {
     <#
     .SYNOPSIS
@@ -5132,6 +5336,7 @@ function Invoke-RollingClusterUpgrade {
                     [void]$inFlight.Add([pscustomobject]@{
                         Host = $name; Wave = "$wave"; Stage = "AwaitingReturn"
                         StartedAt = Get-Date; ReturnedAt = $null; Announced = ""
+                        DisconnectedSince = $null; ReconnectAttempted = $false
                     })
                 }
 
@@ -5152,6 +5357,31 @@ function Invoke-RollingClusterUpgrade {
                     $tracker.ReturnedAt = Get-Date
                     Write-Host "  '$($tracker.Host)' is back in vCenter. Settling $HostProfileComplianceSettleMinutes minute(s) before its compliance scan." -ForegroundColor Green
                     Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Confirm host returned" -Result "Returned" -Details "Back in vCenter with a changed boot time."
+                }
+                elseif (Test-VMHostDisconnected -HostName $tracker.Host) {
+                    # The host is in inventory but vCenter has dropped it. Left alone this never
+                    # resolves - vCenter cannot reconnect a host whose password it no longer knows -
+                    # so the run would wait out its whole window for nothing.
+                    if ($null -eq $tracker.DisconnectedSince) {
+                        $tracker.DisconnectedSince = Get-Date
+                        Write-Host "  '$($tracker.Host)' is Disconnected in vCenter. Allowing $HostReconnectAfterDisconnectMinutes minute(s) for it to settle before reconnecting it." -ForegroundColor Yellow
+                        Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Confirm host returned" -Result "Disconnected" -Details "vCenter reports the host disconnected; waiting $HostReconnectAfterDisconnectMinutes minute(s) before using the root credential."
+                    }
+                    elseif (-not $tracker.ReconnectAttempted -and ((Get-Date) - $tracker.DisconnectedSince).TotalMinutes -ge [double]$HostReconnectAfterDisconnectMinutes) {
+                        $tracker.ReconnectAttempted = $true
+                        $reconnected = Restore-DisconnectedVMHost -HostName $tracker.Host
+                        if ($reconnected) {
+                            Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Reconnect host" -Result "Reconnected" -Details "Reconnected with the ESXi root credential after $HostReconnectAfterDisconnectMinutes minute(s) disconnected. The normal checks continue from here."
+                            # Deliberately not advanced by hand - the next pass runs the SAME return
+                            # check as every other host, so a reconnected host earns its way through
+                            # settle and compliance exactly like one that never dropped.
+                            $tracker.DisconnectedSince = $null
+                        }
+                        else {
+                            Add-ManualAttentionHost -HostName $tracker.Host -Reason "Disconnected in vCenter and could not be reconnected" -Detail "The host was disconnected for $HostReconnectAfterDisconnectMinutes minute(s) and the ESXi root credential did not reconnect it. Check the host's management network and its root password."
+                            Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Reconnect host" -Result "Failed" -Details "Root credential reconnect did not bring the host back."
+                        }
+                    }
                 }
                 elseif (((Get-Date) - $tracker.StartedAt).TotalMinutes -ge $returnCeilingMinutes) {
                     $progress = Get-RollingHostDiagnostic -HostName $tracker.Host
@@ -5703,9 +5933,14 @@ function Invoke-ClusterUpgradeWorkflow {
     param([Parameter(Mandatory=$true)]$Cluster)
     Write-Host "Selected cluster: $($Cluster.Name)" -ForegroundColor Green
     $Global:CurrentClusterName = [string]$Cluster.Name
+    # Per cluster: the root password belongs to the hosts in THIS cluster, not the last one.
+    $Global:EsxiRootCredential = $null
     Reset-ClusterScopedState
     Select-RunMode
     Select-UpgradeMode
+    # Asked for now, while nothing is down. By the time it is needed a host is already offline and
+    # evacuated, and that is the worst moment to go looking for a password.
+    Request-EsxiRootCredential -ClusterName $Cluster.Name
     if ((Test-StageNoAck) -and $Global:UpgradeMode -ne "ESXI_UCS_FIRMWARE") { Stop-WithMessage "STAGE_NO_ACK is only valid with UCSM firmware mode." }
 
     $allClusterHosts = @(Get-VMHost -Location $Cluster | Sort-Object Name)

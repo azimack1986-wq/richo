@@ -12,6 +12,37 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.3.0] — 2026-08-13
+
+#### Added
+
+- **A host that comes back Disconnected is reconnected with the ESXi root
+  password.** The reported failure: the host reboots, returns, and vCenter cannot
+  re-establish its connection because the password it holds for that host no
+  longer works. vCenter will not recover it on its own, so the run waited out its
+  entire window for something that was never going to resolve.
+
+  - **The password is asked for when the cluster is selected**, not when it is
+    first needed — by then a host is already down and evacuated, which is the
+    worst moment to go hunting for a credential.
+  - A host seen `Disconnected` or `NotResponding` for
+    `$HostReconnectAfterDisconnectMinutes` (**5**) is reconnected: first with
+    vCenter's own stored credentials (free, and enough for a transient drop), then
+    with `ReconnectHost_Task` carrying the root credential — the vSphere API's own
+    operation for a stale password.
+  - **Never a remove-and-re-add.** That would take the host's VMs out of inventory
+    with it. A test asserts `Remove-VMHost` and `Add-VMHost` appear nowhere in the
+    reconnect path.
+  - Once reconnected the host goes through the **same return check as every other
+    host** — it earns its way through settle and compliance rather than being
+    waved past them.
+  - Declining the prompt is allowed: a disconnected host is then reported for
+    manual rectification, which is exactly the old behaviour, so skipping costs
+    nothing that was not already the case.
+  - The credential is held **in memory only**, cleared when the cluster changes,
+    and never written to the log or the run summary. The password leaves the
+    `PSCredential` only at the point it is handed to the API.
+
 ### [23.2.0] — 2026-08-13
 
 #### Fixed
@@ -2029,6 +2060,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.3.0-preauth] — 2026-08-13
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.3.0 — the ESXi root password
+is collected at cluster selection and used to reconnect a host vCenter has
+dropped. This is the build to run.
 
 ### [23.2.0-preauth] — 2026-08-13
 
