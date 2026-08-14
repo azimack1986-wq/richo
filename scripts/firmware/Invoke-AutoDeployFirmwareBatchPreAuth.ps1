@@ -453,30 +453,62 @@ if (-not $Global:IntersightConfigurationApplied) {
         throw "Intersight prerequisites are not met in this session. See the list above."
     }
 
+    # NOT -ErrorAction Stop. Set-IntersightConfiguration writes a NON-TERMINATING error in some
+    # paths - "Error performing this operation. Check that BasePath and API Key identifier are
+    # configured correctly" - and applies the configuration anyway. Before this preflight existed
+    # the call had no -ErrorAction at all, that error went past unnoticed, and the run worked.
+    # Promoting it to terminating turned a working run into a failing one on every start.
+    #
+    # The rule that governs this block cuts BOTH ways: the call returning is not proof it took,
+    # and the call erroring is not proof it did not. THE READ-BACK IS THE AUTHORITY. The error is
+    # kept either way - to be shown as a warning when the configuration is good, and as the
+    # explanation when it is not.
+    $configError = $null
     try {
-        Set-IntersightConfiguration @onPremIntersightConfig -ErrorAction Stop #-SkipCertificateCheck
+        Set-IntersightConfiguration @onPremIntersightConfig -ErrorAction SilentlyContinue -ErrorVariable configError #-SkipCertificateCheck
     }
     catch {
-        Write-Host "" -ForegroundColor Red
-        Write-Host "Set-IntersightConfiguration failed: $($_.Exception.Message)" -ForegroundColor Red
-        Write-Host "The configuration has NOT been applied. Nothing has been changed." -ForegroundColor Red
-        throw "Set-IntersightConfiguration failed - see the message above."
+        $configError = $_
     }
 
-    # It returning is not proof it took. Read it back: a BasePath still on the SaaS default is the
-    # state that printed "Active BasePath: https://intersight.com" after claiming success.
     $activeBasePath = ""
     try { $activeBasePath = [string](Get-IntersightConfiguration).BasePath } catch { }
-    if ($activeBasePath -ne "https://$IntersightServer") {
-        Write-Host "" -ForegroundColor Red
-        Write-Host "Set-IntersightConfiguration returned, but the active configuration does not match." -ForegroundColor Red
-        Write-Host "  Asked for: https://$IntersightServer" -ForegroundColor Red
-        Write-Host "  Active   : $(if ($activeBasePath) { $activeBasePath } else { '<nothing configured>' })" -ForegroundColor Red
-        throw "Intersight configuration did not take effect - see the message above."
+
+    $configErrorText = ""
+    if ($configError) {
+        try { $configErrorText = (@($configError) | ForEach-Object { [string]$_ }) -join ' | ' } catch { $configErrorText = [string]$configError }
     }
 
-    $Global:IntersightConfigurationApplied = $true
-    Write-Host "Intersight configuration applied for this PowerShell session: $activeBasePath" -ForegroundColor Green
+    if ($activeBasePath -eq "https://$IntersightServer") {
+        if (-not [string]::IsNullOrWhiteSpace($configErrorText)) {
+            Write-Host "Set-IntersightConfiguration reported an error, but the configuration IS active - continuing." -ForegroundColor Yellow
+            Write-Host "  Reported: $configErrorText" -ForegroundColor DarkGray
+        }
+        $Global:IntersightConfigurationApplied = $true
+        Write-Host "Intersight configuration applied for this PowerShell session: $activeBasePath" -ForegroundColor Green
+    }
+    else {
+        Write-Host "" -ForegroundColor Red
+        Write-Host "The Intersight configuration did not take effect." -ForegroundColor Red
+        Write-Host "  Asked for: https://$IntersightServer" -ForegroundColor Red
+        Write-Host "  Active   : $(if ($activeBasePath) { $activeBasePath } else { '<nothing configured>' })" -ForegroundColor Red
+        if (-not [string]::IsNullOrWhiteSpace($configErrorText)) {
+            Write-Host "  Reported : $configErrorText" -ForegroundColor Red
+        }
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "That message is the module's generic one and covers three different faults:" -ForegroundColor Yellow
+        Write-Host "  1. The secret key file is not a usable key. It must be the PEM downloaded when the" -ForegroundColor Yellow
+        Write-Host "     API key was created - starting -----BEGIN EC PRIVATE KEY----- or" -ForegroundColor Yellow
+        Write-Host "     -----BEGIN RSA PRIVATE KEY-----. A .txt wrapper is fine; re-saved or re-typed" -ForegroundColor Yellow
+        Write-Host "     content is not." -ForegroundColor Yellow
+        Write-Host "     Using: $APIKeyFile" -ForegroundColor Yellow
+        Write-Host "  2. The API Key ID does not match that key file. They are issued as a pair - a key" -ForegroundColor Yellow
+        Write-Host "     ID from one and a secret from another fails exactly like this." -ForegroundColor Yellow
+        Write-Host "  3. More than one version of Intersight.PowerShell is installed. Check with:" -ForegroundColor Yellow
+        Write-Host "     Get-Module -ListAvailable Intersight.PowerShell" -ForegroundColor Yellow
+        # NOT marked as applied - a later run in this session must be free to try again.
+        throw "Intersight configuration did not take effect - see the message above."
+    }
 }
 else {
     Write-Host "Intersight configuration was already applied in this PowerShell session - not re-applying." -ForegroundColor Yellow
@@ -493,7 +525,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.4.0-preauth"
+$ScriptVersion = "23.4.1-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"

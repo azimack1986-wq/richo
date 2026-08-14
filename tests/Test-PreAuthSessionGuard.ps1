@@ -154,14 +154,50 @@ try { Invoke-Expression $authRegion 6>$null } catch { $stopped2 = "$_" -match 'd
 Assert-Equal "a configuration that did not take is caught by reading it back" $true $stopped2
 Assert-Equal "and the session stays unconfigured, so a retry can try again" $false $Global:IntersightConfigurationApplied
 
-# A throwing cmdlet is reported, not swallowed.
+# THE ERROR IS NOT THE AUTHORITY - THE READ-BACK IS.
+#
+# Set-IntersightConfiguration writes a non-terminating error in some paths and applies the
+# configuration anyway. Before the preflight existed the call had no -ErrorAction at all, so that
+# error went past unnoticed and the run worked. Promoting it to terminating turned a working run
+# into a failing one on every start - reported live as
+# "Set-IntersightConfiguration failed: Error performing this operation. Check that BasePath and
+# API Key identifier are configured correctly".
 $Global:IntersightConfigurationApplied = $false
+$script:LastConfig = $null
+function Set-IntersightConfiguration { param($BasePath,$ApiKeyId,$ApiKeyFilePath,$ApiKeyString,$HttpSigningHeader,$HashAlgorithm,$ApiKeyPassPhrase,[switch]$SkipCertificateCheck)
+    # Complains, and applies it anyway. Exactly the live behaviour.
+    Write-Error "Error performing this operation. Check that BasePath and API Key identifier are configured correctly using the Set-IntersightConfiguration cmdlet."
+    $script:LastConfig = [pscustomobject]@{ BasePath = $BasePath } }
+$noisyError = $null
+try { Invoke-Expression $authRegion 6>$null 2>$null } catch { $noisyError = $_ }
+Assert-Equal "an error alongside a good configuration does NOT stop the run" $true ($null -eq $noisyError) "$noisyError"
+Assert-Equal "and the session is marked configured, because the read-back says so" $true $Global:IntersightConfigurationApplied
+
+# The same error with a configuration that genuinely did not take DOES stop, and says why.
+$Global:IntersightConfigurationApplied = $false
+$script:LastConfig = $null
+function Set-IntersightConfiguration { param($BasePath,$ApiKeyId,$ApiKeyFilePath,$ApiKeyString,$HttpSigningHeader,$HashAlgorithm,$ApiKeyPassPhrase,[switch]$SkipCertificateCheck)
+    Write-Error "Error performing this operation. Check that BasePath and API Key identifier are configured correctly."
+    $script:LastConfig = [pscustomobject]@{ BasePath = 'https://intersight.com' } }
+$stopped3 = $false
+try { Invoke-Expression $authRegion 6>$null 2>$null } catch { $stopped3 = "$_" -match 'did not take effect' }
+Assert-Equal "an error AND a bad configuration stops the run" $true $stopped3
+Assert-Equal "and still leaves the session free to retry" $false $Global:IntersightConfigurationApplied
+
+# A hard throw is still caught rather than crashing out of the region.
+$Global:IntersightConfigurationApplied = $false
+$script:LastConfig = $null
 function Set-IntersightConfiguration { param($BasePath,$ApiKeyId,$ApiKeyFilePath,$ApiKeyString,$HttpSigningHeader,$HashAlgorithm,$ApiKeyPassPhrase,[switch]$SkipCertificateCheck)
     throw "iam_api_key_is_invalid" }
-$stopped3 = $false
-try { Invoke-Expression $authRegion 6>$null } catch { $stopped3 = "$_" -match 'Set-IntersightConfiguration failed' }
-Assert-Equal "a failing configuration call stops the run" $true $stopped3
-Assert-Equal "and still leaves the session free to retry" $false $Global:IntersightConfigurationApplied
+$stopped4 = $false
+try { Invoke-Expression $authRegion 6>$null 2>$null } catch { $stopped4 = "$_" -match 'did not take effect' }
+Assert-Equal "a throwing cmdlet with nothing configured stops the run" $true $stopped4
+Assert-Equal "the run is not left thinking it is configured" $false $Global:IntersightConfigurationApplied
+
+# The remediation names the three faults that generic message actually covers.
+Assert-Equal "the key file format is named" $true ($authRegion -match 'BEGIN EC PRIVATE KEY')
+Assert-Equal "the key-ID-and-secret pairing is named" $true ($authRegion -match 'issued as a pair')
+Assert-Equal "duplicate module versions are named" $true ($authRegion -match 'more than one version|More than one version')
 
 # The first-run fix itself: the module is loaded once, guarded, before the cmdlet is used.
 Assert-Equal "the module is loaded before the cmdlet is used" $true ($authRegion -match 'Import-Module -Name Intersight\.PowerShell')

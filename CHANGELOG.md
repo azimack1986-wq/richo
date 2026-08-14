@@ -12,6 +12,38 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.4.1] — 2026-08-13
+
+#### Fixed
+
+- **23.2.0's preflight turned a working run into a failing one on every start.**
+  Reported live as:
+
+  ```
+  Set-IntersightConfiguration failed: Error performing this operation. Check that
+  BasePath and API Key identifier are configured correctly...
+  ```
+
+  My fault, and a plain regression. `Set-IntersightConfiguration` writes a
+  **non-terminating** error in some paths and applies the configuration anyway.
+  Before the preflight the call had no `-ErrorAction` at all, so that error went
+  past unnoticed and the run worked. Adding `-ErrorAction Stop` promoted it to
+  terminating and aborted every run.
+
+  The rule this block already followed cuts both ways, and I only implemented
+  half of it: *the call returning is not proof it took* — and equally **the call
+  erroring is not proof it did not**. The **read-back is the authority**:
+
+  - configuration active → the run continues, and the error is shown as a
+    warning rather than being hidden;
+  - configuration not active → the run stops, with the reported error included as
+    the explanation.
+
+  The failure message now also names the three distinct faults that generic
+  message actually covers: a key file that is not a usable PEM, an API Key ID that
+  does not match the secret it was issued with, and more than one installed
+  version of `Intersight.PowerShell`.
+
 ### [23.4.0] — 2026-08-13
 
 #### Fixed
@@ -2099,6 +2131,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.4.1-preauth] — 2026-08-13
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.4.1 — a non-fatal error
+from `Set-IntersightConfiguration` no longer aborts the run; the read-back
+decides. This is the build to run.
 
 ### [23.4.0-preauth] — 2026-08-13
 
