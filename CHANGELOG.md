@@ -12,6 +12,43 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.5.0] — 2026-08-14
+
+#### Fixed
+
+- **The half-cluster ceiling was not being enforced, so a second wave started
+  while the first was still rebooting.** On a live 21-host cluster the run said:
+
+  ```
+  Ceiling: 10 of 21 host(s) may be out at once (50% of the cluster).
+  ...
+  Capacity allows 17 host(s) out at once; 10 already in flight.
+  WAVE 2: starting 7 host(s) - ...
+  ```
+
+  17 of 21 hosts out at once against a stated cap of 10.
+
+  My fault, from 23.2.0. I exempted parked hosts from the ceiling so that
+  pre-existing parked hosts would not be stranded — but in the rolling engine the
+  hosts already in flight **are** parked. The limit therefore grew by exactly the
+  number in flight, `room = limit - inFlight` never shrank, and the ceiling was
+  meaningless.
+
+  Parked hosts now **count towards** the ceiling. It is a limit on how much of the
+  cluster may be out **at once**, not on how many the run last asked for. So with
+  ten in flight the total stays ten, no room opens, and the next host starts only
+  when one comes back — which is what rolling was supposed to mean.
+
+  The trade this reverses: where more than half a cluster is *already* parked
+  before the run starts, those hosts are now processed within the ceiling rather
+  than all at once. That is the safer reading, and the case is unusual.
+
+#### Fixed (found while testing the above)
+
+- `Test-VMHostDisconnected`, added in 23.3.0 for the reconnect work, sits on the
+  rolling loop's critical path. Where it could not be resolved the loop advanced
+  no host and spun indefinitely. Caught by the rolling harness hanging.
+
 ### [23.4.1] — 2026-08-13
 
 #### Fixed
@@ -2131,6 +2168,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.5.0-preauth] — 2026-08-14
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.5.0 — hosts in flight now
+count against the half-cluster ceiling, so a second wave cannot start while the
+first is still out. This is the build to run.
 
 ### [23.4.1-preauth] — 2026-08-13
 

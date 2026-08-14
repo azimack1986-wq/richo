@@ -117,20 +117,20 @@ Assert-Equal "a cluster too busy to spare a connected host still takes the parke
 
 # Every candidate parked: always safe, never a capacity stop.
 $r = Get-CapacityBasedBatchSize -CandidateHosts @((New-ParkedHost -Name "p1"), (New-ParkedHost -Name "p2"), (New-ParkedHost -Name "p3")) -Cluster $cluster
-Assert-Equal "a batch made up entirely of parked hosts is never refused" 3 $r.SafeBatchSize
+Assert-Equal "a batch made up entirely of parked hosts is never refused" 1 $r.SafeBatchSize
 
 # The free slots ride on top of the sized connected batch: 5 connected + 1 parked = 6.
 $r = Get-CapacityBasedBatchSize -CandidateHosts (@((New-Cluster -Count 10 -CpuUsedEach 32000 -MemUsedEach 153.6)) + @((New-ParkedHost -Name "parked1"))) -Cluster $cluster
-Assert-Equal "a parked host is added on top of the capacity-sized batch" 6 $r.SafeBatchSize
+Assert-Equal "a parked host counts towards the ceiling, it does not raise it" 5 $r.SafeBatchSize
 
-# Parked hosts are already out, so they are added ON TOP of the connected half-cap
-# rather than competing with it: 6 connected (half of 12) plus the 2 parked.
+# Parked hosts COUNT TOWARDS the ceiling rather than raising it: 12 hosts, half is 6, and the
+# 2 already parked are 2 of that 6.
 $r = Get-CapacityBasedBatchSize -CandidateHosts (@((New-Cluster -Count 10 -CpuUsedEach 30000 -MemUsedEach 153.6)) + @((New-ParkedHost -Name "parked1"), (New-ParkedHost -Name "parked2"))) -Cluster $cluster
-Assert-Equal "parked hosts ride on top of the connected half-cap" 8 $r.SafeBatchSize
+Assert-Equal "parked hosts count towards the ceiling, never past it" 6 $r.SafeBatchSize
 
 # One connected host plus parked ones is still a valid batch.
 $r = Get-CapacityBasedBatchSize -CandidateHosts (@((New-Cluster -Count 1 -CpuUsedEach 1000 -MemUsedEach 10)) + @((New-ParkedHost -Name "parked1"), (New-ParkedHost -Name "parked2"))) -Cluster $cluster
-Assert-Equal "one connected host plus two parked is a batch of three" 3 $r.SafeBatchSize
+Assert-Equal "one connected plus two parked is still bounded by the ceiling" 1 $r.SafeBatchSize
 
 # NotResponding and Disconnected are still out. There is nothing to drive through vCenter on a
 # host it cannot reach, and this is the distinction the change had to preserve.
@@ -144,6 +144,33 @@ Assert-Equal "the firmware candidate filter admits Maintenance" $true ($workflow
 Assert-Equal "the ESXi-only filter admits Maintenance too" $true ($workflowText -match 'ConnectionState -eq "Connected" -or \$_\.ConnectionState -eq "Maintenance"\) -and \(\$alreadyTargetHosts')
 Assert-Equal "parked hosts are queued ahead of the rest" $true ($workflowText -match '(?s)Where-Object \{ \$_\.ConnectionState -eq "Maintenance" \}\)\) \{ \[void\]\$pendingHosts\.Add.*Where-Object \{ \$_\.ConnectionState -ne "Maintenance" \}\)\) \{ \[void\]\$pendingHosts\.Add')
 Assert-Equal "and they are recorded as in scope, not excluded" $true ($workflowText -match '-Action "Pre-existing Maintenance mode" -Result "InScope"')
+
+Write-Host "`n=== The ceiling is a TOTAL, and hosts in flight count against it ===" -ForegroundColor Cyan
+# THE LIVE FAULT, from a 21-host cluster. Exempting parked hosts from the ceiling broke the
+# rolling engine completely: the hosts it already had in flight ARE parked, so the limit grew by
+# exactly the number in flight and the room to admit more never shrank. The run reported
+#   "Ceiling: 10 of 21 host(s) may be out at once"
+# and then
+#   "Capacity allows 17 host(s) out at once; 10 already in flight"
+# and started a second wave of 7 while the first 10 were still rebooting.
+$twentyOne = @(1..21 | ForEach-Object { New-TestHost -Name "esx$_" -CpuTotal 100000 -CpuUsed 3400 -MemTotal 767 -MemUsed 100 })
+$r = Get-CapacityBasedBatchSize -CandidateHosts $twentyOne -Cluster $cluster
+Assert-Equal "an idle 21-host cluster takes half of it" 10 $r.SafeBatchSize
+
+# Now ten of them are in flight - exactly the state the live run was in when it admitted more.
+$tenOut = @(1..10 | ForEach-Object { New-TestHost -Name "esx$_" -CpuTotal 100000 -CpuUsed 0 -MemTotal 767 -MemUsed 0 -State "Maintenance" }) +
+          @(11..21 | ForEach-Object { New-TestHost -Name "esx$_" -CpuTotal 100000 -CpuUsed 7500 -MemTotal 767 -MemUsed 187 })
+$r = Get-CapacityBasedBatchSize -CandidateHosts $tenOut -Cluster $cluster
+Assert-Equal "with ten already out, the total is still ten - not seventeen" 10 $r.SafeBatchSize
+# The rolling engine subtracts what is in flight, so this leaves no room at all.
+Assert-Equal "so nothing more may be admitted while those ten are out" 0 ($r.SafeBatchSize - 10)
+
+# Three come back. Room opens by exactly three, and no more.
+$sevenOut = @(1..7 | ForEach-Object { New-TestHost -Name "esx$_" -CpuTotal 100000 -CpuUsed 0 -MemTotal 767 -MemUsed 0 -State "Maintenance" }) +
+            @(8..21 | ForEach-Object { New-TestHost -Name "esx$_" -CpuTotal 100000 -CpuUsed 5900 -MemTotal 767 -MemUsed 147 })
+$r = Get-CapacityBasedBatchSize -CandidateHosts $sevenOut -Cluster $cluster
+Assert-Equal "as hosts return, the total stays at the ceiling" 10 $r.SafeBatchSize
+Assert-Equal "and exactly the freed slots open up" 3 ($r.SafeBatchSize - 7)
 
 Write-Host "`n=== Host profile compliance parsing ===" -ForegroundColor Cyan
 $testHost = New-TestHost -Name "esx1" -CpuTotal 1 -CpuUsed 0 -MemTotal 1 -MemUsed 0

@@ -29,6 +29,7 @@ if ($errors) { throw "parse errors" }
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in @('Invoke-RollingClusterUpgrade','Get-RollingConcurrencyLimit',
                                  'Start-RollingHostWave','Get-RollingHostDiagnostic',
+                                 'Test-VMHostDisconnected','Restore-DisconnectedVMHost',
                                  'Get-CapacityBasedBatchSize','Test-VMHostRejoinedAfterReboot',
                                  'Get-VMHostBootTime','Read-ChoiceExit','Read-PendingConsoleKey',
                                  'Test-DryRun','Test-StageNoAck') } |
@@ -54,6 +55,10 @@ $Global:RunMode = 'LIVE'
 $Global:UpgradeMode = 'ESXI_ONLY'
 $Global:IntersightHostMap = @{}
 $Global:PreRebootBootTimes = @{}
+# No root credential in these runs: the disconnect and reconnect path has its own test, and here a
+# host either comes back or it does not.
+$Global:EsxiRootCredential = $null
+$HostReconnectAfterDisconnectMinutes = 5
 $Global:BatchActionsSent = 0
 $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
 $Global:ExcludedFromRunHosts = @{}

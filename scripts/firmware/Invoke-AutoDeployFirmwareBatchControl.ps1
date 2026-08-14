@@ -339,7 +339,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.4.1"
+$ScriptVersion = "23.5.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -4601,11 +4601,15 @@ function Get-CapacityBasedBatchSize {
     [void]$diagnostics.Add(("Ceiling: {0} of {1} host(s) may be out at once ({2:P0} of the cluster)." -f $hardCap, $clusterSize, $MaxConcurrentHostFraction))
 
     # Free slots, capped so a large pool of parked hosts cannot blow past MaxAbsoluteBatchSize.
-    # Parked hosts are NOT subject to the half-cluster ceiling: they are already out of service,
-    # so capping them achieves nothing except leaving hosts in Maintenance mode un-upgraded. The
-    # ceiling exists to stop the run taking MORE capacity out than the cluster can carry.
-    $freeSlots = $parked.Count
-    if ([int]$MaxAbsoluteBatchSize -gt 0) { $freeSlots = [Math]::Min($freeSlots, [int]$MaxAbsoluteBatchSize) }
+    # Parked hosts COUNT TOWARDS THE CEILING. They are out of service, and the ceiling is a limit
+    # on how much of the cluster may be out AT ONCE - not on how many the run last asked for.
+    #
+    # Exempting them, as an earlier build did, breaks the rolling engine completely: the hosts it
+    # already has in flight ARE parked, so the limit grew by exactly the number in flight and the
+    # room to admit more never shrank. A live 21-host run reported "Ceiling: 10 of 21" and then
+    # "Capacity allows 17 host(s) out at once; 10 already in flight", and started a second wave of
+    # 7 while the first 10 were still rebooting.
+    $freeSlots = [Math]::Min($parked.Count, $hardCap)
     if ($freeSlots -gt 0) {
         [void]$diagnostics.Add(("{0} candidate host(s) are already in Maintenance mode and cost no capacity to take." -f $parked.Count))
     }
@@ -4617,7 +4621,7 @@ function Get-CapacityBasedBatchSize {
         return [pscustomobject]@{ SafeBatchSize=0; Reason="No connected candidate hosts."; Diagnostics=@($diagnostics) }
     }
     if ($connected.Count -eq 1) {
-        $only = 1 + $freeSlots
+        $only = [Math]::Min(1 + $freeSlots, $hardCap)
         return [pscustomobject]@{ SafeBatchSize=$only; Reason="Only one connected candidate host - batch of one$(if ($freeSlots -gt 0) { ", plus $freeSlots already in Maintenance mode" })."; Diagnostics=@($diagnostics) }
     }
 
@@ -4649,7 +4653,9 @@ function Get-CapacityBasedBatchSize {
         [void]$diagnostics.Add(("Batch of {0}: CPU need {1:N0} vs allowed {2:N0} MHz [{3}]; memory need {4:N1} vs allowed {5:N1} GB [{6}]." -f $n, $usedCpuMhz, $cpuLimit, $(if($cpuOk){"OK"}else{"FAIL"}), $usedMemGB, $memLimit, $(if($memOk){"OK"}else{"FAIL"})))
 
         if ($cpuOk -and $memOk) {
-            $total = [Math]::Min($n, $hardCap) + $freeSlots
+            # The TOTAL that may be out at once: what capacity allows removing now, plus what is
+            # already out, never more than the ceiling.
+            $total = [Math]::Min($n + $freeSlots, $hardCap)
             return [pscustomobject]@{
                 SafeBatchSize = $total
                 Reason        = "Largest batch leaving $MinimumCpuHeadroomPercentAfterBatch% CPU and $MinimumMemoryHeadroomPercentAfterBatch% memory headroom after a $ResourceSafetyBuffer safety buffer, capped at $hardCap (half the cluster).$(if ($freeSlots -gt 0) { " $n connected host(s) plus $freeSlots already in Maintenance mode." })"
