@@ -43,7 +43,8 @@ function Assert-Equal { param([string]$Name,$Expected,$Actual)
 $ResourceSafetyBuffer = 0.85
 $MinimumCpuHeadroomPercentAfterBatch = 10
 $MinimumMemoryHeadroomPercentAfterBatch = 10
-$MaxAbsoluteBatchSize = 6
+$MaxAbsoluteBatchSize = 0
+$MaxConcurrentHostFraction = 0.5
 $MaintenanceValidationTimeoutMinutes = 60
 $FirmwareReconnectInitialWaitMinutes = 30
 $HostProfileComplianceSettleMinutes = 8

@@ -12,6 +12,56 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.2.0] — 2026-08-13
+
+#### Fixed
+
+- **The first run of every new session failed; the second worked.** The script
+  imports nothing, relying on PowerShell to auto-load on first use — but
+  auto-loading depends on the command discovery cache, and building that cache
+  means scanning every path in `$env:PSModulePath`. `Intersight.PowerShell` is a
+  large binary module, so from a cold cache (new session, network module path,
+  slow profile share) the first reference resolves *before* the scan finds it and
+  the cmdlet reads as **"not recognized"**. The scan completes afterwards, which
+  is why a re-run in the same session works.
+
+  The module is now loaded once in the AUTHENTICATION region, **guarded by
+  `Get-Module`** so it does nothing when already present and cannot duplicate or
+  fight a pinned bundle. This is the only permitted load in the script, and
+  `Test-ScriptLint` now enforces both that it stays the only one and that it stays
+  guarded.
+
+- **The authentication block announced success whatever happened.** It called
+  `Set-IntersightConfiguration` with no error handling, set the once-per-session
+  flag, and printed *"configuration applied"* unconditionally — so a session
+  without the module reported success, failed much later with *"Intersight
+  environment is not configured"*, and then told the operator on retry that it was
+  *"already applied, start a fresh session"*. Three misleading messages from one
+  unchecked call. Now:
+  - a **preflight** checks the PowerShell edition, that the cmdlet resolved, and
+    that the API key file is reachable **from this account** — the key lives on a
+    network share, so a different user is exactly the case that breaks;
+  - failures are listed with the fix for each, and the run stops;
+  - the configuration is **read back** and compared to what was asked for, which
+    catches the `Active BasePath: https://intersight.com` case directly;
+  - the session is **not** marked configured unless it genuinely worked, so a
+    retry in the same session can try again.
+
+#### Changed
+
+- **AUTO is capped at half the cluster, not a fixed 6.** `$MaxConcurrentHostFraction`
+  (default `0.5`) replaces the hard cap; `$MaxAbsoluteBatchSize` remains as an
+  optional absolute ceiling and defaults to `0` (none). On a 24-host cluster the
+  old 6 was an arbitrary throttle well below what the cluster could carry.
+
+  Capacity, DRS headroom and the resource safety buffer are **unchanged and still
+  the primary constraint** — they normally bind first. The fraction only stops a
+  large, idle cluster being emptied faster than DRS and storage can keep up with.
+
+  Hosts already in Maintenance mode are **exempt** from the ceiling: they are
+  already out of service, so capping them would only strand them un-upgraded.
+  They are added on top of the connected half-cap.
+
 ### [23.1.0] — 2026-08-12
 
 #### Fixed
@@ -1979,6 +2029,13 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.2.0-preauth] — 2026-08-13
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.2.0 — the first run of a
+session no longer fails on a cold module cache, the authentication block stops
+claiming success it did not have, and AUTO scales to half the cluster. This is the
+build to run.
 
 ### [23.1.0-preauth] — 2026-08-12
 

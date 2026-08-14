@@ -173,7 +173,7 @@
       continuously and no host arrives. A host that does not reach Maintenance mode within
       $MaintenanceValidationTimeoutMinutes stops the run, naming it, with the rest of the batch
       untouched. SINGLE mode is a batch of one, so its behaviour is unchanged.
-    - Batch mode is AUTO (sized from live cluster capacity, capped at $MaxAbsoluteBatchSize) or
+    - Batch mode is AUTO (sized from live cluster capacity, capped at half the cluster) or
       SINGLE (one host at a time). There is no free-text batch size.
     - ONLY BLADES WITH CHANGES STAGED ARE IN SCOPE. Before anything is evacuated, every
       Intersight-managed host's server profile is read once and those with nothing to deploy - an
@@ -378,9 +378,92 @@ $onPremIntersightConfig = @{
 }
 
 if (-not $Global:IntersightConfigurationApplied) {
-    Set-IntersightConfiguration @onPremIntersightConfig #-SkipCertificateCheck
+
+    # WHY THE FIRST RUN FAILED AND THE SECOND WORKED.
+    #
+    # This script does not import modules anywhere else - PowerShell auto-loads them on first use.
+    # Auto-loading depends on the command discovery cache, and building that cache means scanning
+    # every path in $env:PSModulePath. Intersight.PowerShell is a large binary module, and when the
+    # cache is cold - a brand new session, a network module path, a slow profile share - the first
+    # reference can be resolved before the scan has found it, and the cmdlet reads as "not
+    # recognized". The scan finishes afterwards, so the SECOND run in the same session works. That
+    # is exactly the reported symptom: fails first time, works on re-run, every time.
+    #
+    # So the module is loaded HERE, once, and only when it is not already present. It cannot
+    # duplicate or fight a pinned bundle: if the module is already in the session this does nothing.
+    # This is the ONLY place in the script permitted to load a module - Test-ScriptLint enforces
+    # that, so the general no-imports rule still holds everywhere else.
+    if (-not (Get-Module -Name Intersight.PowerShell)) {
+        try { Import-Module -Name Intersight.PowerShell -ErrorAction Stop }
+        catch {
+            # Not fatal on its own - the preflight below reports it properly, with the fix.
+            Write-Host "Intersight.PowerShell could not be loaded: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    # PREFLIGHT. This block used to call Set-IntersightConfiguration with no error handling, set
+    # the applied flag, and print "configuration applied" whatever happened. On a machine without
+    # the module that produced a run which announced success, failed much later with "Intersight
+    # environment is not configured", and then - because the flag had been set - told the operator
+    # on retry that it was already applied. Three misleading messages from one unchecked call.
+    $authProblems = New-Object System.Collections.Generic.List[string]
+
+    if ($PSVersionTable.PSEdition -ne 'Core') {
+        [void]$authProblems.Add("This is Windows PowerShell $($PSVersionTable.PSVersion). Intersight.PowerShell is a .NET Core binary module and will not load here. Start PowerShell 7 (pwsh.exe) and run the script from there.")
+    }
+    elseif ($PSVersionTable.PSVersion.Major -lt 7) {
+        [void]$authProblems.Add("This is PowerShell $($PSVersionTable.PSVersion). Intersight.PowerShell needs PowerShell 7 or newer.")
+    }
+
+    if ($null -eq (Get-Command -Name Set-IntersightConfiguration -ErrorAction SilentlyContinue)) {
+        [void]$authProblems.Add("Set-IntersightConfiguration is still not available after loading the module, so Intersight.PowerShell is not installed for THIS user on THIS machine. Install it for your own profile with: Install-Module Intersight.PowerShell -Scope CurrentUser   (match the version to the appliance release, and keep only one version installed).")
+    }
+
+    if ([string]::IsNullOrWhiteSpace($APIKeyFile)) {
+        [void]$authProblems.Add("No API key file path is set in the AUTHENTICATION region.")
+    }
+    elseif (-not (Test-Path -LiteralPath $APIKeyFile)) {
+        [void]$authProblems.Add("The API key file cannot be reached from this account: $APIKeyFile   It is a network share - confirm YOUR account has access to it, or copy the key somewhere local and point APIKeyFile at that copy.")
+    }
+
+    if ($authProblems.Count -gt 0) {
+        Write-Host "" -ForegroundColor Red
+        Write-Host "=====================================================================" -ForegroundColor Red
+        Write-Host " INTERSIGHT CANNOT BE CONFIGURED IN THIS SESSION" -ForegroundColor Red
+        Write-Host "=====================================================================" -ForegroundColor Red
+        $number = 0
+        foreach ($problem in $authProblems.ToArray()) { $number++; Write-Host "$number. $problem" -ForegroundColor Yellow }
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "Session: PowerShell $($PSVersionTable.PSVersion) ($($PSVersionTable.PSEdition)) as $env:USERNAME on $env:COMPUTERNAME" -ForegroundColor Gray
+        Write-Host "=====================================================================" -ForegroundColor Red
+        # NOT marked as applied - a later run in this session must be free to try again.
+        throw "Intersight prerequisites are not met in this session. See the list above."
+    }
+
+    try {
+        Set-IntersightConfiguration @onPremIntersightConfig -ErrorAction Stop #-SkipCertificateCheck
+    }
+    catch {
+        Write-Host "" -ForegroundColor Red
+        Write-Host "Set-IntersightConfiguration failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "The configuration has NOT been applied. Nothing has been changed." -ForegroundColor Red
+        throw "Set-IntersightConfiguration failed - see the message above."
+    }
+
+    # It returning is not proof it took. Read it back: a BasePath still on the SaaS default is the
+    # state that printed "Active BasePath: https://intersight.com" after claiming success.
+    $activeBasePath = ""
+    try { $activeBasePath = [string](Get-IntersightConfiguration).BasePath } catch { }
+    if ($activeBasePath -ne "https://$IntersightServer") {
+        Write-Host "" -ForegroundColor Red
+        Write-Host "Set-IntersightConfiguration returned, but the active configuration does not match." -ForegroundColor Red
+        Write-Host "  Asked for: https://$IntersightServer" -ForegroundColor Red
+        Write-Host "  Active   : $(if ($activeBasePath) { $activeBasePath } else { '<nothing configured>' })" -ForegroundColor Red
+        throw "Intersight configuration did not take effect - see the message above."
+    }
+
     $Global:IntersightConfigurationApplied = $true
-    Write-Host "Intersight configuration applied for this PowerShell session: https://$IntersightServer" -ForegroundColor Green
+    Write-Host "Intersight configuration applied for this PowerShell session: $activeBasePath" -ForegroundColor Green
 }
 else {
     Write-Host "Intersight configuration was already applied in this PowerShell session - not re-applying." -ForegroundColor Yellow
@@ -397,7 +480,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.1.0-preauth"
+$ScriptVersion = "23.2.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -542,7 +625,16 @@ $Global:ExcludedFromRunHosts = @{}
 $ResourceSafetyBuffer = 0.85
 $MinimumCpuHeadroomPercentAfterBatch = 10
 $MinimumMemoryHeadroomPercentAfterBatch = 10
-$MaxAbsoluteBatchSize = 6
+# Hard ceiling on how many hosts may be out of service at once, as a FRACTION of the cluster.
+# 0.5 = never more than half. Capacity, DRS headroom and the resource buffer remain the PRIMARY
+# constraint and normally bind first; this only stops a large, idle cluster being emptied faster
+# than DRS and storage can keep up with.
+# Replaces a fixed cap of 6 at the operator's direction: on a 24-host cluster that was an arbitrary
+# throttle well below what the cluster could carry.
+$MaxConcurrentHostFraction = 0.5
+# Optional absolute ceiling on top of the fraction. 0 means no fixed cap - the fraction and the
+# capacity arithmetic decide.
+$MaxAbsoluteBatchSize = 0
 $MaintenanceValidationTimeoutMinutes = 60
 $EsxiOnlyReconnectInitialWaitMinutes = 15
 # Raised from 40 to 60 minutes at the operator's direction, to cover the firmware activity itself.
@@ -3974,8 +4066,21 @@ function Get-CapacityBasedBatchSize {
     $parked    = @($CandidateHosts | Where-Object { $_.ConnectionState -eq "Maintenance" })
     $diagnostics = New-Object System.Collections.Generic.List[string]
 
+    # The ceiling is HALF THE CLUSTER, not a fixed number. Capacity is still the primary constraint
+    # and usually binds first; this only stops a large, idle cluster being emptied faster than DRS
+    # and storage can keep up with.
+    $clusterSize = $connected.Count + $parked.Count
+    $hardCap = [int][Math]::Floor($clusterSize * [double]$MaxConcurrentHostFraction)
+    if ($hardCap -lt 1) { $hardCap = 1 }
+    if ([int]$MaxAbsoluteBatchSize -gt 0 -and $hardCap -gt [int]$MaxAbsoluteBatchSize) { $hardCap = [int]$MaxAbsoluteBatchSize }
+    [void]$diagnostics.Add(("Ceiling: {0} of {1} host(s) may be out at once ({2:P0} of the cluster)." -f $hardCap, $clusterSize, $MaxConcurrentHostFraction))
+
     # Free slots, capped so a large pool of parked hosts cannot blow past MaxAbsoluteBatchSize.
-    $freeSlots = [Math]::Min($parked.Count, [int]$MaxAbsoluteBatchSize)
+    # Parked hosts are NOT subject to the half-cluster ceiling: they are already out of service,
+    # so capping them achieves nothing except leaving hosts in Maintenance mode un-upgraded. The
+    # ceiling exists to stop the run taking MORE capacity out than the cluster can carry.
+    $freeSlots = $parked.Count
+    if ([int]$MaxAbsoluteBatchSize -gt 0) { $freeSlots = [Math]::Min($freeSlots, [int]$MaxAbsoluteBatchSize) }
     if ($freeSlots -gt 0) {
         [void]$diagnostics.Add(("{0} candidate host(s) are already in Maintenance mode and cost no capacity to take." -f $parked.Count))
     }
@@ -3987,7 +4092,7 @@ function Get-CapacityBasedBatchSize {
         return [pscustomobject]@{ SafeBatchSize=0; Reason="No connected candidate hosts."; Diagnostics=@($diagnostics) }
     }
     if ($connected.Count -eq 1) {
-        $only = [Math]::Min(1 + $freeSlots, [int]$MaxAbsoluteBatchSize)
+        $only = 1 + $freeSlots
         return [pscustomobject]@{ SafeBatchSize=$only; Reason="Only one connected candidate host - batch of one$(if ($freeSlots -gt 0) { ", plus $freeSlots already in Maintenance mode" })."; Diagnostics=@($diagnostics) }
     }
 
@@ -4001,7 +4106,7 @@ function Get-CapacityBasedBatchSize {
     $cpuByCapacity = @($connected | Sort-Object CpuTotalMhz -Descending)
     $memByCapacity = @($connected | Sort-Object MemoryTotalGB -Descending)
 
-    $maxByHostCount = [Math]::Min($connected.Count - 1, [int]$MaxAbsoluteBatchSize)
+    $maxByHostCount = [Math]::Min($connected.Count - 1, $hardCap)
 
     for ($n = $maxByHostCount; $n -ge 1; $n--) {
         $removedCpu = [double](($cpuByCapacity | Select-Object -First $n | Measure-Object -Property CpuTotalMhz -Sum).Sum)
@@ -4019,10 +4124,10 @@ function Get-CapacityBasedBatchSize {
         [void]$diagnostics.Add(("Batch of {0}: CPU need {1:N0} vs allowed {2:N0} MHz [{3}]; memory need {4:N1} vs allowed {5:N1} GB [{6}]." -f $n, $usedCpuMhz, $cpuLimit, $(if($cpuOk){"OK"}else{"FAIL"}), $usedMemGB, $memLimit, $(if($memOk){"OK"}else{"FAIL"})))
 
         if ($cpuOk -and $memOk) {
-            $total = [Math]::Min($n + $freeSlots, [int]$MaxAbsoluteBatchSize)
+            $total = [Math]::Min($n, $hardCap) + $freeSlots
             return [pscustomobject]@{
                 SafeBatchSize = $total
-                Reason        = "Largest batch leaving $MinimumCpuHeadroomPercentAfterBatch% CPU and $MinimumMemoryHeadroomPercentAfterBatch% memory headroom after a $ResourceSafetyBuffer safety buffer, capped at $MaxAbsoluteBatchSize.$(if ($freeSlots -gt 0) { " $n connected host(s) plus $freeSlots already in Maintenance mode." })"
+                Reason        = "Largest batch leaving $MinimumCpuHeadroomPercentAfterBatch% CPU and $MinimumMemoryHeadroomPercentAfterBatch% memory headroom after a $ResourceSafetyBuffer safety buffer, capped at $hardCap (half the cluster).$(if ($freeSlots -gt 0) { " $n connected host(s) plus $freeSlots already in Maintenance mode." })"
                 Diagnostics   = @($diagnostics)
             }
         }
@@ -4057,7 +4162,7 @@ function Select-BatchMode {
     #>
     Write-Host "" -ForegroundColor Cyan
     Write-Host "Select batch mode:" -ForegroundColor Cyan
-    Write-Host "  1. AUTO   - size each batch from live cluster capacity and health (never more than $MaxAbsoluteBatchSize hosts)" -ForegroundColor Cyan
+    Write-Host "  1. AUTO   - size each batch from live cluster capacity and health (never more than half the cluster)" -ForegroundColor Cyan
     Write-Host "  2. SINGLE - one host at a time" -ForegroundColor Cyan
     Write-Host "  3. Exit" -ForegroundColor Cyan
     Write-Host "Both modes then run through the whole cluster automatically, batch after batch," -ForegroundColor Yellow

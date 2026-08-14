@@ -125,14 +125,30 @@ foreach ($path in $targets) {
     # Import-Module reads as an instruction from the script, and one sat in the PowerCLI load
     # diagnostic through several releases while this rule passed - it was only looking for a
     # CommandAst. Comments are exempt: describing the rule is not breaking it.
+    # ONE exception, and only one: the guarded load in the AUTHENTICATION region. Auto-loading
+    # Intersight.PowerShell from a cold command-discovery cache failed on the FIRST run of every
+    # new session and worked on the second - reproducibly, on more than one machine. The load is
+    # guarded by Get-Module so it cannot duplicate or fight a pinned bundle, and it is pinned to
+    # that one module. Everywhere else the rule stands.
+    $importAllowed = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+        Where-Object { $_.GetCommandName() -eq 'Import-Module' } |
+        Where-Object { $_.Extent.Text -match '(?i)Import-Module\s+-Name\s+Intersight\.PowerShell' })
     $imports = @(
         $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
             Where-Object { $_.GetCommandName() -eq 'Import-Module' } |
+            Where-Object { $importAllowed -notcontains $_ } |
             ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Extent.Text)" }
     )
+    if ($importAllowed.Count -gt 1) { $imports += "more than one Intersight.PowerShell load - only the guarded one in the AUTHENTICATION region is allowed" }
+    foreach ($allowed in $importAllowed) {
+        $guard = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] }, $true) |
+            Where-Object { $allowed.Extent.StartOffset -ge $_.Extent.StartOffset -and $allowed.Extent.EndOffset -le $_.Extent.EndOffset -and $_.Extent.Text -match 'Get-Module -Name Intersight\.PowerShell' })
+        if ($guard.Count -eq 0) { $imports += "line $($allowed.Extent.StartLineNumber): the Intersight.PowerShell load is no longer guarded by Get-Module" }
+    }
     $imports += @(
         $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) |
             Where-Object { $_.Value -match '(?i)\bImport-Module\b' } |
+            Where-Object { $node = $_; -not [bool](@($importAllowed | Where-Object { $node.Extent.StartOffset -ge $_.Extent.StartOffset -and $node.Extent.EndOffset -le $_.Extent.EndOffset }).Count) } |
             ForEach-Object { "line $($_.Extent.StartLineNumber): a string tells the operator to run Import-Module - $($_.Extent.Text.Trim())" }
     )
     $imports += @(

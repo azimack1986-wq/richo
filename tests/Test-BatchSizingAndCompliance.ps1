@@ -26,7 +26,8 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 # The settings the sizing function reads from script scope.
-$MaxAbsoluteBatchSize = 6
+$MaxAbsoluteBatchSize = 0
+$MaxConcurrentHostFraction = 0.5
 $ResourceSafetyBuffer = 0.85
 $MinimumCpuHeadroomPercentAfterBatch = 10
 $MinimumMemoryHeadroomPercentAfterBatch = 10
@@ -68,7 +69,7 @@ Write-Host "`n=== Capacity-based batch sizing ===" -ForegroundColor Cyan
 # 10 hosts x 100000 MHz / 512 GB. 30% used cluster-wide.
 # n=6: remaining 400000 * 0.85 * 0.90 = 306000 >= 300000 used -> fits, and 6 is the cap.
 $r = Get-CapacityBasedBatchSize -CandidateHosts (New-Cluster -Count 10 -CpuUsedEach 30000 -MemUsedEach 153.6) -Cluster $cluster
-Assert-Equal "lightly loaded 10-host cluster hits the MaxAbsoluteBatchSize cap" 6 $r.SafeBatchSize
+Assert-Equal "lightly loaded 10-host cluster is capped at half the cluster" 5 $r.SafeBatchSize
 
 # Same cluster at 32% CPU: n=6 allows 306000 < 320000 -> fails; n=5 allows 382500 -> fits.
 $r = Get-CapacityBasedBatchSize -CandidateHosts (New-Cluster -Count 10 -CpuUsedEach 32000 -MemUsedEach 153.6) -Cluster $cluster
@@ -89,14 +90,14 @@ Assert-Equal "memory too tight to remove even one host returns 0" 0 $r.SafeBatch
 
 # Host count is still a ceiling: 4 hosts can never batch more than 3.
 $r = Get-CapacityBasedBatchSize -CandidateHosts (New-Cluster -Count 4 -CpuUsedEach 1000 -MemUsedEach 10) -Cluster $cluster
-Assert-Equal "batch never exceeds connected hosts minus one" 3 $r.SafeBatchSize
+Assert-Equal "a 4-host cluster never takes more than half of it" 2 $r.SafeBatchSize
 
 $r = Get-CapacityBasedBatchSize -CandidateHosts (New-Cluster -Count 1 -CpuUsedEach 1000 -MemUsedEach 10) -Cluster $cluster
 Assert-Equal "single connected host yields a batch of one" 1 $r.SafeBatchSize
 
 $mixed = @((New-Cluster -Count 3 -CpuUsedEach 1000 -MemUsedEach 10)) + @((New-TestHost -Name "down1" -CpuTotal 100000 -CpuUsed 0 -MemTotal 512 -MemUsed 0 -State "NotResponding"))
 $r = Get-CapacityBasedBatchSize -CandidateHosts $mixed -Cluster $cluster
-Assert-Equal "disconnected hosts are excluded from sizing" 2 $r.SafeBatchSize
+Assert-Equal "disconnected hosts are excluded from sizing" 1 $r.SafeBatchSize
 
 $r = Get-CapacityBasedBatchSize -CandidateHosts @() -Cluster $cluster
 Assert-Equal "no connected hosts returns 0" 0 $r.SafeBatchSize
@@ -122,9 +123,10 @@ Assert-Equal "a batch made up entirely of parked hosts is never refused" 3 $r.Sa
 $r = Get-CapacityBasedBatchSize -CandidateHosts (@((New-Cluster -Count 10 -CpuUsedEach 32000 -MemUsedEach 153.6)) + @((New-ParkedHost -Name "parked1"))) -Cluster $cluster
 Assert-Equal "a parked host is added on top of the capacity-sized batch" 6 $r.SafeBatchSize
 
-# ...but never past the absolute cap. Connected already sizes to 6 here.
+# Parked hosts are already out, so they are added ON TOP of the connected half-cap
+# rather than competing with it: 6 connected (half of 12) plus the 2 parked.
 $r = Get-CapacityBasedBatchSize -CandidateHosts (@((New-Cluster -Count 10 -CpuUsedEach 30000 -MemUsedEach 153.6)) + @((New-ParkedHost -Name "parked1"), (New-ParkedHost -Name "parked2"))) -Cluster $cluster
-Assert-Equal "free slots never push the batch past MaxAbsoluteBatchSize" 6 $r.SafeBatchSize
+Assert-Equal "parked hosts ride on top of the connected half-cap" 8 $r.SafeBatchSize
 
 # One connected host plus parked ones is still a valid batch.
 $r = Get-CapacityBasedBatchSize -CandidateHosts (@((New-Cluster -Count 1 -CpuUsedEach 1000 -MemUsedEach 10)) + @((New-ParkedHost -Name "parked1"), (New-ParkedHost -Name "parked2"))) -Cluster $cluster
@@ -134,7 +136,7 @@ Assert-Equal "one connected host plus two parked is a batch of three" 3 $r.SafeB
 # host it cannot reach, and this is the distinction the change had to preserve.
 $unreachable = @((New-Cluster -Count 3 -CpuUsedEach 1000 -MemUsedEach 10)) + @((New-TestHost -Name "down1" -CpuTotal 100000 -CpuUsed 0 -MemTotal 512 -MemUsed 0 -State "NotResponding"))
 $r = Get-CapacityBasedBatchSize -CandidateHosts $unreachable -Cluster $cluster
-Assert-Equal "NotResponding is still excluded, not treated as free" 2 $r.SafeBatchSize
+Assert-Equal "NotResponding is still excluded, not treated as free" 1 $r.SafeBatchSize
 
 Write-Host "`n=== The workflow puts parked hosts in scope, and takes them first ===" -ForegroundColor Cyan
 $workflowText = [System.IO.File]::ReadAllText($scriptPath)

@@ -160,7 +160,7 @@
       continuously and no host arrives. A host that does not reach Maintenance mode within
       $MaintenanceValidationTimeoutMinutes stops the run, naming it, with the rest of the batch
       untouched. SINGLE mode is a batch of one, so its behaviour is unchanged.
-    - Batch mode is AUTO (sized from live cluster capacity, capped at $MaxAbsoluteBatchSize) or
+    - Batch mode is AUTO (sized from live cluster capacity, capped at half the cluster) or
       SINGLE (one host at a time). There is no free-text batch size.
     - ONLY BLADES WITH CHANGES STAGED ARE IN SCOPE. Before anything is evacuated, every
       Intersight-managed host's server profile is read once and those with nothing to deploy - an
@@ -326,7 +326,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.1.0"
+$ScriptVersion = "23.2.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -489,7 +489,16 @@ $Global:ExcludedFromRunHosts = @{}
 $ResourceSafetyBuffer = 0.85
 $MinimumCpuHeadroomPercentAfterBatch = 10
 $MinimumMemoryHeadroomPercentAfterBatch = 10
-$MaxAbsoluteBatchSize = 6
+# Hard ceiling on how many hosts may be out of service at once, as a FRACTION of the cluster.
+# 0.5 = never more than half. Capacity, DRS headroom and the resource buffer remain the PRIMARY
+# constraint and normally bind first; this only stops a large, idle cluster being emptied faster
+# than DRS and storage can keep up with.
+# Replaces a fixed cap of 6 at the operator's direction: on a 24-host cluster that was an arbitrary
+# throttle well below what the cluster could carry.
+$MaxConcurrentHostFraction = 0.5
+# Optional absolute ceiling on top of the fraction. 0 means no fixed cap - the fraction and the
+# capacity arithmetic decide.
+$MaxAbsoluteBatchSize = 0
 $MaintenanceValidationTimeoutMinutes = 60
 $EsxiOnlyReconnectInitialWaitMinutes = 15
 # Raised from 40 to 60 minutes at the operator's direction, to cover the firmware activity itself.
@@ -4346,8 +4355,21 @@ function Get-CapacityBasedBatchSize {
     $parked    = @($CandidateHosts | Where-Object { $_.ConnectionState -eq "Maintenance" })
     $diagnostics = New-Object System.Collections.Generic.List[string]
 
+    # The ceiling is HALF THE CLUSTER, not a fixed number. Capacity is still the primary constraint
+    # and usually binds first; this only stops a large, idle cluster being emptied faster than DRS
+    # and storage can keep up with.
+    $clusterSize = $connected.Count + $parked.Count
+    $hardCap = [int][Math]::Floor($clusterSize * [double]$MaxConcurrentHostFraction)
+    if ($hardCap -lt 1) { $hardCap = 1 }
+    if ([int]$MaxAbsoluteBatchSize -gt 0 -and $hardCap -gt [int]$MaxAbsoluteBatchSize) { $hardCap = [int]$MaxAbsoluteBatchSize }
+    [void]$diagnostics.Add(("Ceiling: {0} of {1} host(s) may be out at once ({2:P0} of the cluster)." -f $hardCap, $clusterSize, $MaxConcurrentHostFraction))
+
     # Free slots, capped so a large pool of parked hosts cannot blow past MaxAbsoluteBatchSize.
-    $freeSlots = [Math]::Min($parked.Count, [int]$MaxAbsoluteBatchSize)
+    # Parked hosts are NOT subject to the half-cluster ceiling: they are already out of service,
+    # so capping them achieves nothing except leaving hosts in Maintenance mode un-upgraded. The
+    # ceiling exists to stop the run taking MORE capacity out than the cluster can carry.
+    $freeSlots = $parked.Count
+    if ([int]$MaxAbsoluteBatchSize -gt 0) { $freeSlots = [Math]::Min($freeSlots, [int]$MaxAbsoluteBatchSize) }
     if ($freeSlots -gt 0) {
         [void]$diagnostics.Add(("{0} candidate host(s) are already in Maintenance mode and cost no capacity to take." -f $parked.Count))
     }
@@ -4359,7 +4381,7 @@ function Get-CapacityBasedBatchSize {
         return [pscustomobject]@{ SafeBatchSize=0; Reason="No connected candidate hosts."; Diagnostics=@($diagnostics) }
     }
     if ($connected.Count -eq 1) {
-        $only = [Math]::Min(1 + $freeSlots, [int]$MaxAbsoluteBatchSize)
+        $only = 1 + $freeSlots
         return [pscustomobject]@{ SafeBatchSize=$only; Reason="Only one connected candidate host - batch of one$(if ($freeSlots -gt 0) { ", plus $freeSlots already in Maintenance mode" })."; Diagnostics=@($diagnostics) }
     }
 
@@ -4373,7 +4395,7 @@ function Get-CapacityBasedBatchSize {
     $cpuByCapacity = @($connected | Sort-Object CpuTotalMhz -Descending)
     $memByCapacity = @($connected | Sort-Object MemoryTotalGB -Descending)
 
-    $maxByHostCount = [Math]::Min($connected.Count - 1, [int]$MaxAbsoluteBatchSize)
+    $maxByHostCount = [Math]::Min($connected.Count - 1, $hardCap)
 
     for ($n = $maxByHostCount; $n -ge 1; $n--) {
         $removedCpu = [double](($cpuByCapacity | Select-Object -First $n | Measure-Object -Property CpuTotalMhz -Sum).Sum)
@@ -4391,10 +4413,10 @@ function Get-CapacityBasedBatchSize {
         [void]$diagnostics.Add(("Batch of {0}: CPU need {1:N0} vs allowed {2:N0} MHz [{3}]; memory need {4:N1} vs allowed {5:N1} GB [{6}]." -f $n, $usedCpuMhz, $cpuLimit, $(if($cpuOk){"OK"}else{"FAIL"}), $usedMemGB, $memLimit, $(if($memOk){"OK"}else{"FAIL"})))
 
         if ($cpuOk -and $memOk) {
-            $total = [Math]::Min($n + $freeSlots, [int]$MaxAbsoluteBatchSize)
+            $total = [Math]::Min($n, $hardCap) + $freeSlots
             return [pscustomobject]@{
                 SafeBatchSize = $total
-                Reason        = "Largest batch leaving $MinimumCpuHeadroomPercentAfterBatch% CPU and $MinimumMemoryHeadroomPercentAfterBatch% memory headroom after a $ResourceSafetyBuffer safety buffer, capped at $MaxAbsoluteBatchSize.$(if ($freeSlots -gt 0) { " $n connected host(s) plus $freeSlots already in Maintenance mode." })"
+                Reason        = "Largest batch leaving $MinimumCpuHeadroomPercentAfterBatch% CPU and $MinimumMemoryHeadroomPercentAfterBatch% memory headroom after a $ResourceSafetyBuffer safety buffer, capped at $hardCap (half the cluster).$(if ($freeSlots -gt 0) { " $n connected host(s) plus $freeSlots already in Maintenance mode." })"
                 Diagnostics   = @($diagnostics)
             }
         }
@@ -4429,7 +4451,7 @@ function Select-BatchMode {
     #>
     Write-Host "" -ForegroundColor Cyan
     Write-Host "Select batch mode:" -ForegroundColor Cyan
-    Write-Host "  1. AUTO   - size each batch from live cluster capacity and health (never more than $MaxAbsoluteBatchSize hosts)" -ForegroundColor Cyan
+    Write-Host "  1. AUTO   - size each batch from live cluster capacity and health (never more than half the cluster)" -ForegroundColor Cyan
     Write-Host "  2. SINGLE - one host at a time" -ForegroundColor Cyan
     Write-Host "  3. Exit" -ForegroundColor Cyan
     Write-Host "Both modes then run through the whole cluster automatically, batch after batch," -ForegroundColor Yellow
