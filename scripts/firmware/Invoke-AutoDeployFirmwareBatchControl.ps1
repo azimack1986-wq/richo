@@ -274,13 +274,13 @@
       Declining the prompt is allowed; a disconnected host is then reported for manual
       rectification instead. The credential is held in memory only, cleared per cluster, and never
       written to the log or the run summary.
-    - A UCS MANAGER HOST ALREADY ON THE TARGET FIRMWARE IS NOT BATCHED. Both conditions are
-      required: the service profile already carries the target host firmware package AND the server
-      is already running the version that package name encodes (global-436h is 4.3(6h)). The policy
-      matching alone is not enough - a profile can carry the new package and still be running the
-      old firmware, waiting for a reboot that has not happened, and that host has real work to do.
-      A pending acknowledgement also keeps it in scope. Unreadable is never a skip.
-      The same question the Intersight path already asked with ConfigState, asked the UCSM way.
+    - A UCS MANAGER HOST WHOSE FIRMWARE POLICY IS ALREADY THE TARGET IS NOT BATCHED. CurrentPolicy
+      equals TargetPolicy means this run has nothing to set, so the host is left alone - the same
+      test the Intersight path makes on ConfigState.
+      The running firmware version and any pending acknowledgement are still READ, but they no
+      longer decide: a host whose package is set yet has not rebooted onto it is excluded on the
+      policy AND named in the closing manual rectification report, so it is visible rather than
+      either silently skipped or needlessly re-evacuated.
     - WHILE A UCS MANAGER HOST IS UPGRADING, the run reports what UCSM is doing on every poll -
       whether the reboot acknowledgement is still outstanding, and the running firmware against the
       target - alongside the vCenter state, exactly as an Intersight host reports its workflow and
@@ -350,7 +350,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.6.0"
+$ScriptVersion = "23.6.1"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -6405,22 +6405,31 @@ function Remove-UcsHostsAlreadyOnTargetFirmware {
             $sp = Resolve-UcsServiceProfileForHost -HostName $hostName -UcsTarget $map.UcsTarget
             if ($null -eq $sp) { continue }
 
+            # THE POLICY IS THE DECISION. Current equals target means this run has nothing to set,
+            # so the host is not batched - at the operator's direction, and it is the same test the
+            # Intersight path makes on ConfigState.
             $currentPolicy = Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $sp
             if ($currentPolicy -ne $targetPolicy) { continue }
 
+            # The running version and any pending acknowledgement no longer decide whether to skip -
+            # they are still READ, and anything that disagrees is carried into the closing report.
+            # A profile can carry the new package and not yet have rebooted onto it, and that host is
+            # now excluded by policy; saying so is what stops it being lost rather than blocking on it.
+            $note = ""
+            $running = ""
+            try { $running = Get-UcsRunningFirmwareVersion -UcsSession $session -ServiceProfile $sp } catch {}
             $expected = ConvertTo-UcsBundleVersionFromPolicyName -PolicyName $targetPolicy
-            if ([string]::IsNullOrWhiteSpace($expected)) { continue }
+            if (-not [string]::IsNullOrWhiteSpace($expected) -and -not [string]::IsNullOrWhiteSpace($running) -and -not ($running -like "$expected*")) {
+                $note = "still running $running, not $expected - the package is set but the server has not rebooted onto it"
+            }
 
-            $running = Get-UcsRunningFirmwareVersion -UcsSession $session -ServiceProfile $sp
-            if ([string]::IsNullOrWhiteSpace($running)) { continue }
-            if (-not ($running -like "$expected*")) { continue }
-
-            # A pending acknowledgement means a reboot is still owed, whatever the versions say.
             $pendingAck = @()
-            try { $pendingAck = @(Get-UcsLsmaintAck -Ucs $session -ErrorAction SilentlyContinue | Where-Object { [string]$_.Dn -like "$($map.ServiceProfileDn)/*" }) } catch { continue }
-            if ($pendingAck.Count -gt 0) { continue }
+            try { $pendingAck = @(Get-UcsLsmaintAck -Ucs $session -ErrorAction SilentlyContinue | Where-Object { [string]$_.Dn -like "$($map.ServiceProfileDn)/*" }) } catch {}
+            if ($pendingAck.Count -gt 0) {
+                $note = "a reboot acknowledgement is still pending on $($map.ServiceProfileDn)"
+            }
 
-            [void]$done.Add([pscustomobject]@{ Host = $hostName; Policy = $currentPolicy; Running = $running })
+            [void]$done.Add([pscustomobject]@{ Host = $hostName; Policy = $currentPolicy; Running = $(if ($running) { $running } else { "unreadable" }); Note = $note; ServiceProfileDn = [string]$map.ServiceProfileDn })
         }
         catch { continue }
     }
@@ -6428,10 +6437,14 @@ function Remove-UcsHostsAlreadyOnTargetFirmware {
     if ($done.Count -eq 0) { return @($CandidateHosts) }
 
     Write-Host "" -ForegroundColor Yellow
-    Write-Host "Excluding $($done.Count) UCS Manager host(s) already on the target firmware:" -ForegroundColor Yellow
+    Write-Host "Excluding $($done.Count) UCS Manager host(s) whose firmware policy is already the target:" -ForegroundColor Yellow
     foreach ($row in $done.ToArray()) {
         Write-Host "  $($row.Host) - policy '$($row.Policy)', running $($row.Running)." -ForegroundColor Yellow
-        Add-SummaryRecord -Stage "Scope" -Batch "" -HostName $row.Host -Action "Exclude from run" -Result "AlreadyOnTarget" -Details "Service profile already carries '$($row.Policy)' and the server is running $($row.Running); nothing to do."
+        Add-SummaryRecord -Stage "Scope" -Batch "" -HostName $row.Host -Action "Exclude from run" -Result "AlreadyOnTarget" -Details "Service profile already carries '$($row.Policy)'; running $($row.Running). $($row.Note)"
+        if (-not [string]::IsNullOrWhiteSpace($row.Note)) {
+            Write-Host "      NOTE: $($row.Note)." -ForegroundColor Yellow
+            Add-ManualAttentionHost -HostName $row.Host -Reason "Excluded on policy, but not confirmed upgraded" -Detail "Service profile '$($row.ServiceProfileDn)' already carries '$($row.Policy)', so this run did not batch it - but $($row.Note). Confirm it in UCS Manager."
+        }
     }
     Write-Host "They are already where this run would put them, so there is nothing to do to them." -ForegroundColor Yellow
 

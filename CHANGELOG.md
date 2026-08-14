@@ -12,6 +12,37 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.6.1] — 2026-08-14
+
+#### Changed
+
+- **`CurrentPolicy` equal to `TargetPolicy` is now the whole test for skipping a
+  UCS Manager host.** A live run showed eleven hosts at
+  `CurrentPolicy global-436h` / `TargetPolicy global-436h` being batched anyway —
+  evacuated, put into Maintenance mode, given a policy they already had, and
+  returned to service. A maintenance window each, for nothing.
+
+  23.6.0 also required the running firmware to match, which was stricter than
+  intended and let those hosts through whenever the version could not be read or
+  had not yet been rebooted onto.
+
+  The running version and any pending acknowledgement are **still read, but they
+  no longer decide**. Where either disagrees the host is still excluded on the
+  policy and **named in the closing manual rectification report** —
+  *"the package is set but the server has not rebooted onto it"*, or *"a reboot
+  acknowledgement is still pending"* — so the gap is visible rather than the host
+  being either silently skipped or needlessly re-evacuated.
+
+  The trade, stated plainly: a host whose package is set but which has not yet
+  rebooted onto it will not be upgraded by this run. That is the intended
+  behaviour — it is reported, not acted on.
+
+#### Fixed
+
+- The exclusion report referenced `$map.ServiceProfileDn` from outside the loop
+  that set it, so every flagged host would have been reported against the **last**
+  host's service profile. The DN is now carried on each row.
+
 ### [23.6.0] — 2026-08-14
 
 Brings the UCS Manager path up to the same two behaviours the Intersight path
@@ -2212,6 +2243,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.6.1-preauth] — 2026-08-14
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.6.1 — a UCS Manager host
+whose current policy already equals the target is excluded, full stop. This is the
+build to run.
 
 ### [23.6.0-preauth] — 2026-08-14
 

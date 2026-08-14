@@ -27,7 +27,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [r
 if ($errors) { throw "parse errors" }
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Get-UcsFabricFamily','Resolve-UcsFirmwarePolicyForTarget','Set-UcsFirmwarePolicyGlobal','Get-UcsFirmwarePolicyRows','Test-UcsFirmwarePolicyExists','Test-DryRun') } |
+    Where-Object { $_.Name -in @('Get-UcsFabricFamily','Resolve-UcsFirmwarePolicyForTarget','Set-UcsFirmwarePolicyGlobal','Remove-UcsHostsAlreadyOnTargetFirmware','ConvertTo-UcsBundleVersionFromPolicyName','Get-UcsFirmwarePolicyRows','Test-UcsFirmwarePolicyExists','Test-DryRun') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $Global:RunMode = 'LIVE'
@@ -228,6 +228,76 @@ $Global:RunMode = 'LIVE'
 $policyText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "creation hands the policy straight to UCS Central" $true ($policyText -match 'Set-UcsFirmwarePolicyGlobal -PolicyName \$policyName')
 Assert-Equal "and the only owner value written is 'policy'" $true ($policyText -match '-PolicyOwner "policy"')
+
+Write-Host "`n=== A policy already on target is not redone ===" -ForegroundColor Cyan
+# Straight from a live run: eleven hosts showed CurrentPolicy global-436h against TargetPolicy
+# global-436h and were batched anyway - evacuated, put into Maintenance mode, given a policy they
+# already had, and returned to service. A maintenance window each, for nothing.
+#
+# CurrentPolicy equal to TargetPolicy is now the whole test, at the operator's direction. The
+# running version is still read, but it reports rather than decides.
+$Global:IntersightHostMap = @{}
+$Global:UcsHostMap = @{}
+$script:SpPolicy = @{}
+$script:SpRunning = @{}
+$script:SpAcks = @{}
+function Get-UcsSessionForTarget { param($UcsTarget) return 'session' }
+function Resolve-UcsServiceProfileForHost { param($HostName,$UcsTarget) return [pscustomobject]@{ Name = $HostName } }
+function Get-UcsServiceProfileFirmwarePolicyName { param($ServiceProfile) return $script:SpPolicy[$ServiceProfile.Name] }
+function Get-UcsRunningFirmwareVersion { param($UcsSession,$ServiceProfile) return $script:SpRunning[$ServiceProfile.Name] }
+function Get-UcsLsmaintAck { param($Ucs,$ErrorAction)
+    return @($script:SpAcks.Keys | ForEach-Object { [pscustomobject]@{ Dn = "org-root/ls-$_/ack" } }) }
+function New-UcsCandidate { param([string]$Name) [pscustomobject]@{ Name = $Name } }
+function Register-UcsHost { param([string]$Name,[string]$Current,[string]$Target,[string]$Running)
+    $Global:UcsHostMap[$Name] = [pscustomobject]@{ UcsTarget='ucsm-a'; ServiceProfileDn="org-root/ls-$Name"; TargetPolicy=$Target }
+    $script:SpPolicy[$Name] = $Current
+    $script:SpRunning[$Name] = $Running }
+
+# The live shape: some already on target, some not.
+$script:SpAcks = @{}
+Register-UcsHost -Name 'esx21' -Current 'global-436h' -Target 'global-436h' -Running '4.3(6h)'
+Register-UcsHost -Name 'esx32' -Current 'global-435c' -Target 'global-436h' -Running '4.3(5c)'
+$kept = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts @((New-UcsCandidate 'esx21'), (New-UcsCandidate 'esx32')) 6>$null)
+Assert-Equal "the host already on target is excluded" $true ($kept.Name -notcontains 'esx21')
+Assert-Equal "and the one that needs the change is kept" $true ($kept.Name -contains 'esx32')
+
+# THE CHANGE: the policy matching is enough on its own. A host whose package is set but which has
+# not rebooted onto it is still excluded - it is not re-evacuated to redo work already scheduled.
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$Global:UcsHostMap = @{}; $script:SpPolicy = @{}; $script:SpRunning = @{}
+Register-UcsHost -Name 'esx40' -Current 'global-436h' -Target 'global-436h' -Running '4.3(5c)'
+$kept = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts @((New-UcsCandidate 'esx40')) 6>$null)
+Assert-Equal "a matching policy excludes even when the running version lags" 0 $kept.Count
+# ...but it is NOT lost: it is named in the closing report so the gap is visible.
+$flagged = @($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Host -eq 'esx40' })
+Assert-Equal "the version gap is carried into the manual rectification report" 1 $flagged.Count
+Assert-Equal "and the report says the server has not rebooted onto it" $true ($flagged[0].Detail -match 'has not rebooted onto it')
+Assert-Equal "naming that host's own service profile" $true ($flagged[0].Detail -match 'ls-esx40')
+
+# An unreadable running version no longer blocks the exclusion either - the policy decides.
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$Global:UcsHostMap = @{}; $script:SpPolicy = @{}; $script:SpRunning = @{}
+Register-UcsHost -Name 'esx41' -Current 'global-436h' -Target 'global-436h' -Running ''
+$kept = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts @((New-UcsCandidate 'esx41')) 6>$null)
+Assert-Equal "an unreadable running version does not keep a matching policy in scope" 0 $kept.Count
+Assert-Equal "and nothing is invented about it" 0 (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Host -eq 'esx41' }).Count)
+
+# A pending acknowledgement is reported, not used to re-batch.
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$Global:UcsHostMap = @{}; $script:SpPolicy = @{}; $script:SpRunning = @{}
+Register-UcsHost -Name 'esx42' -Current 'global-436h' -Target 'global-436h' -Running '4.3(6h)'
+$script:SpAcks = @{ 'esx42' = $true }
+$kept = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts @((New-UcsCandidate 'esx42')) 6>$null)
+Assert-Equal "a pending acknowledgement does not re-batch a matching policy" 0 $kept.Count
+Assert-Equal "but it is reported" $true ((@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Host -eq 'esx42' })[0].Detail) -match 'acknowledgement is still pending')
+$script:SpAcks = @{}
+
+# An Intersight-routed host is not this filter's business.
+$Global:IntersightHostMap = @{ 'esx50' = $true }
+$Global:UcsHostMap = @{}; $script:SpPolicy = @{}; $script:SpRunning = @{}
+$kept = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts @((New-UcsCandidate 'esx50')) 6>$null)
+Assert-Equal "an Intersight-routed host is left alone by the UCS filter" $true ($kept.Name -contains 'esx50')
+$Global:IntersightHostMap = @{}
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }
