@@ -287,6 +287,17 @@
       Declining the prompt is allowed; a disconnected host is then reported for manual
       rectification instead. The credential is held in memory only, cleared per cluster, and never
       written to the log or the run summary.
+    - A UCS MANAGER HOST ALREADY ON THE TARGET FIRMWARE IS NOT BATCHED. Both conditions are
+      required: the service profile already carries the target host firmware package AND the server
+      is already running the version that package name encodes (global-436h is 4.3(6h)). The policy
+      matching alone is not enough - a profile can carry the new package and still be running the
+      old firmware, waiting for a reboot that has not happened, and that host has real work to do.
+      A pending acknowledgement also keeps it in scope. Unreadable is never a skip.
+      The same question the Intersight path already asked with ConfigState, asked the UCSM way.
+    - WHILE A UCS MANAGER HOST IS UPGRADING, the run reports what UCSM is doing on every poll -
+      whether the reboot acknowledgement is still outstanding, and the running firmware against the
+      target - alongside the vCenter state, exactly as an Intersight host reports its workflow and
+      upgrade phase. The rolling loop's R/O/E prompt is the manual check for both.
     - HOSTS ALREADY IN MAINTENANCE MODE ARE IN SCOPE, for both the Intersight and the UCS Manager
       paths. They were previously skipped for being not-Connected, which quietly left them on old
       firmware while the run reported the cluster complete. They are now taken FIRST - being already
@@ -525,7 +536,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.5.0-preauth"
+$ScriptVersion = "23.6.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -5587,6 +5598,22 @@ function Get-RollingHostDiagnostic {
     }
     catch { return "state not readable - $($_.Exception.Message)" }
 
+    # UCS Manager-routed: report what UCSM is doing, so a stalled acknowledgement or an activation
+    # that has not taken is visible while the run is still waiting on vCenter - the same visibility
+    # an Intersight host gets.
+    try {
+        if ($Global:UcsHostMap.ContainsKey($HostName)) {
+            $progress = Get-UcsUpgradeProgress -HostName $HostName
+            $vcState = "not in vCenter inventory yet"
+            try {
+                $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
+                if ($null -ne $hostObj) { $vcState = "vCenter reports $($hostObj.ConnectionState)" }
+            } catch {}
+            return "$($progress.Phase); $vcState"
+        }
+    }
+    catch { }
+
     try {
         $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
         if ($null -eq $hostObj) { return "not in vCenter inventory yet" }
@@ -6000,6 +6027,161 @@ function Show-ClusterFirmwareVerification {
     }
 }
 
+function Get-UcsUpgradeProgress {
+    <#
+    .SYNOPSIS
+        What UCS Manager is currently doing for one host. The UCSM twin of
+        Get-IntersightActivationProgress.
+
+    .DESCRIPTION
+        Two signals, read in the order UCSM works through them:
+
+          1. THE PENDING ACKNOWLEDGEMENT. While an lsmaintAck is still outstanding against the
+             service profile, the reboot has been asked for but not taken. UCSM will not touch the
+             blade until it clears.
+          2. THE RUNNING FIRMWARE. Read from the physical server the profile is associated with and
+             compared against the version the target policy name encodes - global-436h is 4.3(6h).
+             Until it matches, the activation has not finished.
+
+        Complete means both are clear. UNREADABLE IS NEVER COMPLETE: a running version that cannot
+        be read leaves the phase saying so rather than being taken for a match, exactly as an
+        unreadable Intersight ConfigState is.
+
+        Purely a read. Nothing here changes anything, and it never throws - it runs on the rolling
+        loop's critical path, where an exception would stall every host in flight, not just this one.
+    #>
+    param([Parameter(Mandatory=$true)][string]$HostName)
+
+    $result = [pscustomobject]@{ Complete = $false; Phase = "no UCS mapping for this host" }
+    if (-not $Global:UcsHostMap.ContainsKey($HostName)) { return $result }
+
+    try {
+        $map = $Global:UcsHostMap[$HostName]
+        $session = Get-UcsSessionForTarget -UcsTarget $map.UcsTarget
+        if ($null -eq $session) { $result.Phase = "no UCS Manager session for $($map.UcsTarget)"; return $result }
+
+        # 1. Is the acknowledgement still outstanding?
+        $pendingAck = @()
+        try { $pendingAck = @(Get-UcsLsmaintAck -Ucs $session -ErrorAction SilentlyContinue | Where-Object { [string]$_.Dn -like "$($map.ServiceProfileDn)/*" }) } catch {}
+        if ($pendingAck.Count -gt 0) {
+            $result.Phase = "UCS Manager still has a pending reboot acknowledgement on $($map.ServiceProfileDn)"
+            return $result
+        }
+
+        # 2. Has the firmware actually changed?
+        $sp = Resolve-UcsServiceProfileForHost -HostName $HostName -UcsTarget $map.UcsTarget
+        if ($null -eq $sp) { $result.Phase = "the service profile could not be re-read"; return $result }
+
+        $targetPolicy = [string]$map.TargetPolicy
+        if ([string]::IsNullOrWhiteSpace($targetPolicy)) { $targetPolicy = Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $sp }
+        $expected = ConvertTo-UcsBundleVersionFromPolicyName -PolicyName $targetPolicy
+        $running  = Get-UcsRunningFirmwareVersion -UcsSession $session -ServiceProfile $sp
+
+        if ([string]::IsNullOrWhiteSpace($expected)) {
+            # The policy name does not encode a version, so there is nothing honest to compare.
+            # The acknowledgement having cleared is all that can be said.
+            $result.Complete = $true
+            $result.Phase = "the acknowledgement has cleared; '$targetPolicy' encodes no version to verify against"
+            return $result
+        }
+        if ([string]::IsNullOrWhiteSpace($running)) {
+            $result.Phase = "the running firmware version could not be read from UCS Manager"
+            return $result
+        }
+        if ($running -like "$expected*") {
+            $result.Complete = $true
+            $result.Phase = "running $running, which matches the target"
+            return $result
+        }
+
+        $result.Phase = "running $running, activating to $expected"
+        return $result
+    }
+    catch {
+        $result.Phase = "UCS Manager state not readable - $($_.Exception.Message)"
+        return $result
+    }
+}
+
+function Remove-UcsHostsAlreadyOnTargetFirmware {
+    <#
+    .SYNOPSIS
+        Drops UCSM-routed hosts that are already on the target firmware. The UCSM twin of
+        Remove-IntersightHostsAlreadyDeployed.
+
+    .DESCRIPTION
+        A host whose service profile already carries the target host firmware package AND is already
+        running the version that package name encodes has nothing to do. Batching it evacuates it,
+        puts it into Maintenance mode, sets a policy that is already set, finds no pending
+        acknowledgement, and eventually returns it to service - a full maintenance window spent on
+        a host that was finished before the run started.
+
+        BOTH conditions are required. The policy matching alone is not enough: a profile can carry
+        the new package and still be running the old firmware, waiting for a reboot that has not
+        happened. That host has real work to do and must stay in scope.
+
+        UNREADABLE IS NEVER A SKIP. A running version that cannot be read, a service profile that
+        will not resolve, a policy name that encodes no version - all of them keep the host in
+        scope. Skipping on a state this script could not read is how a host silently misses an
+        upgrade while the run reports the cluster complete.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$CandidateHosts)
+
+    if ($CandidateHosts.Count -eq 0) { return @($CandidateHosts) }
+
+    $done = New-Object System.Collections.Generic.List[object]
+
+    foreach ($hostObj in $CandidateHosts) {
+        $hostName = [string]$hostObj.Name
+        # Intersight-routed hosts are not this function's business.
+        if ($Global:IntersightHostMap.ContainsKey($hostName)) { continue }
+        if (-not $Global:UcsHostMap.ContainsKey($hostName)) { continue }
+
+        try {
+            $map = $Global:UcsHostMap[$hostName]
+            $session = Get-UcsSessionForTarget -UcsTarget $map.UcsTarget
+            if ($null -eq $session) { continue }
+
+            $targetPolicy = [string]$map.TargetPolicy
+            if ([string]::IsNullOrWhiteSpace($targetPolicy)) { continue }
+
+            $sp = Resolve-UcsServiceProfileForHost -HostName $hostName -UcsTarget $map.UcsTarget
+            if ($null -eq $sp) { continue }
+
+            $currentPolicy = Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $sp
+            if ($currentPolicy -ne $targetPolicy) { continue }
+
+            $expected = ConvertTo-UcsBundleVersionFromPolicyName -PolicyName $targetPolicy
+            if ([string]::IsNullOrWhiteSpace($expected)) { continue }
+
+            $running = Get-UcsRunningFirmwareVersion -UcsSession $session -ServiceProfile $sp
+            if ([string]::IsNullOrWhiteSpace($running)) { continue }
+            if (-not ($running -like "$expected*")) { continue }
+
+            # A pending acknowledgement means a reboot is still owed, whatever the versions say.
+            $pendingAck = @()
+            try { $pendingAck = @(Get-UcsLsmaintAck -Ucs $session -ErrorAction SilentlyContinue | Where-Object { [string]$_.Dn -like "$($map.ServiceProfileDn)/*" }) } catch { continue }
+            if ($pendingAck.Count -gt 0) { continue }
+
+            [void]$done.Add([pscustomobject]@{ Host = $hostName; Policy = $currentPolicy; Running = $running })
+        }
+        catch { continue }
+    }
+
+    if ($done.Count -eq 0) { return @($CandidateHosts) }
+
+    Write-Host "" -ForegroundColor Yellow
+    Write-Host "Excluding $($done.Count) UCS Manager host(s) already on the target firmware:" -ForegroundColor Yellow
+    foreach ($row in $done.ToArray()) {
+        Write-Host "  $($row.Host) - policy '$($row.Policy)', running $($row.Running)." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "Scope" -Batch "" -HostName $row.Host -Action "Exclude from run" -Result "AlreadyOnTarget" -Details "Service profile already carries '$($row.Policy)' and the server is running $($row.Running); nothing to do."
+    }
+    Write-Host "They are already where this run would put them, so there is nothing to do to them." -ForegroundColor Yellow
+
+    $doneNames = @($done.ToArray() | Select-Object -ExpandProperty Host)
+    return @($CandidateHosts | Where-Object { $doneNames -notcontains $_.Name })
+}
+
 function Remove-IntersightHostsAlreadyDeployed {
     <#
     .SYNOPSIS
@@ -6130,6 +6312,10 @@ function Invoke-ClusterUpgradeWorkflow {
     # Only the blades with changes pending are worth a maintenance window slot.
     if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE" -and -not (Test-StageNoAck)) {
         $patchCandidateHosts = @(Remove-IntersightHostsAlreadyDeployed -CandidateHosts $patchCandidateHosts)
+        # Same question for the UCS Manager-routed hosts: a host already carrying the target package
+        # AND already running the version it encodes has nothing to do, and batching it spends a
+        # maintenance window on a host that was finished before the run started.
+        $patchCandidateHosts = @(Remove-UcsHostsAlreadyOnTargetFirmware -CandidateHosts $patchCandidateHosts)
     }
 
     if ($patchCandidateHosts.Count -eq 0) {

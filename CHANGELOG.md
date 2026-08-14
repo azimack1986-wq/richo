@@ -12,6 +12,50 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.6.0] — 2026-08-14
+
+Brings the UCS Manager path up to the same two behaviours the Intersight path
+already had.
+
+#### Added
+
+- **A UCS Manager host already on the target firmware is no longer batched.**
+  `Remove-UcsHostsAlreadyOnTargetFirmware` is the UCSM twin of
+  `Remove-IntersightHostsAlreadyDeployed`. Previously such a host was evacuated,
+  put into Maintenance mode, given a policy it already had, found to have no
+  pending acknowledgement, and returned to service — a full maintenance window
+  spent on a host that was finished before the run started.
+
+  **Both conditions are required.** The service profile must already carry the
+  target host firmware package **and** the server must already be running the
+  version that package name encodes (`global-436h` → `4.3(6h)`). Policy alone is
+  not enough: a profile can carry the new package and still be running the old
+  firmware, waiting on a reboot that never happened — that host has real work to
+  do and stays in scope. A pending acknowledgement also keeps it in scope.
+
+  **Unreadable is never a skip.** A running version that will not read, a service
+  profile that will not resolve, a policy name that encodes no version — all keep
+  the host in scope. Skipping on a state the script could not read is how a host
+  silently misses an upgrade while the run reports the cluster complete.
+
+- **Live UCS Manager progress while a host is upgrading.** `Get-UcsUpgradeProgress`
+  is the UCSM twin of `Get-IntersightActivationProgress`, reading the two signals
+  in the order UCSM works through them: whether the reboot acknowledgement is
+  still outstanding on the service profile, then the running firmware against the
+  target version. The rolling loop now reports both alongside the vCenter state,
+  so a stalled acknowledgement or an activation that did not take is visible while
+  the run is still waiting on vCenter — the same visibility an Intersight host has
+  always had. The rolling loop's `R`/`O`/`E` prompt is the manual check for both.
+
+  It never throws: it runs on the rolling loop's critical path, where an exception
+  would stall every host in flight rather than just one.
+
+#### Changed
+
+- A cluster where **everything** is already current now reports "nothing to do"
+  rather than batching a host to discover it. With both filters in place there are
+  no candidates left, which is the correct outcome.
+
 ### [23.5.0] — 2026-08-14
 
 #### Fixed
@@ -2168,6 +2212,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.6.0-preauth] — 2026-08-14
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.6.0 — UCS Manager hosts
+already on the target firmware are skipped, and their upgrade progress is polled
+and reported like Intersight's. This is the build to run.
 
 ### [23.5.0-preauth] — 2026-08-14
 

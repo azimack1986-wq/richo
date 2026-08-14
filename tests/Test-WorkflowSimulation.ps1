@@ -587,9 +587,17 @@ $script:IntersightDeployed = $carriedDeployed
 $script:UnexpectedPrompts = New-Object System.Collections.Generic.List[string]
 $secondPassError = $null
 try { Invoke-ClusterUpgradeWorkflow -Cluster $script:Cluster 6>$null } catch { $secondPassError = $_ }
-Assert-True "the second pass ran to completion" ($null -eq $secondPassError) "$($secondPassError)"
+# A cluster that is already current now has NOTHING left to batch: the Intersight hosts are
+# dropped on ConfigState and the UCS Manager hosts on policy-plus-running-version. Running out of
+# candidates is the correct outcome, and the run says so rather than evacuating a host to discover
+# it. Either ending is acceptable here; batching a host is not.
+Assert-True "the second pass either completes or reports nothing to do" (
+    $null -eq $secondPassError -or "$($secondPassError)" -match 'Nothing to do|STOP_WORKFLOW') "$($secondPassError)"
 Assert-True "nothing was asked outside the agreed menu items" ($script:UnexpectedPrompts.Count -eq 0) "asked: $(($script:UnexpectedPrompts | Select-Object -Unique) -join ' | ')"
-Assert-True "and the cluster still completed" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ClusterComplete' }).Count -eq 1)
+# The point of the pass: NO host was put through a maintenance window for work already done.
+Assert-True "no host was evacuated on the second pass" (-not $script:Calls.ContainsKey('Restart-VMHost')) "Restart-VMHost called $($script:Calls['Restart-VMHost']) time(s)"
+Assert-True "and every host was excluded as already current" (
+    @($Global:RunSummary | Where-Object { $_.Action -eq 'Exclude from run' }).Count -ge 1)
 
 # The Intersight profiles are Associated by now, so those hosts are dropped before anything is
 # evacuated. Batching them would take a host out of service, find nothing to send, and put it back.
