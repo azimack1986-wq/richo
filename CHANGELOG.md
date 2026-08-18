@@ -12,6 +12,56 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.11.0] — 2026-08-18
+
+#### Fixed
+
+- **A DN was being compared against a name, so nothing ever verified.** One cause,
+  three symptoms on the same live run:
+
+  ```
+  CurrentPolicy org-root/fw-host-pack-global-436h   TargetPolicy global-436h   NotVerified
+  4 template(s) could NOT be set: vmware-d85pay01 (still 'org-root/fw-host-pack-global-436h'), ...
+  ```
+
+  `lsServer` reports the same policy two ways, and the schema's own field widths
+  say which is which: `hostFwPolicyName` is the bare **name**, capped at 16
+  characters; `operHostFwPolicyName` is the **resolved policy as a distinguished
+  name**, up to 256. 23.9.0 correctly started preferring the resolved property —
+  a profile bound to an updating template carries nothing in the writable one —
+  but returned it raw, so every caller compared `org-root/fw-host-pack-global-436h`
+  against `global-436h` and could never match.
+
+  What that produced: four service profile templates reported as "could NOT be
+  set" when every one of them was already correct; a service profile that
+  re-verified as `NotVerified` for as many attempts as the operator was willing to
+  give it; and a batch that never reached its reboot acknowledgement because it
+  never got past that loop.
+
+  Both forms are now reduced to the bare name by `ConvertTo-UcsFirmwarePolicyName`
+  (sub-organisation DNs included), so names are compared with names. A template
+  already on the target package is reported **compliant** and left alone.
+
+- **The reboot acknowledgement could silently do nothing.** UCSM raises the
+  pending activity *asynchronously* after the firmware package changes, so asking
+  the instant the policy write returns is a race: on a busy domain the object is
+  not there yet, every host reads `PendingAckFound=$false`, the loop acknowledges
+  nothing, and the run reports a batch sent while the blades sit staged and
+  waiting — "the firmware policy updated on the blades but hasn't acknowledged".
+
+  The activity is now **waited for** (up to `$UcsPendingAckWaitMinutes`, default
+  5), and the acknowledgement is **confirmed by re-reading** rather than assumed
+  from the write returning. A trigger that does not clear is reported and listed
+  for manual rectification, naming Pending Activities as where to clear it. A host
+  that never raises one is stated as what it is — either the change did not take,
+  or that profile's maintenance policy is not user-ack and it will reboot on its
+  own — and the boot-time comparison downstream remains the authority on whether
+  the host actually restarted.
+
+  This path had **no test coverage at all**, which is how a silent no-op shipped.
+  `Test-UcsPendingAcknowledge.ps1` now covers it: already-raised, raised late,
+  never raised, and an acknowledgement the domain does not accept.
+
 ### [23.10.1] — 2026-08-18
 
 #### Fixed
@@ -2581,6 +2631,14 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.11.0-preauth] — 2026-08-18
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.11.0 — firmware policy
+comparisons no longer compare a distinguished name against a name, so templates
+already on target report compliant and service profiles verify; and the reboot
+acknowledgement is waited for and confirmed instead of silently skipped. This is
+the build to run.
 
 ### [23.10.1-preauth] — 2026-08-18
 

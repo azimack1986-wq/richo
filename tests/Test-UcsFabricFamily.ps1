@@ -30,7 +30,7 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
     Where-Object { $_.Name -in @('Get-UcsFabricFamily','Resolve-UcsFirmwarePolicyForTarget','Remove-UcsHostsAlreadyOnTargetFirmware','ConvertTo-UcsBundleVersionFromPolicyName','Get-UcsFirmwarePolicyRows','Test-UcsFirmwarePolicyExists','Get-UcsFirmwarePolicyLookup',
                                  'Test-UcsRemotePolicyMessage','Set-UcsServiceProfileTemplateFirmwarePolicy',
                                  'New-UcsGlobalFirmwarePolicy',
-                                 'Get-UcsServiceProfileFirmwarePolicyName',
+                                 'Get-UcsServiceProfileFirmwarePolicyName','ConvertTo-UcsFirmwarePolicyName',
                                  'Test-DryRun') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
@@ -353,6 +353,51 @@ Assert-Equal "naming the fabric family whose mapping is wrong" $true ($tooLong -
 $Global:UcsFirmwarePolicyByFabricFamily.Remove('6500')
 
 $script:Models = @('UCS-FI-6332'); $script:Packs = @('global-436h'); $Global:UcsFirmwarePolicyByTarget = @{}
+
+Write-Host "`n=== A resolved policy arrives as a DN and is reduced to its name ===" -ForegroundColor Cyan
+# THE LIVE FAULT. lsServer reports the same policy two ways: hostFwPolicyName is the bare name
+# (16 characters by schema) and operHostFwPolicyName is the RESOLVED policy as a distinguished
+# name (256). Preferring the resolved one without normalising it compared a DN against a name in
+# every caller, so nothing ever matched:
+#
+#   CurrentPolicy org-root/fw-host-pack-global-436h   TargetPolicy global-436h   NotVerified
+Assert-Equal "a DN reduces to its name" "global-436h" (ConvertTo-UcsFirmwarePolicyName -Value 'org-root/fw-host-pack-global-436h')
+Assert-Equal "a sub-organisation DN too" "global-602d" (ConvertTo-UcsFirmwarePolicyName -Value 'org-root/org-prod/fw-host-pack-global-602d')
+Assert-Equal "a bare name is left alone" "global-436h" (ConvertTo-UcsFirmwarePolicyName -Value 'global-436h')
+Assert-Equal "including one with hyphens of its own" "site-standard-fw" (ConvertTo-UcsFirmwarePolicyName -Value 'site-standard-fw')
+Assert-Equal "surrounding space is trimmed" "global-436h" (ConvertTo-UcsFirmwarePolicyName -Value '  org-root/fw-host-pack-global-436h  ')
+Assert-Equal "nothing in, nothing out" "" (ConvertTo-UcsFirmwarePolicyName -Value '')
+
+# And the reader that every comparison goes through returns the NAME whichever property carried it.
+$viaOper = [pscustomobject]@{ Name='sp-1'; OperHostFwPolicyName='org-root/fw-host-pack-global-436h'; HostFwPolicyName='' }
+Assert-Equal "read from the resolved DN, returned as a name" "global-436h" (Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $viaOper)
+$viaSet = [pscustomobject]@{ Name='sp-2'; OperHostFwPolicyName=''; HostFwPolicyName='global-435c' }
+Assert-Equal "read from the writable name, unchanged" "global-435c" (Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $viaSet)
+# A profile bound to an updating template carries nothing in the writable field - the template
+# supplies it - so the resolved one has to win.
+$bound = [pscustomobject]@{ Name='sp-3'; OperHostFwPolicyName='org-root/fw-host-pack-global-602d'; HostFwPolicyName='' }
+Assert-Equal "a template-bound profile still reports a policy" "global-602d" (Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $bound)
+$neither = [pscustomobject]@{ Name='sp-4'; OperHostFwPolicyName=''; HostFwPolicyName='' }
+Assert-Equal "and nothing at all is UNKNOWN, not an empty match" "UNKNOWN" (Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $neither)
+
+Write-Host "`n=== A template already on target is compliant, not rewritten ===" -ForegroundColor Cyan
+# Straight from the live run: four templates reported as "could NOT be set (still
+# 'org-root/fw-host-pack-global-436h')" when every one of them was already correct.
+$script:Templates = @(
+    [pscustomobject]@{ Name='vmware-d85pay01'; Dn='org-root/ls-vmware-d85pay01'; Type='updating-template'
+                       OperHostFwPolicyName='org-root/fw-host-pack-global-436h'; HostFwPolicyName='' },
+    [pscustomobject]@{ Name='windows_2012r2-rackmount'; Dn='org-root/ls-windows_2012r2-rackmount'; Type='initial-template'
+                       OperHostFwPolicyName='org-root/fw-host-pack-global-436h'; HostFwPolicyName='' }
+)
+$script:TemplateWrites = New-Object System.Collections.Generic.List[string]
+$script:TemplateSetThrows = ""
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget 'PD85000001SS003' -UcsSession 'x' -PolicyName 'global-436h' 6>$null
+Assert-Equal "neither template was written" 0 $script:TemplateWrites.Count
+Assert-Equal "both are recorded as compliant" 2 (@($Global:RunSummary.ToArray() | Where-Object { $_.Result -eq 'Compliant' }).Count)
+Assert-Equal "and nothing is flagged for manual rectification" 0 $Global:ManualAttentionHosts.Count
+$script:Templates = @()
 
 Write-Host "`n=== Service profile templates are aligned to the target package ===" -ForegroundColor Cyan
 # A template that still names the old package puts it back - on the next template push, on a

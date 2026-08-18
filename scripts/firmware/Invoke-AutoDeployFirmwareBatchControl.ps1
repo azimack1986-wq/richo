@@ -350,7 +350,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.10.1"
+$ScriptVersion = "23.11.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -573,6 +573,10 @@ $HostReconnectAfterDisconnectMinutes = 5
 # firmware can refuse the reconnect while hostd is still coming up, and the run then wrote it off
 # as unrecoverable when a second attempt two minutes later would have taken it. After the last
 # attempt the operator is asked, rather than the host being silently abandoned.
+# How long to wait for UCS Manager to raise the pending activity after a firmware package change.
+# It is raised asynchronously, so asking the instant the policy write returns finds nothing on a
+# busy domain - and a batch that acknowledges nothing leaves its blades staged and waiting.
+$UcsPendingAckWaitMinutes = 5
 $HostReconnectMaxAttempts = 3
 $HostReconnectRetryPauseMinutes = 2
 # How long to spend proving a management endpoint answers at all before deciding the path is
@@ -1469,6 +1473,41 @@ function Resolve-UcsServiceProfileForHost {
     return (Get-UcsServiceProfile -Ucs $ucsSession -Name $manualSp.Trim() -ErrorAction SilentlyContinue | Select-Object -First 1)
 }
 
+function ConvertTo-UcsFirmwarePolicyName {
+    <#
+    .SYNOPSIS
+        Reduces a host firmware package reference to its bare name, whether it arrives as a name
+        or as a distinguished name.
+
+    .DESCRIPTION
+        UCSM reports the same policy two ways depending on which property is read:
+
+            hostFwPolicyName      global-436h
+            operHostFwPolicyName  org-root/fw-host-pack-global-436h
+
+        and a sub-organisation deepens the DN further - org-root/org-prod/fw-host-pack-global-436h.
+        Comparing one form against the other never matches, which is exactly what happened when the
+        resolved property started being preferred without normalising it.
+
+        A value with no "/" is already a name and is returned untouched, so a package genuinely
+        named with a hyphen is not mangled.
+
+    .PARAMETER Value
+        Either form, or empty.
+
+    .EXAMPLE
+        ConvertTo-UcsFirmwarePolicyName -Value "org-root/fw-host-pack-global-436h"   # global-436h
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Value)
+
+    $trimmed = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($trimmed)) { return "" }
+    if ($trimmed -notmatch '/') { return $trimmed }
+
+    $leaf = @($trimmed -split '/')[-1]
+    return ($leaf -replace '^fw-host-pack-', '')
+}
+
 function Get-UcsServiceProfileFirmwarePolicyName {
     <#
     .SYNOPSIS
@@ -1480,12 +1519,28 @@ function Get-UcsServiceProfileFirmwarePolicyName {
 
           operHostFwPolicyName  READ_ONLY, up to 256 characters. The RESOLVED policy - what the
                                 profile is really using once the template it is bound to and the
-                                global policy have been applied.
-          hostFwPolicyName      READ_WRITE, at most 16 characters. What was SET on this object.
+                                global policy have been applied - and it is a DISTINGUISHED NAME:
+                                org-root/fw-host-pack-global-436h.
+          hostFwPolicyName      READ_WRITE, at most 16 characters. The bare NAME that was SET on
+                                this object: global-436h.
 
         Oper first, because a profile bound to an updating template usually carries nothing in
         hostFwPolicyName - the template supplies it - and reading only the writable field reports
         such a profile as having no policy at all.
+
+        BUT THE TWO ARE NOT THE SAME SHAPE, and that is what the field widths were saying: 16
+        characters holds a name, 256 holds a DN. Returning oper raw compared a DN against a name in
+        every caller, so nothing ever matched:
+
+            CurrentPolicy org-root/fw-host-pack-global-436h   TargetPolicy global-436h   NotVerified
+
+        On a live run that produced four service profile templates reported as "could NOT be set"
+        when every one of them was already correct, a service profile that re-verified as
+        NotVerified for as many attempts as the operator was willing to give it, and a batch that
+        never reached its reboot acknowledgement because it never got past that loop.
+
+        So both are normalised to the bare name through ConvertTo-UcsFirmwarePolicyName, and every
+        caller compares names to names.
 
         Two properties were dropped from an earlier list. HostFirmwarePackageName is not an
         lsServer property and never matched anything. SrcTemplName is the TEMPLATE'S NAME, not a
@@ -1497,7 +1552,7 @@ function Get-UcsServiceProfileFirmwarePolicyName {
 
     foreach ($prop in @("OperHostFwPolicyName","HostFwPolicyName")) {
         if ($ServiceProfile.PSObject.Properties.Name -contains $prop) {
-            $val = [string]$ServiceProfile.$prop
+            $val = ConvertTo-UcsFirmwarePolicyName -Value ([string]$ServiceProfile.$prop)
             if (-not [string]::IsNullOrWhiteSpace($val)) { return $val }
         }
     }
@@ -2457,21 +2512,91 @@ function Get-UcsPendingRebootObjectsForBatch {
 }
 
 function Invoke-UcsPendingAckForBatch {
+    <#
+    .SYNOPSIS
+        Waits for UCS Manager to raise the pending activity for each host in the batch, acknowledges
+        it, and confirms the acknowledgement cleared.
+
+    .DESCRIPTION
+        UCSM raises the pending activity ASYNCHRONOUSLY after the service profile's firmware package
+        changes. Asking for it the moment the policy write returns is a race: on a busy domain the
+        object is not there yet, every host reads PendingAckFound=$false, the loop acknowledges
+        nothing, and the run reports a batch sent while the blades sit staged and waiting. The
+        symptom is exactly "the firmware policy updated on the blades but has not acknowledged".
+
+        So it is WAITED for, up to $UcsPendingAckWaitMinutes, and the acknowledgement is then
+        CONFIRMED by re-reading rather than assumed from the write returning.
+
+        A host that never raises one is reported rather than retried forever. That is not always
+        wrong - a service profile whose maintenance policy is immediate rather than user-ack
+        reboots on its own and raises nothing - so it is stated as what it is, and the reboot
+        detection downstream, which compares boot times, remains the authority on whether the host
+        actually restarted.
+    #>
     param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,[Parameter(Mandatory=$true)][string]$BatchNumber)
-    $pendingRows = @(Get-UcsPendingRebootObjectsForBatch -HostNames $HostNames)
+
+    if (Test-DryRun) {
+        $preview = @(Get-UcsPendingRebootObjectsForBatch -HostNames $HostNames)
+        $preview | Select-Object Host,UcsTarget,ServiceProfileDn,PendingAckFound,AckDn | Format-Table -AutoSize | Out-Host
+        Write-Host "DRY RUN: Would acknowledge only listed current-batch UCSM pending objects." -ForegroundColor Green
+        return
+    }
+
+    # 1. WAIT for the pending activity to appear. Polled, not slept: on a quiet domain it is there
+    #    on the first look and this costs nothing.
+    $deadline = (Get-Date).AddMinutes([double]$UcsPendingAckWaitMinutes)
+    $pendingRows = @()
+    $announced = $false
+    while ($true) {
+        $pendingRows = @(Get-UcsPendingRebootObjectsForBatch -HostNames $HostNames)
+        $waitingFor = @($pendingRows | Where-Object { -not $_.PendingAckFound })
+        if ($waitingFor.Count -eq 0) { break }
+        if ((Get-Date) -ge $deadline) { break }
+        if (-not $announced) {
+            Write-Host "Waiting up to $UcsPendingAckWaitMinutes minute(s) for UCS Manager to raise the pending activity for: $(($waitingFor | Select-Object -ExpandProperty Host) -join ', ')" -ForegroundColor Yellow
+            $announced = $true
+        }
+        Start-Sleep -Seconds 15
+    }
+
     $pendingRows | Select-Object Host,UcsTarget,ServiceProfileDn,PendingAckFound,AckDn | Format-Table -AutoSize | Out-Host
-    if (Test-DryRun) { Write-Host "DRY RUN: Would acknowledge only listed current-batch UCSM pending objects." -ForegroundColor Green; return }
 
     # The typed ACK-BATCH-N gate that used to sit here has been removed so the run advances
     # through the cluster on its own. The abort point is now the pre-reboot safety window
     # immediately before this call, which covers the whole batch and accepts E to exit.
-    Write-Host "Acknowledging UCSM pending reboot for Batch $BatchNumber ($(@($pendingRows | Where-Object { $_.PendingAckFound }).Count) host(s) with a pending activity)." -ForegroundColor Yellow
-    foreach ($row in $pendingRows) {
-        if (-not $row.PendingAckFound) { continue }
+    $withPending = @($pendingRows | Where-Object { $_.PendingAckFound })
+    Write-Host "Acknowledging UCSM pending reboot for Batch $BatchNumber ($($withPending.Count) host(s) with a pending activity)." -ForegroundColor Yellow
+
+    foreach ($row in $withPending) {
         $ucsSession = Get-UcsSessionForTarget -UcsTarget $row.UcsTarget
         Set-UcsLsmaintAck -Ucs $ucsSession -LsmaintAck $row.AckObject -AdminState "trigger-immediate" -Force -ErrorAction Stop | Out-Null
         $Global:BatchActionsSent++
         Add-SummaryRecord -Stage "UCSMAcknowledge" -Batch $BatchNumber -HostName $row.Host -Action "Acknowledge pending activity" -Result "Sent" -Details $row.AckDn
+    }
+
+    # 2. CONFIRM. The write returning is not proof the domain took it - and an acknowledgement that
+    #    did not take leaves the blade staged with nothing on screen to say so.
+    if ($withPending.Count -gt 0) {
+        Start-Sleep -Seconds 10
+        $after = @(Get-UcsPendingRebootObjectsForBatch -HostNames @($withPending | Select-Object -ExpandProperty Host))
+        foreach ($row in $after) {
+            if (-not $row.PendingAckFound) {
+                Write-Host "  '$($row.Host)': acknowledged - the pending activity has cleared." -ForegroundColor Green
+                Add-SummaryRecord -Stage "UCSMAcknowledge" -Batch $BatchNumber -HostName $row.Host -Action "Confirm acknowledgement" -Result "Cleared" -Details "The pending activity is no longer present, so UCS Manager accepted the trigger."
+                continue
+            }
+            Write-Host "  '$($row.Host)': the pending activity is STILL present after the acknowledgement." -ForegroundColor Yellow
+            Write-Host "    The blade is staged and waiting. Acknowledge it in UCSM under Pending Activities if it does not clear." -ForegroundColor Yellow
+            Add-ManualAttentionHost -HostName $row.Host -Reason "Pending activity not acknowledged" -Detail "The firmware package was set and trigger-immediate was sent, but $($row.AckDn) is still present. The blade is staged and will not reboot until it is acknowledged in UCSM under Pending Activities."
+            Add-SummaryRecord -Stage "UCSMAcknowledge" -Batch $BatchNumber -HostName $row.Host -Action "Confirm acknowledgement" -Result "StillPending" -Details "$($row.AckDn) is still present after trigger-immediate."
+        }
+    }
+
+    # 3. Hosts that never raised one at all.
+    foreach ($row in @($pendingRows | Where-Object { -not $_.PendingAckFound })) {
+        Write-Host "  '$($row.Host)': no pending activity was raised within $UcsPendingAckWaitMinutes minute(s)." -ForegroundColor Yellow
+        Write-Host "    Either the firmware package change did not take, or this profile's maintenance policy is not user-ack and it will reboot on its own." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "UCSMAcknowledge" -Batch $BatchNumber -HostName $row.Host -Action "Acknowledge pending activity" -Result "NoneRaised" -Details "No lsmaintAck appeared under $($row.ServiceProfileDn) within $UcsPendingAckWaitMinutes minute(s). Either the package change did not take, or the maintenance policy is not user-ack."
     }
 }
 
