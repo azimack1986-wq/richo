@@ -31,8 +31,7 @@ if ($errors) { throw "parse errors" }
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in @('Get-IntersightAssignedServerMoid','Invoke-IntersightServerPowerAction',
                                  'Get-IntersightRelationshipMoid','Write-IntersightRelationshipShape',
-                                 'Invoke-IntersightActivationPowerCycle',
-                                 'Get-IntersightFirmwareTaskState','Wait-IntersightActivationComplete',
+                                 'Get-IntersightFirmwareTaskState',
                                  'Wait-IntersightActivationCompleteForBatch','Get-IntersightActivationProgress',
                                  'Invoke-IntersightActivationForBatch',
                                  'Invoke-IntersightProfileActivate',
@@ -50,8 +49,22 @@ $Global:IntersightActivationPowerAction = 'PowerCycle'
 $Global:IntersightActivationWaitMinutes = 0
 $Global:IntersightActivationHoldMinutes = 0
 $Global:IntersightPollIntervalSeconds = 5
+
+# The script has ONE activation implementation and ONE completion poll, and both are the batch
+# form. The single-row wrappers that used to sit in front of them were never called by the script
+# and have been removed, so the test goes through the batch API directly.
+function Invoke-IntersightActivationPowerCycle { param($Row,$BatchNumber)
+    Invoke-IntersightActivationForBatch -Rows @($Row) -BatchNumber $BatchNumber }
+# The phase the wait gave up in is per target on the batch result. It used to be copied into a
+# script-wide global that nothing ever read; the assertions below take it from the result instead.
 $Global:IntersightActivationLastPhase = ''
-$Global:IntersightActivationHeldForBatch = $false
+function Wait-IntersightActivationComplete { param($ProfileMoid,$ServerMoid,$Label,$MaxMinutes)
+    $Global:IntersightActivationLastPhase = 'no polling window was allowed'
+    if ($MaxMinutes -le 0) { return $false }
+    $outcome = Wait-IntersightActivationCompleteForBatch -MaxMinutes $MaxMinutes -Targets @(
+        [pscustomobject]@{ Host = 'single'; ProfileMoid = $ProfileMoid; ServerMoid = $ServerMoid; Label = $Label })
+    $Global:IntersightActivationLastPhase = [string]$outcome['single'].Phase
+    return [bool]$outcome['single'].Completed }
 # The manual rectification register the activation records into. Real function, real globals - a
 # host whose profile has no server must land on that list, not just fail quietly.
 $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
@@ -201,7 +214,6 @@ $script:TaskStates = @('Completed'); $script:TaskReads = 0
 $script:States = @('Pending-changes'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 $script:PowerCalls.Clear(); $script:ActivateCalls.Clear()
-$Global:IntersightActivationHeldForBatch = $false
 Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
 Assert-Equal "Activate was sent, not a power action" $true ($script:ActivateCalls.Count -ge 1 -and $script:PowerCalls.Count -eq 0)
 # With no polling window allowed, nothing can be CONFIRMED - so the decision goes to the operator
@@ -209,7 +221,7 @@ Assert-Equal "Activate was sent, not a power action" $true ($script:ActivateCall
 # of the real outcome is exactly what this must not do.
 Assert-Equal "an unconfirmed activation is recorded as still staged, not as done" "StillStaged" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
 Assert-Equal "and only one outcome is recorded for the host" 1 (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' }).Count)
-Assert-Equal "the batch is told not to hold again on top" $true $Global:IntersightActivationHeldForBatch
+Assert-Equal "and an activation genuinely went out" $true ($script:ActivateCalls.Count -ge 1)
 
 Write-Host "`n=== Firmware task still running: Activate is sent anyway, because it IS the acknowledgement ===" -ForegroundColor Cyan
 # The deadlock this replaced. The firmware.Upgrade sits at IN_PROGRESS precisely BECAUSE it is
@@ -220,14 +232,13 @@ $script:TaskStates = @('InProgress'); $script:TaskReads = 0
 $script:States = @('Pending-changes'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 $script:PowerCalls.Clear(); $script:ActivateCalls.Clear()
-$Global:IntersightActivationHeldForBatch = $false
 Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
 Assert-Equal "Activate goes out while the upgrade is in progress" $true ($script:ActivateCalls.Count -ge 1)
 Assert-Equal "it is the GUI's Activate, not a Deploy" "moid-1:Activate:ProceedOnReboot=True" $script:ActivateCalls[0]
 # A power action genuinely is refused mid-upgrade, so it is not worth attempting there.
 Assert-Equal "no power cycle is attempted underneath a running upgrade" 0 $script:PowerCalls.Count
 Assert-Equal "and it polls rather than looping on the task state" "StillStaged" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
-Assert-Equal "the batch is told not to hold again on top" $true $Global:IntersightActivationHeldForBatch
+Assert-Equal "and an activation genuinely went out" $true ($script:ActivateCalls.Count -ge 1)
 
 Write-Host "`n=== Activate refused mid-upgrade: no power cycle, the operator is asked ===" -ForegroundColor Cyan
 # Refused AND an upgrade running is the only case that reaches the prompt. The power-cycle fallback
@@ -237,11 +248,10 @@ $script:TaskStates = @('InProgress'); $script:TaskReads = 0
 $script:States = @('Pending-changes'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 $script:PowerCalls.Clear(); $script:ActivateCalls.Clear()
-$Global:IntersightActivationHeldForBatch = $false
 Invoke-IntersightActivationPowerCycle -Row $row -BatchNumber '1' 6>$null
 Assert-Equal "nothing was power-cycled underneath the upgrade" 0 $script:PowerCalls.Count
 Assert-Equal "and it is recorded as still staged" "StillStaged" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
-Assert-Equal "the batch is not told it held" $false $Global:IntersightActivationHeldForBatch
+Assert-Equal "and nothing was accepted, so nothing went out" 0 $script:PowerCalls.Count
 $script:ActivateThrows = $false
 
 Write-Host "`n=== RETRY sends Activate again, and settles once it is accepted ===" -ForegroundColor Cyan
@@ -251,7 +261,6 @@ $script:TaskStates = @('InProgress'); $script:TaskReads = 0
 $script:States = @('Pending-changes'); $script:Reads = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 $script:PowerCalls.Clear(); $script:ActivateCalls.Clear()
-$Global:IntersightActivationHeldForBatch = $false
 $script:Answers = @('RETRY','RETRY','CONTINUE'); $script:AnswerIndex = 0
 function Read-Host { param($Prompt)
     $script:PromptCount++
@@ -316,7 +325,7 @@ Write-Host "`n=== Nothing in the activation path touches vCenter ===" -Foregroun
 # firmware task for the profile's server - not the host's state in vCenter - and no vCenter action
 # happens until the activation has finished and the function has returned.
 $activationAst = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Invoke-IntersightActivationPowerCycle','Get-IntersightFirmwareTaskState','Invoke-IntersightServerPowerAction','Wait-IntersightActivationComplete','Invoke-IntersightProfileActivate') }
+    Where-Object { $_.Name -in @('Invoke-IntersightActivationForBatch','Get-IntersightFirmwareTaskState','Invoke-IntersightServerPowerAction','Wait-IntersightActivationCompleteForBatch','Invoke-IntersightProfileActivate') }
 $activationText = ($activationAst | ForEach-Object { $_.Extent.Text }) -join "`n"
 foreach ($viCmdlet in @('Get-VMHost','Set-VMHost','Restart-VMHost','Get-Cluster','Get-Datastore','Move-VM','Test-VMHostProfileCompliance','Get-VMHostProfile')) {
     Assert-Equal "the activation never calls $viCmdlet" $true (-not ($activationText -match "\b$([regex]::Escape($viCmdlet))\b"))
@@ -491,7 +500,6 @@ function Set-IntersightServerProfile { param($Moid,$Action,$ScheduledActions,$Er
 $script:TaskStates = @('Completed'); $script:TaskReads = 0
 $script:ActivateCalls.Clear(); $script:PowerCalls.Clear()
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
-$Global:IntersightActivationHeldForBatch = $false
 $Global:IntersightActivationHoldMinutes = 30
 $rowsForBatch = @(
     [pscustomobject]@{ Host='esx01.example'; ServerProfile='sp-esx01'; ProfileMoid='moid-1'; ConfigState='Pending-changes'; ServerProfileObj=$null }
@@ -507,7 +515,9 @@ Assert-Equal "every host in the batch reached an outcome" 3 $confirmations.Count
 Assert-Equal "and all three are recorded as Activated" 3 (@($confirmations | Where-Object { $_.Result -eq 'Activated' }).Count)
 # The whole point: three hosts cost one window, not three.
 Assert-Equal "the batch took one window, not one per host" $true (($script:FakeNow - $batchStart).TotalMinutes -lt 30) "took $(($script:FakeNow - $batchStart).TotalMinutes) minutes"
-Assert-Equal "the batch is told it has already held" $true $Global:IntersightActivationHeldForBatch
+# The batch holds for the reboot itself, so nothing downstream waits a second window on top. That
+# used to be signalled by a global flag nothing read; what is observable is that the whole batch
+# reached its outcome inside the one window, which the assertion above already proves.
 $Global:IntersightActivationHoldMinutes = 0
 
 Write-Host "`n=== A profile that settles on its own needs nothing sent ===" -ForegroundColor Cyan
@@ -519,8 +529,14 @@ Assert-Equal "nothing was activated against an already-settled profile" 0 $scrip
 Assert-Equal "and it is recorded as Activated" "Activated" (@($Global:RunSummary | Where-Object { $_.Action -eq 'Confirm activation' })[0].Result)
 
 Write-Host "`n=== SINGLE mode runs the same code as a batch ===" -ForegroundColor Cyan
+# There is now exactly ONE activation implementation, which is the strongest form of this: SINGLE
+# cannot diverge from AUTO because there is no second path for it to diverge into. The single-row
+# wrappers that used to delegate to the batch functions were never called by the script and are gone.
+$singleFns = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+    Where-Object { $_.Name -in @('Invoke-IntersightActivationPowerCycle','Wait-IntersightActivationComplete','Confirm-IntersightDeployAccepted') } |
+    ForEach-Object { $_.Name })
+Assert-Equal "no single-row wrapper survives to diverge from the batch path" "" ($singleFns -join ',')
 $singleText = [System.IO.File]::ReadAllText($scriptPath)
-Assert-Equal "the single-host entry point delegates to the batch one" $true ($singleText -match 'Invoke-IntersightActivationForBatch -Rows @\(\$Row\) -BatchNumber \$BatchNumber')
 Assert-Equal "the deploy loop collects rows instead of activating inline" $true ($singleText -match '\[void\]\$needActivation\.Add\(\$row\)')
 Assert-Equal "and activates them together after the loop" $true ($singleText -match 'Invoke-IntersightActivationForBatch -Rows \$needActivation\.ToArray\(\)')
 

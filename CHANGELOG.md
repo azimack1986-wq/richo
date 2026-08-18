@@ -12,6 +12,86 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.9.0] — 2026-08-18
+
+Dead-code pass, plus the behaviour changes that follow from every UCS domain
+being registered with UCS Central. 384 lines and 10 functions removed; the API
+surface was re-checked against Cisco's published schemas rather than memory.
+
+#### Changed
+
+- **The host firmware package is UCS Central's — this script resolves it, it no
+  longer makes it.** Every domain is registered with Central, so the package is
+  defined there and resolves down to the domain. A package the domain has not
+  resolved now **stops the run** and says where to make it, instead of creating a
+  local one.
+
+  Creating locally was worse than stopping. A locally created package carries no
+  bundle versions of its own — they are meant to come from the global policy — so
+  it applies cleanly and upgrades nothing while the run reports success. It also
+  fought Central, which refuses local create, delete and modify on anything it
+  owns. Gone with it: `Add-UcsFirmwareComputeHostPack`, the whole
+  `Set-UcsFirmwarePolicyGlobal` handover, `$Global:AllowUcsFirmwarePolicyCreation`,
+  and the "still local, would upgrade nothing" reporting.
+
+- **SAVE ONLY / NO ACKNOWLEDGEMENT (`STAGE_NO_ACK`) is fully removed.** The mode
+  was withdrawn earlier but `Test-StageNoAck` was kept "harmless" — it returned
+  `$false` everywhere, so thirteen guards testing for it were branches nothing
+  could reach.
+
+#### Fixed
+
+- **DRY RUN was taking hosts out of Maintenance mode for real.** The guard lived
+  in `Confirm-HostProfileComplianceAndExitMaintenance`, the batch function that
+  looped over hosts. When the rolling engine replaced it with a per-host call, the
+  guard was left behind — so a DRY RUN ran a real host profile compliance scan and
+  then issued a real `Set-VMHost -State Connected` against any host it found
+  parked. Nothing else in a dry run touches the estate; this did. The guard is now
+  in `Confirm-SingleHostComplianceAndExit`, where the call actually happens.
+
+- **`Get-UcsServiceProfileFirmwarePolicyName` could return a template name as a
+  firmware policy.** It walked
+  `HostFwPolicyName → HostFirmwarePackageName → OperHostFwPolicyName → SrcTemplName`
+  and returned the first non-empty one. Two of those are wrong:
+  `HostFirmwarePackageName` is not an `lsServer` property at all, and
+  `SrcTemplName` is **the template's name**, not a policy — so a profile with no
+  local policy reported its template name as its firmware package, and the
+  "already on target" comparison then compared a template name against a package
+  name.
+
+  Per Cisco's `lsServer` metadata, `operHostFwPolicyName` is READ_ONLY and carries
+  the **resolved** policy, while `hostFwPolicyName` is READ_WRITE and carries what
+  was set on this object. Oper is now read first, because a profile bound to an
+  updating template usually has nothing in `hostFwPolicyName` — the template
+  supplies it — and reading only the writable field reported such a profile as
+  having no policy at all.
+
+#### Added
+
+- **A firmware package name longer than 16 characters now stops at the mapping
+  table.** `lsServer.hostFwPolicyName` is capped at 16 characters by the schema
+  (`[\-\.:_a-zA-Z0-9]{0,16}`), so a longer name can never be written to a service
+  profile. Caught here it names the fabric family whose mapping is wrong; caught
+  later it is a parameter binding error a long way from the cause.
+
+#### Removed
+
+Ten functions with no caller, and three globals that were written and never read:
+
+- `Read-ManualUcsTargetForHost`
+- `Set-UcsFirmwarePolicyGlobal`
+- `Confirm-IntersightDeployAccepted`, `Wait-IntersightActivationComplete`,
+  `Invoke-IntersightActivationPowerCycle` — single-row wrappers over the batch
+  functions, left behind when the batch path became the only path. SINGLE mode
+  cannot diverge from AUTO now because there is no second path to diverge into.
+- `Confirm-HostProfileComplianceAndExitMaintenance`,
+  `Wait-HostProfileComplianceSettle`, `Wait-BatchReconnectAfterReboot`,
+  `Get-BatchConnectionStateSummary` — the discrete-batch loop the rolling engine
+  replaced.
+- `Test-StageNoAck`
+- `$Global:IntersightActivationHeldForBatch`,
+  `$Global:IntersightActivationLastPhase`, `$Global:UcsCandidateCache`
+
 ### [23.8.0] — 2026-08-18
 
 #### Added
@@ -2410,6 +2490,13 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.9.0-preauth] — 2026-08-18
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.9.0 — dead-code pass, the
+host firmware package is resolved from UCS Central rather than created locally,
+and DRY RUN no longer takes hosts out of Maintenance mode for real. This is the
+build to run.
 
 ### [23.8.0-preauth] — 2026-08-18
 

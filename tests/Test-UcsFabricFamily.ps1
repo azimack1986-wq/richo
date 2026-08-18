@@ -27,7 +27,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [r
 if ($errors) { throw "parse errors" }
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Get-UcsFabricFamily','Resolve-UcsFirmwarePolicyForTarget','Set-UcsFirmwarePolicyGlobal','Remove-UcsHostsAlreadyOnTargetFirmware','ConvertTo-UcsBundleVersionFromPolicyName','Get-UcsFirmwarePolicyRows','Test-UcsFirmwarePolicyExists','Get-UcsFirmwarePolicyLookup',
+    Where-Object { $_.Name -in @('Get-UcsFabricFamily','Resolve-UcsFirmwarePolicyForTarget','Remove-UcsHostsAlreadyOnTargetFirmware','ConvertTo-UcsBundleVersionFromPolicyName','Get-UcsFirmwarePolicyRows','Test-UcsFirmwarePolicyExists','Get-UcsFirmwarePolicyLookup',
                                  'Test-UcsRemotePolicyMessage','Set-UcsServiceProfileTemplateFirmwarePolicy',
                                  'Get-UcsServiceProfileFirmwarePolicyName',
                                  'Test-DryRun') } |
@@ -37,7 +37,6 @@ $Global:RunMode = 'LIVE'
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 $ScriptVersion = 'test'
 $Global:UcsFirmwarePolicyByTarget = @{}
-$Global:AllowUcsFirmwarePolicyCreation = $true
 $Global:UcsFirmwarePolicyByFabricFamily = @{
     '6400' = 'global-602d'
     '6300' = 'global-436h'
@@ -122,27 +121,18 @@ Assert-Equal "no fabric interconnects reports Unknown" "Unknown" (Get-UcsFabricF
 $script:Models = 'THROW'
 Assert-Equal "a failed query reports Unknown rather than throwing" "Unknown" (Get-UcsFabricFamily -UcsSession 'x').Family
 
-Write-Host "`n=== An existing package is reused, never recreated ===" -ForegroundColor Cyan
+Write-Host "`n=== A package the domain has resolved is used as-is ===" -ForegroundColor Cyan
 $script:Models = @('UCS-FI-6454'); $script:Packs = @('global-602d'); $script:Created = @()
 $Global:UcsFirmwarePolicyByTarget = @{}
 Assert-Equal "6400 domain resolves to global-602d" "global-602d" (Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null)
 Assert-Equal "nothing was created" 0 $script:Created.Count
 
-Write-Host "`n=== A missing package is created by name only ===" -ForegroundColor Cyan
-$script:Models = @('UCS-FI-6332'); $script:Packs = @(); $script:Created = @()
-$Global:UcsFirmwarePolicyByTarget = @{}
-Assert-Equal "6300 domain resolves to global-436h" "global-436h" (Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-b' -UcsSession 'x' 6>$null)
-Assert-Equal "exactly one package was created" 1 $script:Created.Count
-Assert-Equal "created at org-root so any org can reference it" "org-root" $script:Created[0].Org
-Assert-Equal "created with the mapped name" "global-436h" $script:Created[0].Name
-Assert-Equal "no blade bundle version was written - it comes from the global setting" $true ([string]::IsNullOrEmpty($script:Created[0].Blade))
-Assert-Equal "no rack bundle version was written - it comes from the global setting" $true ([string]::IsNullOrEmpty($script:Created[0].Rack))
-Assert-Equal "the package is attributed to this script" $true ($script:Created[0].Descr -match 'firmware batch controller')
-
 Write-Host "`n=== The resolution is cached per domain ===" -ForegroundColor Cyan
-$script:Created = @()
+$script:Models = @('UCS-FI-6332'); $script:Packs = @('global-436h'); $Global:UcsFirmwarePolicyByTarget = @{}
+Assert-Equal "6300 domain resolves to global-436h" "global-436h" (Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-b' -UcsSession 'x' 6>$null)
+$script:Models = 'THROW'   # a second call must not go back to the domain at all
 Assert-Equal "a second call reuses the resolved policy" "global-436h" (Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-b' -UcsSession 'x' 6>$null)
-Assert-Equal "and creates nothing further" 0 $script:Created.Count
+$script:Models = @('UCS-FI-6332')
 
 Write-Host "`n=== Creation is not put to the operator ===" -ForegroundColor Cyan
 # At the operator's direction. What gets created is fully determined - the name comes from the
@@ -151,7 +141,7 @@ Write-Host "`n=== Creation is not put to the operator ===" -ForegroundColor Cyan
 # Asserted against the two functions themselves rather than the whole file, so an unrelated
 # message that happens to use the same words cannot make this pass or fail by accident.
 $policyFunctions = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Resolve-UcsFirmwarePolicyForTarget','Set-UcsFirmwarePolicyGlobal') })
+    Where-Object { $_.Name -in @('Resolve-UcsFirmwarePolicyForTarget','Set-UcsServiceProfileTemplateFirmwarePolicy') })
 Assert-Equal "both policy functions are present" 2 $policyFunctions.Count
 $policyPrompts = @($policyFunctions | Where-Object { $_.Extent.Text -match 'Read-ChoiceExit' } | ForEach-Object { $_.Name })
 Assert-Equal "neither asks the operator anything" "" ($policyPrompts -join ',')
@@ -190,16 +180,19 @@ Assert-Equal "an unrelated failure is not mistaken for it" $false (Test-UcsRemot
 Assert-Equal "and neither is nothing" $false (Test-UcsRemotePolicyMessage -Message "")
 
 Write-Host "`n=== An unmapped family stops rather than picking something ===" -ForegroundColor Cyan
-$script:Models = @('UCS-FI-6248UP'); $script:Packs = @(); $Global:UcsFirmwarePolicyByTarget = @{}
+$script:Models = @('UCS-FI-6248UP'); $script:Packs = @('global-436h'); $Global:UcsFirmwarePolicyByTarget = @{}
 $stopped = $false
 try { [void](Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-d' -UcsSession 'x' 6>$null) } catch { $stopped = "$_" -match 'No firmware policy is mapped' }
 Assert-Equal "an unmapped 6200 domain stops the run" $true $stopped
 
-Write-Host "`n=== DRY RUN never creates anything ===" -ForegroundColor Cyan
+Write-Host "`n=== DRY RUN resolves and reports, and writes nothing ===" -ForegroundColor Cyan
 $Global:RunMode = 'DRYRUN'
-$script:Models = @('UCS-FI-6332'); $script:Packs = @(); $script:Created = @(); $Global:UcsFirmwarePolicyByTarget = @{}
-Assert-Equal "DRY RUN still reports the policy it would use" "global-436h" (Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-e' -UcsSession 'x' 6>$null)
+$script:Models = @('UCS-FI-6332'); $script:Packs = @('global-436h'); $script:Created = @()
+$script:TemplateWrites = New-Object System.Collections.Generic.List[string]
+$Global:UcsFirmwarePolicyByTarget = @{}
+Assert-Equal "DRY RUN still reports the policy it will use" "global-436h" (Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-e' -UcsSession 'x' 6>$null)
 Assert-Equal "DRY RUN created nothing" 0 $script:Created.Count
+Assert-Equal "and wrote no template" 0 $script:TemplateWrites.Count
 $Global:RunMode = 'LIVE'
 
 Write-Host "`n=== The target version is read back out of the policy name ===" -ForegroundColor Cyan
@@ -226,79 +219,39 @@ $scriptText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "no -BladeBundleVersion anywhere in the script" $true (-not ($scriptText -match '-BladeBundleVersion'))
 Assert-Equal "no -RackBundleVersion anywhere in the script"  $true (-not ($scriptText -match '-RackBundleVersion'))
 
-Write-Host "`n=== A created policy is handed to UCS Central, not left local ===" -ForegroundColor Cyan
-# The live miss: UCSM created the package and left Owner "local". The package is created by NAME
-# ONLY, with no bundle versions - they are meant to come from the global policy - so a local
-# package applies cleanly and upgrades nothing while the run reports success.
-#
-# Per Cisco's ucsmsdk metadata, firmwareComputeHostPack.policyOwner is READ_WRITE with exactly
-# three values: "local", "pending-policy", "policy".
-$script:OwnerState = 'local'
-$script:OwnerWrites = New-Object System.Collections.Generic.List[string]
-function Get-UcsFirmwareComputeHostPack { param($Ucs,$Org,$Name,$ErrorAction)
-    return [pscustomobject]@{ Name = $Name; PolicyOwner = $script:OwnerState } }
-# No [Parameter()] attributes: they make this an advanced function, which adds the common
-# parameters and then collides with the explicit $ErrorAction the script passes. Pipeline input is
-# taken through $input instead, which a simple function supports.
-function Set-UcsFirmwareComputeHostPack { param($PolicyOwner,[switch]$Force,$ErrorAction)
-    $null = @($input)
-    $script:OwnerWrites.Add("$PolicyOwner|Force=$Force")
-    if ($script:AcceptOwnerWrite) { $script:OwnerState = $PolicyOwner } }
+Write-Host "`n=== The package is UCS Central's - this domain resolves it, it does not make it ===" -ForegroundColor Cyan
+# Every domain is registered with UCS Central, so the host firmware package is defined there and
+# resolves down. An earlier build created one locally when it could not find it, which is worse
+# than stopping: a locally created package carries no bundle versions of its own - they come from
+# the global policy - so it applies cleanly and upgrades nothing while the run reports success.
+# It also fought Central, which refuses local create, delete and modify on anything it owns.
+$policySource = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "no package is ever created" $true (-not ($policySource -match 'Add-UcsFirmwareComputeHostPack'))
+Assert-Equal "no policyOwner is ever written" $true (-not ($policySource -match '-PolicyOwner'))
+Assert-Equal "and the creation switch is gone with it" $true (-not ($policySource -match 'AllowUcsFirmwarePolicyCreation'))
 
-$script:AcceptOwnerWrite = $true
-$script:OwnerState = 'local'; $script:OwnerWrites.Clear()
-Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null
-Assert-Equal "policyOwner is written once" 1 $script:OwnerWrites.Count
-Assert-Equal "to 'policy' - controlled by UCS Central - with -Force" "policy|Force=True" $script:OwnerWrites[0]
-Assert-Equal "and the owner is read back as global" "policy" $script:OwnerState
+$script:Models = @('UCS-FI-6332'); $script:Packs = @(); $Global:UcsFirmwarePolicyByTarget = @{}
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+$missing = $false
+try { [void](Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-f' -UcsSession 'x' 6>$null) } catch { $missing = "$_" }
+Assert-Equal "a package the domain has not resolved stops the run" $true ($missing -match 'not present in ucsm-f')
+Assert-Equal "saying where it actually has to be made" $true ($missing -match 'create it in UCS Central')
+Assert-Equal "and pointing at policy resolution control" $true ($missing -match 'policy resolution control')
+Assert-Equal "recorded as missing, not as a failed create" "Missing" (@($Global:RunSummary.ToArray() | Where-Object { $_.Action -eq 'Resolve firmware policy' })[-1].Result)
 
-# Pending Global is the normal intermediate state, not a failure: the handover was made and the
-# domain is waiting on UCS Central to take it.
-$script:AcceptOwnerWrite = $false
-$script:OwnerState = 'pending-policy'; $script:OwnerWrites.Clear(); $script:Answer = 'X'
-$stoppedPending = $false
-try { Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null } catch { $stoppedPending = $true }
-Assert-Equal "'pending-policy' is accepted, not treated as a failure" $false $stoppedPending
+Write-Host "`n=== A name UCSM could never write is caught at the mapping, not at the profile ===" -ForegroundColor Cyan
+# lsServer.hostFwPolicyName is capped at 16 characters by the schema
+# (r"""[\-\.:_a-zA-Z0-9]{0,16}"""), so a longer name can never reach a service profile. Caught
+# here it names the mapping table; caught later it is a parameter binding error a long way from it.
+$Global:UcsFirmwarePolicyByFabricFamily['6500'] = 'global-a-very-long-package-name'
+$script:Models = @('UCS-FI-6536','UCS-FI-6536'); $Global:UcsFirmwarePolicyByTarget = @{}
+$tooLong = $false
+try { [void](Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-g' -UcsSession 'x' 6>$null) } catch { $tooLong = "$_" }
+Assert-Equal "the run stops before touching anything" $true ($tooLong -match 'at most 16')
+Assert-Equal "naming the fabric family whose mapping is wrong" $true ($tooLong -match "'6500'")
+$Global:UcsFirmwarePolicyByFabricFamily.Remove('6500')
 
-# Still local afterwards means an empty package is about to be attached. At the operator's
-# direction that no longer asks anything: the run carries on to the blades and the gap is carried
-# by the run summary and the manual rectification report instead of a question mid-change.
-$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
-$script:OwnerState = 'local'; $script:OwnerWrites.Clear()
-$continued = $true
-try { Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null } catch { $continued = $false }
-Assert-Equal "a policy still local no longer stops the run" $true $continued
-Assert-Equal "and it is recorded for manual rectification" $true (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Reason -eq 'Host firmware package is not Global' }).Count -ge 1)
-
-# UCS Central already owning the package is SUCCESS, not a failure to make it Global.
-$script:OwnerWrites.Clear()
-$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
-function Set-UcsFirmwareComputeHostPack { param($PolicyOwner,[switch]$Force,$ErrorAction)
-    $null = @($input)
-    $script:OwnerWrites.Add("$PolicyOwner|Force=$Force")
-    throw "PD21000001SS004:Policy org-root/fw-host-pack-global-436h is resolved from remote policy server. Create/Delete/Modify operations are not allowed." }
-$remoteOk = $true
-try { Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null } catch { $remoteOk = $false }
-Assert-Equal "a remote-owned package does not stop the run" $true $remoteOk
-Assert-Equal "and is NOT flagged for manual rectification" 0 (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Reason -eq 'Host firmware package is not Global' }).Count)
-Assert-Equal "recorded as Global, not as a failure" "Global" (@($Global:RunSummary.ToArray() | Where-Object { $_.Action -eq 'Set policy to Global' })[-1].Result)
-# Put the accepting stub back for the checks that follow.
-function Set-UcsFirmwareComputeHostPack { param($PolicyOwner,[switch]$Force,$ErrorAction)
-    $null = @($input)
-    $script:OwnerWrites.Add("$PolicyOwner|Force=$Force")
-    if ($script:AcceptOwnerWrite) { $script:OwnerState = $PolicyOwner } }
-
-# DRY RUN changes no ownership.
-$Global:RunMode = 'DRYRUN'
-$script:OwnerWrites.Clear()
-Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null
-Assert-Equal "DRY RUN writes no policyOwner" 0 $script:OwnerWrites.Count
-$Global:RunMode = 'LIVE'
-
-# It runs as part of creating the policy, not as a separate thing to remember.
-$policyText = [System.IO.File]::ReadAllText($scriptPath)
-Assert-Equal "creation hands the policy straight to UCS Central" $true ($policyText -match 'Set-UcsFirmwarePolicyGlobal -PolicyName \$policyName')
-Assert-Equal "and the only owner value written is 'policy'" $true ($policyText -match '-PolicyOwner "policy"')
+$script:Models = @('UCS-FI-6332'); $script:Packs = @('global-436h'); $Global:UcsFirmwarePolicyByTarget = @{}
 
 Write-Host "`n=== Service profile templates are aligned to the target package ===" -ForegroundColor Cyan
 # A template that still names the old package puts it back - on the next template push, on a

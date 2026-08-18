@@ -33,7 +33,7 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
                                  'Get-CapacityBasedBatchSize','Test-VMHostRejoinedAfterReboot',
                                  'Get-VMHostBootTime','Read-ChoiceExit','Read-PendingConsoleKey',
                                  'Test-VMHostObjectInMaintenance','Get-VMHostMaintenanceState',
-                                 'Test-DryRun','Test-StageNoAck') } |
+                                 'Test-DryRun') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0

@@ -27,7 +27,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [r
 if ($errors) { throw "parse errors" }
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Request-MaintenanceModeForBatch','Wait-VMHostInMaintenance','Wait-VMHostOutOfMaintenance','Get-VMHostMaintenanceState','Test-VMHostObjectInMaintenance','Test-DryRun','Test-StageNoAck') } |
+    Where-Object { $_.Name -in @('Request-MaintenanceModeForBatch','Wait-VMHostInMaintenance','Wait-VMHostOutOfMaintenance','Get-VMHostMaintenanceState','Test-VMHostObjectInMaintenance','Test-DryRun') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $MaintenanceValidationTimeoutMinutes = 1

@@ -79,7 +79,6 @@ $Global:UpgradeMode                     = 'ESXI_UCS_FIRMWARE'
 $Global:UcsCredential                   = [pscredential]::new('u', (ConvertTo-SecureString 'p' -AsPlainText -Force))
 $Global:UcsSessions                     = @{}
 $Global:UcsHostMap                      = @{}
-$Global:UcsCandidateCache               = @{}
 $Global:UcsServiceProfileCache          = @{}
 $Global:AutoExitMaintenanceMode         = $true
 $Global:PreExistingMaintenanceHosts     = @()
@@ -105,7 +104,6 @@ $Global:IntersightRebootImmediatelyToActivate = $true
 $Global:IntersightDeployAcceptedTimeoutSeconds = 5
 $Global:EsxiDiscoveryCache              = @{}
 $Global:UcsFirmwarePolicyByTarget       = @{}
-$Global:AllowUcsFirmwarePolicyCreation  = $true
 $Global:UcsFirmwarePolicyByFabricFamily = @{
     '6400' = 'global-602d'
     '6300' = 'global-436h'
@@ -430,7 +428,9 @@ Assert-True "the fabric family was detected" ($fabricRows.Count -ge 1)
 Assert-True "a 6454 was read as the 6400 family" (@($fabricRows | Where-Object { $_.Result -eq '6400' }).Count -ge 1) "got: $(($fabricRows.Result) -join ', ')"
 $policyRows = @($Global:RunSummary | Where-Object { $_.Stage -eq 'UCSMFirmwarePolicySelection' })
 Assert-True "the 6400 mapping resolved to global-602d" (@($policyRows | Where-Object { $_.Details -match 'global-602d' }).Count -ge 1) "got: $(($policyRows.Details) -join ' | ')"
-Assert-True "an existing package was reused, not recreated" (@($policyRows | Where-Object { $_.Result -eq 'Existing' }).Count -ge 1)
+# "Resolved" - the package is UCS Central's and the domain resolves it. This build no longer has a
+# create path at all, so there is nothing left that could recreate one.
+Assert-True "the package was resolved from the domain, not created" (@($policyRows | Where-Object { $_.Result -eq 'Resolved' }).Count -ge 1)
 Assert-True "no host firmware package was created when one already existed" (-not $script:Calls.ContainsKey('Add-UcsFirmwareComputeHostPack'))
 
 Write-Host "`n=== The run summary is usable evidence ===" -ForegroundColor Cyan

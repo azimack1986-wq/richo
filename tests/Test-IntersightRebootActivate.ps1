@@ -29,7 +29,7 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [r
 if ($errors) { throw "parse errors" }
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Confirm-IntersightDeployAccepted','Confirm-IntersightDeployAcceptedForBatch','Get-IntersightProfileDeployState','Get-IntersightResultList','Get-IntersightServerProfileByName','Get-IntersightAssignedServerMoid','Get-IntersightRelationshipMoid') } |
+    Where-Object { $_.Name -in @('Confirm-IntersightDeployAcceptedForBatch','Get-IntersightProfileDeployState','Get-IntersightResultList','Get-IntersightServerProfileByName','Get-IntersightAssignedServerMoid','Get-IntersightRelationshipMoid') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $Global:IntersightActionableConfigStates = @('Pending-changes','Inconsistent','Out-of-sync','Not-deployed')
@@ -41,6 +41,13 @@ function Add-SummaryRecord { param($Stage,$Batch,$HostName,$Action,$Result,$Deta
     $Global:RunSummary.Add([pscustomobject]@{ Stage=$Stage; Batch=$Batch; Host=$HostName; Action=$Action; Result=$Result; Details=$Details }) }
 function Stop-WithMessage { param($Message) throw "STOP: $Message" }
 function Start-Sleep { param($Seconds,$Milliseconds) }
+
+# The script has ONE implementation of "did the appliance pick the deploy up", and it is the batch
+# one. The single-row wrapper that used to sit in front of it was never called by the script and
+# has been removed, so the test asks the batch API directly through this local shim.
+function Confirm-IntersightDeployAccepted { param($Row,$BatchNumber)
+    $outcome = Confirm-IntersightDeployAcceptedForBatch -Rows @($Row) -BatchNumber $BatchNumber
+    return [bool]$outcome[$Row.Host] }
 
 $script:pass = 0; $script:fail = 0
 function Assert-Equal {

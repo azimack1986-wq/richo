@@ -40,13 +40,10 @@ $wanted = @(
     'Get-VMHostMaintenanceState'
     'Test-VMHostObjectInMaintenance'
     'Wait-VMHostProfileComplianceTask'
-    'Wait-HostProfileComplianceSettle'
-    'Confirm-HostProfileComplianceAndExitMaintenance'
     'Confirm-SingleHostComplianceAndExit'
     'Read-ChoiceExit'
     'Read-PendingConsoleKey'
     'Test-DryRun'
-    'Test-StageNoAck'
 )
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $wanted -contains $_.Name } |
@@ -272,7 +269,7 @@ function Test-VMHostProfileCompliance {
 $script:HostConnectionState = 'Maintenance'
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 function Read-Host { param($Prompt) throw "no prompt should be needed for a compliant host: $Prompt" }
-Confirm-HostProfileComplianceAndExitMaintenance -HostNames @('esx1.example') -BatchNumber '1' 6>$null
+Confirm-SingleHostComplianceAndExit -HostName 'esx1.example' -BatchNumber '1' 6>$null
 Assert-Equal "the host was returned to service" "Connected" $script:HostConnectionState
 Assert-Equal "compliance was recorded as Compliant" "Compliant" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' })[0].Result)
 Assert-Equal "the exit was recorded" "Sent" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'ExitMaintenance' })[0].Result)
@@ -291,7 +288,7 @@ $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 function Read-Host { param($Prompt)
     $script:StateAtPrompt += $script:HostConnectionState
     return 'C' }
-Confirm-HostProfileComplianceAndExitMaintenance -HostNames @('esx1.example') -BatchNumber '1' 6>$null
+Confirm-SingleHostComplianceAndExit -HostName 'esx1.example' -BatchNumber '1' 6>$null
 Assert-Equal "the host stayed in Maintenance mode at every re-check prompt" $true (@($script:StateAtPrompt | Where-Object { $_ -ne 'Maintenance' }).Count -eq 0)
 Assert-Equal "it was prompted twice before passing" 2 $script:StateAtPrompt.Count
 Assert-Equal "the host was released only after it passed" "Connected" $script:HostConnectionState
@@ -306,7 +303,7 @@ $script:HostConnectionState = 'Maintenance'
 $script:PromptCount = 0
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 function Read-Host { param($Prompt) $script:PromptCount++; if ($script:PromptCount -gt 5) { throw "override did not break the loop" }; return 'O' }
-Confirm-HostProfileComplianceAndExitMaintenance -HostNames @('esx1.example') -BatchNumber '1' 6>$null
+Confirm-SingleHostComplianceAndExit -HostName 'esx1.example' -BatchNumber '1' 6>$null
 Assert-Equal "one prompt was enough - the override broke the loop" 1 $script:PromptCount
 Assert-Equal "the non-compliant host was returned to service" "Connected" $script:HostConnectionState
 $override = @($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' })[0]
@@ -319,7 +316,7 @@ $script:HostConnectionState = 'Maintenance'
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 function Read-Host { param($Prompt) return 'E' }
 $exited = $false
-try { Confirm-HostProfileComplianceAndExitMaintenance -HostNames @('esx1.example') -BatchNumber '1' 6>$null }
+try { Confirm-SingleHostComplianceAndExit -HostName 'esx1.example' -BatchNumber '1' 6>$null }
 catch { $exited = "$_" -match 'EXIT:' }
 Assert-Equal "E stops the run" $true $exited
 Assert-Equal "and leaves the host in Maintenance mode" "Maintenance" $script:HostConnectionState
@@ -338,7 +335,7 @@ function Read-Host { param($Prompt)
     if ($script:PromptCount -gt 5) { throw "the NoProfile halt did not settle" }
     $script:StateAtPrompt += $script:HostConnectionState
     return 'O' }
-Confirm-HostProfileComplianceAndExitMaintenance -HostNames @('esx1.example') -BatchNumber '1' 6>$null
+Confirm-SingleHostComplianceAndExit -HostName 'esx1.example' -BatchNumber '1' 6>$null
 Assert-Equal "NoProfile stops to ask rather than carrying on" 1 $script:PromptCount
 Assert-Equal "and the host was still in Maintenance mode when it asked" "Maintenance" $script:StateAtPrompt[0]
 Assert-Equal "the override releases it" "Connected" $script:HostConnectionState
@@ -355,7 +352,7 @@ function Read-Host { param($Prompt)
     $script:PromptCount++
     if ($script:PromptCount -gt 5) { throw "the Unknown halt did not settle" }
     return 'O' }
-Confirm-HostProfileComplianceAndExitMaintenance -HostNames @('esx1.example') -BatchNumber '1' 6>$null
+Confirm-SingleHostComplianceAndExit -HostName 'esx1.example' -BatchNumber '1' 6>$null
 Assert-Equal "Unknown stops to ask" 1 $script:PromptCount
 Assert-Equal "the accepted status is named as Unknown, not Compliant" $true ((@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' })[0].Details) -match 'Unknown')
 
@@ -378,27 +375,18 @@ function Test-VMHostProfileCompliance {
     return [pscustomobject]@{ ComplianceStatus = 'Compliant'; CheckTime = (Get-Date) }
 }
 
-Write-Host "`n=== The settle wait runs before the first scan ===" -ForegroundColor Cyan
-$HostProfileComplianceSettleMinutes = 0.001
-$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+# The settle before the first scan is no longer a function of its own - it is the rolling engine's
+# Settling stage, held per host from ITS OWN return, and asserted in Test-RollingUpgrade.ps1.
 function Read-Host { param($Prompt) throw "no prompt expected: $Prompt" }
-Wait-HostProfileComplianceSettle -HostNames @('esx1.example') -BatchNumber '1' 6>$null
-$settle = @($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileComplianceSettle' })
-Assert-Equal "the settle is recorded under its own stage" 1 $settle.Count
-Assert-Equal "and recorded as completed" "Completed" $settle[0].Result
-Assert-Equal "the settle does not masquerade as a compliance result" 0 (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' }).Count)
-
-$HostProfileComplianceSettleMinutes = 0
-$Global:RunSummary = New-Object System.Collections.Generic.List[object]
-Wait-HostProfileComplianceSettle -HostNames @('esx1.example') -BatchNumber '1' 6>$null
-Assert-Equal "a zero settle is a genuine no-op" 0 $Global:RunSummary.Count
 
 Write-Host "`n=== DRY RUN neither waits nor scans ===" -ForegroundColor Cyan
 $Global:RunMode = 'DRYRUN'
 $script:HostConnectionState = 'Maintenance'
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 function Test-VMHostProfileCompliance { param($VMHost,[switch]$UseCache,$ErrorAction) throw "DRY RUN must not scan" }
-Confirm-HostProfileComplianceAndExitMaintenance -HostNames @('esx1.example') -BatchNumber '1' 6>$null
+Confirm-SingleHostComplianceAndExit -HostName 'esx1.example' -BatchNumber '1' 6>$null
+# The guard used to live in the batch function the rolling engine replaced; losing it left DRY RUN
+# running a real scan and a real Set-VMHost -State Connected.
 Assert-Equal "DRY RUN recorded the intent only" "DryRun" (@($Global:RunSummary | Where-Object { $_.Stage -eq 'HostProfileCompliance' })[0].Result)
 Assert-Equal "DRY RUN left the host in Maintenance mode" "Maintenance" $script:HostConnectionState
 $Global:RunMode = 'LIVE'

@@ -350,7 +350,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.8.0"
+$ScriptVersion = "23.9.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -376,7 +376,6 @@ $Global:UcsFirmwarePolicyByTarget = @{}
 
 # Whether the run may CREATE a missing host firmware package. When false, a missing policy stops
 # the run instead. Creation is always gated by an explicit confirmation and never happens in DRY RUN.
-$Global:AllowUcsFirmwarePolicyCreation = $true
 
 # Intersight PVA routing.
 # CDP/LLDP remains the identity source for every host (same as the UCSM path below). A host whose
@@ -457,17 +456,11 @@ $Global:IntersightActivationHoldMinutes = 60
 # How often to ask Intersight during those windows. The appliance is being asked for three small
 # objects per poll, so this is cheap - but not free, and a whole batch polls in series.
 $Global:IntersightPollIntervalSeconds = 30
-# Set by the poll to whatever it was last waiting on, so a run that gives up says which stage it
-# gave up in rather than just "not activated".
-$Global:IntersightActivationLastPhase = ""
 
 # There is no cap on the number of retries. After each check the operator is asked RETRY or
 # CONTINUE, so the run waits exactly as long as they want it to and never decides on its own that
 # an activation has failed. See Invoke-IntersightActivationPowerCycle.
 
-# Set by the activation when it has already held for the reboot, so the batch loop does not then
-# wait its own post-reboot window on top. Reset per batch.
-$Global:IntersightActivationHeldForBatch = $false
 $Global:IntersightBaseUrlConfirmed = $false
 # NOTE: Intersight's API only supports API-key + HTTP-signature auth (key ID + private key file) -
 # there is no username/password endpoint. Get-IntersightCredentialIfNeeded below still prompts
@@ -556,14 +549,12 @@ $RunTimestamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $SummaryPath = Join-Path $RunDirectory "AutoDeploy-UCSM-Firmware-Batch-Summary-$RunTimestamp.csv"
 $Global:RunSummary = New-Object System.Collections.Generic.List[object]
 
-# DRYRUN or LIVE. STAGE_NO_ACK is retained as a constant only so the guards that reference it stay
-# valid; nothing can select it - see Select-RunMode.
+# DRYRUN or LIVE. Those are the only two - see Select-RunMode.
 $Global:RunMode = "DRYRUN"
 $Global:UpgradeMode = "ESXI_UCS_FIRMWARE" # ESXI_ONLY or ESXI_UCS_FIRMWARE
 $Global:UcsCredential = $null
 $Global:UcsSessions = @{}
 $Global:UcsHostMap = @{}
-$Global:UcsCandidateCache = @{}
 $Global:UcsServiceProfileCache = @{}
 # ESXi root credential for the cluster being worked on. Collected once when the cluster is
 # selected, held only in memory for the run, and cleared per cluster.
@@ -664,7 +655,6 @@ function Read-ChoiceExit {
 }
 
 function Test-DryRun { return ($Global:RunMode -eq "DRYRUN") }
-function Test-StageNoAck { return ($Global:RunMode -eq "STAGE_NO_ACK") }
 
 function Show-OpenFileDialog {
     <#
@@ -1273,7 +1263,6 @@ function Clear-ExistingUcsSessions {
     # Reset script-local UCS session caches after UCS cleanup. The service profile cache is keyed
     # by UCSM target and is only valid for a live session, so it goes with them.
     $Global:UcsSessions = @{}
-    $Global:UcsCandidateCache = @{}
     $Global:UcsServiceProfileCache = @{}
 
     try {
@@ -1327,37 +1316,6 @@ function Get-UcsCandidateListFromSystemName {
     $normalised = Convert-FiSystemNameToUcsCandidate -SystemName $SystemName
     if ([string]::IsNullOrWhiteSpace($normalised)) { return @() }
     return @($normalised)
-}
-
-function Read-ManualUcsTargetForHost {
-    param(
-        [Parameter(Mandatory=$true)]$VMHostObject,
-        [string]$DetectedSystemName = "",
-        [string]$SuggestedUcsTarget = ""
-    )
-
-    Write-Host "" -ForegroundColor Cyan
-    Write-Host "Manual UCSM target entry selected." -ForegroundColor Cyan
-    if (-not [string]::IsNullOrWhiteSpace($DetectedSystemName)) {
-        Write-Host "Detected FI/CDP system name: $DetectedSystemName" -ForegroundColor Yellow
-    }
-    if (-not [string]::IsNullOrWhiteSpace($SuggestedUcsTarget)) {
-        Write-Host "Suggested UCSM target without Fabric suffix: $SuggestedUcsTarget" -ForegroundColor Yellow
-    }
-
-    $manual = Read-Host "Enter UCSM FQDN/IP for host $($VMHostObject.Name), or E to exit"
-    if ($manual.Trim().ToUpper() -in @("E","EXIT")) { Stop-SafeExit -Message "Stopped during manual UCSM mapping." }
-    $manualTarget = Remove-UcsTargetDecoration -Value $manual
-    $session = Connect-UcsCached -UcsTarget $manualTarget
-    if ($null -eq $session) { Stop-WithMessage "Manual UCSM login failed for $manualTarget." }
-
-    return [pscustomobject]@{
-        Host          = $VMHostObject.Name
-        Vmnic         = ""
-        CdpSystemName = $DetectedSystemName
-        UcsTarget     = $manualTarget
-        Discovery     = "MANUAL"
-    }
 }
 
 function Get-UcsCredentialIfNeeded {
@@ -1514,8 +1472,32 @@ function Resolve-UcsServiceProfileForHost {
 }
 
 function Get-UcsServiceProfileFirmwarePolicyName {
+    <#
+    .SYNOPSIS
+        The host firmware package a service profile or template is actually using.
+
+    .DESCRIPTION
+        Two properties, in this order, and they are not interchangeable. From Cisco's own lsServer
+        metadata:
+
+          operHostFwPolicyName  READ_ONLY, up to 256 characters. The RESOLVED policy - what the
+                                profile is really using once the template it is bound to and the
+                                global policy have been applied.
+          hostFwPolicyName      READ_WRITE, at most 16 characters. What was SET on this object.
+
+        Oper first, because a profile bound to an updating template usually carries nothing in
+        hostFwPolicyName - the template supplies it - and reading only the writable field reports
+        such a profile as having no policy at all.
+
+        Two properties were dropped from an earlier list. HostFirmwarePackageName is not an
+        lsServer property and never matched anything. SrcTemplName is the TEMPLATE'S NAME, not a
+        firmware policy: returning it here meant a profile with no policy reported its template
+        name as its policy, and the "already on target" comparison then compared a template name
+        against a package name.
+    #>
     param([Parameter(Mandatory=$true)]$ServiceProfile)
-    foreach ($prop in @("HostFwPolicyName","HostFirmwarePackageName","OperHostFwPolicyName","SrcTemplName")) {
+
+    foreach ($prop in @("OperHostFwPolicyName","HostFwPolicyName")) {
         if ($ServiceProfile.PSObject.Properties.Name -contains $prop) {
             $val = [string]$ServiceProfile.$prop
             if (-not [string]::IsNullOrWhiteSpace($val)) { return $val }
@@ -1606,16 +1588,19 @@ function Resolve-UcsFirmwarePolicyForTarget {
         policy, per $Global:UcsFirmwarePolicyByFabricFamily - so a 6400 domain gets one policy and a
         6300 domain another, with no operator choice to get wrong.
 
-        If the policy is already present in the domain it is used as-is. If it is missing and
-        creation is permitted, the operator is shown exactly what would be created and must confirm;
-        the package is then created at org-root so service profiles in any organisation can
-        reference it. DRY RUN never creates anything.
+        THE PACKAGE IS UCS CENTRAL'S, NOT THIS SCRIPT'S. Every domain is registered with UCS
+        Central, so the host firmware package is defined there and resolves down to the domain, and
+        all this has to do is confirm it arrived. A package missing from the domain stops the run
+        with where to go and make it.
 
-        A created package is created by NAME ONLY. No blade or rack bundle version is set on it, so
-        it takes its versions from the global firmware setting the name refers to - which is where
-        they are managed. Writing bundle strings from this script would pin the package to whatever
-        was current when the script was last edited, and it would then quietly disagree with that
-        setting rather than follow it.
+        An earlier build created the package locally when it could not find one. That is worse than
+        stopping: a locally created package carries no bundle versions of its own - they are meant
+        to come from the global policy - so it applies cleanly and upgrades nothing while the run
+        reports success. It also fought Central, which refuses local create, delete and modify on
+        anything it owns.
+
+        Once the package is confirmed, the domain's service profile templates are aligned to it, so
+        a template does not put the old package back on the next push or rebind.
 
     .PARAMETER UcsTarget
         UCSM name, for messages and caching.
@@ -1645,173 +1630,39 @@ function Resolve-UcsFirmwarePolicyForTarget {
     $policyName = [string]$Global:UcsFirmwarePolicyByFabricFamily[$fabric.Family]
     Write-Host "  Target host firmware package: $policyName" -ForegroundColor Green
 
+    # lsServer.hostFwPolicyName is capped at 16 characters by the UCSM schema
+    # (r"""[\-\.:_a-zA-Z0-9]{0,16}"""). A longer name cannot be written to a service profile at
+    # all, and the failure that produces is a binding error a long way from the mapping table that
+    # actually caused it.
+    if ($policyName.Length -gt 16) {
+        Stop-WithMessage "Host firmware package name '$policyName' is $($policyName.Length) characters. UCSM allows at most 16 on a service profile, so this name can never be applied. Correct the entry for fabric family '$($fabric.Family)' in `$Global:UcsFirmwarePolicyByFabricFamily."
+    }
+
     $lookup = Get-UcsFirmwarePolicyLookup -PolicyName $policyName -UcsSession $UcsSession
 
     if (-not $lookup.Known) {
-        # Every probe errored. Absence has NOT been established, and creating on a guess is how a
-        # package UCS Central already owned came to be "created" and then refused.
+        # Every probe errored. Absence has NOT been established, and acting on a guess about a
+        # package UCS Central owns is what produced "does NOT exist" for one that plainly did.
         Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Resolve firmware policy" -Result "Unreadable" -Details "$UcsTarget - $policyName - $($lookup.Detail)"
-        Stop-WithMessage "Whether host firmware package '$policyName' exists in $UcsTarget could not be established: $($lookup.Detail) Check the UCSM session before continuing - nothing has been created."
+        Stop-WithMessage "Whether host firmware package '$policyName' exists in $UcsTarget could not be established: $($lookup.Detail) Check the UCSM session before continuing."
     }
 
-    if ($lookup.Exists) {
-        Write-Host "  '$policyName' already exists in $UcsTarget ($($lookup.Detail)) - using it as-is." -ForegroundColor Green
-        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Resolve firmware policy" -Result "Existing" -Details "$UcsTarget - $policyName for fabric family $($fabric.Family). Owner=$(if ($lookup.Owner) { $lookup.Owner } else { 'unknown' }). $($lookup.Detail)"
-        # Already there means already made: no creation, no handover, nothing to prompt about.
-        # Straight on to the templates and then the blades.
-        $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
-        Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget $UcsTarget -UcsSession $UcsSession -PolicyName $policyName
-        return $policyName
+    if (-not $lookup.Exists) {
+        # THIS DOMAIN DOES NOT CREATE PACKAGES. Every domain is registered with UCS Central, so the
+        # package is Central's to define and push; a local one created here would carry no bundle
+        # versions of its own, apply cleanly, and upgrade nothing while the run reported success.
+        # That is the exact failure this path used to produce, so the answer is to stop and say
+        # where the package actually has to come from.
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Resolve firmware policy" -Result "Missing" -Details "$UcsTarget - $policyName is not resolved in this domain for fabric family $($fabric.Family)."
+        Stop-WithMessage "Host firmware package '$policyName' is not present in $UcsTarget. It is a global policy: create it in UCS Central and let it resolve to this domain, then run again. Check that $UcsTarget is registered with UCS Central and that its policy resolution control for host firmware packages is set to Global."
     }
 
-    Write-Host "  '$policyName' does NOT exist in $UcsTarget - creating it." -ForegroundColor Yellow
+    Write-Host "  '$policyName' resolves in $UcsTarget ($($lookup.Detail)) - owner $(if ($lookup.Owner) { $lookup.Owner } else { 'unreported' })." -ForegroundColor Green
+    Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Resolve firmware policy" -Result "Resolved" -Details "$UcsTarget - $policyName for fabric family $($fabric.Family). Owner=$(if ($lookup.Owner) { $lookup.Owner } else { 'unreported' }). $($lookup.Detail)"
 
-    if (Test-DryRun) {
-        Write-Host "  DRY RUN: would create it as a host firmware package at org-root, by name only, using the global firmware setting for its bundle versions." -ForegroundColor Green
-        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "DryRun" -Details "$UcsTarget - would create $policyName by name only; bundle versions come from the global setting."
-        $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
-        Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget $UcsTarget -UcsSession $UcsSession -PolicyName $policyName
-        return $policyName
-    }
-
-    if (-not $Global:AllowUcsFirmwarePolicyCreation) {
-        Stop-WithMessage "Host firmware package '$policyName' is missing from $UcsTarget and policy creation is disabled. Create it in UCSM, or set `$Global:AllowUcsFirmwarePolicyCreation to `$true."
-    }
-
-    # NO PROMPT, at the operator's direction. What is created is fully determined - the name comes
-    # from the fabric family, the org is always org-root, and no bundle version is written - so
-    # there was nothing for the confirmation to decide. It is reported here and in the run summary.
-    Write-Host "    Name          : $policyName" -ForegroundColor Yellow
-    Write-Host "    Organisation  : org-root (global, referencable from any org)" -ForegroundColor Yellow
-    Write-Host "    Bundle version: not set here - taken from the global firmware setting '$policyName'." -ForegroundColor Yellow
-
-    try {
-        # Name and description only. Bundle versions are left unset so the package uses the global
-        # firmware setting rather than a version pinned by this script.
-        Add-UcsFirmwareComputeHostPack -Ucs $UcsSession -Org "org-root" -Name $policyName `
-            -Descr "Created by the firmware batch controller for fabric family $($fabric.Family)." `
-            -ErrorAction Stop | Out-Null
-    }
-    catch {
-        if (Test-UcsRemotePolicyMessage -Message $_.Exception.Message) {
-            # UCS Central owns it. It exists, it is Global, and this domain will not let the script
-            # touch it - which is the state the run wants, reached from the other direction.
-            Write-Host "  '$policyName' is resolved from UCS Central in $UcsTarget - it already exists and is Global." -ForegroundColor Green
-            Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "RemoteOwned" -Details "$UcsTarget - $policyName is resolved from UCS Central; no local create or modify is permitted or needed."
-            $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
-            Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget $UcsTarget -UcsSession $UcsSession -PolicyName $policyName
-            return $policyName
-        }
-        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "Failed" -Details "$UcsTarget - $policyName - $($_.Exception.Message)"
-        Stop-WithMessage "Could not create host firmware package '$policyName' in ${UcsTarget}: $($_.Exception.Message)"
-    }
-
-    # Read it back rather than trusting the create call.
-    if (-not (Test-UcsFirmwarePolicyExists -PolicyName $policyName -UcsSession $UcsSession)) {
-        Stop-WithMessage "Host firmware package '$policyName' was created in $UcsTarget but cannot be read back. Check it in UCSM before continuing."
-    }
-
-    Set-UcsFirmwarePolicyGlobal -PolicyName $policyName -UcsTarget $UcsTarget -UcsSession $UcsSession
-
-    Write-Host "  Created and verified '$policyName' in $UcsTarget." -ForegroundColor Green
-    Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "Created" -Details "$UcsTarget - $policyName created by name only for fabric family $($fabric.Family); bundle versions come from the global setting."
     $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
     Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget $UcsTarget -UcsSession $UcsSession -PolicyName $policyName
     return $policyName
-}
-
-function Set-UcsFirmwarePolicyGlobal {
-    <#
-    .SYNOPSIS
-        Hands a newly created host firmware package to UCS Central - the API equivalent of
-        "Use Global" in UCSM.
-
-    .DESCRIPTION
-        THIS IS THE WHOLE POINT OF THE POLICY. The package is created by name only, with no bundle
-        versions, because the versions are meant to come from the global policy. Left LOCAL it is an
-        empty package: it applies cleanly, changes no firmware, and the run reports success having
-        upgraded nothing. That is what was seen in UCSM - the package created, Owner "local".
-
-        policyOwner is a read-write property of firmwareComputeHostPack. Per Cisco's own ucsmsdk
-        metadata its allowed values are exactly:
-
-            "local"           owned by this UCS domain
-            "pending-policy"  handed over, UCS Central has not taken it yet - UCSM shows
-                              Owner: "Pending Global"
-            "policy"          controlled by UCS Central - Owner: "Global"
-
-        So "Use Global" is a write of policyOwner, and the GUI's "Do you want to make this policy
-        controlled by UCS Central?" confirmation is the write itself - there is no separate
-        acknowledgement object to set afterwards.
-
-        Both "policy" and "pending-policy" are accepted here. Pending is the normal intermediate
-        state while UCS Central picks the change up, not a failure - the handover has been made and
-        the domain is waiting on Central.
-
-        Still "local" afterwards means the handover did not take, which leaves an empty package
-        about to be attached to service profiles. That is put to the operator rather than carried
-        on through.
-    #>
-    param(
-        [Parameter(Mandatory=$true)][string]$PolicyName,
-        [Parameter(Mandatory=$true)][string]$UcsTarget,
-        [Parameter(Mandatory=$true)]$UcsSession
-    )
-
-    if (Test-DryRun) {
-        Write-Host "DRY RUN: would set host firmware package '$PolicyName' in $UcsTarget to Global (policyOwner = policy)." -ForegroundColor Green
-        return
-    }
-
-    Write-Host "  Setting '$PolicyName' to Global (controlled by UCS Central)." -ForegroundColor Yellow
-
-    try {
-        Get-UcsFirmwareComputeHostPack -Ucs $UcsSession -Org "org-root" -Name $PolicyName -ErrorAction Stop |
-            Set-UcsFirmwareComputeHostPack -PolicyOwner "policy" -Force -ErrorAction Stop | Out-Null
-    }
-    catch {
-        if (Test-UcsRemotePolicyMessage -Message $_.Exception.Message) {
-            # "Resolved from remote policy server. Create/Delete/Modify operations are not allowed."
-            # is UCSM saying UCS Central ALREADY owns this package - which is Global, and is what
-            # was being asked for. Reported as a failure it produced "could not be made Global and
-            # would upgrade nothing" for a package that was in exactly the right state.
-            Write-Host "  '$PolicyName' is resolved from UCS Central - it is already Global and this domain cannot modify it." -ForegroundColor Green
-            Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Set policy to Global" -Result "Global" -Details "$UcsTarget - $PolicyName is resolved from UCS Central; no local modify is permitted or needed."
-            return
-        }
-        Write-Host "  Could not set '$PolicyName' to Global: $($_.Exception.Message)" -ForegroundColor Yellow
-        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Set policy to Global" -Result "Failed" -Details "$UcsTarget - $PolicyName - $($_.Exception.Message)"
-    }
-
-    # Read the owner back. The write returning is not proof the domain accepted the handover.
-    $owner = ""
-    try {
-        $policy = Get-UcsFirmwareComputeHostPack -Ucs $UcsSession -Org "org-root" -Name $PolicyName -ErrorAction Stop | Select-Object -First 1
-        if ($null -ne $policy) { $owner = [string]$policy.PolicyOwner }
-    }
-    catch { }
-
-    if ($owner -eq "policy" -or $owner -eq "pending-policy") {
-        $label = if ($owner -eq "policy") { "Global" } else { "Pending Global - UCS Central has not taken it yet" }
-        Write-Host "  '$PolicyName' is now $label." -ForegroundColor Green
-        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Set policy to Global" -Result "Global" -Details "$UcsTarget - $PolicyName - policyOwner=$owner."
-        return
-    }
-
-    # Still local: the package carries no bundle versions, so attaching it would change no firmware
-    # while the run reported success.
-    Write-Host "" -ForegroundColor Yellow
-    Write-Host "  '$PolicyName' is still owned locally (policyOwner=$(if ($owner) { $owner } else { 'unreadable' }))." -ForegroundColor Yellow
-    Write-Host "  This package has NO bundle versions of its own - they are meant to come from the global" -ForegroundColor Yellow
-    Write-Host "  policy. Left local it will apply cleanly and upgrade nothing." -ForegroundColor Yellow
-    Write-Host "  Check that $UcsTarget is registered with UCS Central and that global policy resolution" -ForegroundColor Yellow
-    Write-Host "  is enabled for host firmware packages." -ForegroundColor Yellow
-    Add-ManualAttentionHost -HostName $UcsTarget -Reason "Host firmware package is not Global" -Detail "'$PolicyName' in $UcsTarget has policyOwner=$(if ($owner) { $owner } else { 'unreadable' }). It carries no bundle versions, so as a local policy it will not change any firmware. Set it to Use Global in UCSM, or confirm the domain is registered with UCS Central."
-    Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Set policy to Global" -Result "StillLocal" -Details "$UcsTarget - $PolicyName - policyOwner=$owner; the package has no bundle versions of its own."
-    # NO PROMPT, at the operator's direction: the handover is attempted once and the run carries on
-    # to the blades either way. The entry above and the manual rectification report are how this is
-    # surfaced now, rather than a question mid-run that stops a cluster from being upgraded.
-    Write-Host "  Continuing to the blades. This is on the run summary and the manual rectification report." -ForegroundColor Yellow
 }
 
 function Get-UcsFirmwarePolicyLookup {
@@ -2385,14 +2236,12 @@ function Set-UcsFirmwarePolicyForBatch {
     if ($failedVerification.Count -gt 0) {
         Write-Host "WARNING: One or more service profiles did not verify with the requested target policy after the set command." -ForegroundColor Yellow
         $failedVerification | Select-Object Host,ServiceProfileDn,BeforePolicy,RequestedPolicy,AfterPolicy,Result | Format-Table -AutoSize | Out-Host
-        if (-not (Test-StageNoAck)) {
-            if ($Attempt -ge $MaxAttempts) {
-                Stop-WithMessage "Firmware policy verification still failing after $MaxAttempts attempts for Batch $BatchNumber. Resolve in UCSM before continuing."
-            }
-            $choice = Read-ChoiceExit -Message "Firmware policy verification failed for one or more hosts (attempt $Attempt of $MaxAttempts). R to recheck, X to stop, E to exit" -AllowedChoices @("R","X")
-            if ($choice -eq "X") { Stop-WithMessage "Firmware policy verification failed after set command." }
-            if ($choice -eq "R") { return Set-UcsFirmwarePolicyForBatch -HostNames $HostNames -BatchNumber $BatchNumber -Attempt ($Attempt + 1) -MaxAttempts $MaxAttempts }
+        if ($Attempt -ge $MaxAttempts) {
+            Stop-WithMessage "Firmware policy verification still failing after $MaxAttempts attempts for Batch $BatchNumber. Resolve in UCSM before continuing."
         }
+        $choice = Read-ChoiceExit -Message "Firmware policy verification failed for one or more hosts (attempt $Attempt of $MaxAttempts). R to recheck, X to stop, E to exit" -AllowedChoices @("R","X")
+        if ($choice -eq "X") { Stop-WithMessage "Firmware policy verification failed after set command." }
+        if ($choice -eq "R") { return Set-UcsFirmwarePolicyForBatch -HostNames $HostNames -BatchNumber $BatchNumber -Attempt ($Attempt + 1) -MaxAttempts $MaxAttempts }
     }
 }
 
@@ -3609,23 +3458,6 @@ function Confirm-IntersightDeployAcceptedForBatch {
     return $result
 }
 
-function Confirm-IntersightDeployAccepted {
-    <#
-    .SYNOPSIS
-        Single-profile wrapper over the batch confirmation.
-
-    .DESCRIPTION
-        One implementation of "did the appliance pick the deploy up", so a change to how that is
-        decided cannot land in one path and miss the other.
-    #>
-    param(
-        [Parameter(Mandatory=$true)]$Row,
-        [Parameter(Mandatory=$true)][string]$BatchNumber
-    )
-    $outcome = Confirm-IntersightDeployAcceptedForBatch -Rows @($Row) -BatchNumber $BatchNumber
-    return [bool]$outcome[$Row.Host]
-}
-
 function Get-IntersightRelationshipMoid {
     <#
     .SYNOPSIS
@@ -4447,41 +4279,6 @@ function Wait-IntersightActivationCompleteForBatch {
     return $result
 }
 
-function Wait-IntersightActivationComplete {
-    <#
-    .SYNOPSIS
-        Single-profile wrapper over the batch poll. Returns $true when the activation completed.
-
-    .DESCRIPTION
-        SINGLE mode, and any caller with one profile in hand. There is one implementation of the
-        polling - Wait-IntersightActivationCompleteForBatch - so a fix to how completion is decided
-        cannot land in one path and miss the other.
-
-        Sets $Global:IntersightActivationLastPhase to whatever it was last waiting on, so a caller
-        that gives up says which stage it gave up in rather than just "not activated".
-    #>
-    param(
-        [Parameter(Mandatory=$true)][string]$ProfileMoid,
-        [Parameter(Mandatory=$true)][string]$ServerMoid,
-        [Parameter(Mandatory=$true)][string]$Label,
-        [Parameter(Mandatory=$true)][int]$MaxMinutes
-    )
-
-    $Global:IntersightActivationLastPhase = "not started"
-    if ($MaxMinutes -le 0) {
-        $Global:IntersightActivationLastPhase = "no polling window was allowed"
-        return $false
-    }
-
-    $key = "single"
-    $outcome = Wait-IntersightActivationCompleteForBatch -MaxMinutes $MaxMinutes -Targets @(
-        [pscustomobject]@{ Host = $key; ProfileMoid = $ProfileMoid; ServerMoid = $ServerMoid; Label = $Label }
-    )
-
-    $Global:IntersightActivationLastPhase = [string]$outcome[$key].Phase
-    return [bool]$outcome[$key].Completed
-}
-
 function Invoke-IntersightProfileActivate {
     <#
     .SYNOPSIS
@@ -4686,9 +4483,6 @@ function Invoke-IntersightActivationForBatch {
             }
         }
 
-        # Only claim the post-reboot wait if something genuinely went out or completed.
-        if ($anySent) { $Global:IntersightActivationHeldForBatch = $true }
-
         if ($stillGoing.Count -eq 0) { return }
 
         # --- One decision for the batch, not one per host -----------------------------------------
@@ -4719,22 +4513,6 @@ function Invoke-IntersightActivationForBatch {
 
         $targets = $stillGoing
     }
-}
-
-function Invoke-IntersightActivationPowerCycle {
-    <#
-    .SYNOPSIS
-        Single-profile wrapper over the concurrent batch activation.
-
-    .DESCRIPTION
-        SINGLE mode is a batch of one, so it runs the same code as AUTO. There is one implementation
-        of the activation, which is what keeps the two modes honest about behaving identically.
-    #>
-    param(
-        [Parameter(Mandatory=$true)]$Row,
-        [Parameter(Mandatory=$true)][string]$BatchNumber
-    )
-    Invoke-IntersightActivationForBatch -Rows @($Row) -BatchNumber $BatchNumber
 }
 
 function Invoke-IntersightAcceptAndRebootImmediateForBatch {
@@ -4785,13 +4563,6 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
         return
     }
 
-    if (Test-StageNoAck) {
-        foreach ($row in $pendingRows) {
-            Add-SummaryRecord -Stage "IntersightAcceptReboot" -Batch $BatchNumber -HostName $row.Host -Action "Deploy server profile" -Result "Skipped" -Details "STAGE_NO_ACK mode - no acknowledgement sent."
-        }
-        Write-Host "SAVE ONLY / NO ACKNOWLEDGEMENT mode selected: skipping Intersight accept/reboot for this batch." -ForegroundColor Green
-        return
-    }
 
     if (@($pendingRows | Where-Object { $_.RequiresDeploy }).Count -gt 0) {
         Assert-IntersightUpgradeCmdletSurface
@@ -5074,8 +4845,8 @@ function Select-RunMode {
         report on afterwards. If staging without rebooting is genuinely wanted, it is a change of
         its own, made deliberately in the platform.
 
-        Test-StageNoAck is kept and still returns $false everywhere, so the branches that guarded
-        against it remain harmless. Nothing can select the mode.
+        The guards that used to test for it have gone with it. A mode nothing can select is a
+        branch nothing can reach, and reading them cost more than they protected.
     #>
     Write-Host "`nSelect run mode:`n  1. LIVE RUN`n  2. DRY RUN / VALIDATION ONLY`n  3. Exit" -ForegroundColor Cyan
     $choice = Read-ChoiceExit -Message "Select run mode" -AllowedChoices @("1","2","3")
@@ -5246,55 +5017,6 @@ function Select-BatchMode {
     $mode = if ($choice -eq "2") { "SINGLE" } else { "AUTO" }
     Add-SummaryRecord -Stage "BatchMode" -Batch "" -HostName "" -Action "Select batch mode" -Result $mode -Details "Automatic progression through cluster after each healthy batch."
     return $mode
-}
-
-function Wait-HostProfileComplianceSettle {
-    <#
-    .SYNOPSIS
-        Pauses after a batch is confirmed back in vCenter, before the first host profile compliance scan.
-
-    .DESCRIPTION
-        A host that has just re-registered is not settled. hostd and the profile engine are still
-        starting, and on a stateless host Auto Deploy may still be applying the answer file. A scan
-        run in that window reports differences that resolve themselves shortly after; taken as real
-        they stop the batch and send an operator looking for a fault that is not there.
-
-        Waited once per batch rather than once per host - every host in the batch came back through
-        the same reconnect gate, so one settle covers all of them and a per-host wait would add
-        dead time per host for nothing. Press C to scan now, E to exit.
-    #>
-    param(
-        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,
-        [Parameter(Mandatory=$true)][string]$BatchNumber
-    )
-
-    $minutes = $HostProfileComplianceSettleMinutes
-    if ($minutes -le 0) { return }
-
-    Write-Host "" -ForegroundColor Cyan
-    Write-Host "Batch $BatchNumber is back in vCenter. Waiting $minutes minute(s) for the host(s) to settle before the compliance scan." -ForegroundColor Cyan
-    Write-Host "  Hosts: $($HostNames -join ', ')" -ForegroundColor Gray
-    Write-Host "  Press C to scan now, E to exit." -ForegroundColor Cyan
-
-    $endTime = (Get-Date).AddMinutes($minutes)
-    $lastAnnounced = -1
-    while ((Get-Date) -lt $endTime) {
-        $key = Read-PendingConsoleKey
-        if ($key -eq "E") { Stop-SafeExit -Message "Stopped during the host profile compliance settle wait." }
-        if ($key -eq "C") {
-            Write-Host "  Settle wait ended early by the operator." -ForegroundColor Yellow
-            Add-SummaryRecord -Stage "HostProfileComplianceSettle" -Batch $BatchNumber -HostName "" -Action "Settle wait" -Result "Skipped" -Details "Operator scanned before the $minutes minute settle elapsed."
-            return
-        }
-        $remaining = [int][math]::Ceiling(($endTime - (Get-Date)).TotalSeconds)
-        if ($remaining -ne $lastAnnounced -and ($remaining % 30) -eq 0) {
-            Write-Host "  $remaining second(s) remaining..." -ForegroundColor Gray
-            $lastAnnounced = $remaining
-        }
-        Start-Sleep -Seconds 1
-    }
-
-    Add-SummaryRecord -Stage "HostProfileComplianceSettle" -Batch $BatchNumber -HostName "" -Action "Settle wait" -Result "Completed" -Details "Waited $minutes minute(s) after reconnect before scanning compliance."
 }
 
 function Wait-VMHostProfileComplianceTask {
@@ -5731,6 +5453,18 @@ function Confirm-SingleHostComplianceAndExit {
     )
 
     $hostName = $HostName
+
+    # DRY RUN CHANGES NOTHING. This guard used to live one level up, in the batch function that
+    # called this one for every host in turn. When the rolling engine replaced that function the
+    # guard went with it, and DRY RUN was left running a real compliance scan and then issuing a
+    # real Set-VMHost -State Connected against any host it found in Maintenance mode. Nothing else
+    # in a DRY RUN touches the estate; this did.
+    if (Test-DryRun) {
+        Write-Host "DRY RUN: would scan '$hostName' against its host profile, then take it out of Maintenance mode if it passed." -ForegroundColor Green
+        Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "DryRun" -Details "No compliance scan issued and no Maintenance mode change made."
+        return
+    }
+
     Write-Host "" -ForegroundColor Cyan
     Write-Host "Host profile compliance check for '$hostName' (Batch $BatchNumber)..." -ForegroundColor Cyan
 
@@ -5818,66 +5552,6 @@ function Confirm-SingleHostComplianceAndExit {
         }
     }
 
-}
-
-function Confirm-HostProfileComplianceAndExitMaintenance {
-    <#
-    .SYNOPSIS
-        Per host: verify host profile compliance, then take the host out of Maintenance mode.
-
-    .DESCRIPTION
-        Runs once the batch is confirmed back in vCenter, and waits
-        $HostProfileComplianceSettleMinutes first so the hosts are past the noisy window straight
-        after re-registration. Then, for each host in turn while it is still in Maintenance mode, a
-        compliance scan is run to completion - not read from vCenter's cache - and the resulting
-        status decides what happens:
-
-          Compliant - the host is taken out of Maintenance mode and the run moves on by itself.
-                      This is the ONLY status that continues without asking.
-
-          ANYTHING ELSE - NonCompliant, Unknown, or NoProfile - halts the run. The host stays in
-          Maintenance mode, the batch does not advance, and the operator is told to resolve the
-          host profile issue manually in vCenter before continuing. Then:
-
-            C - continue: the issue has been resolved. The host is re-checked, and once it reports
-                Compliant it comes out of Maintenance mode and the run carries on automatically.
-                If it still is not compliant, the halt repeats.
-            O - override: accept the host as it is and return it to service.
-            E - exit safely, leaving the host in Maintenance mode.
-
-        Unknown halts for the same reason NonCompliant does: an unreadable result is not a pass,
-        and a scan that could not be completed lands there too.
-
-        The override exists because a host can be held back by a difference the operator has already
-        assessed and accepted, and stalling a change window on it helps nobody. It is a deliberate
-        decision, not a shortcut: the host is returned to service against a profile it does not
-        match, so it is announced on screen and recorded in the run summary as Overridden, naming
-        the status that was accepted.
-
-        Applies to every reboot path - UCS Manager, Intersight, and ESXi-only - since all three
-        return the host through the same Maintenance mode cycle. It also applies identically to
-        both batch modes: SINGLE is a batch of one through this same loop, and AUTO runs the same
-        per-host gate over every host in the batch, so an Intersight host is gated the same way
-        whichever mode selected it.
-    #>
-    param(
-        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,
-        [Parameter(Mandatory=$true)][string]$BatchNumber
-    )
-
-    if ((Test-DryRun) -or (Test-StageNoAck)) {
-        Write-Host "DRY/STAGE: Would wait $HostProfileComplianceSettleMinutes minute(s), scan host profile compliance for $($HostNames -join ', '), then exit Maintenance mode for each compliant host." -ForegroundColor Green
-        foreach ($hostName in $HostNames) {
-            Add-SummaryRecord -Stage "HostProfileCompliance" -Batch $BatchNumber -HostName $hostName -Action "Check compliance" -Result "DryRun" -Details "No settle wait and no compliance scan issued."
-        }
-        return
-    }
-
-    Wait-HostProfileComplianceSettle -HostNames $HostNames -BatchNumber $BatchNumber
-
-    foreach ($hostName in $HostNames) {
-        Confirm-SingleHostComplianceAndExit -HostName $hostName -BatchNumber $BatchNumber
-    }
 }
 
 function Test-VMHostObjectInMaintenance {
@@ -5979,7 +5653,7 @@ function Wait-VMHostOutOfMaintenance {
         [int]$TimeoutMinutes = 10
     )
 
-    if ((Test-DryRun) -or (Test-StageNoAck)) { return $true }
+    if (Test-DryRun) { return $true }
 
     $endTime = (Get-Date).AddMinutes($TimeoutMinutes)
     $announced = $false
@@ -6188,7 +5862,7 @@ function Request-MaintenanceModeForBatch {
     #>
     param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames)
 
-    if ((Test-DryRun) -or (Test-StageNoAck)) { Write-Host "DRY/STAGE: Would request Maintenance mode, one at a time, for $($HostNames -join ', ')." -ForegroundColor Green; return }
+    if (Test-DryRun) { Write-Host "DRY RUN: would request Maintenance mode, one at a time, for $($HostNames -join ', ')." -ForegroundColor Green; return }
 
     Write-Host "Entering Maintenance mode one host at a time, in cluster order: $($HostNames -join ', ')" -ForegroundColor Cyan
 
@@ -6249,7 +5923,7 @@ function Request-MaintenanceModeForBatch {
 
 function Wait-BatchMaintenanceMode {
     param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,[int]$TimeoutMinutes=60)
-    if ((Test-DryRun) -or (Test-StageNoAck)) { return @(foreach ($name in $HostNames) { Get-VMHost -Name $name -ErrorAction SilentlyContinue }) }
+    if (Test-DryRun) { return @(foreach ($name in $HostNames) { Get-VMHost -Name $name -ErrorAction SilentlyContinue }) }
     $timeout = (Get-Date).AddMinutes($TimeoutMinutes)
     do {
         $notReady = @($HostNames | Where-Object { -not (Get-VMHostMaintenanceState -HostName $_).InMaintenance })
@@ -6412,7 +6086,7 @@ function Invoke-RollingClusterUpgrade {
 
                 # DRY RUN never reboots anything, so nothing will ever "come back". Take these
                 # straight to the gate, which reports its own intent and changes nothing.
-                if ((Test-DryRun) -or (Test-StageNoAck)) {
+                if (Test-DryRun) {
                     foreach ($tracker in $inFlight.ToArray()) { $tracker.Stage = "Compliance" }
                 }
             }
@@ -6691,62 +6365,6 @@ function Save-BatchBootTimes {
     }
 }
 
-function Get-BatchConnectionStateSummary {
-    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames)
-    return @(foreach ($hostName in $HostNames) {
-        $h = Get-VMHost -Name $hostName -ErrorAction SilentlyContinue
-        if ($h) {
-            $bootTime = Get-VMHostBootTime -VMHostObject $h
-            # Rebooted is Unknown, not False, when there is nothing to compare against. Treating a
-            # missing baseline as "did not reboot" would stall a run that is otherwise fine.
-            $rebooted = "Unknown"
-            if ($Global:PreRebootBootTimes.ContainsKey($hostName)) {
-                $before = [string]$Global:PreRebootBootTimes[$hostName]
-                if ([string]::IsNullOrWhiteSpace($before) -or [string]::IsNullOrWhiteSpace($bootTime)) { $rebooted = "Unknown" }
-                elseif ($bootTime -ne $before) { $rebooted = "Yes" }
-                else { $rebooted = "No" }
-            }
-            [pscustomobject]@{Host=$h.Name;Found=$true;ConnectionState=[string]$h.ConnectionState;PowerState=[string]$h.PowerState;Build=$h.Build;Rebooted=$rebooted}
-        }
-        else { [pscustomobject]@{Host=$hostName;Found=$false;ConnectionState="NotFound";PowerState="Unknown";Build="";Rebooted="Unknown"} }
-    })
-}
-
-function Wait-BatchReconnectAfterReboot {
-    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$HostNames,[int]$InitialWaitMinutes,[string]$ModeLabel)
-    if ((Test-DryRun) -or (Test-StageNoAck)) { return (Get-BatchConnectionStateSummary -HostNames $HostNames) }
-    Write-Host "$ModeLabel initial wait: $InitialWaitMinutes minutes. Press R to recheck early, E to exit." -ForegroundColor Yellow
-    $endTime = (Get-Date).AddMinutes($InitialWaitMinutes)
-    while ((Get-Date) -lt $endTime) {
-        $key = Read-PendingConsoleKey
-        if ($key -eq "E") { Stop-SafeExit -Message "Stopped during post-reboot wait." }
-        if ($key -eq "R") { break }
-        Start-Sleep -Seconds 1
-    }
-    do {
-        $summary = Get-BatchConnectionStateSummary -HostNames $HostNames
-        $summary | Format-Table -AutoSize | Out-Host
-
-        # A host counts as back only when vCenter has it in inventory in a usable state AND its
-        # boot time has changed. Connection state alone cannot tell "came back" from "never left",
-        # and on a firmware run the difference is whether the compliance scan and the return to
-        # service happen against the new firmware or the old. Rebooted=Unknown is accepted - it
-        # means there was no baseline to compare, not that the host failed to restart.
-        $bad = @($summary | Where-Object {
-            ($_.ConnectionState -ne "Connected" -and $_.ConnectionState -ne "Maintenance") -or ($_.Rebooted -eq "No")
-        })
-        if ($bad.Count -eq 0) { return $summary }
-
-        $notRebooted = @($bad | Where-Object { $_.Rebooted -eq "No" })
-        if ($notRebooted.Count -gt 0) {
-            Write-Host "Still waiting for these host(s) to actually restart - vCenter reports the same boot time as before: $(($notRebooted | Select-Object -ExpandProperty Host) -join ', ')" -ForegroundColor Yellow
-        }
-        $choice = Read-ChoiceExit -Message "Reconnect incomplete. R to recheck, O to override, X to stop, E to exit" -AllowedChoices @("R","O","X")
-        if ($choice -eq "X") { return $null }
-        if ($choice -eq "O") { return $summary }
-    } while ($true)
-}
-
 function Reset-ClusterScopedState {
     <#
     .SYNOPSIS
@@ -6771,7 +6389,6 @@ function Reset-ClusterScopedState {
 
     $Global:UcsHostMap = @{}
     $Global:UcsServiceProfileCache = @{}
-    $Global:UcsCandidateCache = @{}
     $Global:IntersightHostMap = @{}
     $Global:IntersightProfileCache = @{}
     $Global:IntersightSkippedHosts = @{}
@@ -6878,8 +6495,8 @@ function Show-ClusterFirmwareVerification {
     Write-Host "" -ForegroundColor Cyan
     Write-Host "=== Post-change verification: $($Cluster.Name) ===" -ForegroundColor Cyan
 
-    if ((Test-DryRun) -or (Test-StageNoAck)) {
-        Write-Host "DRY/STAGE: no verification read - nothing was changed." -ForegroundColor Green
+    if (Test-DryRun) {
+        Write-Host "DRY RUN: no verification read - nothing was changed." -ForegroundColor Green
         return
     }
 
@@ -7213,7 +6830,6 @@ function Invoke-ClusterUpgradeWorkflow {
     # Asked for now, while nothing is down. By the time it is needed a host is already offline and
     # evacuated, and that is the worst moment to go looking for a password.
     Request-EsxiRootCredential -ClusterName $Cluster.Name
-    if ((Test-StageNoAck) -and $Global:UpgradeMode -ne "ESXI_UCS_FIRMWARE") { Stop-WithMessage "STAGE_NO_ACK is only valid with UCSM firmware mode." }
 
     $allClusterHosts = @(Get-VMHost -Location $Cluster | Sort-Object Name)
     if ($allClusterHosts.Count -eq 0) { Stop-WithMessage "No hosts found in selected cluster." }
@@ -7279,7 +6895,7 @@ function Invoke-ClusterUpgradeWorkflow {
     }
 
     # Only the blades with changes pending are worth a maintenance window slot.
-    if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE" -and -not (Test-StageNoAck)) {
+    if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") {
         $patchCandidateHosts = @(Remove-IntersightHostsAlreadyDeployed -CandidateHosts $patchCandidateHosts)
         # Same question for the UCS Manager-routed hosts: a host already carrying the target package
         # AND already running the version it encodes has nothing to do, and batching it spends a
