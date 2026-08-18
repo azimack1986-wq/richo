@@ -53,11 +53,11 @@ function Get-Module { param($Name,[switch]$ListAvailable)
     if ($ListAvailable) { return @() }   # never used directly - see the cache assertion below
     if ($script:Loaded -contains $Name) { return [pscustomobject]@{ Name = $Name } }
     return $null }
-function Get-AvailableModuleVersion { param($Name,[switch]$Refresh)
-    if ($script:Available -contains $Name) { return [pscustomobject]@{ Name = $Name; Version = '1.0' } }
-    return $null }
 function Import-Module { param($Name,$ErrorAction)
+    # A module that is not installed throws here - which is exactly how the real cmdlet behaves,
+    # and why no availability probe is needed in front of it.
     if ($script:ImportFails -contains $Name) { throw "blocked by policy" }
+    if ($script:Available -notcontains $Name) { throw "The specified module '$Name' was not loaded because no valid module file was found in any module directory." }
     $script:Imported.Add($Name) }
 
 function Reset-ModuleState {
@@ -122,7 +122,7 @@ $importFn = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Lang
 Assert-Equal "no Install-Module" $true (-not ($importFn.Extent.Text -match 'Install-Module'))
 Assert-Equal "no Update-Module" $true (-not ($importFn.Extent.Text -match 'Update-Module'))
 Assert-Equal "no Save-Module" $true (-not ($importFn.Extent.Text -match 'Save-Module'))
-Assert-Equal "availability goes through the cache, not Get-Module -ListAvailable" $true ($importFn.Extent.Text -match 'Get-AvailableModuleVersion -Name \$name')
+Assert-Equal "it imports rather than probing availability first" $true (-not ($importFn.Extent.Text -match 'Get-Module -ListAvailable'))
 Assert-Equal "and the already-loaded guard is still there" $true ($importFn.Extent.Text -match 'Get-Module -Name \$name')
 
 Write-Host "`n=== It is the first thing the pre-flight does ===" -ForegroundColor Cyan

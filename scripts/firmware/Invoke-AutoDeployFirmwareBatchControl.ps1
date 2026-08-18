@@ -350,7 +350,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.10.0"
+$ScriptVersion = "23.10.1"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -844,13 +844,11 @@ function Import-RequiredModules {
         if ($loaded) { continue }
 
         foreach ($name in $entry.Names) {
-            # Through the cache, never Get-Module -ListAvailable directly: enumerating
-            # Intersight.PowerShell's manifest is slow enough on a network module path to read
-            # as a hang, and this loop would otherwise repeat it for every candidate name.
-            if ($null -eq (Get-AvailableModuleVersion -Name $name)) {
-                [void]$tried.Add("$name (not installed for this PowerShell)")
-                continue
-            }
+            # Straight to the import. No availability probe in front of it: Get-Module
+            # -ListAvailable walks every entry in $env:PSModulePath and parses each manifest it
+            # finds, which for Intersight.PowerShell is slow enough on a network module path to
+            # read as a hang - and it answers a question the import itself already answers. A
+            # module that is not installed throws here and is recorded by the catch below.
             try {
                 Import-Module -Name $name -ErrorAction Stop
                 Write-Host "  $($entry.Purpose): loaded $name." -ForegroundColor Green

@@ -50,6 +50,19 @@ function Assert-NoFindings {
 
 $readOnlyAutomatics = @('host','true','false','null','pid','pshome','psculture','psuiculture','psversiontable','myinvocation','executioncontext')
 
+# Every function defined anywhere in the scripts being linted, and where it lives. Used by rule 8
+# to catch a script calling a helper that only exists in a SIBLING script - see there for why.
+$definedAnywhere = @{}
+foreach ($path in $targets) {
+    $e = $null; $tk = $null
+    $a = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tk, [ref]$e)
+    if ($e) { continue }
+    foreach ($f in $a.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        if (-not $definedAnywhere.ContainsKey($f.Name)) { $definedAnywhere[$f.Name] = New-Object System.Collections.Generic.List[string] }
+        [void]$definedAnywhere[$f.Name].Add((Split-Path $path -Leaf))
+    }
+}
+
 foreach ($path in $targets) {
     $name = Split-Path $path -Leaf
     Write-Host "`n=== $name ===" -ForegroundColor Cyan
@@ -176,7 +189,9 @@ foreach ($path in $targets) {
     }
     foreach ($fn in $importFunction) {
         if ($fn.Extent.Text -notmatch 'Get-Module -Name \$name') { $imports += "Import-RequiredModules no longer checks Get-Module before importing" }
-        if ($fn.Extent.Text -notmatch 'Get-AvailableModuleVersion -Name \$name') { $imports += "Import-RequiredModules no longer checks the module is installed before importing" }
+        # Deliberately NO availability probe: Get-Module -ListAvailable answers a question the
+        # import itself answers, and pays for walking every PSModulePath entry to do it.
+        if ($fn.Extent.Text -match 'Get-Module -ListAvailable') { $imports += "Import-RequiredModules probes availability instead of just importing" }
         if ($fn.Extent.Text -match '(?i)Install-Module|Update-Module') { $imports += "Import-RequiredModules must never install or update a module" }
     }
     $imports += @(
@@ -268,6 +283,36 @@ foreach ($path in $targets) {
     else {
         Assert-NoFindings "module enumeration is bounded" @($enumerations | Select-Object -Skip 3)
     }
+
+    # --- 8. A helper that only exists in a SIBLING script ---------------------------------------
+    # SHIPPED AND HIT ON A LIVE RUN. A change routed Import-RequiredModules through
+    # Get-AvailableModuleVersion in both variants, but that helper is a declared parity exception
+    # and exists only in the Control build. The PreAuth build - the one that gets run - died on its
+    # first line of work with "The term 'Get-AvailableModuleVersion' is not recognized".
+    #
+    # Nothing caught it. The tests import functions by name into a scope where the stubs already
+    # exist, so a missing definition never surfaces; the parity test allows the two files to differ
+    # in declared places; and the dead-code scan looks for functions DEFINED and never called, not
+    # for functions CALLED and never defined.
+    #
+    # Only names that are functions somewhere in this repo are considered, so vendor cmdlets and
+    # PowerShell built-ins cannot produce a false finding.
+    $definedHere = @{}
+    foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        $definedHere[$f.Name] = $true
+    }
+    $foreignCalls = @(
+        $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+            Where-Object {
+                $called = $_.GetCommandName()
+                $called -and $definedAnywhere.ContainsKey($called) -and -not $definedHere.ContainsKey($called)
+            } |
+            ForEach-Object {
+                $called = $_.GetCommandName()
+                "line $($_.Extent.StartLineNumber): calls '$called', which is only defined in $(($definedAnywhere[$called] | Sort-Object -Unique) -join ', ')"
+            }
+    )
+    Assert-NoFindings "every helper it calls is defined in this script" $foreignCalls
 }
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })

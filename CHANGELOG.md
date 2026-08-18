@@ -12,6 +12,38 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.10.1] — 2026-08-18
+
+#### Fixed
+
+- **Every run died immediately with "The term 'Get-AvailableModuleVersion' is not
+  recognized".** `Import-RequiredModules` (new in 23.8.0) checked whether a module
+  was installed before importing it, and routed that check through
+  `Get-AvailableModuleVersion` — a helper that is a **declared parity exception**
+  and exists only in the Control build. The pre-auth build, which is the one that
+  gets run, had no such function.
+
+  The probe is gone rather than duplicated, at the operator's direction: the
+  import is now simply attempted. `Get-Module -ListAvailable` answers a question
+  the import itself answers, and pays for walking every `$env:PSModulePath` entry
+  and parsing each manifest to do it — which on a network module path is the very
+  slowness this whole area exists to avoid. A module that is not installed throws
+  on import and is recorded, exactly as one that fails to load already was.
+
+  The already-loaded `Get-Module` guard is untouched, so a pinned bundle is still
+  never disturbed, and nothing is installed or upgraded.
+
+- **Nothing in the test suite could have caught it, so a rule was added.** The
+  suites import functions by name into a scope where the stubs already exist, so a
+  missing definition never surfaces; the parity test permits the two builds to
+  differ in declared places; and the dead-code scan looks for functions DEFINED
+  and never called, not for functions CALLED and never defined.
+
+  `Test-ScriptLint` now fails any script that calls a function which is defined
+  only in a sibling script. Only names that are functions somewhere in this repo
+  are considered, so vendor cmdlets and built-ins cannot produce a false finding.
+  Verified to bite by reintroducing the exact fault.
+
 ### [23.10.0] — 2026-08-18
 
 #### Added
@@ -2549,6 +2581,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.10.1-preauth] — 2026-08-18
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.10.1 — fixes the
+`Get-AvailableModuleVersion` error that stopped every run of 23.8.0 through
+23.10.0 on this build. This is the build to run.
 
 ### [23.10.0-preauth] — 2026-08-18
 
