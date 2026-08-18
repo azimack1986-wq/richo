@@ -12,6 +12,97 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.8.0] — 2026-08-18
+
+#### Added
+
+- **The modules the run needs are loaded explicitly, once, each behind a
+  `Get-Module` guard.** Auto-loading was failing on random servers inside the VS
+  Code integrated console, and the cmdlets came back "not recognized".
+
+  Auto-loading depends on the command discovery cache, and building it means
+  walking every entry in `$env:PSModulePath` and parsing each manifest found.
+  `Intersight.PowerShell` exports several thousand cmdlets and PowerCLI is dozens
+  of modules, so on a cold cache — a new session, a network module path, a roaming
+  profile share — a reference can resolve before the scan has reached the module.
+
+  `Import-RequiredModules` covers `VMware.VimAutomation.Core`,
+  `Intersight.PowerShell` and UCS PowerTool (trying `Cisco.UCSManager`,
+  `Cisco.UCS.Core` and `CiscoUcsPS` in turn, since the module has been renamed
+  across releases). A module already in the session is left exactly as it is, so a
+  pinned bundle is never disturbed, and **nothing is installed or upgraded**. A
+  module that will not load is reported and the run continues to the checks that
+  can say precisely what is missing.
+
+- **UCS Manager and Intersight are probed before the login, with a 60-second
+  budget, and an unreachable endpoint says so.** A firewall that DENIES a port
+  sends a reset and the connect fails at once; one that DROPS it sends nothing, so
+  the client sat on its own timeout — minutes, with no output — and then reported
+  something about credentials, which sends the operator to the wrong team.
+
+  HTTPS first, then HTTP, only to tell "nothing gets through" from "TLS is the
+  problem". When neither answers, the message names the jump box, the endpoint and
+  both ports, and says a firewall rule may need to be raised. `R` re-probes for
+  the common case of the rule being raised while the run waits, `C` continues
+  anyway, `E` exits.
+
+- **Every service profile TEMPLATE in a UCS domain is checked against the target
+  host firmware package**, once, when that domain's policy is resolved. Templates
+  already naming the target are reported compliant and left alone. Setting only
+  the service profiles fixed the blades in the cluster and left the domain to undo
+  it — on the next template push, on a rebind, or on the next profile created from
+  that template.
+
+  A template change raises a pending activity on the profiles bound to it; it does
+  not reboot anything. This run acknowledges only the blades in its own batches,
+  and says on screen that anything else is left pending. A template UCS Central
+  owns is reported as managed there, not as a failure.
+
+#### Fixed
+
+- **The host firmware package was created when it already existed, and then the
+  handover was reported as failed.** Live output: *"'global-436h' does NOT exist in
+  PD21000001SS004"*, then *"Could not set 'global-436h' to Global: Policy
+  org-root/fw-host-pack-global-436h is resolved from remote policy server.
+  Create/Delete/Modify operations are not allowed."*
+
+  Two separate faults:
+
+  1. `Get-UcsFirmwareComputeHostPack` was called with `-ErrorAction
+     SilentlyContinue`, so a query that FAILED returned an empty list and read as
+     "the package is not there". `Get-UcsFirmwarePolicyLookup` now probes by org
+     and name, by distinguished name, and finally the full list, and reports
+     Exists / Absent / **Unknown** as three different answers. Unknown stops the
+     run rather than creating on a guess.
+  2. *"Resolved from remote policy server"* is UCSM saying UCS Central **already
+     owns** the package — which is Global, and is what was being asked for.
+     Reported as a failure it produced "could not be made Global and would upgrade
+     nothing" for a package in exactly the right state. It is now recognised as
+     success, on the create path, the set-Global path and the template path alike.
+
+- **A host that vCenter dropped got one reconnect attempt.** A host that has just
+  rebooted onto new firmware routinely refuses the first one — hostd still
+  starting, the vmk not up, the certificate being regenerated — and a single try
+  wrote those off as unrecoverable. Now **three attempts, two minutes apart**, and
+  when they run out the operator is asked rather than the host being abandoned:
+  `R` retries the full set after manual intervention, `S` sets it aside for the
+  manual rectification report and releases its slot so the rest of the cluster
+  continues, `E` exits.
+
+#### Changed
+
+- **The UCS firmware policy no longer prompts, at the operator's direction.** The
+  create confirmation is gone — what gets created is fully determined (the name
+  from the fabric family, the org always `org-root`, no bundle version written),
+  so there was nothing for the question to decide. A package that already exists
+  is used as-is and goes straight to the templates and the blades. A handover that
+  does not take is recorded and listed for manual rectification, and the run
+  carries on rather than stopping mid-change.
+
+  The trade, stated plainly: a domain that is not registered with UCS Central will
+  now get a local, empty package attached and the run will report it afterwards
+  rather than stopping in front of it.
+
 ### [23.7.0] — 2026-08-14
 
 #### Fixed
@@ -2319,6 +2410,14 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.8.0-preauth] — 2026-08-18
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.8.0 — modules are loaded
+explicitly, UCS Manager and Intersight are probed for reachability before the
+login, service profile templates are aligned to the target firmware package, the
+policy path no longer prompts, and a dropped host gets three reconnect attempts.
+This is the build to run.
 
 ### [23.7.0-preauth] — 2026-08-14
 

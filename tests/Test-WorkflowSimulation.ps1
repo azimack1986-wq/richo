@@ -198,6 +198,9 @@ function Test-VMHostProfileCompliance {
     return [pscustomobject]@{ ComplianceStatus = 'Compliant'; CheckTime = (Get-Date) }
 }
 
+# The endpoint probe that now runs ahead of both logins. Answering means the run never sees the
+# firewall prompt, which is the correct simulation of a jump box that can reach its estate.
+function Test-TcpPortOpen { param($ComputerName,$Port,$TimeoutSeconds) Note-Call 'Test-TcpPortOpen'; return $true }
 function Connect-Ucs { param($Name,$Credential,$ErrorAction) Note-Call 'Connect-Ucs'; return [pscustomobject]@{ Ucs = $Name } }
 function Disconnect-Ucs { param($Ucs,$ErrorAction) }
 function Get-UcsPSSession { param($ErrorAction) return @() }

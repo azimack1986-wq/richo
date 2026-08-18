@@ -60,6 +60,8 @@ $Global:PreRebootBootTimes = @{}
 # host either comes back or it does not.
 $Global:EsxiRootCredential = $null
 $HostReconnectAfterDisconnectMinutes = 5
+$HostReconnectMaxAttempts = 3
+$HostReconnectRetryPauseMinutes = 2
 $Global:BatchActionsSent = 0
 $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
 $Global:ExcludedFromRunHosts = @{}
@@ -69,6 +71,8 @@ function Add-SummaryRecord { param($Stage,$Batch,$HostName,$Action,$Result,$Deta
     $Global:RunSummary.Add([pscustomobject]@{ Stage=$Stage; Batch=$Batch; Host=$HostName; Action=$Action; Result=$Result; Details=$Details }) }
 function Stop-SafeExit { param($Message) throw "EXIT: $Message" }
 function Stop-WithMessage { param($Message) throw "STOP: $Message" }
+function Add-ManualAttentionHost { param($HostName,$Reason,$Detail,$ClusterName,[switch]$ExcludeFromRun)
+    $Global:ManualAttentionHosts.Add([pscustomobject]@{ Host=$HostName; Reason=$Reason; Detail=$Detail; Excluded=[bool]$ExcludeFromRun }) }
 
 # --- Fake clock ---------------------------------------------------------------------------------
 $script:Now = [datetime]'2026-08-12T00:00:00'
@@ -178,6 +182,65 @@ Invoke-RollingClusterUpgrade -Cluster $cluster -OrderedHostNames @('esx01','esx0
 Assert-Equal "DRY RUN rebooted nothing" 0 (@($script:Log | Where-Object { $_ -like 'reboot:*' }).Count)
 Assert-Equal "and still reached every host" 3 (@($script:Log | Where-Object { $_ -like 'complete:*' }).Count)
 $Global:RunMode = 'LIVE'
+
+Write-Host "`n=== A disconnected host gets three reconnect attempts, two minutes apart ===" -ForegroundColor Cyan
+# One attempt was not enough. A host that has just rebooted onto new firmware routinely refuses the
+# first reconnect - hostd still starting, the vmk not up, the certificate being regenerated - and a
+# single try wrote those off as unrecoverable when the next would have taken them.
+Reset-Cluster -Count 2 -Returns @{ esx01 = 9999; esx02 = 10 }
+$script:ReconnectCalls = New-Object System.Collections.Generic.List[string]
+$script:ReconnectSucceedsOn = 0        # 0 = never
+$script:Answers = New-Object System.Collections.Generic.Queue[string]
+
+function Test-VMHostDisconnected { param($HostName) return ($HostName -eq 'esx01') }
+function Restore-DisconnectedVMHost { param($HostName,$TimeoutMinutes)
+    $script:ReconnectCalls.Add("$HostName@$($script:Now.ToString('HH:mm'))")
+    if ($script:ReconnectSucceedsOn -gt 0 -and $script:ReconnectCalls.Count -ge $script:ReconnectSucceedsOn) {
+        $script:Hosts[$HostName].ConnectionState = 'Connected'
+        $script:Hosts[$HostName].ExtensionData.Runtime.BootTime = '2026-08-12T01:00:00Z'
+        return $true
+    }
+    return $false }
+function Read-ChoiceExit { param($Message,$AllowedChoices,$ExitMessage)
+    if ($script:Answers.Count -eq 0) { throw "EXIT: $ExitMessage" }
+    return $script:Answers.Dequeue() }
+
+$script:Answers.Enqueue('S')   # set aside once the attempts run out
+Invoke-RollingClusterUpgrade -Cluster $cluster -OrderedHostNames @('esx01','esx02') -BatchMode 'AUTO' 6>$null
+
+Assert-Equal "exactly three attempts were made" 3 $script:ReconnectCalls.Count
+$times = @($script:ReconnectCalls.ToArray() | ForEach-Object { [datetime]::ParseExact(($_ -split '@')[1], 'HH:mm', $null) })
+Assert-Equal "the second is two minutes after the first" 2 ([int](($times[1] - $times[0]).TotalMinutes))
+Assert-Equal "and the third two minutes after that" 2 ([int](($times[2] - $times[1]).TotalMinutes))
+Assert-Equal "each attempt is recorded" 3 (@($Global:RunSummary.ToArray() | Where-Object { $_.Action -eq 'Reconnect host' -and $_.Result -eq 'Retrying' }).Count)
+
+Write-Host "`n=== Out of attempts, the operator is asked - not the host abandoned ===" -ForegroundColor Cyan
+Assert-Equal "set aside on the record" 1 (@($Global:RunSummary.ToArray() | Where-Object { $_.Result -eq 'SetAside' }).Count)
+Assert-Equal "and listed for manual rectification" 1 (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Host -eq 'esx01' -and $_.Reason -match 'could not be reconnected' }).Count)
+Assert-Equal "the rest of the cluster still completed" $true (@($script:Log | Where-Object { $_ -eq 'complete:esx02' }).Count -ge 1)
+
+Write-Host "`n=== A reconnect that works stops the retries and rejoins the normal flow ===" -ForegroundColor Cyan
+Reset-Cluster -Count 1 -Returns @{ esx01 = 9999 }
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$script:ReconnectCalls = New-Object System.Collections.Generic.List[string]
+$script:ReconnectSucceedsOn = 2
+$script:Answers.Clear()
+Invoke-RollingClusterUpgrade -Cluster $cluster -OrderedHostNames @('esx01') -BatchMode 'AUTO' 6>$null
+Assert-Equal "it stopped at the attempt that worked" 2 $script:ReconnectCalls.Count
+Assert-Equal "recorded as reconnected" 1 (@($Global:RunSummary.ToArray() | Where-Object { $_.Result -eq 'Reconnected' }).Count)
+Assert-Equal "nothing was left for manual rectification" 0 $Global:ManualAttentionHosts.Count
+Assert-Equal "and the host completed" 1 (@($script:Log | Where-Object { $_ -eq 'complete:esx01' }).Count)
+
+Write-Host "`n=== R gives it another three attempts after manual intervention ===" -ForegroundColor Cyan
+Reset-Cluster -Count 1 -Returns @{ esx01 = 9999 }
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$script:ReconnectCalls = New-Object System.Collections.Generic.List[string]
+$script:ReconnectSucceedsOn = 5        # works on the 5th, which is the 2nd of the second round
+$script:Answers.Clear(); $script:Answers.Enqueue('R')
+Invoke-RollingClusterUpgrade -Cluster $cluster -OrderedHostNames @('esx01') -BatchMode 'AUTO' 6>$null
+Assert-Equal "the retries resume rather than stopping at three" 5 $script:ReconnectCalls.Count
+Assert-Equal "the operator retry is on the record" 1 (@($Global:RunSummary.ToArray() | Where-Object { $_.Result -eq 'OperatorRetry' }).Count)
+Assert-Equal "and the host came back" 1 (@($script:Log | Where-Object { $_ -eq 'complete:esx01' }).Count)
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

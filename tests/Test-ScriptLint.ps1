@@ -125,25 +125,59 @@ foreach ($path in $targets) {
     # Import-Module reads as an instruction from the script, and one sat in the PowerCLI load
     # diagnostic through several releases while this rule passed - it was only looking for a
     # CommandAst. Comments are exempt: describing the rule is not breaking it.
-    # ONE exception, and only one: the guarded load in the AUTHENTICATION region. Auto-loading
-    # Intersight.PowerShell from a cold command-discovery cache failed on the FIRST run of every
-    # new session and worked on the second - reproducibly, on more than one machine. The load is
-    # guarded by Get-Module so it cannot duplicate or fight a pinned bundle, and it is pinned to
-    # that one module. Everywhere else the rule stands.
+    # TWO exceptions, both guarded, and nowhere else. Auto-loading from a cold command-discovery
+    # cache failed on the FIRST run of a new session and worked on the second - reproducibly, on
+    # more than one machine, and again inside VS Code's integrated console where modules were
+    # reported not loading on random servers.
+    #
+    #   1. The guarded Intersight.PowerShell load in the AUTHENTICATION region, which has to run
+    #      before Set-IntersightConfiguration is referenced.
+    #   2. Import-RequiredModules, which loads the run's modules once, each behind Get-Module.
+    #
+    # The rule this preserves is "do not fight the host build". A Get-Module guard means a module
+    # already in the session - including a pinned bundle - is untouched, and nothing is installed
+    # or upgraded. Everywhere else an Import-Module is still a finding.
+    $importFunction = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+        Where-Object { $_.Name -eq 'Import-RequiredModules' })
+    $imports = @()
+    $allImportCalls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+        Where-Object { $_.GetCommandName() -eq 'Import-Module' })
+    # Only scripts that actually load something need the function; the rule for the rest is
+    # simply that they load nothing, which the finding list below already enforces.
+    if ($allImportCalls.Count -gt 0 -and $importFunction.Count -ne 1) {
+        $imports += "this script imports modules but has no single Import-RequiredModules to hold the guarded loads"
+    }
+
+    $inImportFunction = {
+        param($node)
+        foreach ($fn in $importFunction) {
+            if ($node.Extent.StartOffset -ge $fn.Extent.StartOffset -and $node.Extent.EndOffset -le $fn.Extent.EndOffset) { return $true }
+        }
+        return $false
+    }
+
     $importAllowed = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
         Where-Object { $_.GetCommandName() -eq 'Import-Module' } |
-        Where-Object { $_.Extent.Text -match '(?i)Import-Module\s+-Name\s+Intersight\.PowerShell' })
-    $imports = @(
+        Where-Object { ($_.Extent.Text -match '(?i)Import-Module\s+-Name\s+Intersight\.PowerShell') -or (& $inImportFunction $_) })
+    $imports += @(
         $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
             Where-Object { $_.GetCommandName() -eq 'Import-Module' } |
             Where-Object { $importAllowed -notcontains $_ } |
             ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.Extent.Text)" }
     )
-    if ($importAllowed.Count -gt 1) { $imports += "more than one Intersight.PowerShell load - only the guarded one in the AUTHENTICATION region is allowed" }
+    # Inside Import-RequiredModules the guard is the Get-Module -ListAvailable probe plus the
+    # already-loaded check above it, both in the same function, so the per-call If guard below
+    # applies only to the AUTHENTICATION region load.
     foreach ($allowed in $importAllowed) {
+        if (& $inImportFunction $allowed) { continue }
         $guard = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.IfStatementAst] }, $true) |
             Where-Object { $allowed.Extent.StartOffset -ge $_.Extent.StartOffset -and $allowed.Extent.EndOffset -le $_.Extent.EndOffset -and $_.Extent.Text -match 'Get-Module -Name Intersight\.PowerShell' })
         if ($guard.Count -eq 0) { $imports += "line $($allowed.Extent.StartLineNumber): the Intersight.PowerShell load is no longer guarded by Get-Module" }
+    }
+    foreach ($fn in $importFunction) {
+        if ($fn.Extent.Text -notmatch 'Get-Module -Name \$name') { $imports += "Import-RequiredModules no longer checks Get-Module before importing" }
+        if ($fn.Extent.Text -notmatch 'Get-AvailableModuleVersion -Name \$name') { $imports += "Import-RequiredModules no longer checks the module is installed before importing" }
+        if ($fn.Extent.Text -match '(?i)Install-Module|Update-Module') { $imports += "Import-RequiredModules must never install or update a module" }
     }
     $imports += @(
         $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] }, $true) |

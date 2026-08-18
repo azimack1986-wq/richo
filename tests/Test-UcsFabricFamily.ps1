@@ -27,7 +27,10 @@ $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [r
 if ($errors) { throw "parse errors" }
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Get-UcsFabricFamily','Resolve-UcsFirmwarePolicyForTarget','Set-UcsFirmwarePolicyGlobal','Remove-UcsHostsAlreadyOnTargetFirmware','ConvertTo-UcsBundleVersionFromPolicyName','Get-UcsFirmwarePolicyRows','Test-UcsFirmwarePolicyExists','Test-DryRun') } |
+    Where-Object { $_.Name -in @('Get-UcsFabricFamily','Resolve-UcsFirmwarePolicyForTarget','Set-UcsFirmwarePolicyGlobal','Remove-UcsHostsAlreadyOnTargetFirmware','ConvertTo-UcsBundleVersionFromPolicyName','Get-UcsFirmwarePolicyRows','Test-UcsFirmwarePolicyExists','Get-UcsFirmwarePolicyLookup',
+                                 'Test-UcsRemotePolicyMessage','Set-UcsServiceProfileTemplateFirmwarePolicy',
+                                 'Get-UcsServiceProfileFirmwarePolicyName',
+                                 'Test-DryRun') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $Global:RunMode = 'LIVE'
@@ -66,8 +69,29 @@ $script:Answer = 'C'
 function Get-UcsNetworkElement { param($Ucs,$ErrorAction)
     if ($script:Models -eq 'THROW') { throw "connection lost" }
     return @($script:Models | ForEach-Object { [pscustomobject]@{ Dn='sys/switch'; Model=$_ } }) }
-function Get-UcsFirmwareComputeHostPack { param($Ucs,$ErrorAction)
-    return @($script:Packs | ForEach-Object { [pscustomobject]@{ Name=$_; Dn="org-root/fw-host-pack-$_"; Descr='' } }) }
+# The real cmdlet is asked three different ways by Get-UcsFirmwarePolicyLookup - by org and name,
+# by Dn, and unfiltered - so the stub has to answer all three, and be able to FAIL, which is the
+# case that used to be read as "the policy does not exist".
+$script:PackQueryThrows = $false
+function Get-UcsFirmwareComputeHostPack { param($Ucs,$Org,$Name,$Dn,$ErrorAction)
+    if ($script:PackQueryThrows) { throw "connection lost" }
+    $all = @($script:Packs | ForEach-Object { [pscustomobject]@{ Name=$_; Dn="org-root/fw-host-pack-$_"; Descr=''; PolicyOwner='local' } })
+    if ($Name) { return @($all | Where-Object { $_.Name -eq $Name }) }
+    if ($Dn)   { return @($all | Where-Object { $_.Dn -eq $Dn }) }
+    return $all }
+
+# Service profile templates, for the alignment pass that runs once the policy is resolved.
+$script:Templates = @()
+$script:TemplateWrites = New-Object System.Collections.Generic.List[string]
+$script:TemplateSetThrows = ""
+function Get-UcsServiceProfile { param($Ucs,$Type,$Dn,$ErrorAction)
+    if ($Dn) { return @($script:Templates | Where-Object { $_.Dn -eq $Dn }) }
+    if ($Type) { return @($script:Templates | Where-Object { $_.Type -eq $Type }) }
+    return @($script:Templates) }
+function Set-UcsServiceProfile { param($Ucs,$ServiceProfile,$HostFwPolicyName,[switch]$Force,$ErrorAction)
+    if ($script:TemplateSetThrows) { throw $script:TemplateSetThrows }
+    $script:TemplateWrites.Add("$($ServiceProfile.Name)|$HostFwPolicyName|Force=$Force")
+    $ServiceProfile.HostFwPolicyName = $HostFwPolicyName }
 # Bundle parameters are still declared, so that passing one is recorded rather than silently
 # swallowed by parameter binding - the assertions below require that they arrive empty.
 function Add-UcsFirmwareComputeHostPack { param($Ucs,$Org,$Name,$BladeBundleVersion,$RackBundleVersion,$Descr,$ErrorAction)
@@ -120,14 +144,50 @@ $script:Created = @()
 Assert-Equal "a second call reuses the resolved policy" "global-436h" (Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-b' -UcsSession 'x' 6>$null)
 Assert-Equal "and creates nothing further" 0 $script:Created.Count
 
-Write-Host "`n=== Declining creation stops the run ===" -ForegroundColor Cyan
-$script:Models = @('UCS-FI-6332'); $script:Packs = @(); $script:Created = @(); $script:Answer = 'X'
-$Global:UcsFirmwarePolicyByTarget = @{}
-$stopped = $false
-try { [void](Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-c' -UcsSession 'x' 6>$null) } catch { $stopped = "$_" -match 'creation was declined' }
-Assert-Equal "STOP prevents creation and stops" $true $stopped
-Assert-Equal "nothing was created after declining" 0 $script:Created.Count
-$script:Answer = 'C'
+Write-Host "`n=== Creation is not put to the operator ===" -ForegroundColor Cyan
+# At the operator's direction. What gets created is fully determined - the name comes from the
+# fabric family, the org is always org-root, no bundle version is written - so the confirmation
+# had nothing to decide and only stood between the run and the blades.
+# Asserted against the two functions themselves rather than the whole file, so an unrelated
+# message that happens to use the same words cannot make this pass or fail by accident.
+$policyFunctions = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+    Where-Object { $_.Name -in @('Resolve-UcsFirmwarePolicyForTarget','Set-UcsFirmwarePolicyGlobal') })
+Assert-Equal "both policy functions are present" 2 $policyFunctions.Count
+$policyPrompts = @($policyFunctions | Where-Object { $_.Extent.Text -match 'Read-ChoiceExit' } | ForEach-Object { $_.Name })
+Assert-Equal "neither asks the operator anything" "" ($policyPrompts -join ',')
+$policySource = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "and no 'creation was declined' path survives" $true (-not ($policySource -match 'creation was declined'))
+
+Write-Host "`n=== A query that cannot be answered is never read as 'not there' ===" -ForegroundColor Cyan
+# THE LIVE FAULT. Get-UcsFirmwareComputeHostPack was called with -ErrorAction SilentlyContinue, so
+# a failed query returned an empty list, the run decided the package was missing, and tried to
+# CREATE one UCS Central already owned. UCSM refused with "resolved from remote policy server".
+$script:PackQueryThrows = $true
+$lookup = Get-UcsFirmwarePolicyLookup -PolicyName 'global-436h' -UcsSession 'x'
+Assert-Equal "an unanswerable lookup is Unknown, not absent" $false $lookup.Known
+Assert-Equal "and does not claim the policy exists" $false $lookup.Exists
+$script:Models = @('UCS-FI-6332'); $script:Created = @(); $Global:UcsFirmwarePolicyByTarget = @{}
+$stoppedUnknown = $false
+try { [void](Resolve-UcsFirmwarePolicyForTarget -UcsTarget 'ucsm-c' -UcsSession 'x' 6>$null) } catch { $stoppedUnknown = "$_" -match 'could not be established' }
+Assert-Equal "the run stops rather than creating on a guess" $true $stoppedUnknown
+Assert-Equal "and nothing was created" 0 $script:Created.Count
+$script:PackQueryThrows = $false
+
+Write-Host "`n=== The lookup finds a package by name, by Dn, or in the list ===" -ForegroundColor Cyan
+$script:Packs = @('global-436h')
+Assert-Equal "found, and known" $true (Get-UcsFirmwarePolicyLookup -PolicyName 'global-436h' -UcsSession 'x').Exists
+Assert-Equal "a genuine absence is Known and not Exists" $false (Get-UcsFirmwarePolicyLookup -PolicyName 'global-999z' -UcsSession 'x').Exists
+Assert-Equal "and a genuine absence is answered, not unknown" $true (Get-UcsFirmwarePolicyLookup -PolicyName 'global-999z' -UcsSession 'x').Known
+$script:Packs = @()
+
+Write-Host "`n=== 'Resolved from remote policy server' means already Global ===" -ForegroundColor Cyan
+# UCSM's own wording for "UCS Central owns this object, you may not touch it". Read as a failure it
+# produced "could not be made Global and would upgrade nothing" for a package that was in exactly
+# the state the run wanted.
+Assert-Equal "the message is recognised" $true (Test-UcsRemotePolicyMessage -Message "PD21000001SS004:Policy org-root/fw-host-pack-global-436h is resolved from remote policy server. Create/Delete/Modify operations are not allowed.")
+Assert-Equal "casing does not matter" $true (Test-UcsRemotePolicyMessage -Message "RESOLVED FROM REMOTE POLICY SERVER")
+Assert-Equal "an unrelated failure is not mistaken for it" $false (Test-UcsRemotePolicyMessage -Message "Authentication failed")
+Assert-Equal "and neither is nothing" $false (Test-UcsRemotePolicyMessage -Message "")
 
 Write-Host "`n=== An unmapped family stops rather than picking something ===" -ForegroundColor Cyan
 $script:Models = @('UCS-FI-6248UP'); $script:Packs = @(); $Global:UcsFirmwarePolicyByTarget = @{}
@@ -200,22 +260,33 @@ $stoppedPending = $false
 try { Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null } catch { $stoppedPending = $true }
 Assert-Equal "'pending-policy' is accepted, not treated as a failure" $false $stoppedPending
 
-# Still local afterwards means an empty package is about to be attached - that is put to the
-# operator rather than carried on through.
-$script:OwnerState = 'local'; $script:OwnerWrites.Clear(); $script:Answer = 'X'
-$stoppedLocal = $false
-try { Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null }
-catch { $stoppedLocal = "$_" -match 'not Global' }
-Assert-Equal "a policy still local stops the run when the operator says so" $true $stoppedLocal
-Assert-Equal "and the operator is told it would upgrade nothing" $true ($script:LastPrompt -match 'upgrade nothing')
-
-# C continues, deliberately, with the host flagged for manual rectification.
+# Still local afterwards means an empty package is about to be attached. At the operator's
+# direction that no longer asks anything: the run carries on to the blades and the gap is carried
+# by the run summary and the manual rectification report instead of a question mid-change.
 $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
-$script:OwnerState = 'local'; $script:Answer = 'C'
+$script:OwnerState = 'local'; $script:OwnerWrites.Clear()
 $continued = $true
 try { Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null } catch { $continued = $false }
-Assert-Equal "C carries on rather than ending the run" $true $continued
+Assert-Equal "a policy still local no longer stops the run" $true $continued
 Assert-Equal "and it is recorded for manual rectification" $true (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Reason -eq 'Host firmware package is not Global' }).Count -ge 1)
+
+# UCS Central already owning the package is SUCCESS, not a failure to make it Global.
+$script:OwnerWrites.Clear()
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+function Set-UcsFirmwareComputeHostPack { param($PolicyOwner,[switch]$Force,$ErrorAction)
+    $null = @($input)
+    $script:OwnerWrites.Add("$PolicyOwner|Force=$Force")
+    throw "PD21000001SS004:Policy org-root/fw-host-pack-global-436h is resolved from remote policy server. Create/Delete/Modify operations are not allowed." }
+$remoteOk = $true
+try { Set-UcsFirmwarePolicyGlobal -PolicyName 'global-436h' -UcsTarget 'ucsm-a' -UcsSession 'x' 6>$null } catch { $remoteOk = $false }
+Assert-Equal "a remote-owned package does not stop the run" $true $remoteOk
+Assert-Equal "and is NOT flagged for manual rectification" 0 (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Reason -eq 'Host firmware package is not Global' }).Count)
+Assert-Equal "recorded as Global, not as a failure" "Global" (@($Global:RunSummary.ToArray() | Where-Object { $_.Action -eq 'Set policy to Global' })[-1].Result)
+# Put the accepting stub back for the checks that follow.
+function Set-UcsFirmwareComputeHostPack { param($PolicyOwner,[switch]$Force,$ErrorAction)
+    $null = @($input)
+    $script:OwnerWrites.Add("$PolicyOwner|Force=$Force")
+    if ($script:AcceptOwnerWrite) { $script:OwnerState = $PolicyOwner } }
 
 # DRY RUN changes no ownership.
 $Global:RunMode = 'DRYRUN'
@@ -228,6 +299,60 @@ $Global:RunMode = 'LIVE'
 $policyText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "creation hands the policy straight to UCS Central" $true ($policyText -match 'Set-UcsFirmwarePolicyGlobal -PolicyName \$policyName')
 Assert-Equal "and the only owner value written is 'policy'" $true ($policyText -match '-PolicyOwner "policy"')
+
+Write-Host "`n=== Service profile templates are aligned to the target package ===" -ForegroundColor Cyan
+# A template that still names the old package puts it back - on the next template push, on a
+# rebind, or on the next profile created from it. Setting only the profiles fixes this cluster and
+# leaves the domain to undo it.
+function New-Template { param([string]$Name,[string]$Policy,[string]$Type)
+    [pscustomobject]@{ Name=$Name; Dn="org-root/ls-$Name"; Type=$Type; HostFwPolicyName=$Policy } }
+
+$script:Templates = @(
+    (New-Template -Name 'vmware-d84dds05' -Policy 'global-435c' -Type 'updating-template'),
+    (New-Template -Name 'vmware-d84vdi01' -Policy 'global-436h' -Type 'updating-template'),
+    (New-Template -Name 'vmware-d84vdi02' -Policy 'global-434a' -Type 'initial-template')
+)
+$script:TemplateWrites.Clear(); $script:TemplateSetThrows = ""
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget 'ucsm-a' -UcsSession 'x' -PolicyName 'global-436h' 6>$null
+
+Assert-Equal "only the two off-target templates were written" 2 $script:TemplateWrites.Count
+Assert-Equal "the one already on target was left alone" 0 (@($script:TemplateWrites.ToArray() | Where-Object { $_ -match 'vmware-d84vdi01' }).Count)
+Assert-Equal "and it is recorded as compliant, not changed" "Compliant" (@($Global:RunSummary.ToArray() | Where-Object { $_.Details -match 'vmware-d84vdi01' })[0].Result)
+Assert-Equal "both template types are covered" $true (($script:TemplateWrites.ToArray() -join ',') -match 'vmware-d84dds05' -and ($script:TemplateWrites.ToArray() -join ',') -match 'vmware-d84vdi02')
+Assert-Equal "each write named the target package, with -Force" "global-436h|Force=True" (($script:TemplateWrites[0] -split '\|', 2)[1])
+Assert-Equal "the change is verified by reading the template back" "Updated" (@($Global:RunSummary.ToArray() | Where-Object { $_.Details -match 'vmware-d84dds05' })[0].Result)
+
+# A template UCS Central owns is not a failure - Central manages it.
+$script:Templates = @((New-Template -Name 'central-tmpl' -Policy 'global-435c' -Type 'updating-template'))
+$script:TemplateWrites.Clear()
+$script:TemplateSetThrows = "Policy org-root/ls-central-tmpl is resolved from remote policy server. Create/Delete/Modify operations are not allowed."
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget 'ucsm-a' -UcsSession 'x' -PolicyName 'global-436h' 6>$null
+Assert-Equal "a UCS Central-owned template is recorded as remote-owned" "RemoteOwned" (@($Global:RunSummary.ToArray() | Where-Object { $_.Details -match 'central-tmpl' })[0].Result)
+Assert-Equal "and raises nothing for manual rectification" 0 $Global:ManualAttentionHosts.Count
+
+# A genuine failure IS flagged, because a template left on the old package will undo the run.
+$script:TemplateSetThrows = "server busy"
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget 'ucsm-a' -UcsSession 'x' -PolicyName 'global-436h' 6>$null
+Assert-Equal "a template that will not take is flagged" 1 (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Reason -match 'template not on the target firmware package' }).Count)
+$script:TemplateSetThrows = ""
+
+# DRY RUN writes nothing.
+$Global:RunMode = 'DRYRUN'
+$script:Templates = @((New-Template -Name 'dry-tmpl' -Policy 'global-435c' -Type 'updating-template'))
+$script:TemplateWrites.Clear()
+Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget 'ucsm-a' -UcsSession 'x' -PolicyName 'global-436h' 6>$null
+Assert-Equal "DRY RUN writes no template" 0 $script:TemplateWrites.Count
+$Global:RunMode = 'LIVE'
+$script:Templates = @()
+
+# It runs as part of resolving the policy, not as a separate thing to remember.
+$resolveFn = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+    Where-Object { $_.Name -eq 'Resolve-UcsFirmwarePolicyForTarget' })[0]
+Assert-Equal "resolving a domain's policy also aligns its templates" $true ($resolveFn.Extent.Text -match 'Set-UcsServiceProfileTemplateFirmwarePolicy')
 
 Write-Host "`n=== A policy already on target is compliant, and nothing else is consulted ===" -ForegroundColor Cyan
 # Straight from a live run: eleven hosts showed CurrentPolicy global-436h against TargetPolicy

@@ -536,7 +536,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.7.0-preauth"
+$ScriptVersion = "23.8.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -662,6 +662,7 @@ $Global:BatchActionsSent = 0
 # Boot time per host, captured before the reboot is requested. The reconnect gate compares against
 # it so that "the host is Connected" cannot be mistaken for "the host came back".
 $Global:PreRebootBootTimes = @{}
+$Global:RequiredModulesLoaded = $false
 $Global:IntersightReadyChecked = $false
 $Global:IntersightUnusable = $false
 $Global:IntersightUnusableReason = ""
@@ -745,6 +746,18 @@ $Global:EsxiRootCredential = $null
 # Short enough not to waste the change window, long enough not to fight a host that is simply
 # still coming up - vCenter reports Disconnected briefly during a normal boot.
 $HostReconnectAfterDisconnectMinutes = 5
+# How many times the ESXi root credential is used on a host vCenter has dropped, and how long to
+# wait between those attempts. One attempt was not enough: a host that has just rebooted onto new
+# firmware can refuse the reconnect while hostd is still coming up, and the run then wrote it off
+# as unrecoverable when a second attempt two minutes later would have taken it. After the last
+# attempt the operator is asked, rather than the host being silently abandoned.
+$HostReconnectMaxAttempts = 3
+$HostReconnectRetryPauseMinutes = 2
+# How long to spend proving a management endpoint answers at all before deciding the path is
+# blocked. Applies to UCS Manager and to Intersight. A blocked port does not refuse a connection,
+# it drops the packet - so the client sits there until ITS timeout, which is minutes, with nothing
+# on screen. Sixty seconds is long enough for a slow appliance and short enough to be told about.
+$ManagementEndpointProbeTimeoutSeconds = 60
 $Global:AutoExitMaintenanceMode = $true
 $Global:PrerequisitesConfirmed = $false
 
@@ -825,6 +838,90 @@ function Test-StageNoAck { return ($Global:RunMode -eq "STAGE_NO_ACK") }
 
 
 
+function Import-RequiredModules {
+    <#
+    .SYNOPSIS
+        Loads the modules this run needs, once, and only where they are not already loaded.
+
+    .DESCRIPTION
+        This script relied on PowerShell auto-loading every module on first use. On a prepared jump
+        host that is fine. In a VS Code / PowerShell Integrated Console session it is not, and the
+        reported symptom was exactly that: on random servers the modules were not loading into the
+        Visual Studio Code session, and cmdlets came back "not recognized".
+
+        Auto-loading depends on the command discovery cache, and building it means walking every
+        path in $env:PSModulePath. Intersight.PowerShell exports several thousand cmdlets and
+        PowerCLI is dozens of modules, so on a cold cache - a new session, a network module path, a
+        roaming profile share - a reference can be resolved before the scan has reached the module.
+        The scan then finishes, which is why the SECOND run in the same session works.
+
+        Loading here is safe against the thing the no-imports rule was protecting: each load is
+        guarded by Get-Module, so a module already present - including a deliberately pinned
+        bundle - is left exactly as it is. Nothing is installed, nothing is updated, and no version
+        is chosen.
+
+        Nothing here is fatal. A module that will not load is reported with what was tried, and the
+        run continues to the checks that can say precisely what is missing and why it matters:
+        Assert-IntersightPowerShellAvailable, Assert-UcsPowerToolAvailable and Connect-VCenterServer.
+
+    .EXAMPLE
+        Import-RequiredModules
+    #>
+    if ($Global:RequiredModulesLoaded) { return }
+    $Global:RequiredModulesLoaded = $true
+
+    # Name, and what it is for. Alternatives are for products whose module was renamed between
+    # releases - the first one present wins and the rest are not looked at.
+    $wanted = @(
+        [pscustomobject]@{ Purpose = "vCenter (PowerCLI)"; Names = @("VMware.VimAutomation.Core") }
+        [pscustomobject]@{ Purpose = "Intersight";         Names = @("Intersight.PowerShell") }
+        [pscustomobject]@{ Purpose = "UCS Manager";        Names = @("Cisco.UCSManager", "Cisco.UCS.Core", "CiscoUcsPS") }
+    )
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Loading the modules this run needs (already-loaded modules are left untouched)..." -ForegroundColor Cyan
+
+    foreach ($entry in $wanted) {
+        $loaded = $false
+        $tried = New-Object System.Collections.Generic.List[string]
+
+        foreach ($name in $entry.Names) {
+            if (Get-Module -Name $name) {
+                Write-Host "  $($entry.Purpose): $name already loaded." -ForegroundColor DarkGray
+                $loaded = $true
+                break
+            }
+        }
+        if ($loaded) { continue }
+
+        foreach ($name in $entry.Names) {
+            # Through the cache, never Get-Module -ListAvailable directly: enumerating
+            # Intersight.PowerShell's manifest is slow enough on a network module path to read
+            # as a hang, and this loop would otherwise repeat it for every candidate name.
+            if ($null -eq (Get-AvailableModuleVersion -Name $name)) {
+                [void]$tried.Add("$name (not installed for this PowerShell)")
+                continue
+            }
+            try {
+                Import-Module -Name $name -ErrorAction Stop
+                Write-Host "  $($entry.Purpose): loaded $name." -ForegroundColor Green
+                Add-SummaryRecord -Stage "ModuleLoad" -Batch "" -HostName "" -Action "Load module" -Result "Loaded" -Details "$($entry.Purpose) - $name."
+                $loaded = $true
+                break
+            }
+            catch {
+                [void]$tried.Add("$name ($($_.Exception.Message))")
+            }
+        }
+
+        if (-not $loaded) {
+            Write-Host "  $($entry.Purpose): not loaded. Tried: $($tried.ToArray() -join '; ')" -ForegroundColor Yellow
+            Write-Host "    Not fatal here - the check for this product will say what is missing when it is needed." -ForegroundColor DarkGray
+            Add-SummaryRecord -Stage "ModuleLoad" -Batch "" -HostName "" -Action "Load module" -Result "NotLoaded" -Details "$($entry.Purpose) - tried: $($tried.ToArray() -join '; ')"
+        }
+    }
+}
+
 function Confirm-RunPrerequisites {
     <#
     .SYNOPSIS
@@ -843,6 +940,10 @@ function Confirm-RunPrerequisites {
     #>
     if ($Global:PrerequisitesConfirmed) { return }
 
+    # First, before anything reads a cmdlet name. See Import-RequiredModules for why leaving this
+    # to auto-loading failed on some sessions and not others.
+    Import-RequiredModules
+
     Write-Host "" -ForegroundColor Cyan
     Write-Host "=====================================================================" -ForegroundColor Cyan
     Write-Host " REQUIREMENTS - assumed present, not verified here" -ForegroundColor Cyan
@@ -853,7 +954,8 @@ function Confirm-RunPrerequisites {
     Write-Host "     VMware PowerCLI 12.3.0 or newer." -ForegroundColor Gray
     Write-Host "     Intersight.PowerShell - ONE version, matching the appliance release." -ForegroundColor Gray
     Write-Host "     Cisco UCS PowerTool - only if a host in scope is UCS Manager-managed." -ForegroundColor Gray
-    Write-Host "     Nothing is imported by this script; PowerShell auto-loads on first use." -ForegroundColor Gray
+    Write-Host "     Loaded above where they were not already in the session; nothing is installed" -ForegroundColor Gray
+    Write-Host "     or upgraded, and a module already loaded is left exactly as it is." -ForegroundColor Gray
 
     Write-Host "2. Intersight API key" -ForegroundColor Yellow
     Write-Host "     Already applied in THIS PowerShell session by Set-IntersightConfiguration -" -ForegroundColor Gray
@@ -1008,6 +1110,167 @@ function Read-PendingConsoleKey {
         }
     } catch {}
     return ""
+}
+
+function Test-TcpPortOpen {
+    <#
+    .SYNOPSIS
+        Can a TCP connection be opened to this host and port within the timeout? Never throws.
+
+    .DESCRIPTION
+        BeginConnect plus a bounded WaitOne, because a synchronous connect cannot be given a
+        timeout - and the case this exists for is precisely the one that hangs. A firewall that
+        DENIES a port sends a reset and the connect fails immediately; a firewall that DROPS it
+        sends nothing, and the client waits out its own timeout with no output at all.
+
+        Name resolution failures land in the catch and read as "not open", which is correct for
+        the question being asked: the endpoint cannot be reached from this jump box.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$ComputerName,
+        [Parameter(Mandatory=$true)][int]$Port,
+        [int]$TimeoutSeconds = 30
+    )
+
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $async = $client.BeginConnect($ComputerName, $Port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))) { return $false }
+        $client.EndConnect($async)
+        return $true
+    }
+    catch { return $false }
+    finally { if ($null -ne $client) { try { $client.Close() } catch { } } }
+}
+
+function Get-EndpointHostName {
+    <#
+    .SYNOPSIS
+        Strips a URL or a decorated target down to the bare host name the socket needs.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Target)
+    $value = [string]$Target
+    $value = $value -replace '^\s*https?://', ''
+    $value = $value.Split('/')[0]
+    # Bare IPv6 is left alone; a host:port form is not, because the port is supplied separately.
+    if ($value -notmatch ':.*:' -and $value.Contains(':')) { $value = $value.Split(':')[0] }
+    return $value.Trim()
+}
+
+function Test-ManagementEndpointReachable {
+    <#
+    .SYNOPSIS
+        Proves a management endpoint answers on HTTPS or HTTP within the probe budget.
+
+    .DESCRIPTION
+        Asked before the expensive login, for UCS Manager and for Intersight alike. Both speak
+        HTTPS, so 443 is tried first and gets the larger share of the budget; 80 is tried after,
+        only to tell "nothing at all gets through" apart from "TLS is the problem", because those
+        two point at different teams.
+
+        Returns a result rather than throwing. Whether an unreachable endpoint stops the run is the
+        caller's decision, not this function's.
+    #>
+    param(
+        # AllowEmptyString because "there is no endpoint configured" is one of the answers this is
+        # meant to give, not a parameter-binding error thrown from underneath the caller.
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Target,
+        [int]$TimeoutSeconds = 60
+    )
+
+    $hostName = Get-EndpointHostName -Target $Target
+    $started = Get-Date
+
+    if ([string]::IsNullOrWhiteSpace($hostName)) {
+        return [pscustomobject]@{ Reachable = $false; Port = 0; HostName = ""; ElapsedSeconds = 0; Detail = "No host name could be taken from '$Target'." }
+    }
+
+    # Two thirds to HTTPS, the rest to HTTP, so the whole probe stays inside the budget.
+    $httpsBudget = [int][Math]::Max(5, [Math]::Floor($TimeoutSeconds * 2 / 3))
+    $httpBudget  = [int][Math]::Max(5, $TimeoutSeconds - $httpsBudget)
+
+    if (Test-TcpPortOpen -ComputerName $hostName -Port 443 -TimeoutSeconds $httpsBudget) {
+        return [pscustomobject]@{ Reachable = $true; Port = 443; HostName = $hostName
+            ElapsedSeconds = [int]((Get-Date) - $started).TotalSeconds; Detail = "TCP 443 answered." }
+    }
+
+    if (Test-TcpPortOpen -ComputerName $hostName -Port 80 -TimeoutSeconds $httpBudget) {
+        return [pscustomobject]@{ Reachable = $true; Port = 80; HostName = $hostName
+            ElapsedSeconds = [int]((Get-Date) - $started).TotalSeconds; Detail = "TCP 443 did not answer, but TCP 80 did." }
+    }
+
+    return [pscustomobject]@{ Reachable = $false; Port = 0; HostName = $hostName
+        ElapsedSeconds = [int]((Get-Date) - $started).TotalSeconds
+        Detail = "Neither TCP 443 nor TCP 80 answered within $TimeoutSeconds second(s)." }
+}
+
+function Confirm-ManagementEndpointReachable {
+    <#
+    .SYNOPSIS
+        Probes an endpoint and, if nothing answers, says so plainly and asks what to do.
+
+    .DESCRIPTION
+        Put in front of the UCS Manager and Intersight logins because the failure they produce on
+        their own is useless. A dropped packet gives the PowerTool or the Intersight client no
+        error to report until its own timeout expires, minutes later, and what it prints then talks
+        about credentials - which sends the operator to the wrong team.
+
+        The message names the jump box, the endpoint and both ports, so the request that follows
+        is a firewall request with the detail already in it.
+
+        R re-probes, for the common case where the rule is being raised while the run waits.
+        C continues anyway - the probe is evidence, not proof, and an endpoint reachable only
+        through a proxy would fail it while the client still works. E exits.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Target,
+        [Parameter(Mandatory=$true)][string]$DeviceKind,
+        [int]$TimeoutSeconds = 60
+    )
+
+    for ($attempt = 1; $attempt -le 20; $attempt++) {
+        Write-Host "Checking that $DeviceKind '$Target' is reachable from this jump box (up to $TimeoutSeconds second(s))..." -ForegroundColor Cyan
+        $probe = Test-ManagementEndpointReachable -Target $Target -TimeoutSeconds $TimeoutSeconds
+
+        if ($probe.Reachable) {
+            Write-Host "  Reachable on TCP $($probe.Port) after $($probe.ElapsedSeconds) second(s)." -ForegroundColor Green
+            Add-SummaryRecord -Stage "EndpointReachability" -Batch "" -HostName "" -Action "Probe $DeviceKind" -Result "Reachable" -Details "$Target - $($probe.Detail)"
+            return $true
+        }
+
+        Write-Host "" -ForegroundColor Red
+        Write-Host "=====================================================================" -ForegroundColor Red
+        Write-Host " $($DeviceKind.ToUpper()) IS NOT ACCESSIBLE FROM THIS JUMP BOX" -ForegroundColor Red
+        Write-Host "=====================================================================" -ForegroundColor Red
+        Write-Host "  Endpoint : $($probe.HostName)" -ForegroundColor Yellow
+        Write-Host "  From     : $env:COMPUTERNAME as $env:USERNAME" -ForegroundColor Yellow
+        Write-Host "  Result   : $($probe.Detail)" -ForegroundColor Yellow
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "  Nothing answered on HTTPS (443) or HTTP (80), so this is a network path" -ForegroundColor Yellow
+        Write-Host "  problem, not a credential problem. A FIREWALL RULE MAY NEED TO BE RAISED" -ForegroundColor Yellow
+        Write-Host "  to allow this jump box to reach $($probe.HostName) on TCP 443." -ForegroundColor Yellow
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "  Worth confirming before raising it:" -ForegroundColor Yellow
+        Write-Host "    - the name resolves from here      : Resolve-DnsName $($probe.HostName)" -ForegroundColor Gray
+        Write-Host "    - the port is what is blocked       : Test-NetConnection $($probe.HostName) -Port 443" -ForegroundColor Gray
+        Write-Host "    - you are on the right jump box for this environment" -ForegroundColor Gray
+        Write-Host "=====================================================================" -ForegroundColor Red
+
+        Add-SummaryRecord -Stage "EndpointReachability" -Batch "" -HostName "" -Action "Probe $DeviceKind" -Result "Unreachable" -Details "$Target - $($probe.Detail) Probed from $env:COMPUTERNAME."
+
+        $choice = Read-ChoiceExit `
+            -Message "$DeviceKind '$Target' did not answer. R to probe again, C to continue anyway, E to exit" `
+            -AllowedChoices @("R","C") `
+            -ExitMessage "Stopped because $DeviceKind '$Target' is not reachable from this jump box."
+        if ($choice -eq "C") {
+            Write-Host "  Continuing anyway - the login will be attempted and may still fail." -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "EndpointReachability" -Batch "" -HostName "" -Action "Probe $DeviceKind" -Result "Overridden" -Details "$Target - operator continued past an unreachable endpoint."
+            return $false
+        }
+    }
+
+    return $false
 }
 
 # -----------------------------
@@ -1166,6 +1429,10 @@ function Connect-UcsCached {
         return $Global:UcsSessions[$target]
     }
 
+    # Before the login, not after it. Connect-Ucs against a blocked address sits on its own
+    # timeout with nothing on screen and then blames the credentials.
+    [void](Confirm-ManagementEndpointReachable -Target $target -DeviceKind "UCS Manager" -TimeoutSeconds $ManagementEndpointProbeTimeoutSeconds)
+
     Write-Host "Connecting to UCSM: $target" -ForegroundColor Cyan
     try {
         $session = Connect-UcsOneAttempt -UcsTarget $target
@@ -1299,7 +1566,11 @@ function Get-UcsServiceProfileFirmwarePolicyName {
 function Get-UcsFirmwarePolicyRows {
     param([Parameter(Mandatory=$true)]$UcsSession)
 
-    $policies = @(Get-UcsFirmwareComputeHostPack -Ucs $UcsSession -ErrorAction SilentlyContinue)
+    # NOT SilentlyContinue. A failed query returned an empty list that read as "the policy does not
+    # exist in this domain", and the run then tried to CREATE a package that was already there -
+    # which UCSM refused with "resolved from remote policy server". A query that cannot be answered
+    # is not evidence of absence, so it is allowed to throw and the caller decides.
+    $policies = @(Get-UcsFirmwareComputeHostPack -Ucs $UcsSession -ErrorAction Stop)
     $rows = foreach ($policy in $policies) {
         $policyName = [string]$policy.Name
         if ([string]::IsNullOrWhiteSpace($policyName) -and $policy.PSObject.Properties.Name -contains "Dn") {
@@ -1413,20 +1684,32 @@ function Resolve-UcsFirmwarePolicyForTarget {
     $policyName = [string]$Global:UcsFirmwarePolicyByFabricFamily[$fabric.Family]
     Write-Host "  Target host firmware package: $policyName" -ForegroundColor Green
 
-    $existing = @(Get-UcsFirmwarePolicyRows -UcsSession $UcsSession | Where-Object { $_.Name -eq $policyName })
-    if ($existing.Count -gt 0) {
-        Write-Host "  '$policyName' already exists in $UcsTarget - using it as-is." -ForegroundColor Green
-        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Resolve firmware policy" -Result "Existing" -Details "$UcsTarget - $policyName for fabric family $($fabric.Family)."
+    $lookup = Get-UcsFirmwarePolicyLookup -PolicyName $policyName -UcsSession $UcsSession
+
+    if (-not $lookup.Known) {
+        # Every probe errored. Absence has NOT been established, and creating on a guess is how a
+        # package UCS Central already owned came to be "created" and then refused.
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Resolve firmware policy" -Result "Unreadable" -Details "$UcsTarget - $policyName - $($lookup.Detail)"
+        Stop-WithMessage "Whether host firmware package '$policyName' exists in $UcsTarget could not be established: $($lookup.Detail) Check the UCSM session before continuing - nothing has been created."
+    }
+
+    if ($lookup.Exists) {
+        Write-Host "  '$policyName' already exists in $UcsTarget ($($lookup.Detail)) - using it as-is." -ForegroundColor Green
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Resolve firmware policy" -Result "Existing" -Details "$UcsTarget - $policyName for fabric family $($fabric.Family). Owner=$(if ($lookup.Owner) { $lookup.Owner } else { 'unknown' }). $($lookup.Detail)"
+        # Already there means already made: no creation, no handover, nothing to prompt about.
+        # Straight on to the templates and then the blades.
         $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
+        Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget $UcsTarget -UcsSession $UcsSession -PolicyName $policyName
         return $policyName
     }
 
-    Write-Host "  '$policyName' does NOT exist in $UcsTarget." -ForegroundColor Yellow
+    Write-Host "  '$policyName' does NOT exist in $UcsTarget - creating it." -ForegroundColor Yellow
 
     if (Test-DryRun) {
         Write-Host "  DRY RUN: would create it as a host firmware package at org-root, by name only, using the global firmware setting for its bundle versions." -ForegroundColor Green
         Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "DryRun" -Details "$UcsTarget - would create $policyName by name only; bundle versions come from the global setting."
         $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
+        Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget $UcsTarget -UcsSession $UcsSession -PolicyName $policyName
         return $policyName
     }
 
@@ -1434,19 +1717,12 @@ function Resolve-UcsFirmwarePolicyForTarget {
         Stop-WithMessage "Host firmware package '$policyName' is missing from $UcsTarget and policy creation is disabled. Create it in UCSM, or set `$Global:AllowUcsFirmwarePolicyCreation to `$true."
     }
 
-    Write-Host "  About to CREATE a host firmware package in ${UcsTarget}:" -ForegroundColor Yellow
+    # NO PROMPT, at the operator's direction. What is created is fully determined - the name comes
+    # from the fabric family, the org is always org-root, and no bundle version is written - so
+    # there was nothing for the confirmation to decide. It is reported here and in the run summary.
     Write-Host "    Name          : $policyName" -ForegroundColor Yellow
     Write-Host "    Organisation  : org-root (global, referencable from any org)" -ForegroundColor Yellow
     Write-Host "    Bundle version: not set here - taken from the global firmware setting '$policyName'." -ForegroundColor Yellow
-    Write-Host "  The service profiles are then pointed at this package, and everything else follows from that setting." -ForegroundColor Yellow
-
-    $choice = Read-ChoiceExit `
-        -Message "Create host firmware package '$policyName' in $UcsTarget? C to create, X to stop, E to exit" `
-        -AllowedChoices @("C","X") `
-        -ExitMessage "Stopped before creating a UCS host firmware package."
-    if ($choice -eq "X") {
-        Stop-WithMessage "Host firmware package '$policyName' is missing from $UcsTarget and creation was declined."
-    }
 
     try {
         # Name and description only. Bundle versions are left unset so the package uses the global
@@ -1456,6 +1732,15 @@ function Resolve-UcsFirmwarePolicyForTarget {
             -ErrorAction Stop | Out-Null
     }
     catch {
+        if (Test-UcsRemotePolicyMessage -Message $_.Exception.Message) {
+            # UCS Central owns it. It exists, it is Global, and this domain will not let the script
+            # touch it - which is the state the run wants, reached from the other direction.
+            Write-Host "  '$policyName' is resolved from UCS Central in $UcsTarget - it already exists and is Global." -ForegroundColor Green
+            Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "RemoteOwned" -Details "$UcsTarget - $policyName is resolved from UCS Central; no local create or modify is permitted or needed."
+            $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
+            Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget $UcsTarget -UcsSession $UcsSession -PolicyName $policyName
+            return $policyName
+        }
         Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "Failed" -Details "$UcsTarget - $policyName - $($_.Exception.Message)"
         Stop-WithMessage "Could not create host firmware package '$policyName' in ${UcsTarget}: $($_.Exception.Message)"
     }
@@ -1470,6 +1755,7 @@ function Resolve-UcsFirmwarePolicyForTarget {
     Write-Host "  Created and verified '$policyName' in $UcsTarget." -ForegroundColor Green
     Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create firmware policy" -Result "Created" -Details "$UcsTarget - $policyName created by name only for fabric family $($fabric.Family); bundle versions come from the global setting."
     $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
+    Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget $UcsTarget -UcsSession $UcsSession -PolicyName $policyName
     return $policyName
 }
 
@@ -1523,6 +1809,15 @@ function Set-UcsFirmwarePolicyGlobal {
             Set-UcsFirmwareComputeHostPack -PolicyOwner "policy" -Force -ErrorAction Stop | Out-Null
     }
     catch {
+        if (Test-UcsRemotePolicyMessage -Message $_.Exception.Message) {
+            # "Resolved from remote policy server. Create/Delete/Modify operations are not allowed."
+            # is UCSM saying UCS Central ALREADY owns this package - which is Global, and is what
+            # was being asked for. Reported as a failure it produced "could not be made Global and
+            # would upgrade nothing" for a package that was in exactly the right state.
+            Write-Host "  '$PolicyName' is resolved from UCS Central - it is already Global and this domain cannot modify it." -ForegroundColor Green
+            Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Set policy to Global" -Result "Global" -Details "$UcsTarget - $PolicyName is resolved from UCS Central; no local modify is permitted or needed."
+            return
+        }
         Write-Host "  Could not set '$PolicyName' to Global: $($_.Exception.Message)" -ForegroundColor Yellow
         Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Set policy to Global" -Result "Failed" -Details "$UcsTarget - $PolicyName - $($_.Exception.Message)"
     }
@@ -1552,11 +1847,87 @@ function Set-UcsFirmwarePolicyGlobal {
     Write-Host "  is enabled for host firmware packages." -ForegroundColor Yellow
     Add-ManualAttentionHost -HostName $UcsTarget -Reason "Host firmware package is not Global" -Detail "'$PolicyName' in $UcsTarget has policyOwner=$(if ($owner) { $owner } else { 'unreadable' }). It carries no bundle versions, so as a local policy it will not change any firmware. Set it to Use Global in UCSM, or confirm the domain is registered with UCS Central."
     Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Set policy to Global" -Result "StillLocal" -Details "$UcsTarget - $PolicyName - policyOwner=$owner; the package has no bundle versions of its own."
+    # NO PROMPT, at the operator's direction: the handover is attempted once and the run carries on
+    # to the blades either way. The entry above and the manual rectification report are how this is
+    # surfaced now, rather than a question mid-run that stops a cluster from being upgraded.
+    Write-Host "  Continuing to the blades. This is on the run summary and the manual rectification report." -ForegroundColor Yellow
+}
 
-    $choice = Read-ChoiceExit -Message "'$PolicyName' could not be made Global and would upgrade nothing. C to continue anyway, X to stop, E to exit" -AllowedChoices @("C","X") -ExitMessage "Stopped because '$PolicyName' is not Global."
-    if ($choice -eq "X") {
-        Stop-WithMessage "Host firmware package '$PolicyName' in $UcsTarget is not Global and carries no bundle versions."
+function Get-UcsFirmwarePolicyLookup {
+    <#
+    .SYNOPSIS
+        Does this host firmware package exist in the domain? Answers Yes, No, or Unknown.
+
+    .DESCRIPTION
+        Three probes, cheapest and most specific first, because ONE of them silently returning
+        nothing is what caused a run to try to create a package that already existed:
+
+          1. By org and name.
+          2. By distinguished name - org-root/fw-host-pack-<name> - which is the form UCSM reports
+             in its own error messages, and the form a package resolved from UCS Central carries.
+          3. The full package list.
+
+        A hit on any of them is Exists. Every probe failing to ANSWER - not returning nothing, but
+        erroring - is Unknown, and Unknown is never treated as absent. That distinction is the
+        whole point: a swallowed query previously read as "not there", the run created a package
+        UCS Central already owned, and UCSM refused the follow-up modify with "resolved from remote
+        policy server. Create/Delete/Modify operations are not allowed."
+
+    .PARAMETER PolicyName
+        Host firmware package name, for example global-436h.
+
+    .PARAMETER UcsSession
+        A connected UCSM session.
+
+    .EXAMPLE
+        $lookup = Get-UcsFirmwarePolicyLookup -PolicyName "global-436h" -UcsSession $s
+        if ($lookup.Exists) { ... }
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$PolicyName,
+        [Parameter(Mandatory=$true)]$UcsSession
+    )
+
+    $errors = New-Object System.Collections.Generic.List[string]
+    $answered = $false
+
+    try {
+        $byName = @(Get-UcsFirmwareComputeHostPack -Ucs $UcsSession -Org "org-root" -Name $PolicyName -ErrorAction Stop)
+        $answered = $true
+        if ($byName.Count -gt 0) {
+            return [pscustomobject]@{ Exists = $true; Known = $true; Policy = $byName[0]
+                Owner = [string]$byName[0].PolicyOwner; Detail = "Found by org and name." }
+        }
     }
+    catch { [void]$errors.Add("by name: $($_.Exception.Message)") }
+
+    try {
+        $byDn = @(Get-UcsFirmwareComputeHostPack -Ucs $UcsSession -Dn "org-root/fw-host-pack-$PolicyName" -ErrorAction Stop)
+        $answered = $true
+        if ($byDn.Count -gt 0) {
+            return [pscustomobject]@{ Exists = $true; Known = $true; Policy = $byDn[0]
+                Owner = [string]$byDn[0].PolicyOwner; Detail = "Found by distinguished name." }
+        }
+    }
+    catch { [void]$errors.Add("by Dn: $($_.Exception.Message)") }
+
+    try {
+        $rows = @(Get-UcsFirmwarePolicyRows -UcsSession $UcsSession | Where-Object { $_.Name -eq $PolicyName })
+        $answered = $true
+        if ($rows.Count -gt 0) {
+            return [pscustomobject]@{ Exists = $true; Known = $true; Policy = $rows[0].RawObject
+                Owner = [string]$rows[0].RawObject.PolicyOwner; Detail = "Found in the package list." }
+        }
+    }
+    catch { [void]$errors.Add("full list: $($_.Exception.Message)") }
+
+    if ($answered) {
+        return [pscustomobject]@{ Exists = $false; Known = $true; Policy = $null; Owner = ""
+            Detail = "Not present - the domain answered and does not have it." }
+    }
+
+    return [pscustomobject]@{ Exists = $false; Known = $false; Policy = $null; Owner = ""
+        Detail = "The domain could not be asked. $($errors.ToArray() -join '; ')" }
 }
 
 function Test-UcsFirmwarePolicyExists {
@@ -1564,12 +1935,162 @@ function Test-UcsFirmwarePolicyExists {
         [Parameter(Mandatory=$true)][string]$PolicyName,
         [Parameter(Mandatory=$true)]$UcsSession
     )
+    return (Get-UcsFirmwarePolicyLookup -PolicyName $PolicyName -UcsSession $UcsSession).Exists
+}
+
+function Test-UcsRemotePolicyMessage {
+    <#
+    .SYNOPSIS
+        Is this UCSM error the one that means "UCS Central already owns this policy"?
+
+    .DESCRIPTION
+        UCSM refuses a local write to a globally resolved object with:
+
+            Policy org-root/fw-host-pack-<name> is resolved from remote policy server.
+            Create/Delete/Modify operations are not allowed.
+
+        That is not a failure to make the package Global. It is UCSM saying the package ALREADY IS
+        Global - Central owns it, so the domain will not let this script touch it. Treating it as an
+        error is what put "could not be made Global and would upgrade nothing" on screen for a
+        package that was in exactly the state the run wanted.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Message)
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    return ($Message -match '(?i)resolved from remote policy server')
+}
+
+function Set-UcsServiceProfileTemplateFirmwarePolicy {
+    <#
+    .SYNOPSIS
+        Points every service profile TEMPLATE in the domain at the target host firmware package.
+
+    .DESCRIPTION
+        The service profiles this run touches are almost always bound to a template, and a template
+        that still names the old package puts it back. Setting only the profiles therefore fixes
+        the blades in this cluster and leaves the domain to undo it - on the next template push, on
+        a rebind, or on the next profile created from that template.
+
+        So the templates are checked once per domain, when the policy for that domain is resolved,
+        and any that already carry the target package are left alone and reported as compliant.
+        Nothing is prompted: the package being set is the same one the blades are getting anyway.
+
+        WHAT THIS DOES NOT DO: it does not reboot anything. A host firmware package change on a
+        service profile raises a PENDING ACTIVITY that waits for the maintenance-policy
+        acknowledgement, and this run acknowledges only the blades in its own batches. Templates
+        outside this cluster will show a pending activity for someone to action deliberately -
+        which is called out on screen rather than left to be discovered.
+
+    .PARAMETER UcsTarget
+        UCSM name, for messages and the run summary.
+
+    .PARAMETER UcsSession
+        A connected UCSM session for that domain.
+
+    .PARAMETER PolicyName
+        The host firmware package the templates should name.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$UcsTarget,
+        [Parameter(Mandatory=$true)]$UcsSession,
+        [Parameter(Mandatory=$true)][string]$PolicyName
+    )
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Checking service profile templates in $UcsTarget against '$PolicyName'..." -ForegroundColor Cyan
+
+    $templates = @()
     try {
-        $policyRows = @(Get-UcsFirmwarePolicyRows -UcsSession $UcsSession)
-        return (($policyRows | Where-Object { $_.Name -eq $PolicyName }).Count -gt 0)
+        # lsServer carries instances and templates alike; the type tells them apart. Asked for
+        # explicitly so a domain with thousands of profiles is not enumerated to find a handful
+        # of templates.
+        $templates = @(Get-UcsServiceProfile -Ucs $UcsSession -Type "initial-template" -ErrorAction Stop) +
+                     @(Get-UcsServiceProfile -Ucs $UcsSession -Type "updating-template" -ErrorAction Stop)
     }
     catch {
-        return $false
+        # Older PowerTool builds do not take -Type here. Fall back to filtering, which costs more.
+        try {
+            $templates = @(Get-UcsServiceProfile -Ucs $UcsSession -ErrorAction Stop |
+                Where-Object { [string]$_.Type -match '(?i)template' })
+        }
+        catch {
+            Write-Host "  Service profile templates could not be read from ${UcsTarget}: $($_.Exception.Message)" -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "UCSMTemplateFirmwarePolicy" -Batch "" -HostName "" -Action "Check templates" -Result "Unreadable" -Details "$UcsTarget - $($_.Exception.Message)"
+            return
+        }
+    }
+
+    if ($templates.Count -eq 0) {
+        Write-Host "  No service profile templates in $UcsTarget - nothing to align." -ForegroundColor Gray
+        Add-SummaryRecord -Stage "UCSMTemplateFirmwarePolicy" -Batch "" -HostName "" -Action "Check templates" -Result "None" -Details "$UcsTarget - no service profile templates found."
+        return
+    }
+
+    $compliant = New-Object System.Collections.Generic.List[string]
+    $changed   = New-Object System.Collections.Generic.List[string]
+    $failed    = New-Object System.Collections.Generic.List[string]
+
+    foreach ($template in $templates) {
+        $name = [string]$template.Name
+        $dn = [string]$template.Dn
+        $current = Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $template
+
+        if ($current -eq $PolicyName) {
+            [void]$compliant.Add($name)
+            Add-SummaryRecord -Stage "UCSMTemplateFirmwarePolicy" -Batch "" -HostName "" -Action "Check template" -Result "Compliant" -Details "$UcsTarget - $dn already names '$PolicyName'."
+            continue
+        }
+
+        if (Test-DryRun) {
+            [void]$changed.Add("$name ($current -> $PolicyName, DRY RUN)")
+            Add-SummaryRecord -Stage "UCSMTemplateFirmwarePolicy" -Batch "" -HostName "" -Action "Set template policy" -Result "DryRun" -Details "$UcsTarget - would set $dn from '$current' to '$PolicyName'."
+            continue
+        }
+
+        try {
+            Set-UcsServiceProfile -Ucs $UcsSession -ServiceProfile $template -HostFwPolicyName $PolicyName -Force -ErrorAction Stop | Out-Null
+
+            # Read back. The set returning is not proof the domain took it.
+            $after = $current
+            try {
+                $reread = Get-UcsServiceProfile -Ucs $UcsSession -Dn $dn -ErrorAction Stop
+                if ($null -ne $reread) { $after = Get-UcsServiceProfileFirmwarePolicyName -ServiceProfile $reread }
+            }
+            catch { }
+
+            if ($after -eq $PolicyName) {
+                [void]$changed.Add("$name ($current -> $PolicyName)")
+                Add-SummaryRecord -Stage "UCSMTemplateFirmwarePolicy" -Batch "" -HostName "" -Action "Set template policy" -Result "Updated" -Details "$UcsTarget - $dn set from '$current' to '$PolicyName' and read back."
+            }
+            else {
+                [void]$failed.Add("$name (still '$after')")
+                Add-SummaryRecord -Stage "UCSMTemplateFirmwarePolicy" -Batch "" -HostName "" -Action "Set template policy" -Result "NotVerified" -Details "$UcsTarget - $dn still names '$after' after the set."
+            }
+        }
+        catch {
+            $message = $_.Exception.Message
+            if (Test-UcsRemotePolicyMessage -Message $message) {
+                # The template itself is owned by UCS Central. Nothing for this run to do, and
+                # nothing wrong - Central manages it.
+                [void]$compliant.Add("$name (owned by UCS Central)")
+                Add-SummaryRecord -Stage "UCSMTemplateFirmwarePolicy" -Batch "" -HostName "" -Action "Set template policy" -Result "RemoteOwned" -Details "$UcsTarget - $dn is resolved from UCS Central and is managed there."
+                continue
+            }
+            [void]$failed.Add("$name ($message)")
+            Add-SummaryRecord -Stage "UCSMTemplateFirmwarePolicy" -Batch "" -HostName "" -Action "Set template policy" -Result "Failed" -Details "$UcsTarget - $dn - $message"
+        }
+    }
+
+    if ($compliant.Count -gt 0) {
+        Write-Host "  $($compliant.Count) template(s) already on '$PolicyName' - compliant, nothing to do: $($compliant.ToArray() -join ', ')" -ForegroundColor Green
+    }
+    if ($changed.Count -gt 0) {
+        Write-Host "  $($changed.Count) template(s) updated to '$PolicyName': $($changed.ToArray() -join ', ')" -ForegroundColor Yellow
+        Write-Host "  A template change raises a PENDING ACTIVITY on the profiles bound to it. This run" -ForegroundColor Yellow
+        Write-Host "  acknowledges only the blades in its own batches; any others are left pending for you." -ForegroundColor Yellow
+    }
+    if ($failed.Count -gt 0) {
+        Write-Host "  $($failed.Count) template(s) could NOT be set: $($failed.ToArray() -join ', ')" -ForegroundColor Red
+        Add-ManualAttentionHost -HostName $UcsTarget -Reason "Service profile template not on the target firmware package" -Detail "In $UcsTarget these templates do not name '$PolicyName': $($failed.ToArray() -join ', '). A profile rebound or recreated from them will go back to the old package."
     }
 }
 
@@ -2198,6 +2719,11 @@ function Assert-IntersightReady {
 
     $Global:IntersightBaseUrl = [string]$activeConfig.BasePath
     Write-Host "  Active BasePath: $Global:IntersightBaseUrl" -ForegroundColor Gray
+
+    # The read below is the first thing that actually crosses the network. Against a blocked
+    # appliance it produces a client-side timeout whose message is about signing and credentials,
+    # so the path is checked first and reported as what it is.
+    [void](Confirm-ManagementEndpointReachable -Target $Global:IntersightBaseUrl -DeviceKind "Intersight" -TimeoutSeconds $ManagementEndpointProbeTimeoutSeconds)
 
     try {
         [void](Get-IntersightServerProfile -Top 1 -Skip 0 -ErrorAction Stop)
@@ -5622,7 +6148,8 @@ function Invoke-RollingClusterUpgrade {
                     [void]$inFlight.Add([pscustomobject]@{
                         Host = $name; Wave = "$wave"; Stage = "AwaitingReturn"
                         StartedAt = Get-Date; ReturnedAt = $null; Announced = ""
-                        DisconnectedSince = $null; ReconnectAttempted = $false
+                        DisconnectedSince = $null; ReconnectAttempts = 0; NextReconnectAt = $null
+                        ReconnectGiveUpAsked = $false
                     })
                 }
 
@@ -5653,19 +6180,66 @@ function Invoke-RollingClusterUpgrade {
                         Write-Host "  '$($tracker.Host)' is Disconnected in vCenter. Allowing $HostReconnectAfterDisconnectMinutes minute(s) for it to settle before reconnecting it." -ForegroundColor Yellow
                         Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Confirm host returned" -Result "Disconnected" -Details "vCenter reports the host disconnected; waiting $HostReconnectAfterDisconnectMinutes minute(s) before using the root credential."
                     }
-                    elseif (-not $tracker.ReconnectAttempted -and ((Get-Date) - $tracker.DisconnectedSince).TotalMinutes -ge [double]$HostReconnectAfterDisconnectMinutes) {
-                        $tracker.ReconnectAttempted = $true
+                    elseif ($tracker.ReconnectAttempts -lt [int]$HostReconnectMaxAttempts -and
+                            ((Get-Date) - $tracker.DisconnectedSince).TotalMinutes -ge [double]$HostReconnectAfterDisconnectMinutes -and
+                            ($null -eq $tracker.NextReconnectAt -or (Get-Date) -ge $tracker.NextReconnectAt)) {
+                        # THREE attempts, $HostReconnectRetryPauseMinutes apart, not one. A host that
+                        # has just rebooted onto new firmware routinely refuses the first reconnect -
+                        # hostd is still starting, the vmk is not up yet, the certificate is being
+                        # regenerated - and one attempt wrote those off as unrecoverable when the
+                        # next would have taken them.
+                        $tracker.ReconnectAttempts = $tracker.ReconnectAttempts + 1
+                        $attemptLabel = "$($tracker.ReconnectAttempts) of $HostReconnectMaxAttempts"
+                        Write-Host "  Reconnect attempt $attemptLabel for '$($tracker.Host)'." -ForegroundColor Yellow
+
                         $reconnected = Restore-DisconnectedVMHost -HostName $tracker.Host
                         if ($reconnected) {
-                            Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Reconnect host" -Result "Reconnected" -Details "Reconnected with the ESXi root credential after $HostReconnectAfterDisconnectMinutes minute(s) disconnected. The normal checks continue from here."
+                            Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Reconnect host" -Result "Reconnected" -Details "Reconnected with the ESXi root credential on attempt $attemptLabel. The normal checks continue from here."
                             # Deliberately not advanced by hand - the next pass runs the SAME return
                             # check as every other host, so a reconnected host earns its way through
                             # settle and compliance exactly like one that never dropped.
                             $tracker.DisconnectedSince = $null
+                            $tracker.ReconnectAttempts = 0
+                            $tracker.NextReconnectAt = $null
                         }
                         else {
-                            Add-ManualAttentionHost -HostName $tracker.Host -Reason "Disconnected in vCenter and could not be reconnected" -Detail "The host was disconnected for $HostReconnectAfterDisconnectMinutes minute(s) and the ESXi root credential did not reconnect it. Check the host's management network and its root password."
-                            Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Reconnect host" -Result "Failed" -Details "Root credential reconnect did not bring the host back."
+                            $tracker.NextReconnectAt = (Get-Date).AddMinutes([double]$HostReconnectRetryPauseMinutes)
+                            Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Reconnect host" -Result "Retrying" -Details "Attempt $attemptLabel did not bring the host back; next attempt in $HostReconnectRetryPauseMinutes minute(s)."
+                            if ($tracker.ReconnectAttempts -lt [int]$HostReconnectMaxAttempts) {
+                                Write-Host "  '$($tracker.Host)' did not reconnect. Trying again in $HostReconnectRetryPauseMinutes minute(s)." -ForegroundColor Yellow
+                            }
+                        }
+                    }
+                    elseif ($tracker.ReconnectAttempts -ge [int]$HostReconnectMaxAttempts -and -not $tracker.ReconnectGiveUpAsked) {
+                        # Out of attempts. The operator is asked rather than the host being written
+                        # off silently, because at this point somebody has to look at it.
+                        $tracker.ReconnectGiveUpAsked = $true
+                        Write-Host "" -ForegroundColor Red
+                        Write-Host "'$($tracker.Host)' is still Disconnected in vCenter after $HostReconnectMaxAttempts reconnect attempt(s) with the ESXi root credential." -ForegroundColor Red
+                        Write-Host "  MANUAL INTERVENTION IS NEEDED. Worth checking on the host, in order:" -ForegroundColor Yellow
+                        Write-Host "    - it is powered on and has finished booting (KVM or CIMC console)" -ForegroundColor Gray
+                        Write-Host "    - its management vmk has an address and the gateway answers" -ForegroundColor Gray
+                        Write-Host "    - the root password matches the one given for this cluster" -ForegroundColor Gray
+                        Write-Host "    - hostd and vpxa are running: /etc/init.d/hostd status" -ForegroundColor Gray
+                        Write-Host "" -ForegroundColor Yellow
+                        Write-Host "  R - retry: reconnect it again from here, once you have made a change." -ForegroundColor Yellow
+                        Write-Host "  S - set aside: leave it for manual rectification and carry on with the rest." -ForegroundColor Yellow
+                        Write-Host "  E - exit the run here." -ForegroundColor Yellow
+                        $choice = Read-ChoiceExit -Message "'$($tracker.Host)' will not reconnect. R to retry, S to set aside and continue, E to exit" -AllowedChoices @("R","S") -ExitMessage "Stopped because '$($tracker.Host)' could not be reconnected."
+
+                        if ($choice -eq "R") {
+                            $tracker.ReconnectAttempts = 0
+                            $tracker.NextReconnectAt = $null
+                            $tracker.ReconnectGiveUpAsked = $false
+                            $tracker.DisconnectedSince = Get-Date
+                            Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Reconnect host" -Result "OperatorRetry" -Details "Operator asked for another $HostReconnectMaxAttempts attempt(s) after manual intervention."
+                        }
+                        else {
+                            Add-ManualAttentionHost -HostName $tracker.Host -Reason "Disconnected in vCenter and could not be reconnected" -Detail "$HostReconnectMaxAttempts reconnect attempt(s) with the ESXi root credential, $HostReconnectRetryPauseMinutes minute(s) apart, did not bring it back. Set aside by the operator so the rest of the cluster could continue. Check the host's management network, its root password, and hostd."
+                            Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Reconnect host" -Result "SetAside" -Details "Not reconnected after $HostReconnectMaxAttempts attempt(s); set aside by the operator and left for manual rectification."
+                            [void]$inFlight.Remove($tracker)
+                            $completed++
+                            Write-Host "  '$($tracker.Host)' set aside. Its slot is released so the rest of the cluster continues." -ForegroundColor Yellow
                         }
                     }
                 }
