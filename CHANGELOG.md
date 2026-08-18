@@ -12,6 +12,65 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.10.0] — 2026-08-18
+
+#### Added
+
+- **A host firmware package missing from a UCS domain is now created there and
+  handed to UCS Central in ONE managed-object write.** The package has to exist in
+  the domain before Central can take it over, so a registered domain that has
+  never had this package still needs it made once. 23.9.0 stopped the run in that
+  case; it now creates it and carries on.
+
+  The write is deliberately single. Creating the package LOCAL, committing, and
+  then modifying `policyOwner` is the order that failed: by the second call the
+  object was resolved from the policy server and UCSM refused it —
+  *"Policy org-root/fw-host-pack-global-436h is resolved from remote policy
+  server. Create/Delete/Modify operations are not allowed."* — leaving a local,
+  empty package attached to service profiles. Sending the ownership **with** the
+  create closes that window.
+
+  On the wire this is the pair the UCSM GUI sends for "create, Use Global":
+
+  ```xml
+  <configEstimateImpact><inConfigs>
+    <pair key="org-root/fw-host-pack-global-602d">
+      <firmwareComputeHostPack name="global-602d" policyOwner="pending-policy"
+          dn="org-root/fw-host-pack-global-602d" status="created,modified"/>
+    </pair>
+  </inConfigs></configEstimateImpact>
+
+  <configConfMos>  ...the same inConfigs...  </configConfMos>
+  ```
+
+  and the PowerTool that produces it:
+
+  | Step | Cmdlet | XML |
+  |---|---|---|
+  | open the batch | `Start-UcsTransaction` | — |
+  | the object | `Add-UcsFirmwareComputeHostPack -ModifyPresent -PolicyOwner "pending-policy"` | `status="created,modified"` |
+  | estimate | `Get-UcsTransactionImpact` | `configEstimateImpact` |
+  | commit | `Complete-UcsTransaction` | `configConfMos` |
+
+  `pending-policy` is UCSM's "Pending Global" — the domain offering the object up.
+  Central then claims it and it becomes `policy`. Both read back as success; only
+  `local` means the handover did not take, and that is flagged for manual
+  rectification while the run continues, because the blades still need their
+  windows.
+
+  Nothing is version-specific: the name comes from
+  `$Global:UcsFirmwarePolicyByFabricFamily`, so a 6300 domain gets `global-436h`
+  and a 6400 domain `global-602d` from the same code path. Both are asserted.
+
+  No blade or rack bundle version is ever written. That is the point of the
+  handover — the versions come from the global policy, and one pinned here would
+  quietly disagree with it.
+
+  A create that genuinely fails stops the run before any service profile is
+  touched. A create UCS Central refuses because it already owns the package is
+  success, not failure, and the half-open transaction is discarded rather than
+  left on the session.
+
 ### [23.9.0] — 2026-08-18
 
 Dead-code pass, plus the behaviour changes that follow from every UCS domain
@@ -2490,6 +2549,14 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.10.0-preauth] — 2026-08-18
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.10.0 — a missing host
+firmware package is created in UCSM and handed to UCS Central in one write
+(`policyOwner="pending-policy"`, `status="created,modified"`), for whichever
+package the fabric family maps to, and the run continues. This is the build to
+run.
 
 ### [23.9.0-preauth] — 2026-08-18
 

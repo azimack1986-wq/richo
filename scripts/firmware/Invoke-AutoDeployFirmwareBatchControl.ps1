@@ -350,7 +350,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.9.0"
+$ScriptVersion = "23.10.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -1588,19 +1588,20 @@ function Resolve-UcsFirmwarePolicyForTarget {
         policy, per $Global:UcsFirmwarePolicyByFabricFamily - so a 6400 domain gets one policy and a
         6300 domain another, with no operator choice to get wrong.
 
-        THE PACKAGE IS UCS CENTRAL'S, NOT THIS SCRIPT'S. Every domain is registered with UCS
-        Central, so the host firmware package is defined there and resolves down to the domain, and
-        all this has to do is confirm it arrived. A package missing from the domain stops the run
-        with where to go and make it.
+        Where the package already resolves in the domain it is used as-is, whoever owns it.
 
-        An earlier build created the package locally when it could not find one. That is worse than
-        stopping: a locally created package carries no bundle versions of its own - they are meant
-        to come from the global policy - so it applies cleanly and upgrades nothing while the run
-        reports success. It also fought Central, which refuses local create, delete and modify on
-        anything it owns.
+        Where it does not, it is CREATED ONCE IN UCSM AND HANDED STRAIGHT TO UCS CENTRAL - a single
+        managed-object write carrying policyOwner="pending-policy", which is what the GUI sends for
+        "create, Use Global". The package has to exist in the domain before Central can take it
+        over, and doing the create and the handover as two separate operations is what failed: by
+        the time the second one went out the object was resolved from the policy server and UCSM
+        refused it, leaving a local, empty package behind. See New-UcsGlobalFirmwarePolicy.
 
-        Once the package is confirmed, the domain's service profile templates are aligned to it, so
-        a template does not put the old package back on the next push or rebind.
+        No bundle version is ever written. That is the point of the handover - the versions come
+        from the global policy, and a version pinned here would quietly disagree with it.
+
+        Once the package is confirmed or created, the domain's service profile templates are
+        aligned to it, so a template does not put the old package back on the next push or rebind.
 
     .PARAMETER UcsTarget
         UCSM name, for messages and caching.
@@ -1647,18 +1648,26 @@ function Resolve-UcsFirmwarePolicyForTarget {
         Stop-WithMessage "Whether host firmware package '$policyName' exists in $UcsTarget could not be established: $($lookup.Detail) Check the UCSM session before continuing."
     }
 
-    if (-not $lookup.Exists) {
-        # THIS DOMAIN DOES NOT CREATE PACKAGES. Every domain is registered with UCS Central, so the
-        # package is Central's to define and push; a local one created here would carry no bundle
-        # versions of its own, apply cleanly, and upgrade nothing while the run reported success.
-        # That is the exact failure this path used to produce, so the answer is to stop and say
-        # where the package actually has to come from.
-        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Resolve firmware policy" -Result "Missing" -Details "$UcsTarget - $policyName is not resolved in this domain for fabric family $($fabric.Family)."
-        Stop-WithMessage "Host firmware package '$policyName' is not present in $UcsTarget. It is a global policy: create it in UCS Central and let it resolve to this domain, then run again. Check that $UcsTarget is registered with UCS Central and that its policy resolution control for host firmware packages is set to Global."
+    if ($lookup.Exists) {
+        Write-Host "  '$policyName' resolves in $UcsTarget ($($lookup.Detail)) - owner $(if ($lookup.Owner) { $lookup.Owner } else { 'unreported' })." -ForegroundColor Green
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Resolve firmware policy" -Result "Resolved" -Details "$UcsTarget - $policyName for fabric family $($fabric.Family). Owner=$(if ($lookup.Owner) { $lookup.Owner } else { 'unreported' }). $($lookup.Detail)"
     }
-
-    Write-Host "  '$policyName' resolves in $UcsTarget ($($lookup.Detail)) - owner $(if ($lookup.Owner) { $lookup.Owner } else { 'unreported' })." -ForegroundColor Green
-    Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Resolve firmware policy" -Result "Resolved" -Details "$UcsTarget - $policyName for fabric family $($fabric.Family). Owner=$(if ($lookup.Owner) { $lookup.Owner } else { 'unreported' }). $($lookup.Detail)"
+    elseif (Test-DryRun) {
+        Write-Host "  '$policyName' is not in $UcsTarget. DRY RUN: would create it at org-root with policyOwner=pending-policy and hand it to UCS Central." -ForegroundColor Green
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create global firmware policy" -Result "DryRun" -Details "$UcsTarget - would create org-root/fw-host-pack-$policyName with policyOwner=pending-policy; no bundle versions written."
+    }
+    else {
+        # The package has to exist in the domain before Central can take it over. Created here in
+        # ONE write that carries the ownership with it - see New-UcsGlobalFirmwarePolicy for why
+        # create-then-modify is the order that failed.
+        Write-Host "  '$policyName' is not present in $UcsTarget." -ForegroundColor Yellow
+        $made = New-UcsGlobalFirmwarePolicy -PolicyName $policyName -UcsTarget $UcsTarget -UcsSession $UcsSession
+        if (-not $made.Created) {
+            Stop-WithMessage "Host firmware package '$policyName' is missing from $UcsTarget and could not be created: $($made.Detail) Nothing has been changed on any service profile."
+        }
+        # Created - the run carries on into the templates and the blades, as it would have if the
+        # package had already been there.
+    }
 
     $Global:UcsFirmwarePolicyByTarget[$UcsTarget] = $policyName
     Set-UcsServiceProfileTemplateFirmwarePolicy -UcsTarget $UcsTarget -UcsSession $UcsSession -PolicyName $policyName
@@ -1769,6 +1778,184 @@ function Test-UcsRemotePolicyMessage {
     param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Message)
     if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
     return ($Message -match '(?i)resolved from remote policy server')
+}
+
+function New-UcsGlobalFirmwarePolicy {
+    <#
+    .SYNOPSIS
+        Creates a missing host firmware package in UCSM and hands it to UCS Central in ONE write.
+
+    .DESCRIPTION
+        The package has to exist in the domain before Central can take it over, so a domain that is
+        registered but has never had this package still needs it made once. This is that step, and
+        it is deliberately a SINGLE managed-object write rather than create-then-modify.
+
+        WHY ONE WRITE. An earlier build created the package LOCAL, committed, and then issued a
+        second call to change policyOwner. By then the object was resolved from the policy server
+        and UCSM refused the modify:
+
+            Policy org-root/fw-host-pack-global-436h is resolved from remote policy server.
+            Create/Delete/Modify operations are not allowed.
+
+        which left a local, empty package attached to service profiles - it applies cleanly and
+        upgrades nothing. Sending the ownership WITH the create closes that window.
+
+        WHAT GOES ON THE WIRE. Exactly the pair the UCSM GUI sends for "create, Use Global":
+
+            <configEstimateImpact>
+              <inConfigs><pair key="org-root/fw-host-pack-<name>">
+                <firmwareComputeHostPack name="<name>" policyOwner="pending-policy"
+                    dn="org-root/fw-host-pack-<name>" status="created,modified"/>
+              </pair></inConfigs>
+            </configEstimateImpact>
+
+            <configConfMos> ...the same inConfigs... </configConfMos>
+
+        and the PowerTool that produces it:
+
+            Start-UcsTransaction                              opens the configConfMos batch
+            Add-Ucs... -ModifyPresent                         status="created,modified"
+                       -PolicyOwner "pending-policy"          the handover, in the same MO
+            Get-UcsTransactionImpact                          configEstimateImpact
+            Complete-UcsTransaction                           configConfMos
+
+        No Descr and no bundle versions are sent, because the payload carries neither. The versions
+        are the whole point of handing it to Central: they come from the global policy, not from
+        anything written here.
+
+        POLICY OWNER IS "pending-policy", NOT "policy". Per Cisco's firmwareComputeHostPack
+        metadata the value is one of local / pending-policy / policy, and pending-policy is what
+        the domain sets when it offers the object up - UCSM shows "Pending Global". Central then
+        claims it and it becomes "policy". Both are success here; only "local" means the handover
+        did not take.
+
+        Never throws. A package that cannot be created is reported and the caller decides.
+
+    .PARAMETER PolicyName
+        The package name for this domain's fabric family - global-436h on a 6300, global-602d on a
+        6400, and so on. Nothing here is specific to any one of them.
+
+    .PARAMETER UcsTarget
+        UCSM name, for messages and the run summary.
+
+    .PARAMETER UcsSession
+        A connected UCSM session for that domain.
+
+    .EXAMPLE
+        $made = New-UcsGlobalFirmwarePolicy -PolicyName 'global-602d' -UcsTarget 'ucsm-a' -UcsSession $s
+        if ($made.Created) { ... }
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$PolicyName,
+        [Parameter(Mandatory=$true)][string]$UcsTarget,
+        [Parameter(Mandatory=$true)]$UcsSession
+    )
+
+    $dn = "org-root/fw-host-pack-$PolicyName"
+
+    Write-Host "  Creating '$PolicyName' in $UcsTarget and handing it to UCS Central in one write." -ForegroundColor Yellow
+    Write-Host "    dn          : $dn" -ForegroundColor Gray
+    Write-Host "    policyOwner : pending-policy (UCSM shows this as Pending Global)" -ForegroundColor Gray
+    Write-Host "    status      : created,modified" -ForegroundColor Gray
+
+    # Does this PowerTool build expose policyOwner on the Add cmdlet? Asked rather than assumed:
+    # where it is missing the single write is impossible and the two-step below is the only route.
+    $ownerAtCreate = $false
+    try { $ownerAtCreate = [bool](Get-Command -Name Add-UcsFirmwareComputeHostPack -ErrorAction Stop).Parameters.ContainsKey('PolicyOwner') }
+    catch { $ownerAtCreate = $false }
+
+    $inTransaction = $false
+    try {
+        Start-UcsTransaction -Ucs $UcsSession -ErrorAction Stop | Out-Null
+        $inTransaction = $true
+
+        if ($ownerAtCreate) {
+            Add-UcsFirmwareComputeHostPack -Ucs $UcsSession -Org "org-root" -Name $PolicyName `
+                -PolicyOwner "pending-policy" -ModifyPresent -ErrorAction Stop | Out-Null
+        }
+        else {
+            Add-UcsFirmwareComputeHostPack -Ucs $UcsSession -Org "org-root" -Name $PolicyName `
+                -ModifyPresent -ErrorAction Stop | Out-Null
+        }
+
+        # configEstimateImpact, before the commit, the same question the GUI asks. Informational:
+        # it is reported and never acted on, because the operator has already approved this change.
+        try {
+            $impact = Get-UcsTransactionImpact -Ucs $UcsSession -ErrorAction Stop
+            foreach ($line in @($impact)) {
+                $text = if ($line.PSObject.Properties.Name -contains 'Message') { [string]$line.Message } else { [string]$line }
+                if (-not [string]::IsNullOrWhiteSpace($text)) { Write-Host "    Impact: $text" -ForegroundColor Gray }
+            }
+        }
+        catch { Write-Host "    (no impact estimate available from this domain: $($_.Exception.Message))" -ForegroundColor DarkGray }
+
+        Complete-UcsTransaction -Ucs $UcsSession -ErrorAction Stop | Out-Null
+        $inTransaction = $false
+    }
+    catch {
+        $message = $_.Exception.Message
+        if ($inTransaction) {
+            # Leave no half-built batch on the session for the next call to commit by accident.
+            try { if (Get-Command -Name Undo-UcsTransaction -ErrorAction SilentlyContinue) { Undo-UcsTransaction -Ucs $UcsSession -ErrorAction SilentlyContinue | Out-Null } } catch { }
+        }
+
+        if (Test-UcsRemotePolicyMessage -Message $message) {
+            # Central already owns it. Nothing to create and nothing to hand over - the end state
+            # this was working towards, reached from the other direction.
+            Write-Host "  '$PolicyName' is resolved from UCS Central - it already exists and Central owns it." -ForegroundColor Green
+            Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create global firmware policy" -Result "RemoteOwned" -Details "$UcsTarget - $dn is resolved from UCS Central; no local create is permitted or needed."
+            return [pscustomobject]@{ Created = $true; Owner = "policy"; Detail = "Resolved from UCS Central." }
+        }
+
+        Write-Host "  Could not create '$PolicyName' in ${UcsTarget}: $message" -ForegroundColor Red
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create global firmware policy" -Result "Failed" -Details "$UcsTarget - $dn - $message"
+        return [pscustomobject]@{ Created = $false; Owner = ""; Detail = $message }
+    }
+
+    # Where the Add cmdlet could not carry it, the handover is a second write. This is the order
+    # that failed before, so it is only reached when the single write was not available at all.
+    if (-not $ownerAtCreate) {
+        Write-Host "    This PowerTool build cannot set policyOwner at create, so the handover is a second write." -ForegroundColor Yellow
+        try {
+            Get-UcsFirmwareComputeHostPack -Ucs $UcsSession -Org "org-root" -Name $PolicyName -ErrorAction Stop |
+                Set-UcsFirmwareComputeHostPack -PolicyOwner "pending-policy" -Force -ErrorAction Stop | Out-Null
+        }
+        catch {
+            if (Test-UcsRemotePolicyMessage -Message $_.Exception.Message) {
+                Write-Host "  '$PolicyName' is now resolved from UCS Central." -ForegroundColor Green
+            }
+            else {
+                Write-Host "    The handover write failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+        }
+    }
+
+    # READ THE OWNER BACK. The write returning is not proof the domain accepted the handover, and a
+    # package left local carries no bundle versions - it would apply cleanly and upgrade nothing.
+    $lookup = Get-UcsFirmwarePolicyLookup -PolicyName $PolicyName -UcsSession $UcsSession
+    $owner = [string]$lookup.Owner
+
+    if (-not $lookup.Exists) {
+        Write-Host "  '$PolicyName' cannot be read back from $UcsTarget after the write." -ForegroundColor Red
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create global firmware policy" -Result "NotReadBack" -Details "$UcsTarget - $dn was written but does not read back. $($lookup.Detail)"
+        return [pscustomobject]@{ Created = $false; Owner = ""; Detail = "Written but not readable afterwards. $($lookup.Detail)" }
+    }
+
+    if ($owner -eq "policy" -or $owner -eq "pending-policy") {
+        $label = if ($owner -eq "policy") { "Global - UCS Central has taken it" } else { "Pending Global - offered to UCS Central, not yet claimed" }
+        Write-Host "  '$PolicyName' created in $UcsTarget and is $label." -ForegroundColor Green
+        Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create global firmware policy" -Result "Created" -Details "$UcsTarget - $dn created with policyOwner=$owner; bundle versions come from the global policy."
+        return [pscustomobject]@{ Created = $true; Owner = $owner; Detail = $label }
+    }
+
+    # Created, but still local. It exists, so the run can continue and the blades will get a
+    # package - but an empty one, so this is called out rather than passed over.
+    Write-Host "  '$PolicyName' was created in $UcsTarget but is still owned locally (policyOwner=$(if ($owner) { $owner } else { 'unreported' }))." -ForegroundColor Yellow
+    Write-Host "  A local package carries no bundle versions of its own, so it will apply cleanly and change no firmware." -ForegroundColor Yellow
+    Write-Host "  Check that $UcsTarget is registered with UCS Central and that policy resolution for host firmware packages is Global." -ForegroundColor Yellow
+    Add-ManualAttentionHost -HostName $UcsTarget -Reason "Host firmware package is not Global" -Detail "'$PolicyName' was created in $UcsTarget but policyOwner is '$(if ($owner) { $owner } else { 'unreported' })'. A local package has no bundle versions of its own and will not change any firmware. Set it to Use Global in UCSM, or confirm the domain is registered with UCS Central."
+    Add-SummaryRecord -Stage "UCSMFirmwarePolicySelection" -Batch "" -HostName "" -Action "Create global firmware policy" -Result "StillLocal" -Details "$UcsTarget - $dn created but policyOwner=$owner; the package has no bundle versions of its own."
+    return [pscustomobject]@{ Created = $true; Owner = $owner; Detail = "Created but still local." }
 }
 
 function Set-UcsServiceProfileTemplateFirmwarePolicy {
