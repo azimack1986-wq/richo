@@ -28,7 +28,7 @@ $errors = $null; $tokens = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
 if ($errors) { throw "parse errors" }
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Restore-DisconnectedVMHost','Test-VMHostDisconnected') } |
+    Where-Object { $_.Name -in @('Restore-DisconnectedVMHost','Test-VMHostDisconnected','Test-VMHostNotResponding') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0
@@ -69,13 +69,26 @@ function New-VMHostConnectSpec { param($HostName,$Credential)
 
 $cred = [pscredential]::new('root', (ConvertTo-SecureString 'S3cret!' -AsPlainText -Force))
 
-Write-Host "`n=== Disconnected is told apart from still-rebooting ===" -ForegroundColor Cyan
-# A host still coming up is absent, and resolves itself. A host vCenter has DISCONNECTED because
-# it cannot authenticate will sit there indefinitely - only that is worth a root password.
-foreach ($pair in @(@('Disconnected',$true), @('NotResponding',$true), @('Connected',$false), @('Maintenance',$false))) {
+Write-Host "`n=== Disconnected is told apart from Not Responding ===" -ForegroundColor Cyan
+# NOT INTERCHANGEABLE, and treating them as one was wrong on the case that matters most.
+# NotResponding is vCenter unable to reach the host RIGHT NOW - which is exactly what a blade being
+# reflashed and power-cycled looks like, and it resolves itself when the host boots. Disconnected
+# is vCenter having GIVEN UP, typically because the credential it holds no longer works, and that
+# never resolves on its own.
+#
+# Including NotResponding here started the reconnect clock on every host in the middle of its own
+# firmware reboot: useless, and a way to lock the root account against a host that was never broken.
+foreach ($pair in @(@('Disconnected',$true), @('NotResponding',$false), @('Connected',$false), @('Maintenance',$false))) {
     $script:State = $pair[0]
     Assert-Equal "'$($pair[0])' reports disconnected = $($pair[1])" $pair[1] (Test-VMHostDisconnected -HostName 'esx01')
 }
+foreach ($pair in @(@('NotResponding',$true), @('Disconnected',$false), @('Connected',$false), @('Maintenance',$false))) {
+    $script:State = $pair[0]
+    Assert-Equal "'$($pair[0])' reports not-responding = $($pair[1])" $pair[1] (Test-VMHostNotResponding -HostName 'esx01')
+}
+$script:HostPresent = $false
+Assert-Equal "a host absent from inventory is not 'not responding'" $false (Test-VMHostNotResponding -HostName 'esx01')
+$script:HostPresent = $true
 $script:HostPresent = $false
 Assert-Equal "a host absent from inventory is not 'disconnected'" $false (Test-VMHostDisconnected -HostName 'esx01')
 $script:HostPresent = $true

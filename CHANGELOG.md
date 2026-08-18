@@ -12,6 +12,48 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.12.0] — 2026-08-18
+
+#### Fixed
+
+- **Not Responding was treated as Disconnected, so the reconnect fired on hosts
+  that were simply rebooting.** The two are not interchangeable:
+
+  | State | Means | Right response |
+  |---|---|---|
+  | `NotResponding` | vCenter cannot reach the host **right now** — what a blade being reflashed and power-cycled looks like | leave it; it resolves when the host boots |
+  | `Disconnected` | vCenter has **given up**, typically because the credential it holds no longer works | reconnect with the root credential |
+
+  `Test-VMHostDisconnected` matched both, so the reconnect clock started on every
+  host in the middle of its own firmware reboot — useless, and a way to lock the
+  root account against a host that was never broken. It now matches `Disconnected`
+  only, and `Test-VMHostNotResponding` reports the other.
+
+#### Changed
+
+- **Nothing is done to a host for the first 40 minutes after its firmware
+  action** (`$FirmwareQuietWindowMinutes`). The blade is being reflashed and
+  rebooted; it is *supposed* to fall out of vCenter. The rejoin check still runs
+  every pass throughout, so a host that comes back at twelve minutes is picked up
+  at twelve minutes — the window gates **remediation**, not detection.
+
+  After it: `NotResponding` is left alone and re-reported every
+  `$HostNotRespondingRecheckMinutes` (5) rather than on every five-second pass;
+  `Disconnected` goes to the reconnect logic — three attempts two minutes apart,
+  then the operator.
+
+- **The host profile compliance settle is 4 minutes, not 8**, and can be skipped
+  from the console with **O**. It is a settle, not a repair: it exists so the scan
+  does not run through the noisy window straight after a host re-registers. The
+  scan itself is unchanged, and the scan is still what decides.
+
+- **The return-ceiling prompt is now an outer bound rather than the last `elseif`
+  in the state chain.** Caught while testing the change above: with a state branch
+  matching on every pass, a host stuck `NotResponding` would never have reached
+  the prompt and the run would have waited on it with no way out but `E`. It is
+  skipped only while a disconnect is actively being worked, because that path ends
+  in its own prompt.
+
 ### [23.11.0] — 2026-08-18
 
 #### Fixed
@@ -2631,6 +2673,13 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.12.0-preauth] — 2026-08-18
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.12.0 — Not Responding is no
+longer mistaken for Disconnected, nothing is done to a host for the first 40
+minutes of its firmware action, and the compliance settle is 4 minutes with an O
+override. This is the build to run.
 
 ### [23.11.0-preauth] — 2026-08-18
 

@@ -536,7 +536,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.11.0-preauth"
+$ScriptVersion = "23.12.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -655,6 +655,8 @@ $Global:BatchActionsSent = 0
 # Boot time per host, captured before the reboot is requested. The reconnect gate compares against
 # it so that "the host is Connected" cannot be mistaken for "the host came back".
 $Global:PreRebootBootTimes = @{}
+# Set by O during the rolling upgrade: skip the remainder of the host profile compliance settle.
+$Global:SkipComplianceSettle = $false
 $Global:RequiredModulesLoaded = $false
 $Global:IntersightReadyChecked = $false
 $Global:IntersightUnusable = $false
@@ -700,7 +702,10 @@ $ReconnectCheckIntervalSeconds = 60
 #
 # Raised from 2 to 8 minutes at the operator's direction: two minutes was not covering the profile
 # engine's own work on a freshly rebooted host, so the first scan was answering too early.
-$HostProfileComplianceSettleMinutes = 8
+# Cut from 8 to 4 at the operator's direction. It is a settle, not a fix: it exists so the scan
+# does not run through the noisy window straight after a host re-registers. Four minutes covers
+# that, and the wait can be skipped from the console with O when the host is plainly ready.
+$HostProfileComplianceSettleMinutes = 4
 # Bound on waiting for a compliance check vCenter or Auto Deploy started itself to finish before
 # this run starts its own, so the scan that answers is the one whose result is acted on.
 $HostProfileComplianceScanTimeoutMinutes = 10
@@ -736,6 +741,16 @@ $Global:EsxiRootCredential = $null
 # How long a host must be seen DISCONNECTED before the root credential is used to reconnect it.
 # Short enough not to waste the change window, long enough not to fight a host that is simply
 # still coming up - vCenter reports Disconnected briefly during a normal boot.
+# NOTHING IS DONE TO A HOST FOR THIS LONG AFTER ITS FIRMWARE ACTION. The blade is being
+# reflashed and rebooted; it is SUPPOSED to fall out of vCenter, and reaching for the root
+# credential while that is happening fixes nothing and risks locking the account. The rejoin check
+# still runs every pass throughout - a host that comes back at twelve minutes is picked up at
+# twelve minutes. This only gates REMEDIATION.
+$FirmwareQuietWindowMinutes = 40
+# While a host is NotResponding after that window, it is left alone and looked at again this
+# often. NotResponding is a host vCenter cannot reach right now, which is what a rebooting host
+# looks like; Disconnected is vCenter having given up on it, which is the one worth acting on.
+$HostNotRespondingRecheckMinutes = 5
 $HostReconnectAfterDisconnectMinutes = 5
 # How many times the ESXi root credential is used on a host vCenter has dropped, and how long to
 # wait between those attempts. One attempt was not enough: a host that has just rebooted onto new
@@ -3993,25 +4008,53 @@ function New-VMHostConnectSpec {
     return $spec
 }
 
-function Test-VMHostDisconnected {
+function Test-VMHostNotResponding {
     <#
     .SYNOPSIS
-        Is this host in vCenter's inventory but not usable? Disconnected or NotResponding.
+        Is vCenter unable to reach this host right now? NotResponding only.
 
     .DESCRIPTION
-        Told apart from "not back yet" deliberately. A host still rebooting is absent or briefly
-        NotResponding and will resolve itself; a host vCenter has DISCONNECTED because it cannot
-        authenticate to it will sit there indefinitely. Only the second is worth spending a root
-        password on, and the caller waits $HostReconnectAfterDisconnectMinutes before deciding
-        which it is looking at.
+        The expected state for a blade in the middle of a firmware reflash and power cycle, and the
+        reason it is told apart from Disconnected: vCenter cannot reach the host, but it has not
+        given up on it. Nothing is done about a host in this state - it resolves itself when the
+        host boots - it is only reported, so the operator can see the difference between "still
+        going" and "vCenter has dropped it".
     #>
     param([Parameter(Mandatory=$true)][string]$HostName)
 
     try {
         $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
         if ($null -eq $hostObj) { return $false }
-        $state = [string]$hostObj.ConnectionState
-        return ($state -eq "Disconnected" -or $state -eq "NotResponding")
+        return ([string]$hostObj.ConnectionState -eq "NotResponding")
+    }
+    catch { return $false }
+}
+
+function Test-VMHostDisconnected {
+    <#
+    .SYNOPSIS
+        Is this host in vCenter's inventory but not usable? Disconnected or NotResponding.
+
+    .DESCRIPTION
+        DISCONNECTED ONLY. The two states are not interchangeable and treating them as one was
+        wrong on the case that matters most:
+
+          NotResponding  vCenter cannot reach the host RIGHT NOW. That is what a blade being
+                         reflashed and power-cycled looks like, and it is expected. It resolves
+                         itself when the host boots.
+          Disconnected   vCenter has GIVEN UP on the host - typically because the credential it
+                         holds no longer works. This never resolves on its own.
+
+        Only the second is worth spending a root password on. Including NotResponding started the
+        reconnect clock on every host in the middle of its own firmware reboot, which is both
+        useless and a way to lock the root account against a host that was never broken.
+    #>
+    param([Parameter(Mandatory=$true)][string]$HostName)
+
+    try {
+        $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
+        if ($null -eq $hostObj) { return $false }
+        return ([string]$hostObj.ConnectionState -eq "Disconnected")
     }
     catch { return $false }
 }
@@ -6133,7 +6176,7 @@ function Invoke-RollingClusterUpgrade {
                         Host = $name; Wave = "$wave"; Stage = "AwaitingReturn"
                         StartedAt = Get-Date; ReturnedAt = $null; Announced = ""
                         DisconnectedSince = $null; ReconnectAttempts = 0; NextReconnectAt = $null
-                        ReconnectGiveUpAsked = $false
+                        ReconnectGiveUpAsked = $false; NextNotRespondingCheckAt = $null
                     })
                 }
 
@@ -6149,11 +6192,33 @@ function Invoke-RollingClusterUpgrade {
         foreach ($tracker in $inFlight.ToArray()) {
 
             if ($tracker.Stage -eq "AwaitingReturn") {
+                $sinceStart = ((Get-Date) - $tracker.StartedAt).TotalMinutes
+
                 if (Test-VMHostRejoinedAfterReboot -HostName $tracker.Host) {
                     $tracker.Stage = "Settling"
                     $tracker.ReturnedAt = Get-Date
-                    Write-Host "  '$($tracker.Host)' is back in vCenter. Settling $HostProfileComplianceSettleMinutes minute(s) before its compliance scan." -ForegroundColor Green
+                    Write-Host "  '$($tracker.Host)' is back in vCenter. Settling $HostProfileComplianceSettleMinutes minute(s) before its compliance scan - press O to scan now." -ForegroundColor Green
                     Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Confirm host returned" -Result "Returned" -Details "Back in vCenter with a changed boot time."
+                }
+                elseif ($sinceStart -lt [double]$FirmwareQuietWindowMinutes) {
+                    # THE QUIET WINDOW. The blade is being reflashed and rebooted, so it is meant to
+                    # be out of vCenter, and nothing here should be reaching for a root credential
+                    # over it. The rejoin check above still runs every pass, so a host that comes
+                    # back inside the window is picked up the moment it does.
+                    if ($tracker.Announced -ne "quiet") {
+                        Write-Host "  '$($tracker.Host)': firmware window - vCenter state is not acted on for the first $FirmwareQuietWindowMinutes minute(s)." -ForegroundColor DarkGray
+                        $tracker.Announced = "quiet"
+                    }
+                }
+                elseif (Test-VMHostNotResponding -HostName $tracker.Host) {
+                    # Still not reachable after the quiet window. LEFT ALONE - this is a host that
+                    # is up or coming up and cannot be talked to yet, not one vCenter has given up
+                    # on. Looked at again every $HostNotRespondingRecheckMinutes.
+                    if ($null -eq $tracker.NextNotRespondingCheckAt -or (Get-Date) -ge $tracker.NextNotRespondingCheckAt) {
+                        $tracker.NextNotRespondingCheckAt = (Get-Date).AddMinutes([double]$HostNotRespondingRecheckMinutes)
+                        Write-Host "  '$($tracker.Host)' is Not Responding $([int]$sinceStart) minute(s) in. Leaving it - looking again in $HostNotRespondingRecheckMinutes minute(s)." -ForegroundColor Yellow
+                        Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Confirm host returned" -Result "NotResponding" -Details "Not Responding $([int]$sinceStart) minute(s) after its firmware action; left alone and re-checked in $HostNotRespondingRecheckMinutes minute(s)."
+                    }
                 }
                 elseif (Test-VMHostDisconnected -HostName $tracker.Host) {
                     # The host is in inventory but vCenter has dropped it. Left alone this never
@@ -6227,7 +6292,16 @@ function Invoke-RollingClusterUpgrade {
                         }
                     }
                 }
-                elseif (((Get-Date) - $tracker.StartedAt).TotalMinutes -ge $returnCeilingMinutes) {
+
+                # THE OUTER BOUND, and deliberately NOT an elseif on the states above. It was one,
+                # and a host that sat Not Responding never reached it - the state branch matched on
+                # every pass, so the run waited on that host with no way out but E.
+                #
+                # Skipped while a disconnect is being worked, because that path has its own
+                # escalation and ends in its own prompt; two questions about one host is worse than
+                # none.
+                if ($tracker.Stage -eq "AwaitingReturn" -and $null -eq $tracker.DisconnectedSince -and
+                    ((Get-Date) - $tracker.StartedAt).TotalMinutes -ge $returnCeilingMinutes) {
                     $progress = Get-RollingHostDiagnostic -HostName $tracker.Host
                     Write-Host "" -ForegroundColor Yellow
                     Write-Host "'$($tracker.Host)' has not come back after $returnCeilingMinutes minute(s). $progress" -ForegroundColor Yellow
@@ -6246,6 +6320,17 @@ function Invoke-RollingClusterUpgrade {
 
             if ($tracker.Stage -eq "Settling") {
                 $waited = if ($null -eq $tracker.ReturnedAt) { [double]$HostProfileComplianceSettleMinutes } else { ((Get-Date) - $tracker.ReturnedAt).TotalMinutes }
+
+                # O skips the rest of the settle. It is a quiet period, not a repair - so where the
+                # host is plainly back and the engineer can see it, waiting the balance out serves
+                # nothing. The scan itself is unchanged, and it is the scan that decides.
+                if ($Global:SkipComplianceSettle) {
+                    $tracker.Stage = "Compliance"
+                    Write-Host "  '$($tracker.Host)': settle skipped at the operator's instruction - scanning now." -ForegroundColor Yellow
+                    Add-SummaryRecord -Stage "HostProfileComplianceSettle" -Batch $tracker.Wave -HostName $tracker.Host -Action "Settle before compliance scan" -Result "Skipped" -Details "Operator pressed O after $([int]$waited) of $HostProfileComplianceSettleMinutes minute(s)."
+                    continue
+                }
+
                 if ($waited -ge [double]$HostProfileComplianceSettleMinutes) {
                     $tracker.Stage = "Compliance"
                     Add-SummaryRecord -Stage "HostProfileComplianceSettle" -Batch $tracker.Wave -HostName $tracker.Host -Action "Settle before compliance scan" -Result "Completed" -Details "Waited $([int]$waited) minute(s) from this host's own return before scanning."
@@ -6264,9 +6349,16 @@ function Invoke-RollingClusterUpgrade {
 
         if ($pending.Count -eq 0 -and $inFlight.Count -eq 0) { break }
 
-        # Nothing advanced this pass. Wait, watching for E, then look again.
+        # Nothing advanced this pass. Wait, watching for a key, then look again.
         $key = Read-PendingConsoleKey
         if ($key -eq "E") { Stop-SafeExit -Message "Stopped during the rolling upgrade." }
+        if ($key -eq "O") {
+            # Applies to every host settling now and to any that reach it afterwards, because the
+            # operator pressing it means "stop making me wait for this", not "just that one".
+            $Global:SkipComplianceSettle = $true
+            Write-Host "  O - the host profile compliance settle is skipped for the rest of this run." -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "HostProfileComplianceSettle" -Batch "" -HostName "" -Action "Skip settle" -Result "Enabled" -Details "Operator pressed O; the $HostProfileComplianceSettleMinutes minute settle is skipped for the remainder of the run."
+        }
 
         if ((Get-Date) -ge $nextPoll) {
             $nextPoll = (Get-Date).AddSeconds($intervalSeconds)

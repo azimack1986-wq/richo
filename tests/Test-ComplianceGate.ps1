@@ -364,8 +364,11 @@ Assert-Equal "the halt points at Authentication Configuration" $true ($gateText 
 Assert-Equal "and at Active Directory Permission" $true ($gateText -match 'Active Directory Permission')
 Assert-Equal "the requirements say to re-enable them afterwards" $true ($gateText -match '(?i)RE-ENABLE BOTH AFTER THE UPGRADE')
 
-Write-Host "`n=== The settle is 8 minutes, and the activation waits are 60 ===" -ForegroundColor Cyan
-Assert-Equal "the compliance settle is 8 minutes" $true ($gateText -match '\$HostProfileComplianceSettleMinutes = 8')
+Write-Host "`n=== The settle is 4 minutes, and the activation waits are 60 ===" -ForegroundColor Cyan
+# Cut from 8 to 4 at the operator's direction. It is a settle, not a fix: it exists so the scan does
+# not run through the noisy window straight after a host re-registers, and four minutes covers that.
+# It can also be skipped from the console with O - see Test-RollingUpgrade.ps1.
+Assert-Equal "the compliance settle is 4 minutes" $true ($gateText -match '\$HostProfileComplianceSettleMinutes = 4')
 Assert-Equal "the activation stand-off is 60 minutes" $true ($gateText -match '\$Global:IntersightActivationWaitMinutes = 60')
 Assert-Equal "the activation hold is 60 minutes" $true ($gateText -match '\$Global:IntersightActivationHoldMinutes = 60')
 

@@ -29,7 +29,7 @@ if ($errors) { throw "parse errors" }
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in @('Invoke-RollingClusterUpgrade','Get-RollingConcurrencyLimit',
                                  'Start-RollingHostWave','Get-RollingHostDiagnostic',
-                                 'Test-VMHostDisconnected','Restore-DisconnectedVMHost',
+                                 'Test-VMHostDisconnected','Test-VMHostNotResponding','Restore-DisconnectedVMHost',
                                  'Get-CapacityBasedBatchSize','Test-VMHostRejoinedAfterReboot',
                                  'Get-VMHostBootTime','Read-ChoiceExit','Read-PendingConsoleKey',
                                  'Test-VMHostObjectInMaintenance','Get-VMHostMaintenanceState',
@@ -62,6 +62,11 @@ $Global:EsxiRootCredential = $null
 $HostReconnectAfterDisconnectMinutes = 5
 $HostReconnectMaxAttempts = 3
 $HostReconnectRetryPauseMinutes = 2
+# The quiet window is exercised in its own section below; the older sections predate it and
+# assert the behaviour AFTER it, so it is zeroed for them and set explicitly where it matters.
+$FirmwareQuietWindowMinutes = 0
+$HostNotRespondingRecheckMinutes = 5
+$Global:SkipComplianceSettle = $false
 $Global:BatchActionsSent = 0
 $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
 $Global:ExcludedFromRunHosts = @{}
@@ -104,6 +109,8 @@ function Get-VMHost { param($Name,$Location,$ErrorAction)
     if ($Name) { return $script:Hosts[$Name] }
     return @($script:Hosts.Values | Sort-Object Name) }
 function Get-Cluster { param($Name,$ErrorAction) return [pscustomobject]@{ Name='TestCluster' } }
+function Test-VMHostNotResponding { param($HostName) return ($script:NotResponding -contains $HostName) }
+$script:NotResponding = @()
 
 # Entering Maintenance mode, and the reboot, are what the wave does. The host comes back on its
 # own schedule afterwards - modelled by stamping a due time and flipping the boot time when it
@@ -241,6 +248,87 @@ Invoke-RollingClusterUpgrade -Cluster $cluster -OrderedHostNames @('esx01') -Bat
 Assert-Equal "the retries resume rather than stopping at three" 5 $script:ReconnectCalls.Count
 Assert-Equal "the operator retry is on the record" 1 (@($Global:RunSummary.ToArray() | Where-Object { $_.Result -eq 'OperatorRetry' }).Count)
 Assert-Equal "and the host came back" 1 (@($script:Log | Where-Object { $_ -eq 'complete:esx01' }).Count)
+
+Write-Host "`n=== Nothing is done to a host for the first 40 minutes ===" -ForegroundColor Cyan
+# The blade is being reflashed and power-cycled. It is SUPPOSED to fall out of vCenter, and
+# reaching for a root credential while that happens fixes nothing and risks locking the account.
+$FirmwareQuietWindowMinutes = 40
+Reset-Cluster -Count 1 -Returns @{ esx01 = 9999 }
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$script:ReconnectCalls = New-Object System.Collections.Generic.List[string]
+$script:ReconnectSucceedsOn = 0
+$script:Answers = New-Object System.Collections.Generic.Queue[string]
+$script:NotResponding = @()
+# Disconnected from the very first pass, so only the quiet window can be holding the run back.
+function Test-VMHostDisconnected { param($HostName) return ($HostName -eq 'esx01') }
+function Restore-DisconnectedVMHost { param($HostName,$TimeoutMinutes)
+    $script:ReconnectCalls.Add("$HostName@$([int](($script:Now - [datetime]'2026-08-12T00:00:00').TotalMinutes))")
+    return $false }
+function Read-ChoiceExit { param($Message,$AllowedChoices,$ExitMessage)
+    if ($script:Answers.Count -eq 0) { throw "EXIT: $ExitMessage" }
+    return $script:Answers.Dequeue() }
+
+$script:Answers.Enqueue('S')
+Invoke-RollingClusterUpgrade -Cluster $cluster -OrderedHostNames @('esx01') -BatchMode 'AUTO' 6>$null
+
+Assert-Equal "the host was eventually reconnected-attempted" 3 $script:ReconnectCalls.Count
+$firstAt = [int](($script:ReconnectCalls[0] -split '@')[1])
+# 40 minute quiet window, then the 5 minute disconnect settle on top of it.
+Assert-Equal "nothing was tried inside the quiet window" $true ($firstAt -ge 40)
+Assert-Equal "and the disconnect settle still applied after it" $true ($firstAt -ge 45)
+
+Write-Host "`n=== Not Responding is left alone and looked at again, never reconnected ===" -ForegroundColor Cyan
+# NotResponding is a host vCenter cannot reach right now - the expected state mid-reboot. Only
+# Disconnected, where vCenter has given up, is worth a root password.
+Reset-Cluster -Count 1 -Returns @{ esx01 = 9999 }
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$script:ReconnectCalls = New-Object System.Collections.Generic.List[string]
+$script:NotResponding = @('esx01')
+function Test-VMHostDisconnected { param($HostName) return $false }
+$script:Answers.Clear(); $script:Answers.Enqueue('O')   # break out at the return ceiling
+Invoke-RollingClusterUpgrade -Cluster $cluster -OrderedHostNames @('esx01') -BatchMode 'AUTO' 6>$null
+
+Assert-Equal "no reconnect was ever attempted" 0 $script:ReconnectCalls.Count
+$notResponding = @($Global:RunSummary.ToArray() | Where-Object { $_.Result -eq 'NotResponding' })
+Assert-Equal "it was reported as Not Responding" $true ($notResponding.Count -ge 1)
+# Reported on a cadence, not on every pass. The loop turns every 5 seconds, so reporting each time
+# would bury the console; the run reports it, it does not nag.
+Assert-Equal "the first report is at the end of the quiet window" $true ($notResponding[0].Details -match 'Not Responding 40 minute')
+Assert-Equal "and the second five minutes later, not five seconds" $true ($notResponding[1].Details -match 'Not Responding 45 minute')
+
+Write-Host "`n=== A host stuck Not Responding still reaches the operator ===" -ForegroundColor Cyan
+# THE REGRESSION THIS GUARDS. The return ceiling used to be an elseif on the state branches, so a
+# host that sat Not Responding matched on every pass and never reached it - the run waited on that
+# host with no way out but E. The ceiling is now an outer bound, checked whatever the state.
+Assert-Equal "the ceiling prompt fired" $true ($script:Answers.Count -eq 0)
+Assert-Equal "and the operator's override took the host forward" 1 (@($script:Log | Where-Object { $_ -eq 'complete:esx01' }).Count)
+Assert-Equal "recorded as not having returned in time" 1 (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Reason -eq 'Did not return within the expected window' }).Count)
+$script:NotResponding = @()
+$FirmwareQuietWindowMinutes = 0
+
+Write-Host "`n=== O skips the rest of the compliance settle ===" -ForegroundColor Cyan
+# A settle is a quiet period, not a repair. Where the host is plainly back, waiting the balance
+# out serves nothing - and the scan that follows is unchanged, so the scan still decides.
+$HostProfileComplianceSettleMinutes = 4
+Reset-Cluster -Count 1 -Returns @{ esx01 = 5 }
+function Test-VMHostDisconnected { param($HostName) return $false }
+$Global:SkipComplianceSettle = $false
+$script:Keys = New-Object System.Collections.Generic.Queue[string]
+function Read-PendingConsoleKey { if ($script:Keys.Count -eq 0) { return "" }; return $script:Keys.Dequeue() }
+$script:Keys.Enqueue('O')
+Invoke-RollingClusterUpgrade -Cluster $cluster -OrderedHostNames @('esx01') -BatchMode 'AUTO' 6>$null
+Assert-Equal "the settle was skipped, not waited out" "Skipped" (@($Global:RunSummary.ToArray() | Where-Object { $_.Stage -eq 'HostProfileComplianceSettle' })[-1].Result)
+Assert-Equal "and the host still completed" 1 (@($script:Log | Where-Object { $_ -eq 'complete:esx01' }).Count)
+
+# Without O the settle is served in full.
+$Global:SkipComplianceSettle = $false
+Reset-Cluster -Count 1 -Returns @{ esx01 = 5 }
+$script:Keys.Clear()
+Invoke-RollingClusterUpgrade -Cluster $cluster -OrderedHostNames @('esx01') -BatchMode 'AUTO' 6>$null
+$settle = @($Global:RunSummary.ToArray() | Where-Object { $_.Stage -eq 'HostProfileComplianceSettle' })[-1]
+Assert-Equal "the settle completed rather than being skipped" "Completed" $settle.Result
+Assert-Equal "having waited the 4 minutes" $true ($settle.Details -match 'Waited 4 minute')
+$HostProfileComplianceSettleMinutes = 8
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }
