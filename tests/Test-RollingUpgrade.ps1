@@ -30,6 +30,7 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
     Where-Object { $_.Name -in @('Invoke-RollingClusterUpgrade','Get-RollingConcurrencyLimit',
                                  'Start-RollingHostWave','Get-RollingHostDiagnostic',
                                  'Test-VMHostDisconnected','Test-VMHostNotResponding','Restore-DisconnectedVMHost',
+                                 'Test-VMHostVimAccountPasswordError',
                                  'Get-CapacityBasedBatchSize','Test-VMHostRejoinedAfterReboot',
                                  'Get-VMHostBootTime','Read-ChoiceExit','Read-PendingConsoleKey',
                                  'Test-VMHostObjectInMaintenance','Get-VMHostMaintenanceState',
@@ -67,6 +68,14 @@ $HostReconnectRetryPauseMinutes = 2
 $FirmwareQuietWindowMinutes = 0
 $HostNotRespondingRecheckMinutes = 5
 $Global:SkipComplianceSettle = $false
+$Global:LastHostReconnectError = ""
+# The platform restart the run falls back to when the reconnect cannot succeed. Stubbed here:
+# its own behaviour is not what these assertions are about, only that it is reached.
+$script:PlatformReboots = New-Object System.Collections.Generic.List[string]
+$script:PlatformRebootWorks = $true
+function Invoke-PlatformHostReboot { param($HostName)
+    $script:PlatformReboots.Add($HostName)
+    return $script:PlatformRebootWorks }
 $Global:BatchActionsSent = 0
 $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
 $Global:ExcludedFromRunHosts = @{}
@@ -329,6 +338,60 @@ $settle = @($Global:RunSummary.ToArray() | Where-Object { $_.Stage -eq 'HostProf
 Assert-Equal "the settle completed rather than being skipped" "Completed" $settle.Result
 Assert-Equal "having waited the 4 minutes" $true ($settle.Details -match 'Waited 4 minute')
 $HostProfileComplianceSettleMinutes = 8
+
+Write-Host "`n=== Out of reconnect attempts, the host is restarted from its platform ===" -ForegroundColor Cyan
+# The reconnect fails because vCenter cannot provision its OWN vpxuser account - the host's password
+# policy rejects the password vCenter generates. No further attempt can change that; a restart can,
+# because it clears the failed provisioning. vCenter is not usable here - the host is disconnected -
+# so it goes through Intersight or UCS Manager. No acknowledgement: it is not a firmware step.
+Reset-Cluster -Count 1 -Returns @{ esx01 = 9999 }
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$script:PlatformReboots = New-Object System.Collections.Generic.List[string]
+$script:PlatformRebootWorks = $true
+$script:ReconnectCalls = New-Object System.Collections.Generic.List[string]
+$script:Answers = New-Object System.Collections.Generic.Queue[string]
+$script:NotResponding = @()
+$script:LastPrompt = ""
+function Test-VMHostDisconnected { param($HostName) return ($HostName -eq 'esx01') }
+function Restore-DisconnectedVMHost { param($HostName,$TimeoutMinutes)
+    $script:ReconnectCalls.Add($HostName)
+    $Global:LastHostReconnectError = 'A general system error occurred: Weak password: not enough different characters or classes.'
+    return $false }
+function Read-ChoiceExit { param($Message,$AllowedChoices,$ExitMessage)
+    $script:LastPrompt = $Message
+    if ($script:Answers.Count -eq 0) { throw "EXIT: $ExitMessage" }
+    return $script:Answers.Dequeue() }
+
+# C carries on waiting after the restart; the host still does not come back, so the second time
+# round it is set aside.
+$script:Answers.Enqueue('C')
+$script:Answers.Enqueue('S')
+Invoke-RollingClusterUpgrade -Cluster $cluster -OrderedHostNames @('esx01') -BatchMode 'AUTO' 6>$null
+
+Assert-Equal "three reconnect attempts came first" $true ($script:ReconnectCalls.Count -ge 3)
+Assert-Equal "then the host was restarted from its platform" 1 $script:PlatformReboots.Count
+Assert-Equal "and it was the right host" "esx01" $script:PlatformReboots[0]
+Assert-Equal "the restart is on the record" 1 (@($Global:RunSummary.ToArray() | Where-Object { $_.Result -eq 'PlatformRestart' }).Count)
+# The cycle starts again after the restart rather than giving up on the host.
+Assert-Equal "the reconnect cycle restarted" $true ($script:ReconnectCalls.Count -gt 3)
+# ONCE PER HOST. A restart that did not fix it will not fix it the second time, and restarting on
+# every exhausted cycle is a reboot loop the operator has to notice to stop.
+Assert-Equal "it is not restarted a second time" 1 $script:PlatformReboots.Count
+Assert-Equal "the operator is asked instead" $true ($script:LastPrompt -match 'will not reconnect')
+Assert-Equal "and it ends set aside, not silently abandoned" 1 (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Host -eq 'esx01' }).Count)
+
+Write-Host "`n=== A host that cannot be restarted falls back to the manual prompt ===" -ForegroundColor Cyan
+Reset-Cluster -Count 1 -Returns @{ esx01 = 9999 }
+$Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
+$script:PlatformReboots = New-Object System.Collections.Generic.List[string]
+$script:PlatformRebootWorks = $false
+$script:ReconnectCalls = New-Object System.Collections.Generic.List[string]
+$script:Answers.Clear(); $script:Answers.Enqueue('S')
+Invoke-RollingClusterUpgrade -Cluster $cluster -OrderedHostNames @('esx01') -BatchMode 'AUTO' 6>$null
+Assert-Equal "the restart was attempted" 1 $script:PlatformReboots.Count
+Assert-Equal "and the operator gets the manual prompt instead" $true ($script:LastPrompt -match 'will not reconnect')
+Assert-Equal "set aside for manual rectification" 1 (@($Global:ManualAttentionHosts.ToArray() | Where-Object { $_.Host -eq 'esx01' }).Count)
+$script:PlatformRebootWorks = $true
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

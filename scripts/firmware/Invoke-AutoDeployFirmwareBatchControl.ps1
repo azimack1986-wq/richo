@@ -350,7 +350,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.12.0"
+$ScriptVersion = "23.13.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -488,6 +488,9 @@ $Global:BatchActionsSent = 0
 $Global:PreRebootBootTimes = @{}
 # Set by O during the rolling upgrade: skip the remainder of the host profile compliance settle.
 $Global:SkipComplianceSettle = $false
+# The last message vCenter gave for a failed reconnect, so the caller can tell a password-policy
+# rejection - which no retry fixes - from a transient one.
+$Global:LastHostReconnectError = ""
 $Global:ModuleVersionCache = @{}
 $Global:SlowModulePathReported = $false
 $Global:IntersightUnusable = $false
@@ -588,6 +591,18 @@ $HostReconnectAfterDisconnectMinutes = 5
 # firmware can refuse the reconnect while hostd is still coming up, and the run then wrote it off
 # as unrecoverable when a second attempt two minutes later would have taken it. After the last
 # attempt the operator is asked, rather than the host being silently abandoned.
+# WHICH host profile nodes count as Active Directory, matched on the profile TYPE rather than on
+# position in the tree. The run unticks exactly these before a cluster and re-ticks them after, and
+# touches nothing else - not Role, not User Configuration, not Lockdown Mode, not Host Acceptance
+# Level, and not anything outside Security Settings.
+$Global:HostProfileActiveDirectoryPatterns = @(
+    '(?i)^authentication',      # the Authentication Configuration node; ActiveDirectory is its child
+    '(?i)activedirectory'       # Active Directory Configuration, Active Directory Permission, the principal
+)
+# Which nodes THIS RUN unticked, per profile name, so the re-tick puts back only those and leaves a
+# setting that was already off exactly as it was found.
+$Global:HostProfileAdChanges = @{}
+
 # How long to wait for UCS Manager to raise the pending activity after a firmware package change.
 # It is raised asynchronously, so asking the instant the policy write returns finds nothing on a
 # busy domain - and a batch that acknowledges nothing leaves its blades staged and waiting.
@@ -943,12 +958,15 @@ function Confirm-RunPrerequisites {
     Write-Host "4. Credentials to hand" -ForegroundColor Yellow
     Write-Host "     vCenter and UCS Manager, for the prompts that follow." -ForegroundColor Gray
 
-    Write-Host "5. Host profile - Security settings to untick BEFORE starting" -ForegroundColor Yellow
-    Write-Host "     In the host profile attached to the hosts in scope, under Security, UNTICK:" -ForegroundColor Gray
-    Write-Host "       - Authentication Configuration" -ForegroundColor Gray
+    Write-Host "5. Host profile - Security settings, handled by this run" -ForegroundColor Yellow
+    Write-Host "     In the host profile attached to the cluster, under Security Settings, these" -ForegroundColor Gray
+    Write-Host "     are UNTICKED when the cluster starts and RE-TICKED when it finishes:" -ForegroundColor Gray
+    Write-Host "       - Authentication Configuration (and Active Directory Configuration under it)" -ForegroundColor Gray
     Write-Host "       - Active Directory Permission" -ForegroundColor Gray
     Write-Host "     Left ticked, the profile will not apply cleanly to a host that has just" -ForegroundColor Gray
     Write-Host "     rebooted and rejoined, and the compliance gate in this run will halt on it." -ForegroundColor Gray
+    Write-Host "     NOTHING ELSE in the profile is read, copied or written, and a setting you had" -ForegroundColor Gray
+    Write-Host "     already unticked yourself is left unticked at the end." -ForegroundColor Gray
     Write-Host "     RE-ENABLE BOTH AFTER THE UPGRADE IS COMPLETE. This run does not change them" -ForegroundColor Red
     Write-Host "     and does not put them back - that is a manual step at the end of the change." -ForegroundColor Red
 
@@ -1055,9 +1073,10 @@ function Show-ManualAttentionReport {
     }
 
     Write-Host "" -ForegroundColor Yellow
-    Write-Host "REMINDER: re-enable 'Authentication Configuration' and 'Active Directory Permission'" -ForegroundColor Yellow
-    Write-Host "under Security in the host profile now the upgrade is done. This run did not change" -ForegroundColor Yellow
-    Write-Host "them and has not put them back." -ForegroundColor Yellow
+    Write-Host "CHECK: 'Authentication Configuration' and 'Active Directory Permission' under Security" -ForegroundColor Yellow
+    Write-Host "Settings were unticked when this cluster started and re-ticked when it finished. Confirm" -ForegroundColor Yellow
+    Write-Host "they are back on in the host profile - and if anything above says they could not be" -ForegroundColor Yellow
+    Write-Host "re-ticked, put them back by hand now." -ForegroundColor Yellow
     Write-Host "=====================================================================" -ForegroundColor Cyan
 }
 
@@ -4350,6 +4369,8 @@ function Restore-DisconnectedVMHost {
     }
 
     Write-Host "  Reconnecting '$HostName' with the ESXi root credential." -ForegroundColor Yellow
+    # Cleared per attempt so the caller reads THIS attempt's failure, not a previous host's.
+    $Global:LastHostReconnectError = ""
 
     try {
         $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
@@ -4360,7 +4381,10 @@ function Restore-DisconnectedVMHost {
 
         # 1. The cheap attempt: vCenter's own stored credentials.
         try { Set-VMHost -VMHost $hostObj -State Connected -Confirm:$false -ErrorAction Stop | Out-Null }
-        catch { Write-Host "  Reconnect with vCenter's stored credentials failed: $($_.Exception.Message)" -ForegroundColor DarkGray }
+        catch {
+            $Global:LastHostReconnectError = $_.Exception.Message
+            Write-Host "  Reconnect with vCenter's stored credentials failed: $($_.Exception.Message)" -ForegroundColor DarkGray
+        }
 
         $hostObj = Get-VMHost -Name $HostName -ErrorAction SilentlyContinue
         if ($null -ne $hostObj -and ($hostObj.ConnectionState -eq "Connected" -or $hostObj.ConnectionState -eq "Maintenance")) {
@@ -4373,7 +4397,12 @@ function Restore-DisconnectedVMHost {
         [void]$hostObj.ExtensionData.ReconnectHost_Task($spec, $null, $null)
     }
     catch {
+        $Global:LastHostReconnectError = $_.Exception.Message
         Write-Host "  Reconnecting '$HostName' failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        if (Test-VMHostVimAccountPasswordError -Message $_.Exception.Message) {
+            Write-Host "  This is the host's OWN password policy rejecting the vpxuser account vCenter generates," -ForegroundColor Yellow
+            Write-Host "  not the root credential. Retrying cannot fix it - see Test-VMHostVimAccountPasswordError." -ForegroundColor Yellow
+        }
         return $false
     }
 
@@ -4392,6 +4421,126 @@ function Restore-DisconnectedVMHost {
     }
 
     Write-Host "  '$HostName' is still not connected $TimeoutMinutes minute(s) after the reconnect was sent." -ForegroundColor Yellow
+    return $false
+}
+
+function Test-VMHostVimAccountPasswordError {
+    <#
+    .SYNOPSIS
+        Is this reconnect failure the ESXi password-policy one that no retry can fix?
+
+    .DESCRIPTION
+        Seen on a live run, reported by vCenter against a host that would not reconnect:
+
+            A general system error occurred: Weak password: not enough different characters
+            or classes. *** passwd: Authentication token manipulation error
+            Failed to configure the VIM account on the host
+            Weak password: "not enough different characters or classes".
+
+        WHAT IS ACTUALLY HAPPENING, and why it matters that this is told apart. Reconnecting a
+        host is not just an authentication: vCenter re-provisions its own service account on the
+        host - vpxuser - and sets a randomly generated password for it. The host's password policy
+        then REJECTS that password. So the root credential is fine, the network is fine, and the
+        reconnect still cannot complete, because the failure is on the host's side of an account
+        this run does not control.
+
+        Retrying is useless: the next attempt generates another password and the same policy
+        rejects it the same way. What does clear it is the host restarting - which resets the
+        stale account state the failed provisioning left behind - so that is what happens after
+        the attempts are spent.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    return ($Message -match '(?i)weak password' -or
+            $Message -match '(?i)authentication token manipulation' -or
+            $Message -match '(?i)failed to configure the VIM account')
+}
+
+function Invoke-PlatformHostReboot {
+    <#
+    .SYNOPSIS
+        Restarts a host through Intersight or UCS Manager, bypassing vCenter entirely.
+
+    .DESCRIPTION
+        For the case where vCenter CANNOT be used: the host is disconnected, so there is nothing
+        to send Restart-VMHost to. The blade is restarted from the platform that owns it instead,
+        which is the same route the firmware activation already uses.
+
+        NO ACKNOWLEDGEMENT IS INVOLVED. This is not a firmware step and raises no pending activity
+        to accept - it is a power cycle, sent directly:
+
+          Intersight    the profile's assigned server, AdminPowerState PowerCycle.
+          UCS Manager   the service profile's lsPower object, state cycle-immediate. Per Cisco's
+                        LsPower metadata that is a read-write property whose values include
+                        cycle-immediate, and the object is the "power" child of the profile DN.
+
+        Never throws. A host that cannot be restarted is the caller's decision, not a reason to
+        end a run with other hosts in flight.
+
+    .PARAMETER HostName
+        The ESXi host, resolved to its platform through the run's own mapping.
+
+    .EXAMPLE
+        if (Invoke-PlatformHostReboot -HostName 'esx01.example') { ... }
+    #>
+    param([Parameter(Mandatory=$true)][string]$HostName)
+
+    if (Test-DryRun) {
+        Write-Host "  DRY RUN: would restart '$HostName' from its platform (Intersight or UCS Manager)." -ForegroundColor Green
+        return $false
+    }
+
+    # Intersight first, because a host present in that map has no UCS Manager service profile.
+    if ($null -ne $Global:IntersightHostMap -and $Global:IntersightHostMap.ContainsKey($HostName)) {
+        try {
+            $profileObj = Resolve-IntersightServerProfileForHost -HostName $HostName
+            if ($null -eq $profileObj) {
+                Write-Host "  '$HostName' has no resolvable Intersight server profile, so it cannot be restarted from there." -ForegroundColor Yellow
+                return $false
+            }
+            $serverMoid = Get-IntersightAssignedServerMoid -ServerProfile $profileObj -Quiet
+            if ([string]::IsNullOrWhiteSpace($serverMoid)) {
+                Write-Host "  '$HostName' has an Intersight profile with no server assigned, so there is nothing to restart." -ForegroundColor Yellow
+                return $false
+            }
+            Write-Host "  Restarting '$HostName' through Intersight ($($Global:IntersightActivationPowerAction))." -ForegroundColor Yellow
+            $outcome = Invoke-IntersightServerPowerAction -ServerMoid $serverMoid -PowerState $Global:IntersightActivationPowerAction
+            if ($outcome.Sent) {
+                Add-SummaryRecord -Stage "Reconnect" -Batch "" -HostName $HostName -Action "Restart from platform" -Result "Sent" -Details "Intersight $($Global:IntersightActivationPowerAction) to server $serverMoid. No acknowledgement involved."
+                return $true
+            }
+            Write-Host "  Intersight did not accept the restart for '$HostName': $($outcome.Detail)" -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "Reconnect" -Batch "" -HostName $HostName -Action "Restart from platform" -Result "Refused" -Details "Intersight refused the power action: $($outcome.Detail)"
+            return $false
+        }
+        catch {
+            Write-Host "  Restarting '$HostName' through Intersight failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "Reconnect" -Batch "" -HostName $HostName -Action "Restart from platform" -Result "Failed" -Details "Intersight - $($_.Exception.Message)"
+            return $false
+        }
+    }
+
+    if ($null -ne $Global:UcsHostMap -and $Global:UcsHostMap.ContainsKey($HostName)) {
+        $map = $Global:UcsHostMap[$HostName]
+        try {
+            $ucsSession = Get-UcsSessionForTarget -UcsTarget $map.UcsTarget
+            $powerDn = "$($map.ServiceProfileDn)/power"
+            Write-Host "  Restarting '$HostName' through UCS Manager (cycle-immediate on $powerDn)." -ForegroundColor Yellow
+            Get-UcsLsPower -Ucs $ucsSession -Dn $powerDn -ErrorAction Stop |
+                Set-UcsLsPower -State "cycle-immediate" -Force -ErrorAction Stop | Out-Null
+            Add-SummaryRecord -Stage "Reconnect" -Batch "" -HostName $HostName -Action "Restart from platform" -Result "Sent" -Details "UCS Manager cycle-immediate on $powerDn. No acknowledgement involved."
+            return $true
+        }
+        catch {
+            Write-Host "  Restarting '$HostName' through UCS Manager failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "Reconnect" -Batch "" -HostName $HostName -Action "Restart from platform" -Result "Failed" -Details "UCS Manager - $($_.Exception.Message)"
+            return $false
+        }
+    }
+
+    Write-Host "  '$HostName' is not mapped to Intersight or UCS Manager, so it cannot be restarted from a platform." -ForegroundColor Yellow
+    Add-SummaryRecord -Stage "Reconnect" -Batch "" -HostName $HostName -Action "Restart from platform" -Result "NoPlatform" -Details "The host is in neither the Intersight nor the UCS Manager map."
     return $false
 }
 
@@ -5614,6 +5763,284 @@ function Get-ComplianceStatusFromComplianceManager {
     try { return @($manager.QueryComplianceStatus($profileRefs, $entityRefs)) } catch { return @() }
 }
 
+function Get-HostProfileApplyNode {
+    <#
+    .SYNOPSIS
+        Every node in a host profile's apply tree, each with a stable path. Reads only.
+
+    .DESCRIPTION
+        A host profile is a tree of ApplyProfile objects. Per the vSphere API each node carries:
+
+            Enabled          bool    - the tick box in the Edit host profile dialog
+            ProfileTypeName  string  - what kind of profile it is
+            Property[]       array   - generic subprofile lists, each with a PropertyName and
+                                       its own Profile[] of child nodes
+
+        and HostApplyProfile additionally exposes typed children - Authentication, Security,
+        Network, Firewall and so on - where Authentication holds ActiveDirectory and Security
+        holds Permission[].
+
+        Rather than hard-coding that shape, this walks anything that LOOKS like an apply node: a
+        property whose value has both Enabled and ProfileTypeName. New profile plug-ins therefore
+        appear on their own, and nothing has to be updated when vSphere adds one.
+
+        The path is built from the property names as it descends - security/permission[2] - so a
+        node found on one pass can be found again on a later one to put it back.
+
+    .PARAMETER Node
+        An ApplyProfile - normally $profile.ExtensionData.Config.ApplyProfile.
+
+    .PARAMETER Path
+        Internal. The path accumulated so far.
+
+    .PARAMETER Depth
+        Internal. Bounded so a malformed tree cannot recurse without end.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][AllowNull()]$Node,
+        [string]$Path = "",
+        [int]$Depth = 0
+    )
+
+    $found = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $Node -or $Depth -gt 24) { return $found }
+
+    $isNode = $false
+    try {
+        $names = @($Node.PSObject.Properties.Name)
+        $isNode = ($names -contains 'Enabled' -and $names -contains 'ProfileTypeName')
+    }
+    catch { return $found }
+    if (-not $isNode) { return $found }
+
+    [void]$found.Add([pscustomobject]@{
+        Path            = $(if ($Path) { $Path } else { "root" })
+        ProfileTypeName = [string]$Node.ProfileTypeName
+        Node            = $Node
+    })
+
+    foreach ($property in @($Node.PSObject.Properties)) {
+        $name = $property.Name
+        if ($name -in @('Enabled','ProfileTypeName','ProfileVersion','Policy','Favorite','ToBeMerged','ToReplaceWith','ToBeDeleted','CopyEnableStatus','Hidden','Key')) { continue }
+
+        $value = $null
+        try { $value = $property.Value } catch { continue }
+        if ($null -eq $value) { continue }
+
+        # The generic subprofile container: PropertyName plus its own Profile[].
+        if ($name -eq 'Property') {
+            $index = 0
+            foreach ($container in @($value)) {
+                if ($null -eq $container) { $index++; continue }
+                $label = if ($container.PSObject.Properties.Name -contains 'PropertyName') { [string]$container.PropertyName } else { "property$index" }
+                $childIndex = 0
+                foreach ($child in @($container.Profile)) {
+                    foreach ($row in (Get-HostProfileApplyNode -Node $child -Path "$(if ($Path) { "$Path/" })$label[$childIndex]" -Depth ($Depth + 1))) { [void]$found.Add($row) }
+                    $childIndex++
+                }
+                $index++
+            }
+            continue
+        }
+
+        if ($value -is [System.Array] -or $value -is [System.Collections.IList]) {
+            $index = 0
+            foreach ($item in @($value)) {
+                foreach ($row in (Get-HostProfileApplyNode -Node $item -Path "$(if ($Path) { "$Path/" })$name[$index]" -Depth ($Depth + 1))) { [void]$found.Add($row) }
+                $index++
+            }
+            continue
+        }
+
+        foreach ($row in (Get-HostProfileApplyNode -Node $value -Path "$(if ($Path) { "$Path/" })$name" -Depth ($Depth + 1))) { [void]$found.Add($row) }
+    }
+
+    return $found
+}
+
+function Test-HostProfileActiveDirectoryNode {
+    <#
+    .SYNOPSIS
+        Is this apply node one of the Active Directory settings, and nothing else?
+
+    .DESCRIPTION
+        DELIBERATELY NARROW. The instruction was to untick the Active Directory settings and to
+        leave every other setting exactly as it is, so this matches on the profile TYPE and never
+        on position in the tree:
+
+          Authentication configuration   the AuthenticationProfile node, whose only child in the
+                                         API is ActiveDirectory - which is what the Edit host
+                                         profile dialog shows beneath it.
+          Active Directory Permission    any node whose profile type names Active Directory,
+                                         including the permission entry and its principal.
+
+        What it must NOT match, all of which sit alongside those in the same dialog: Role, User
+        Configuration, Lockdown Mode, Host Acceptance Level, Domain Settings, Firewall
+        Configuration and Service Configuration.
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$ProfileTypeName)
+
+    if ([string]::IsNullOrWhiteSpace($ProfileTypeName)) { return $false }
+    foreach ($pattern in $Global:HostProfileActiveDirectoryPatterns) {
+        if ($ProfileTypeName -match $pattern) { return $true }
+    }
+    return $false
+}
+
+function Get-ClusterHostProfile {
+    <#
+    .SYNOPSIS
+        The host profile(s) attached to a cluster, or an empty list.
+    #>
+    param([Parameter(Mandatory=$true)]$Cluster)
+
+    try { return @(Get-VMHostProfile -Entity $Cluster -ErrorAction Stop) }
+    catch {
+        Write-Host "  No host profile could be read for '$($Cluster.Name)': $($_.Exception.Message)" -ForegroundColor Yellow
+        return @()
+    }
+}
+
+function Set-ClusterHostProfileActiveDirectory {
+    <#
+    .SYNOPSIS
+        Unticks, or re-ticks, ONLY the Active Directory settings in the cluster's host profile.
+
+    .DESCRIPTION
+        The pre-flight has always told the operator to untick Authentication Configuration and
+        Active Directory Permission before starting, and to put them back afterwards, because a
+        profile carrying them will not apply cleanly to a host that has just rebooted and
+        rejoined - and the compliance gate then halts on it. This does that step, so it is not a
+        manual one that can be forgotten at either end.
+
+        WHAT IS TOUCHED, AND NOTHING ELSE. Only the Enabled flag of nodes that
+        Test-HostProfileActiveDirectoryNode matches. No other node is written, no policy or option
+        value is read across, nothing is copied from a reference host, and the profile's name and
+        annotation are carried through unchanged. When re-ticking, only the nodes THIS RUN turned
+        off are turned back on - one that was already unticked before the run stays unticked.
+
+        The write is HostProfile.UpdateHostProfile with a HostProfileCompleteConfigSpec whose
+        ApplyProfile is the profile's own tree with those flags changed.
+        DisabledExpressionListChanged is left false, so the Profile Engine ignores the disabled
+        expression list rather than replacing it.
+
+        Never throws. A profile that cannot be changed is reported and listed for manual attention
+        - it is a pre-requisite, not the change itself, and it must not take a cluster down with it.
+
+    .PARAMETER Cluster
+        The cluster whose attached host profile is being changed.
+
+    .PARAMETER Enable
+        $false to untick before the run, $true to put back what was unticked.
+
+    .EXAMPLE
+        Set-ClusterHostProfileActiveDirectory -Cluster $cluster -Enable $false
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Cluster,
+        [Parameter(Mandatory=$true)][bool]$Enable
+    )
+
+    $action = if ($Enable) { "Re-enable" } else { "Disable" }
+    $word   = if ($Enable) { "re-ticking" } else { "unticking" }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Host profile: $word the Active Directory settings for '$($Cluster.Name)'." -ForegroundColor Cyan
+
+    if (Test-DryRun) {
+        Write-Host "  DRY RUN: no host profile is changed." -ForegroundColor Green
+        Add-SummaryRecord -Stage "HostProfileActiveDirectory" -Batch "" -HostName "" -Action "$action AD settings" -Result "DryRun" -Details "$($Cluster.Name) - no change made."
+        return
+    }
+
+    $profiles = @(Get-ClusterHostProfile -Cluster $Cluster)
+    if ($profiles.Count -eq 0) {
+        Write-Host "  No host profile is attached to '$($Cluster.Name)' - nothing to change." -ForegroundColor Gray
+        Add-SummaryRecord -Stage "HostProfileActiveDirectory" -Batch "" -HostName "" -Action "$action AD settings" -Result "NoProfile" -Details "$($Cluster.Name) has no attached host profile."
+        return
+    }
+
+    foreach ($hostProfile in $profiles) {
+        $profileName = [string]$hostProfile.Name
+        $view = $null
+        try { $view = $hostProfile.ExtensionData }
+        catch { $view = $null }
+
+        if ($null -eq $view -or $null -eq $view.Config -or $null -eq $view.Config.ApplyProfile) {
+            Write-Host "  '$profileName' has no readable apply profile - skipped." -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "HostProfileActiveDirectory" -Batch "" -HostName "" -Action "$action AD settings" -Result "Unreadable" -Details "$profileName - the apply profile could not be read."
+            continue
+        }
+
+        $applyProfile = $view.Config.ApplyProfile
+        $nodes = @(Get-HostProfileApplyNode -Node $applyProfile |
+            Where-Object { Test-HostProfileActiveDirectoryNode -ProfileTypeName $_.ProfileTypeName })
+
+        if ($nodes.Count -eq 0) {
+            Write-Host "  '$profileName' has no Active Directory settings - nothing to change." -ForegroundColor Gray
+            Add-SummaryRecord -Stage "HostProfileActiveDirectory" -Batch "" -HostName "" -Action "$action AD settings" -Result "NoneFound" -Details "$profileName - no node matched the Active Directory profile types."
+            continue
+        }
+
+        if (-not $Global:HostProfileAdChanges.ContainsKey($profileName)) {
+            $Global:HostProfileAdChanges[$profileName] = New-Object System.Collections.Generic.List[string]
+        }
+        $changedPaths = $Global:HostProfileAdChanges[$profileName]
+
+        $touched = New-Object System.Collections.Generic.List[string]
+        foreach ($row in $nodes) {
+            if ($Enable) {
+                # ONLY what this run turned off. A setting the operator had already unticked for
+                # their own reasons is left exactly as it was found.
+                if ($changedPaths -notcontains $row.Path) { continue }
+                if ([bool]$row.Node.Enabled) { continue }
+                $row.Node.Enabled = $true
+                [void]$touched.Add("$($row.Path) [$($row.ProfileTypeName)]")
+            }
+            else {
+                if (-not [bool]$row.Node.Enabled) { continue }
+                $row.Node.Enabled = $false
+                [void]$touched.Add("$($row.Path) [$($row.ProfileTypeName)]")
+                if ($changedPaths -notcontains $row.Path) { [void]$changedPaths.Add($row.Path) }
+            }
+        }
+
+        if ($touched.Count -eq 0) {
+            Write-Host "  '$profileName': the Active Directory settings are already $(if ($Enable) { 'ticked' } else { 'unticked' }) - no write made." -ForegroundColor Green
+            Add-SummaryRecord -Stage "HostProfileActiveDirectory" -Batch "" -HostName "" -Action "$action AD settings" -Result "AlreadySet" -Details "$profileName - nothing needed changing."
+            continue
+        }
+
+        try {
+            $spec = New-Object VMware.Vim.HostProfileCompleteConfigSpec
+            # Carried through unchanged rather than left unset, so nothing can be blanked by the
+            # write. The apply profile is the profile's OWN tree with only the flags above changed.
+            $spec.Name = $view.Name
+            $spec.Annotation = $view.Config.Annotation
+            $spec.Enabled = $view.Config.Enabled
+            $spec.ApplyProfile = $applyProfile
+            # Left false: the Profile Engine then ignores the disabled expression list instead of
+            # replacing the profile's own with an empty one.
+            $spec.DisabledExpressionListChanged = $false
+
+            $view.UpdateHostProfile($spec)
+
+            Write-Host "  '$profileName': $($touched.Count) Active Directory setting(s) $(if ($Enable) { 're-ticked' } else { 'unticked' })." -ForegroundColor Green
+            foreach ($entry in $touched.ToArray()) { Write-Host "      $entry" -ForegroundColor Gray }
+            Add-SummaryRecord -Stage "HostProfileActiveDirectory" -Batch "" -HostName "" -Action "$action AD settings" -Result "Applied" -Details "$profileName - $($touched.ToArray() -join '; ')"
+        }
+        catch {
+            Write-Host "  '$profileName' could not be updated: $($_.Exception.Message)" -ForegroundColor Red
+            if (-not $Enable) {
+                Write-Host "  Untick 'Authentication Configuration' and 'Active Directory Permission' by hand before continuing," -ForegroundColor Yellow
+                Write-Host "  or the host profile will not apply to a host that has just rebooted and the gate will halt on it." -ForegroundColor Yellow
+            }
+            Add-ManualAttentionHost -HostName $profileName -Reason "Host profile Active Directory settings not $(if ($Enable) { 're-ticked' } else { 'unticked' })" -Detail "UpdateHostProfile failed on '$profileName': $($_.Exception.Message). $(if ($Enable) { 'Re-tick' } else { 'Untick' }) Authentication Configuration and Active Directory Permission by hand."
+            Add-SummaryRecord -Stage "HostProfileActiveDirectory" -Batch "" -HostName "" -Action "$action AD settings" -Result "Failed" -Details "$profileName - $($_.Exception.Message)"
+        }
+    }
+}
+
 function Get-VMHostProfileComplianceState {
     <#
     .SYNOPSIS
@@ -6434,6 +6861,7 @@ function Invoke-RollingClusterUpgrade {
                         StartedAt = Get-Date; ReturnedAt = $null; Announced = ""
                         DisconnectedSince = $null; ReconnectAttempts = 0; NextReconnectAt = $null
                         ReconnectGiveUpAsked = $false; NextNotRespondingCheckAt = $null
+                        PlatformRestartDone = $false
                     })
                 }
 
@@ -6520,18 +6948,68 @@ function Invoke-RollingClusterUpgrade {
                         # Out of attempts. The operator is asked rather than the host being written
                         # off silently, because at this point somebody has to look at it.
                         $tracker.ReconnectGiveUpAsked = $true
+                        $lastError = [string]$Global:LastHostReconnectError
+                        $vimAccount = Test-VMHostVimAccountPasswordError -Message $lastError
+
                         Write-Host "" -ForegroundColor Red
                         Write-Host "'$($tracker.Host)' is still Disconnected in vCenter after $HostReconnectMaxAttempts reconnect attempt(s) with the ESXi root credential." -ForegroundColor Red
-                        Write-Host "  MANUAL INTERVENTION IS NEEDED. Worth checking on the host, in order:" -ForegroundColor Yellow
-                        Write-Host "    - it is powered on and has finished booting (KVM or CIMC console)" -ForegroundColor Gray
-                        Write-Host "    - its management vmk has an address and the gateway answers" -ForegroundColor Gray
-                        Write-Host "    - the root password matches the one given for this cluster" -ForegroundColor Gray
-                        Write-Host "    - hostd and vpxa are running: /etc/init.d/hostd status" -ForegroundColor Gray
-                        Write-Host "" -ForegroundColor Yellow
-                        Write-Host "  R - retry: reconnect it again from here, once you have made a change." -ForegroundColor Yellow
-                        Write-Host "  S - set aside: leave it for manual rectification and carry on with the rest." -ForegroundColor Yellow
-                        Write-Host "  E - exit the run here." -ForegroundColor Yellow
-                        $choice = Read-ChoiceExit -Message "'$($tracker.Host)' will not reconnect. R to retry, S to set aside and continue, E to exit" -AllowedChoices @("R","S") -ExitMessage "Stopped because '$($tracker.Host)' could not be reconnected."
+                        if (-not [string]::IsNullOrWhiteSpace($lastError)) {
+                            Write-Host "  vCenter reported: $lastError" -ForegroundColor Gray
+                        }
+                        if ($vimAccount) {
+                            Write-Host "  That is the HOST'S password policy rejecting the vpxuser account vCenter generates when it" -ForegroundColor Yellow
+                            Write-Host "  reconnects - not the root credential, and not something another attempt can change." -ForegroundColor Yellow
+                        }
+
+                        # RESTART IT FROM THE PLATFORM. vCenter cannot be used - the host is
+                        # disconnected - so the blade is power-cycled through Intersight or UCS
+                        # Manager instead. No acknowledgement: this is not a firmware step.
+                        #
+                        # ONCE PER HOST. A restart that did not fix it will not fix it the second
+                        # time either, and restarting on every exhausted cycle is a reboot loop the
+                        # operator has to notice to stop. The second time round they are asked.
+                        $rebooted = $false
+                        if (-not $tracker.PlatformRestartDone) {
+                            $tracker.PlatformRestartDone = $true
+                            Write-Host "  Restarting the host from its platform to clear the failed account provisioning." -ForegroundColor Yellow
+                            $rebooted = Invoke-PlatformHostReboot -HostName $tracker.Host
+                        }
+                        else {
+                            Write-Host "  It has already been restarted from its platform once, and restarting again would not help." -ForegroundColor Yellow
+                        }
+
+                        if ($rebooted) {
+                            # Back to the start of the cycle. The host is coming up, so the quiet
+                            # window and the normal detection apply to it again exactly as they did
+                            # the first time, including another $HostReconnectMaxAttempts if it
+                            # comes back Disconnected once more.
+                            $tracker.StartedAt = Get-Date
+                            $tracker.DisconnectedSince = $null
+                            $tracker.ReconnectAttempts = 0
+                            $tracker.NextReconnectAt = $null
+                            $tracker.ReconnectGiveUpAsked = $false
+                            $tracker.Announced = ""
+                            Write-Host "" -ForegroundColor Yellow
+                            Write-Host "  '$($tracker.Host)' has been RESTARTED from its platform. The run now waits for it to come back" -ForegroundColor Yellow
+                            Write-Host "  and reconnects it as normal. Nothing was acknowledged and no firmware action was sent." -ForegroundColor Yellow
+                            Add-SummaryRecord -Stage "Reconnect" -Batch $tracker.Wave -HostName $tracker.Host -Action "Reconnect host" -Result "PlatformRestart" -Details "$HostReconnectMaxAttempts reconnect attempt(s) failed$(if ($vimAccount) { ' with the host password policy rejecting the vpxuser account' }); the host was power-cycled from its platform and the wait restarted."
+                            $choice = Read-ChoiceExit -Message "'$($tracker.Host)' was restarted from its platform. C to carry on waiting for it, S to set it aside, E to exit" -AllowedChoices @("C","S") -ExitMessage "Stopped after restarting '$($tracker.Host)'."
+                            if ($choice -eq "C") { continue }
+                        }
+                        else {
+                            Write-Host "" -ForegroundColor Yellow
+                            Write-Host "  The host could NOT be restarted from its platform either." -ForegroundColor Yellow
+                            Write-Host "  MANUAL INTERVENTION IS NEEDED. Worth checking on the host, in order:" -ForegroundColor Yellow
+                            Write-Host "    - it is powered on and has finished booting (KVM or CIMC console)" -ForegroundColor Gray
+                            Write-Host "    - its management vmk has an address and the gateway answers" -ForegroundColor Gray
+                            Write-Host "    - the root password matches the one given for this cluster" -ForegroundColor Gray
+                            Write-Host "    - hostd and vpxa are running: /etc/init.d/hostd status" -ForegroundColor Gray
+                            Write-Host "" -ForegroundColor Yellow
+                            Write-Host "  R - retry: reconnect it again from here, once you have made a change." -ForegroundColor Yellow
+                            Write-Host "  S - set aside: leave it for manual rectification and carry on with the rest." -ForegroundColor Yellow
+                            Write-Host "  E - exit the run here." -ForegroundColor Yellow
+                            $choice = Read-ChoiceExit -Message "'$($tracker.Host)' will not reconnect. R to retry, S to set aside and continue, E to exit" -AllowedChoices @("R","S") -ExitMessage "Stopped because '$($tracker.Host)' could not be reconnected."
+                        }
 
                         if ($choice -eq "R") {
                             $tracker.ReconnectAttempts = 0
@@ -7322,12 +7800,27 @@ function Invoke-ClusterUpgradeWorkflow {
     $pendingHosts = New-Object System.Collections.ArrayList
     foreach ($hostObj in @($patchCandidateHosts | Where-Object { Test-VMHostObjectInMaintenance -VMHostObject $_ })) { [void]$pendingHosts.Add($hostObj.Name) }
     foreach ($hostObj in @($patchCandidateHosts | Where-Object { -not (Test-VMHostObjectInMaintenance -VMHostObject $_) })) { [void]$pendingHosts.Add($hostObj.Name) }
-    # ROLLING, NOT BATCHED. The old loop took N hosts, put them all through, and did not start
-    # host N+1 until the SLOWEST of the first N had finished - so a host back in twenty minutes sat
-    # idle while its neighbour took fifty. Invoke-RollingClusterUpgrade tracks each host on its own
-    # and refills its slot the moment it is back in service, within whatever live capacity allows.
-    # SINGLE mode is the same engine with the limit fixed at one.
-    Invoke-RollingClusterUpgrade -Cluster $Cluster -OrderedHostNames @($pendingHosts) -BatchMode $batchMode
+    # PRE-REQUISITE, NOT THE CHANGE. The host profile will not apply cleanly to a host that has
+    # just rebooted and rejoined while its Active Directory settings are ticked, and the compliance
+    # gate then halts on it. Unticked here and put back when the cluster finishes, so it stops
+    # being a manual step that can be forgotten at either end. Nothing else in the profile is read
+    # or written - see Set-ClusterHostProfileActiveDirectory.
+    Set-ClusterHostProfileActiveDirectory -Cluster $Cluster -Enable $false
+
+    try {
+        # ROLLING, NOT BATCHED. The old loop took N hosts, put them all through, and did not start
+        # host N+1 until the SLOWEST of the first N had finished - so a host back in twenty minutes
+        # sat idle while its neighbour took fifty. Invoke-RollingClusterUpgrade tracks each host on
+        # its own and refills its slot the moment it is back in service, within whatever live
+        # capacity allows. SINGLE mode is the same engine with the limit fixed at one.
+        Invoke-RollingClusterUpgrade -Cluster $Cluster -OrderedHostNames @($pendingHosts) -BatchMode $batchMode
+    }
+    finally {
+        # In a finally so an exit, a stop or an unhandled error still puts the profile back. A run
+        # that ends early leaving Active Directory unticked is a change nobody made deliberately
+        # and nobody would think to look for.
+        Set-ClusterHostProfileActiveDirectory -Cluster $Cluster -Enable $true
+    }
 
     Show-ClusterFirmwareVerification -Cluster $Cluster -HostNames @($patchCandidateHosts | Select-Object -ExpandProperty Name)
     Show-ManualAttentionReport -ClusterName $Cluster.Name

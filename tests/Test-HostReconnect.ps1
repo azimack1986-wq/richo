@@ -28,7 +28,7 @@ $errors = $null; $tokens = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
 if ($errors) { throw "parse errors" }
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
-    Where-Object { $_.Name -in @('Restore-DisconnectedVMHost','Test-VMHostDisconnected','Test-VMHostNotResponding') } |
+    Where-Object { $_.Name -in @('Restore-DisconnectedVMHost','Test-VMHostDisconnected','Test-VMHostNotResponding','Test-VMHostVimAccountPasswordError') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0
@@ -140,6 +140,24 @@ $scriptText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "the password is never written to the run summary" $true (-not ($scriptText -match 'Details.*GetNetworkCredential'))
 Assert-Equal "the credential is cleared when the cluster changes" $true ($scriptText -match '\$Global:EsxiRootCredential = \$null\s*\r?\n\s*Reset-ClusterScopedState')
 Assert-Equal "the disconnect grace period is 5 minutes" $true ($scriptText -match '\$HostReconnectAfterDisconnectMinutes = 5')
+
+Write-Host "`n=== The VIM account password rejection is told apart from a real failure ===" -ForegroundColor Cyan
+# Straight from vCenter on a live run. Reconnecting a host is not just an authentication: vCenter
+# re-provisions its OWN service account - vpxuser - and generates a password for it, which the
+# host's password policy then rejects. The root credential is fine and no retry can change the
+# outcome, so this is what sends the run to a platform restart instead of a fourth attempt.
+$live = 'A general system error occurred: Weak password: not enough different characters or classes. *** passwd: Authentication token manipulation error' + [char]10 + 'Failed to configure the VIM account on the host' + [char]10 + 'Weak password: "not enough different characters or classes".'
+Assert-Equal "the live message is recognised" $true (Test-VMHostVimAccountPasswordError -Message $live)
+Assert-Equal "so is the weak-password phrase alone" $true (Test-VMHostVimAccountPasswordError -Message 'Weak password: not enough different characters or classes')
+Assert-Equal "so is the token manipulation error" $true (Test-VMHostVimAccountPasswordError -Message 'passwd: Authentication token manipulation error')
+Assert-Equal "so is the VIM account line" $true (Test-VMHostVimAccountPasswordError -Message 'Failed to configure the VIM account on the host')
+Assert-Equal "casing does not matter" $true (Test-VMHostVimAccountPasswordError -Message 'WEAK PASSWORD')
+# Things that genuinely ARE the root credential, or the network, must not be mistaken for it - a
+# platform power cycle is the wrong answer to a wrong password.
+Assert-Equal "a wrong password is not this" $false (Test-VMHostVimAccountPasswordError -Message 'Cannot complete login due to an incorrect user name or password.')
+Assert-Equal "an unreachable host is not this" $false (Test-VMHostVimAccountPasswordError -Message 'Unable to connect to the remote server')
+Assert-Equal "a permission error is not this" $false (Test-VMHostVimAccountPasswordError -Message 'Permission to perform this operation was denied.')
+Assert-Equal "and nothing is not this" $false (Test-VMHostVimAccountPasswordError -Message '')
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

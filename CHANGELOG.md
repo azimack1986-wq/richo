@@ -12,6 +12,68 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.13.0] — 2026-08-19
+
+#### Added
+
+- **A host that cannot be reconnected is restarted from its platform.** The live
+  failure, reported by vCenter:
+
+  ```
+  A general system error occurred: Weak password: not enough different characters
+  or classes. *** passwd: Authentication token manipulation error
+  Failed to configure the VIM account on the host
+  Weak password: "not enough different characters or classes".
+  ```
+
+  Reconnecting a host is not just an authentication. vCenter re-provisions **its
+  own** service account — `vpxuser` — and generates a password for it, which the
+  host's password policy then rejects. The root credential is fine, the network is
+  fine, and no number of retries can change the outcome, because the failure is on
+  the host's side of an account this run does not control.
+
+  So after the three attempts are spent, the blade is power-cycled through
+  Intersight (`PowerCycle`) or UCS Manager (`lsPower` state `cycle-immediate` on
+  the service profile's `power` child) — vCenter cannot be used, the host is
+  disconnected. **No acknowledgement is involved**: this is not a firmware step and
+  raises no pending activity. The wait then restarts and the host reconnects as
+  normal.
+
+  Once per host. A restart that did not fix it will not fix it the second time,
+  and restarting on every exhausted cycle is a reboot loop somebody has to notice
+  to stop; the second time round the operator is asked.
+  `Test-VMHostVimAccountPasswordError` names the cause on screen so it is not
+  mistaken for a wrong root password.
+
+- **The host profile's Active Directory settings are unticked when a cluster
+  starts and re-ticked when it finishes.** Previously a manual pre-requisite the
+  run only reminded you about — and one that halts the compliance gate on every
+  host if forgotten, because the profile will not apply cleanly to a host that has
+  just rebooted and rejoined.
+
+  Under Security Settings, exactly these: **Authentication Configuration** (and
+  Active Directory Configuration beneath it) and **Active Directory Permission**
+  with its principal.
+
+  **Nothing else is read, copied or written.** Matching is on the profile *type*,
+  never on position in the tree, so Role, User Configuration, Lockdown Mode, Host
+  Acceptance Level, Firewall Configuration and Service Configuration cannot be
+  caught by it. The profile's name and annotation are carried through unchanged,
+  `disabledExpressionListChanged` is left false so the disabled expression list is
+  ignored rather than replaced, and the profile's own apply tree is submitted with
+  only those `enabled` flags changed. On the way back, only the settings **this
+  run** turned off are turned back on — one you had already unticked yourself
+  stays unticked.
+
+  The re-tick is in a `finally`, so an exit, a stop or an unhandled error still
+  puts the profile back. A profile that cannot be written is reported and listed
+  for manual rectification rather than taking the cluster down with it — it is a
+  pre-requisite, not the change itself.
+
+  `Test-HostProfileActiveDirectory.ps1` covers it, including the negative
+  assertion that matters most: a snapshot of every other node's `enabled` flag
+  before and after, compared.
+
 ### [23.12.0] — 2026-08-18
 
 #### Fixed
@@ -2673,6 +2735,13 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.13.0-preauth] — 2026-08-19
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.13.0 — a host whose
+reconnect fails on the vpxuser password policy is restarted from Intersight or UCS
+Manager, and the host profile's Active Directory settings are unticked for the
+cluster and re-ticked when it finishes. This is the build to run.
 
 ### [23.12.0-preauth] — 2026-08-18
 
