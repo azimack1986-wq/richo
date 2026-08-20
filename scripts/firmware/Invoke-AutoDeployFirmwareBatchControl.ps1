@@ -350,7 +350,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.13.0"
+$ScriptVersion = "23.14.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -591,6 +591,23 @@ $HostReconnectAfterDisconnectMinutes = 5
 # firmware can refuse the reconnect while hostd is still coming up, and the run then wrote it off
 # as unrecoverable when a second attempt two minutes later would have taken it. After the last
 # attempt the operator is asked, rather than the host being silently abandoned.
+# VMWARE ARIA OPERATIONS - ESXi patching hardware suppression.
+# Blank turns the whole thing off, which is the default: a site without Aria, or without this
+# group, runs exactly as it did before. Set the appliance FQDN to enable it.
+$Global:AriaOperationsServer = ""
+# The custom datacenter the cluster joins for the change. Resolved by name each run so the object
+# can be recreated in Aria without editing this script.
+$Global:AriaSuppressionGroupName = "ESXi Patching Hardware Suppression"
+# The Source Display Name under Administration > Authentication Sources. LOCAL is a local Aria
+# account, which is the recommendation: the token is short-lived and acquired per run, so nothing
+# durable is stored, and a local account still works when the directory does not - which matters
+# here, because this run unticks Active Directory from the host profile at the same time.
+$Global:AriaAuthSource = "LOCAL"
+$Global:AriaSkipCertificateCheck = $true
+$Global:AriaCredential = $null
+$Global:AriaSession = $null
+$Global:AriaUnusable = $false
+
 # WHICH host profile nodes count as Active Directory, matched on the profile TYPE rather than on
 # position in the tree. The run unticks exactly these before a cluster and re-ticks them after, and
 # touches nothing else - not Role, not User Configuration, not Lockdown Mode, not Host Acceptance
@@ -5249,6 +5266,413 @@ function Invoke-IntersightAcceptAndRebootImmediateForBatch {
 }
 
 # -----------------------------
+# VMware Aria Operations - ESXi patching hardware suppression
+# -----------------------------
+
+function Invoke-AriaRestCall {
+    <#
+    .SYNOPSIS
+        One REST call to Aria Operations' suite-api, with the session token attached.
+
+    .DESCRIPTION
+        Everything else in this region goes through here so the token header, the certificate
+        handling and the error shape are decided once.
+
+        -SkipCertificateCheck exists only on PowerShell 6 and newer. It is passed when the
+        installed Invoke-RestMethod actually has it and left off otherwise, rather than assumed -
+        an appliance certificate that the jump box does not trust is the normal case, not the
+        exception, and a run should not fail on the parameter binding instead of on the certificate.
+
+    .PARAMETER Method
+        GET, POST or DELETE.
+
+    .PARAMETER Path
+        Path below the appliance root, starting with /suite-api/.
+
+    .PARAMETER Body
+        Optional object, sent as JSON.
+
+    .PARAMETER Token
+        The session token. Omitted for the acquire call itself.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Method,
+        [Parameter(Mandatory=$true)][string]$Path,
+        $Body = $null,
+        [AllowEmptyString()][string]$Token = ""
+    )
+
+    $uri = "https://$($Global:AriaOperationsServer)$Path"
+    $headers = @{ "Accept" = "application/json"; "Content-Type" = "application/json" }
+    if (-not [string]::IsNullOrWhiteSpace($Token)) { $headers["Authorization"] = "vRealizeOpsToken $Token" }
+
+    $params = @{ Uri = $uri; Method = $Method; Headers = $headers; ErrorAction = "Stop" }
+    if ($null -ne $Body) { $params["Body"] = ($Body | ConvertTo-Json -Depth 6 -Compress) }
+
+    if ($Global:AriaSkipCertificateCheck) {
+        $supported = $false
+        try { $supported = (Get-Command Invoke-RestMethod -ErrorAction Stop).Parameters.ContainsKey('SkipCertificateCheck') } catch { }
+        if ($supported) { $params["SkipCertificateCheck"] = $true }
+    }
+
+    return Invoke-RestMethod @params
+}
+
+function Connect-AriaOperations {
+    <#
+    .SYNOPSIS
+        Acquires a suite-api session token for this run. Returns $true when Aria is usable.
+
+    .DESCRIPTION
+        POST /suite-api/api/auth/token/acquire with username, authSource and password; every call
+        afterwards carries "Authorization: vRealizeOpsToken <token>". The token is short-lived and
+        acquired per run, which is why a local service account with a password is a better fit here
+        than a long-lived credential sitting in the script: nothing durable is stored, and a local
+        account keeps working when the directory does not - which matters, since this run unticks
+        Active Directory from the host profile at the same time.
+
+        The credential is held in memory for the run and never written to the log or the summary.
+
+        Declining, or a failure, is NOT fatal. Suppression is a courtesy to the monitoring team,
+        not part of the change: the run continues and says plainly that the cluster is not
+        suppressed, so it can be done by hand.
+    #>
+    if ($null -ne $Global:AriaSession) { return $true }
+    if ([string]::IsNullOrWhiteSpace($Global:AriaOperationsServer)) { return $false }
+    if ($Global:AriaUnusable) { return $false }
+
+    if (Test-DryRun) {
+        Write-Host "DRY RUN: would sign in to Aria Operations at $($Global:AriaOperationsServer)." -ForegroundColor Green
+        return $false
+    }
+
+    [void](Confirm-ManagementEndpointReachable -Target $Global:AriaOperationsServer -DeviceKind "Aria Operations" -TimeoutSeconds $ManagementEndpointProbeTimeoutSeconds)
+
+    if ($null -eq $Global:AriaCredential) {
+        Write-Host "" -ForegroundColor Cyan
+        Write-Host "Aria Operations sign-in for $($Global:AriaOperationsServer)" -ForegroundColor Cyan
+        Write-Host "  Used only to add this cluster to '$($Global:AriaSuppressionGroupName)' for the change," -ForegroundColor Gray
+        Write-Host "  and to take it out again when the cluster finishes. Authentication source: $($Global:AriaAuthSource)." -ForegroundColor Gray
+        Write-Host "  Held in memory for this run only, never written to the summary or the log." -ForegroundColor Gray
+        try { $Global:AriaCredential = Get-Credential -Message "Aria Operations account for $($Global:AriaOperationsServer) (authSource $($Global:AriaAuthSource))" }
+        catch { $Global:AriaCredential = $null }
+    }
+
+    if ($null -eq $Global:AriaCredential -or [string]::IsNullOrWhiteSpace($Global:AriaCredential.GetNetworkCredential().Password)) {
+        Write-Host "  No Aria Operations credential given - this cluster will NOT be put into patching suppression." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "NotProvided" -Details "No credential entered; suppression is not applied."
+        $Global:AriaUnusable = $true
+        return $false
+    }
+
+    try {
+        $acquire = Invoke-AriaRestCall -Method "POST" -Path "/suite-api/api/auth/token/acquire" -Body @{
+            username   = $Global:AriaCredential.UserName
+            authSource = $Global:AriaAuthSource
+            password   = $Global:AriaCredential.GetNetworkCredential().Password
+        }
+        $token = [string]$acquire.token
+        if ([string]::IsNullOrWhiteSpace($token)) { throw "the appliance returned no token" }
+
+        $Global:AriaSession = $token
+        Write-Host "  Signed in to Aria Operations." -ForegroundColor Green
+        Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Connected" -Details "$($Global:AriaOperationsServer) as $($Global:AriaCredential.UserName) via authSource $($Global:AriaAuthSource)."
+        return $true
+    }
+    catch {
+        Write-Host "  Aria Operations sign-in failed: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "  Check the account, and that authSource '$($Global:AriaAuthSource)' matches a Source Display Name" -ForegroundColor Yellow
+        Write-Host "  under Administration > Authentication Sources. The run continues without suppression." -ForegroundColor Yellow
+        # Dropped so a wrong password is asked for again rather than reused for the rest of the run.
+        $Global:AriaCredential = $null
+        $Global:AriaUnusable = $true
+        Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Failed" -Details "$($Global:AriaOperationsServer) - $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Disconnect-AriaOperations {
+    <#
+    .SYNOPSIS
+        Releases the suite-api token. Best effort.
+    #>
+    if ($null -eq $Global:AriaSession) { return }
+    try { [void](Invoke-AriaRestCall -Method "POST" -Path "/suite-api/api/auth/token/release" -Token $Global:AriaSession) } catch { }
+    $Global:AriaSession = $null
+}
+
+function Get-AriaResourceId {
+    <#
+    .SYNOPSIS
+        Resolves one Aria object to its resource UUID, refusing to guess between two.
+
+    .DESCRIPTION
+        GET /suite-api/api/resources filtered by name, then narrowed by resource kind where one is
+        given. The identifier this returns is the same UUID the Aria UI uses - the resourceId of
+        the custom datacenter and the entries in its child list are both this.
+
+        AMBIGUITY IS NOT RESOLVED BY PICKING ONE. Two clusters of the same name in different
+        vCenters is normal in this estate, and the Aria object picker shows them as identical rows.
+        Taking the first would suppress the wrong cluster and leave the right one alerting, so
+        where more than one survives the filter this returns nothing and says what it saw.
+
+    .PARAMETER Name
+        Exact object name.
+
+    .PARAMETER ResourceKind
+        Optional resourceKindKey, for example ClusterComputeResource.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Name,
+        [string]$ResourceKind = ""
+    )
+
+    $encoded = [System.Uri]::EscapeDataString($Name)
+    $path = "/suite-api/api/resources?name=$encoded&pageSize=200"
+    if (-not [string]::IsNullOrWhiteSpace($ResourceKind)) { $path += "&resourceKind=$([System.Uri]::EscapeDataString($ResourceKind))" }
+
+    $response = Invoke-AriaRestCall -Method "GET" -Path $path -Token $Global:AriaSession
+    $matched = @(@($response.resourceList) | Where-Object {
+        $null -ne $_ -and [string]$_.resourceKey.name -eq $Name -and
+        ([string]::IsNullOrWhiteSpace($ResourceKind) -or [string]$_.resourceKey.resourceKindKey -eq $ResourceKind)
+    })
+
+    if ($matched.Count -eq 0) {
+        Write-Host "  Aria Operations has no object named '$Name'$(if ($ResourceKind) { " of kind $ResourceKind" })." -ForegroundColor Yellow
+        return ""
+    }
+    if ($matched.Count -gt 1) {
+        Write-Host "  Aria Operations has $($matched.Count) objects named '$Name'$(if ($ResourceKind) { " of kind $ResourceKind" }) - refusing to guess which one." -ForegroundColor Yellow
+        foreach ($row in $matched) { Write-Host "      $($row.identifier)  $($row.resourceKey.adapterKindKey)/$($row.resourceKey.resourceKindKey)" -ForegroundColor Gray }
+        return ""
+    }
+
+    return [string]$matched[0].identifier
+}
+
+function Get-AriaCustomDatacenter {
+    <#
+    .SYNOPSIS
+        The suppression custom datacenter, whole, as the appliance holds it.
+
+    .DESCRIPTION
+        GET /suite-api/api/resources/customdatacenters lists them; the one whose name matches is
+        then re-read by id so the object that goes back on the PUT is the object that came off the
+        appliance, not a summary of it.
+
+        Refuses to choose between two of the same name rather than picking the first.
+    #>
+    param([Parameter(Mandatory=$true)][string]$Name)
+
+    $listing = Invoke-AriaRestCall -Method "GET" -Path "/suite-api/api/resources/customdatacenters" -Token $Global:AriaSession
+
+    # The listing property name has moved between releases, so take whichever array of objects the
+    # response carries rather than depending on one.
+    $candidates = @()
+    foreach ($property in @($listing.PSObject.Properties)) {
+        if ($property.Value -is [System.Array] -or $property.Value -is [System.Collections.IList]) {
+            $candidates += @($property.Value)
+        }
+    }
+    if ($candidates.Count -eq 0) { $candidates = @($listing) }
+
+    $matched = @($candidates | Where-Object { $null -ne $_ -and [string]$_.name -eq $Name })
+    if ($matched.Count -eq 0) {
+        Write-Host "  Aria Operations has no custom datacenter named '$Name'." -ForegroundColor Yellow
+        return $null
+    }
+    if ($matched.Count -gt 1) {
+        Write-Host "  Aria Operations has $($matched.Count) custom datacenters named '$Name' - refusing to guess which one." -ForegroundColor Yellow
+        return $null
+    }
+
+    $id = [string]$matched[0].id
+    if ([string]::IsNullOrWhiteSpace($id)) { $id = [string]$matched[0].identifier }
+    if ([string]::IsNullOrWhiteSpace($id)) {
+        Write-Host "  The custom datacenter '$Name' was found but carries no id." -ForegroundColor Yellow
+        return $null
+    }
+
+    return Invoke-AriaRestCall -Method "GET" -Path "/suite-api/api/resources/customdatacenters/$id" -Token $Global:AriaSession
+}
+
+function Get-AriaMembershipProperty {
+    <#
+    .SYNOPSIS
+        Which property of a custom datacenter holds its member ids? Discovered, never assumed.
+
+    .DESCRIPTION
+        The update is a PUT of the WHOLE object, so the member list has to be edited in place and
+        everything else handed back untouched.
+
+        childResourceIds is the documented name, from the appliance's own example payload:
+
+            { "id": "...", "name": "custom datacenter", "description": "...",
+              "childResourceIds": [ "4f64f721-...", "8ab92306-..." ] }
+
+        so that is taken when it is present - which also means an EMPTY group is handled correctly,
+        where searching for an array of UUIDs would find nothing to go on.
+
+        The search is the fallback, for a release that spells it differently: the object is scanned
+        for the one property that is an array of UUIDs. EXACTLY ONE, or nothing. Two candidates
+        means the wrong one could be edited, and editing the wrong array of a custom datacenter is
+        how every other cluster falls out of suppression, so where it cannot be identified the
+        caller stops and says so.
+    #>
+    param([Parameter(Mandatory=$true)]$CustomDatacenter)
+
+    $names = @()
+    try { $names = @($CustomDatacenter.PSObject.Properties.Name) } catch { }
+    if ($names -contains 'childResourceIds') { return 'childResourceIds' }
+
+    $uuid = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    $found = New-Object System.Collections.Generic.List[string]
+
+    foreach ($property in @($CustomDatacenter.PSObject.Properties)) {
+        $value = $property.Value
+        if ($null -eq $value) { continue }
+        if (-not ($value -is [System.Array] -or $value -is [System.Collections.IList])) { continue }
+        $items = @($value)
+        if ($items.Count -eq 0) { continue }
+        $allUuids = $true
+        foreach ($item in $items) {
+            if ($item -isnot [string] -or $item -notmatch $uuid) { $allUuids = $false; break }
+        }
+        if ($allUuids) { [void]$found.Add($property.Name) }
+    }
+
+    if ($found.Count -eq 1) { return $found[0] }
+    if ($found.Count -eq 0) { return "" }
+
+    Write-Host "  The custom datacenter has $($found.Count) properties that look like a member list ($($found.ToArray() -join ', ')) - refusing to guess which one to edit." -ForegroundColor Yellow
+    return ""
+}
+
+function Set-ClusterAriaPatchingSuppression {
+    <#
+    .SYNOPSIS
+        Adds the cluster to the ESXi patching hardware suppression custom datacenter, or takes it
+        out again.
+
+    .DESCRIPTION
+        The group is a custom datacenter in Aria Operations - "ESXi Patching Hardware Suppression",
+        a temporary container whose members have their hardware alerting suppressed for the change.
+        Blades are about to be reflashed and power-cycled, which is exactly what the hardware
+        monitors exist to shout about, and a change window's worth of expected alerts trains people
+        to ignore the real ones.
+
+        THE SUPPORTED API, NOT THE ONE THE BROWSER CALLS. The UI posts the whole edit form to
+        /vcf-operations/plug/ops/customDatacenter.action with a secureToken - a private interface
+        bound to a browser session. The same thing is reachable properly:
+
+            GET /suite-api/api/resources/customdatacenters        find it by name
+            GET /suite-api/api/resources/customdatacenters/{id}   read the whole object
+            PUT /suite-api/api/resources/customdatacenters        write the whole object back
+
+        READ, MODIFY, WRITE - and the read is not optional. PUT replaces the object, so the member
+        list that goes back must be the one that came off the appliance with a single id added or
+        removed. Composing that list from anything else - the run's own idea of who should be in
+        it, a cached copy, an empty array on a failed read - silently drops every other cluster out
+        of suppression. Nothing is ever written unless the read succeeded and the member property
+        was positively identified.
+
+        The change is then confirmed by re-reading, because a PUT returning says nothing about what
+        the appliance stored.
+
+        NOTHING HERE IS FATAL. Suppression is a courtesy to the monitoring team, not part of the
+        change. A failure is reported and listed for manual attention and the upgrade carries on -
+        an unsuppressed cluster raises alerts, which is a great deal better than a cluster that
+        does not get patched.
+
+    .PARAMETER Cluster
+        The vCenter cluster being worked on. Matched to the Aria object by name.
+
+    .PARAMETER InSuppression
+        $true to add it for the change, $false to take it out afterwards.
+
+    .EXAMPLE
+        Set-ClusterAriaPatchingSuppression -Cluster $cluster -InSuppression $true
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Cluster,
+        [Parameter(Mandatory=$true)][bool]$InSuppression
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Global:AriaOperationsServer)) { return }
+
+    $clusterName = [string]$Cluster.Name
+    $verb = if ($InSuppression) { "Add to" } else { "Remove from" }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Aria Operations: $(if ($InSuppression) { 'adding' } else { 'removing' }) '$clusterName' $(if ($InSuppression) { 'to' } else { 'from' }) '$($Global:AriaSuppressionGroupName)'." -ForegroundColor Cyan
+
+    if (Test-DryRun) {
+        Write-Host "  DRY RUN: no change is made in Aria Operations." -ForegroundColor Green
+        Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "$verb suppression" -Result "DryRun" -Details "$clusterName - no change made."
+        return
+    }
+
+    if (-not (Connect-AriaOperations)) {
+        Write-Host "  Aria Operations is not available, so '$clusterName' is NOT $(if ($InSuppression) { 'suppressed' } else { 'un-suppressed' })." -ForegroundColor Yellow
+        Add-ManualAttentionHost -HostName $clusterName -Reason "Aria patching suppression not $(if ($InSuppression) { 'applied' } else { 'removed' })" -Detail "Aria Operations could not be used. $(if ($InSuppression) { 'Add' } else { 'Remove' }) '$clusterName' $(if ($InSuppression) { 'to' } else { 'from' }) '$($Global:AriaSuppressionGroupName)' by hand."
+        return
+    }
+
+    try {
+        $group = Get-AriaCustomDatacenter -Name $Global:AriaSuppressionGroupName
+        if ($null -eq $group) { throw "the custom datacenter '$($Global:AriaSuppressionGroupName)' could not be read" }
+
+        $memberProperty = Get-AriaMembershipProperty -CustomDatacenter $group
+        if ([string]::IsNullOrWhiteSpace($memberProperty)) { throw "the custom datacenter's member list could not be identified, so nothing was written" }
+
+        $clusterId = Get-AriaResourceId -Name $clusterName -ResourceKind "ClusterComputeResource"
+        if ([string]::IsNullOrWhiteSpace($clusterId)) { throw "cluster '$clusterName' could not be resolved to a single Aria object" }
+
+        $before = @($group.$memberProperty)
+        $present = ($before -contains $clusterId)
+
+        if ($InSuppression -and $present) {
+            Write-Host "  '$clusterName' is already in the suppression group - nothing to do." -ForegroundColor Green
+            Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "$verb suppression" -Result "AlreadyIn" -Details "$clusterName ($clusterId) was already a member; $($before.Count) member(s) untouched."
+            return
+        }
+        if (-not $InSuppression -and -not $present) {
+            Write-Host "  '$clusterName' is not in the suppression group - nothing to do." -ForegroundColor Green
+            Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "$verb suppression" -Result "AlreadyOut" -Details "$clusterName ($clusterId) was not a member; $($before.Count) member(s) untouched."
+            return
+        }
+
+        # ONE ID DIFFERENT. Everything else on the object goes back exactly as it came.
+        $after = if ($InSuppression) { @($before) + @($clusterId) } else { @($before | Where-Object { $_ -ne $clusterId }) }
+        $expected = if ($InSuppression) { $before.Count + 1 } else { $before.Count - 1 }
+        if (@($after).Count -ne $expected) { throw "the member list came out at $(@($after).Count) entries where $expected was expected - refusing to write it" }
+
+        $group.$memberProperty = @($after)
+        [void](Invoke-AriaRestCall -Method "PUT" -Path "/suite-api/api/resources/customdatacenters" -Token $Global:AriaSession -Body $group)
+
+        # Read it back. A PUT returning says nothing about what the appliance stored.
+        Start-Sleep -Seconds 5
+        $reread = Get-AriaCustomDatacenter -Name $Global:AriaSuppressionGroupName
+        if ($null -eq $reread) { throw "the custom datacenter could not be re-read to confirm the change" }
+        $now = @($reread.$memberProperty)
+
+        if ((($now -contains $clusterId) -eq $InSuppression) -and @($now).Count -eq $expected) {
+            Write-Host "  '$clusterName' is now $(if ($InSuppression) { 'in' } else { 'out of' }) '$($Global:AriaSuppressionGroupName)' - $(@($now).Count) member(s)." -ForegroundColor Green
+            Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "$verb suppression" -Result "Applied" -Details "$clusterName ($clusterId) $(if ($InSuppression) { 'added to' } else { 'removed from' }) '$($Global:AriaSuppressionGroupName)'; membership went from $($before.Count) to $(@($now).Count), confirmed by re-reading."
+            return
+        }
+
+        throw "the membership read back as $(@($now).Count) member(s) with the cluster $(if ($now -contains $clusterId) { 'present' } else { 'absent' }), which is not what was written"
+    }
+    catch {
+        Write-Host "  Aria Operations could not be updated: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "  $(if ($InSuppression) { 'Add' } else { 'Remove' }) '$clusterName' $(if ($InSuppression) { 'to' } else { 'from' }) '$($Global:AriaSuppressionGroupName)' by hand." -ForegroundColor Yellow
+        Add-ManualAttentionHost -HostName $clusterName -Reason "Aria patching suppression not $(if ($InSuppression) { 'applied' } else { 'removed' })" -Detail "$($_.Exception.Message). $(if ($InSuppression) { 'Add' } else { 'Remove' }) '$clusterName' $(if ($InSuppression) { 'to' } else { 'from' }) '$($Global:AriaSuppressionGroupName)' in Aria Operations by hand."
+        Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "$verb suppression" -Result "Failed" -Details "$clusterName - $($_.Exception.Message)"
+    }
+}
+
+# -----------------------------
 # vCenter workflow helpers
 # -----------------------------
 
@@ -7807,6 +8231,11 @@ function Invoke-ClusterUpgradeWorkflow {
     # or written - see Set-ClusterHostProfileActiveDirectory.
     Set-ClusterHostProfileActiveDirectory -Cluster $Cluster -Enable $false
 
+    # Hardware alerting for this cluster is suppressed for the duration. Blades are about to be
+    # reflashed and power-cycled, which is exactly what the hardware monitors are there to shout
+    # about, and a change window's worth of expected alerts trains people to ignore the real ones.
+    Set-ClusterAriaPatchingSuppression -Cluster $Cluster -InSuppression $true
+
     try {
         # ROLLING, NOT BATCHED. The old loop took N hosts, put them all through, and did not start
         # host N+1 until the SLOWEST of the first N had finished - so a host back in twenty minutes
@@ -7816,10 +8245,11 @@ function Invoke-ClusterUpgradeWorkflow {
         Invoke-RollingClusterUpgrade -Cluster $Cluster -OrderedHostNames @($pendingHosts) -BatchMode $batchMode
     }
     finally {
-        # In a finally so an exit, a stop or an unhandled error still puts the profile back. A run
-        # that ends early leaving Active Directory unticked is a change nobody made deliberately
-        # and nobody would think to look for.
+        # In a finally so an exit, a stop or an unhandled error still puts these back. A run that
+        # ends early leaving Active Directory unticked, or a cluster suppressed in Aria, is a change
+        # nobody made deliberately and nobody would think to look for.
         Set-ClusterHostProfileActiveDirectory -Cluster $Cluster -Enable $true
+        Set-ClusterAriaPatchingSuppression -Cluster $Cluster -InSuppression $false
     }
 
     Show-ClusterFirmwareVerification -Cluster $Cluster -HostNames @($patchCandidateHosts | Select-Object -ExpandProperty Name)
@@ -7878,6 +8308,7 @@ try {
     # Intersight.PowerShell holds process-wide configuration rather than a session object, so there
     # is nothing to disconnect. Clear the in-memory key material instead.
     $Global:IntersightSession = $null
+    Disconnect-AriaOperations
     $Global:IntersightApiKeyId = ""
     $Global:IntersightApiKeyFilePath = ""
     # Only if a connection was actually established - otherwise this reports a confusing

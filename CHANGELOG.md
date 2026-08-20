@@ -12,6 +12,62 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.14.0] — 2026-08-19
+
+#### Added
+
+- **The cluster is put into the Aria Operations ESXi patching hardware suppression
+  group for the change, and taken out when it finishes.** Blades are about to be
+  reflashed and power-cycled, which is exactly what the hardware monitors exist to
+  shout about, and a change window's worth of expected alerts trains people to
+  ignore the real ones.
+
+  **Auth: a local Aria service account with a password**, over
+  `POST /suite-api/api/auth/token/acquire` with `authSource` `LOCAL`, then
+  `Authorization: vRealizeOpsToken <token>` on every call. The token is short-lived
+  and acquired per run, so nothing durable is stored, and a local account keeps
+  working when the directory does not — which matters here, because the same run
+  unticks Active Directory from the host profile. The credential is held in memory
+  only and never written to the log or the summary; the token is released at exit.
+
+  **The supported API, not the one the browser calls.** The UI posts the whole edit
+  form to `/vcf-operations/plug/ops/customDatacenter.action` with a `secureToken` —
+  a private interface bound to a browser session. The same object is reachable
+  properly:
+
+  ```
+  GET /suite-api/api/resources/customdatacenters        find it by name
+  GET /suite-api/api/resources/customdatacenters/{id}   read the whole object
+  PUT /suite-api/api/resources/customdatacenters        write the whole object back
+  ```
+
+  **PUT replaces the object, so this is read-modify-write and the read is not
+  optional.** The member list that goes back is the one that came off the appliance
+  with a single id added or removed. Composing it from anything else — the run's own
+  idea of who belongs, a cached copy, an empty array after a failed read — silently
+  drops every other cluster out of suppression. Nothing is written unless the read
+  succeeded, the member property was positively identified, and the resulting list
+  is exactly one entry different from the one read. The change is then confirmed by
+  re-reading, because a PUT returning says nothing about what was stored.
+
+  `childResourceIds` is taken by name from the appliance's own payload, which also
+  makes an empty group work; a scan for the single array-of-UUIDs property is the
+  fallback for a release that renames it, and two candidates are refused rather
+  than guessed between.
+
+  Two clusters of the same name — which this estate has, and which the Aria object
+  picker shows as identical rows — are never resolved by taking the first. That
+  would suppress the wrong cluster and leave the right one alerting.
+
+  **Nothing here is fatal.** Suppression is a courtesy to the monitoring team, not
+  part of the change: a failure is reported, listed for manual rectification, and
+  the upgrade carries on. An unsuppressed cluster raises alerts; a cluster that
+  does not get patched is worse. Removal is in the same `finally` as the host
+  profile restore, so an exit or an error still takes the cluster back out.
+
+  Off unless `$Global:AriaOperationsServer` is set, so a site without Aria runs
+  exactly as before.
+
 ### [23.13.0] — 2026-08-19
 
 #### Added
@@ -2735,6 +2791,13 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.14.0-preauth] — 2026-08-19
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.14.0 — the cluster is added
+to the Aria Operations ESXi patching hardware suppression custom datacenter for the
+change and removed when it finishes, over the supported suite-api. This is the
+build to run.
 
 ### [23.13.0-preauth] — 2026-08-19
 
