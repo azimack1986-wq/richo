@@ -378,7 +378,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.15.0"
+$ScriptVersion = "23.16.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -1524,23 +1524,110 @@ function Get-UcsSessionForTarget {
     return $session
 }
 
+function Get-LldpSystemName {
+    <#
+    .SYNOPSIS
+        The neighbour's system name out of an LLDP hint, or "" if it does not carry one.
+
+    .DESCRIPTION
+        LLDP does not put the system name in a field of its own. LinkLayerDiscoveryProtocolInfo has
+        ChassisId, PortId and TimeToLive, and everything else arrives as key/value pairs in
+        Parameter[] - "System Name", "System Description", "Port Description" and so on, with the
+        spelling and spacing decided by the sender. So the parameter is matched loosely rather than
+        by an exact key.
+
+        ChassisId is the fallback, but only when it is not a MAC address. On a UCS fabric
+        interconnect the chassis id is usually the MAC, which is no use at all as a UCSM name and
+        would send the run off to build an FQDN out of hex.
+    #>
+    param([Parameter(Mandatory=$true)]$LldpInfo)
+
+    foreach ($parameter in @($LldpInfo.Parameter)) {
+        if ($null -eq $parameter) { continue }
+        $key = [string]$parameter.Key
+        # "System Name", "SystemName", "sysName" - all seen, depending on the sender.
+        if ($key -notmatch '(?i)^\s*(system[\s_-]*name|sysname)\s*$') { continue }
+        $value = [string]$parameter.Value
+        if (-not [string]::IsNullOrWhiteSpace($value)) { return $value.Trim() }
+    }
+
+    $chassis = [string]$LldpInfo.ChassisId
+    if ([string]::IsNullOrWhiteSpace($chassis)) { return "" }
+    # A MAC in any of the usual separators is an identifier, not a name.
+    if ($chassis -match '^([0-9a-fA-F]{2}[:\-\.]){5}[0-9a-fA-F]{2}$') { return "" }
+    if ($chassis -match '^[0-9a-fA-F]{12}$') { return "" }
+    return $chassis.Trim()
+}
+
 function Get-EsxiDiscoveryProtocolInfo {
+    <#
+    .SYNOPSIS
+        Every CDP and LLDP neighbour name a host's physical NICs report.
+
+    .DESCRIPTION
+        BOTH PROTOCOLS. This read CDP only - PhysicalNicHintInfo.ConnectedSwitchPort - and ignored
+        LldpInfo entirely, while every message about it said "CDP/LLDP". On a domain running LLDP
+        with CDP disabled, which is ordinary on 6400-series fabric interconnects, ConnectedSwitchPort
+        is null and the host reported NO_CDP_LLDP for neighbours plainly visible in ESXi. Every host
+        in the cluster then fell through to the manual UCSM prompt.
+
+        BOTH CDP NAME FIELDS, too. PhysicalNicCdpInfo carries devId AND systemName, and they are not
+        always the same string - devId can be the switch's hostname while systemName carries the
+        fabric name the Intersight CSV is keyed on. Only devId was read. Both are now returned as
+        separate candidate rows, so whichever one matches, matches.
+
+        A row per candidate, tagged with the protocol it came from, so the discovery table can show
+        the operator where a name was learned rather than just asserting one.
+    #>
     param([Parameter(Mandatory=$true)]$VMHostObject)
+
     $results = New-Object System.Collections.ArrayList
     try {
         $hostView = Get-View -Id $VMHostObject.Id -ErrorAction Stop
         $networkSystem = Get-View -Id $hostView.ConfigManager.NetworkSystem -ErrorAction Stop
+
         foreach ($pnic in $hostView.Config.Network.Pnic | Sort-Object Device) {
             try {
                 $hints = $networkSystem.QueryNetworkHint($pnic.Device)
                 foreach ($hint in $hints) {
-                    if ($null -ne $hint.ConnectedSwitchPort -and -not [string]::IsNullOrWhiteSpace($hint.ConnectedSwitchPort.DevId)) {
-                        [void]$results.Add([pscustomobject]@{ Host=$VMHostObject.Name; Vmnic=$pnic.Device; SystemName=$hint.ConnectedSwitchPort.DevId; PortId=$hint.ConnectedSwitchPort.PortId })
+                    if ($null -eq $hint) { continue }
+                    $seen = New-Object System.Collections.Generic.List[string]
+
+                    # --- CDP ---------------------------------------------------------------
+                    $cdp = $null
+                    try { $cdp = $hint.ConnectedSwitchPort } catch { }
+                    if ($null -ne $cdp) {
+                        # systemName first: on a fabric interconnect it is the name the Intersight
+                        # export is keyed on, where devId can be something else entirely.
+                        foreach ($candidate in @([string]$cdp.SystemName, [string]$cdp.DevId)) {
+                            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+                            $value = $candidate.Trim()
+                            if ($seen -contains $value) { continue }
+                            [void]$seen.Add($value)
+                            [void]$results.Add([pscustomobject]@{
+                                Host = $VMHostObject.Name; Vmnic = $pnic.Device
+                                SystemName = $value; PortId = [string]$cdp.PortId; Source = "CDP" })
+                        }
+                    }
+
+                    # --- LLDP --------------------------------------------------------------
+                    $lldp = $null
+                    try { $lldp = $hint.LldpInfo } catch { }
+                    if ($null -ne $lldp) {
+                        $value = Get-LldpSystemName -LldpInfo $lldp
+                        if (-not [string]::IsNullOrWhiteSpace($value) -and $seen -notcontains $value) {
+                            [void]$seen.Add($value)
+                            [void]$results.Add([pscustomobject]@{
+                                Host = $VMHostObject.Name; Vmnic = $pnic.Device
+                                SystemName = $value; PortId = [string]$lldp.PortId; Source = "LLDP" })
+                        }
                     }
                 }
-            } catch {}
+            } catch { }
         }
-    } catch { Write-Host "Could not query CDP/LLDP for $($VMHostObject.Name): $($_.Exception.Message)" -ForegroundColor Yellow }
+    }
+    catch { Write-Host "Could not query CDP/LLDP for $($VMHostObject.Name): $($_.Exception.Message)" -ForegroundColor Yellow }
+
     return @($results)
 }
 
@@ -1557,17 +1644,66 @@ function Get-EsxiPreferredDiscovery {
     #>
     param([Parameter(Mandatory=$true)]$VMHostObject)
 
+    $candidates = @(Get-EsxiDiscoveryCandidate -VMHostObject $VMHostObject)
+    if ($candidates.Count -eq 0) { return $null }
+    return $candidates[0]
+}
+
+function Get-EsxiDiscoveryCandidate {
+    <#
+    .SYNOPSIS
+        EVERY neighbour name a host reports, best first, cached per host.
+
+    .DESCRIPTION
+        A host does not report one name. It reports a CDP devId and a CDP systemName and an LLDP
+        system name, per physical NIC, and they are not always the same string - which is the whole
+        reason the caller should try all of them rather than the first.
+
+        Ordered so the most likely answer is first: the low-numbered uplinks before the rest, since
+        those are the ones cabled to the fabric on every host in this estate, and within a NIC the
+        order the protocols were read in.
+
+        QueryNetworkHint is the slowest call in the discovery phase and both the Intersight
+        detection pass and the UCSM mapping pass need the same answer, so the list is cached for
+        the life of the run.
+    #>
+    param([Parameter(Mandatory=$true)]$VMHostObject)
+
     if ($Global:EsxiDiscoveryCache.ContainsKey($VMHostObject.Name)) {
-        return $Global:EsxiDiscoveryCache[$VMHostObject.Name]
+        return @($Global:EsxiDiscoveryCache[$VMHostObject.Name])
     }
 
     $discovery = @(Get-EsxiDiscoveryProtocolInfo -VMHostObject $VMHostObject)
-    $preferred = @($discovery | Where-Object { $_.Vmnic -in @("vmnic0","vmnic1","vmnic2","vmnic3") } | Sort-Object Vmnic | Select-Object -First 1)
-    if ($preferred.Count -eq 0 -and $discovery.Count -gt 0) { $preferred = @($discovery | Select-Object -First 1) }
+    $front = @($discovery | Where-Object { $_.Vmnic -in @("vmnic0","vmnic1","vmnic2","vmnic3") })
+    $rest  = @($discovery | Where-Object { $_.Vmnic -notin @("vmnic0","vmnic1","vmnic2","vmnic3") })
+    $ordered = @($front) + @($rest)
 
-    $result = if ($preferred.Count -gt 0) { $preferred[0] } else { $null }
-    $Global:EsxiDiscoveryCache[$VMHostObject.Name] = $result
-    return $result
+    $Global:EsxiDiscoveryCache[$VMHostObject.Name] = $ordered
+    return @($ordered)
+}
+
+function Resolve-IntersightCsvMatchFromHost {
+    <#
+    .SYNOPSIS
+        Tries EVERY name a host reports against the Intersight CSV, and returns the first that hits.
+
+    .DESCRIPTION
+        Matching only the first name found is a coin toss when a host reports several. A blade can
+        report a CDP devId that is not in the export and an LLDP system name that is, and testing
+        only the one would route it to UCS Manager - where it has no service profile, because it is
+        Intersight-managed.
+
+        Returns the match and the row that produced it, or $null.
+    #>
+    param([Parameter(Mandatory=$true)]$VMHostObject)
+
+    foreach ($candidate in @(Get-EsxiDiscoveryCandidate -VMHostObject $VMHostObject)) {
+        $match = Resolve-IntersightCsvMatch -CdpSystemName $candidate.SystemName
+        if ($null -ne $match) {
+            return [pscustomobject]@{ Match = $match; Discovery = $candidate }
+        }
+    }
+    return $null
 }
 
 function Get-ShortHostName { param([Parameter(Mandatory=$true)][string]$HostName) return ($HostName.Trim().Split('.')[0]) }
@@ -2298,9 +2434,12 @@ function Build-InfrastructureHostMapping {
 
     $intersightRoutedRows = New-Object System.Collections.ArrayList
     foreach ($hostObj in $reachable) {
-        $preferred = Get-EsxiPreferredDiscovery -VMHostObject $hostObj
+        # EVERY name the host reports is tried, not just the first. A blade can report a CDP devId
+        # that is not in the export alongside an LLDP system name that is.
+        $hit = Resolve-IntersightCsvMatchFromHost -VMHostObject $hostObj
+        $preferred = if ($null -ne $hit) { $hit.Discovery } else { Get-EsxiPreferredDiscovery -VMHostObject $hostObj }
         $systemName = if ($null -ne $preferred) { $preferred.SystemName } else { "" }
-        $match = Resolve-IntersightCsvMatch -CdpSystemName $systemName
+        $match = if ($null -ne $hit) { $hit.Match } else { $null }
 
         if ($null -ne $match) {
             $csvRow = $match.Row
@@ -2357,14 +2496,23 @@ function Build-InfrastructureHostMapping {
 
     foreach ($hostObj in $ucsOnlyHosts) {
         # Cached from the detection pass above - no second QueryNetworkHint round trip.
-        $preferred = Get-EsxiPreferredDiscovery -VMHostObject $hostObj
+        # The first reported name that yields a usable UCSM target, not simply the first name.
+        $preferred = $null
+        $candidate = ""
+        foreach ($row in @(Get-EsxiDiscoveryCandidate -VMHostObject $hostObj)) {
+            $possible = (Get-UcsCandidateListFromSystemName -SystemName $row.SystemName | Select-Object -First 1)
+            if (-not [string]::IsNullOrWhiteSpace($possible)) { $preferred = $row; $candidate = $possible; break }
+        }
+        # Nothing produced a target, but a name was still learned - carry it so the operator sees
+        # what the host actually reported instead of a blank row.
+        if ($null -eq $preferred) { $preferred = Get-EsxiPreferredDiscovery -VMHostObject $hostObj }
 
         if ($null -ne $preferred) {
             $systemName = $preferred.SystemName
-            $candidate = (Get-UcsCandidateListFromSystemName -SystemName $systemName | Select-Object -First 1)
             [void]$discoveryRows.Add([pscustomobject]@{
                 Host          = $hostObj.Name
                 Vmnic         = $preferred.Vmnic
+                Protocol      = [string]$preferred.Source
                 CdpSystemName = $systemName
                 UcsTarget     = $candidate
                 Discovery     = "AUTO_DISCOVERED"
@@ -2375,6 +2523,7 @@ function Build-InfrastructureHostMapping {
             [void]$discoveryRows.Add([pscustomobject]@{
                 Host          = $hostObj.Name
                 Vmnic         = ""
+                Protocol      = ""
                 CdpSystemName = ""
                 UcsTarget     = ""
                 Discovery     = "NO_CDP_LLDP"
@@ -2385,7 +2534,8 @@ function Build-InfrastructureHostMapping {
 
     Write-Host "" -ForegroundColor Cyan
     Write-Host "UCSM discovery summary for cluster hosts:" -ForegroundColor Cyan
-    $discoveryRows | Select-Object Host,Vmnic,CdpSystemName,UcsTarget,Discovery | Format-Table -AutoSize | Out-Host
+    # Protocol is shown so "no name" can be told from "a name, learned over LLDP" at a glance.
+    $discoveryRows | Select-Object Host,Vmnic,Protocol,CdpSystemName,UcsTarget,Discovery | Format-Table -AutoSize | Out-Host
 
     $missingTargets = @($discoveryRows | Where-Object { [string]::IsNullOrWhiteSpace($_.UcsTarget) })
     if ($missingTargets.Count -gt 0) {

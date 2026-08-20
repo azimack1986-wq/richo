@@ -12,6 +12,51 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.16.0] — 2026-08-19
+
+#### Fixed
+
+- **LLDP was never read, so a whole cluster reported `NO_CDP_LLDP` for neighbours
+  plainly visible in ESXi.** Five D24 hosts detected as UCS Manager-managed with no
+  system name, and every one of them fell through to the manual "enter a UCSM
+  FQDN" prompt.
+
+  `Get-EsxiDiscoveryProtocolInfo` looked at `PhysicalNicHintInfo.ConnectedSwitchPort`
+  — which is **CDP only** — and never at `LldpInfo`, while every message about it
+  said "CDP/LLDP". On a domain running LLDP with CDP disabled, ordinary on
+  6400-series fabric interconnects, `ConnectedSwitchPort` is null and there was
+  nothing to find.
+
+  LLDP has no system-name field: `LinkLayerDiscoveryProtocolInfo` carries
+  `ChassisId`, `PortId` and a `Parameter[]` of key/value pairs, and the name arrives
+  in there with whatever spelling the sender chose — so the key is matched loosely
+  (`System Name`, `SystemName`, `sysName`). `ChassisId` is the fallback, but only
+  when it is not a MAC address: on a fabric interconnect it usually is, and offering
+  it would send the run off to build a UCSM FQDN out of hex.
+
+- **Only one of CDP's two name fields was read.** `PhysicalNicCdpInfo` carries
+  `devId` **and** `systemName`, and they are not always the same string — `devId`
+  can be the switch's hostname while `systemName` carries the fabric name the
+  Intersight export is keyed on. Both are now offered, `systemName` first.
+
+- **Only the first name a host reported was tried.** With several candidates per
+  host that is a coin toss: a blade can report a CDP `devId` absent from the export
+  alongside an LLDP system name that is in it, and testing only the first would
+  route an Intersight-managed blade to UCS Manager, where it has no service profile
+  at all. `Resolve-IntersightCsvMatchFromHost` now tries every reported name against
+  the CSV, and the UCSM pass takes the first name that yields a usable target rather
+  than simply the first name.
+
+#### Changed
+
+- The UCSM discovery table gains a **Protocol** column, so "no name" can be told
+  from "a name, learned over LLDP" at a glance.
+
+- `Test-EsxiDiscoveryProtocol.ps1` covers this path, which had none: LLDP alone,
+  CDP alone, both at once without duplicates, the parameter-key spellings, MAC
+  chassis ids, uplink ordering, the per-host query cache, and matching on a name
+  that is not the first one tried.
+
 ### [23.15.0] — 2026-08-19
 
 #### Changed
@@ -2854,6 +2899,12 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.16.0-preauth] — 2026-08-19
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.16.0 — LLDP is read as well
+as CDP, both CDP name fields are read, and every name a host reports is tried
+against the Intersight CSV. This is the build to run.
 
 ### [23.15.0-preauth] — 2026-08-19
 
