@@ -12,6 +12,69 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.15.0] — 2026-08-19
+
+#### Changed
+
+- **Aria Operations suppression is ON by default**, pointed at
+  `siepd85vop1110.dpe.protected.mil.au`. Every cluster joins the "ESXi Patching
+  Hardware Suppression" custom datacenter before its hosts are rebooted and leaves
+  when it finishes.
+
+  **That is the D85 appliance, and it has to be changed for another site.** The
+  warning is in three places so it cannot be missed: a boxed note at the top of
+  `.DESCRIPTION`, the setting itself under a banner in User Settings, and item 4 of
+  the pre-flight, on screen every run. Left wrong, the run signs in to D85, fails to
+  find the cluster there, reports that it could not be suppressed, and carries on
+  unsuppressed — the upgrade still happens, the alerts still fire. `""` turns it off
+  cleanly.
+
+- **The Intersight fabric CSV now lives beside the script**, not at
+  `C:\temp\intersightfabric.csv`:
+
+  ```powershell
+  $IntersightCsvPath = Join-Path $PSScriptRoot 'intersightfabric.csv'
+  ```
+
+  The script is launched from a share, so the CSV travels with it — one copy to
+  keep current instead of a `C:\temp` copy per jump box, each quietly going stale.
+  `$PSScriptRoot` is set when a file is run *or dot-sourced*, which is how this is
+  launched; it is empty only when the contents are pasted into a console, and
+  `Join-Path` throws on an empty first argument, so that case falls back to the
+  working directory rather than failing at line one with a parameter binding error.
+
+#### Added
+
+- **The root password is set in the host profile — but only where the profile is
+  leaving it unchanged.** A profile set to "Leave password unchanged for the
+  default account" asserts nothing about root, so a host that reboots keeps
+  whatever it had. That is one of the ways it comes back with a password vCenter no
+  longer knows, which is what the reconnect and the platform restart in 23.13.0
+  exist to recover from.
+
+  The rule, exactly as asked:
+
+  | Profile's root password policy | What happens |
+  |---|---|
+  | already a fixed password | **left alone** — somebody chose that value, and it may not even be the one entered |
+  | "leave password unchanged" | **set** to the password entered for this cluster |
+
+  And nothing else: one policy, on the root user account, on profiles attached to
+  this cluster. Another account's password policy is not touched, no other node is
+  written, and the same read-modify-write over the profile's own apply tree is used
+  as for the Active Directory settings — name and annotation carried through, the
+  disabled expression list untouched.
+
+  The two states are told apart by whether the policy option **carries a password
+  parameter**, not by matching an option id, because those move between releases.
+  The id to switch *to* is asked of the Profile Engine through
+  `QueryPolicyMetadata` — the option declaring a `password` or security-sensitive
+  parameter — with `$Global:HostProfileFixedPasswordOptionId` as the fallback.
+
+  The password reaches the policy option and nothing else: not the console, not the
+  log, not the run summary. There is a test asserting it does not appear in the
+  summary. `$Global:SetRootPasswordInHostProfile = $false` turns it off.
+
 ### [23.14.0] — 2026-08-19
 
 #### Added
@@ -2791,6 +2854,13 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.15.0-preauth] — 2026-08-19
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.15.0 — Aria suppression is on
+by default against the D85 appliance (CHANGE IT FOR ANOTHER SITE), the Intersight
+CSV is read from beside the script, and the root password is set in the host profile
+where the profile is leaving it unchanged. This is the build to run.
 
 ### [23.14.0-preauth] — 2026-08-19
 

@@ -33,7 +33,9 @@ if ($errors) { throw "parse errors" }
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in @('Get-HostProfileApplyNode','Test-HostProfileActiveDirectoryNode',
-                                 'Get-ClusterHostProfile','Set-ClusterHostProfileActiveDirectory','Test-DryRun') } |
+                                 'Get-ClusterHostProfile','Set-ClusterHostProfileActiveDirectory',
+                                 'Get-HostProfileRootPasswordPolicy','Get-HostProfileFixedPasswordOptionId',
+                                 'Set-ClusterHostProfileRootPassword','Test-DryRun') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0
@@ -80,13 +82,42 @@ function New-TestProfileTree {
                            [pscustomobject]@{ PropertyName = 'lockdown'; Array = $false
                                               Profile = @((New-Node -Type 'LockdownModeProfile')) })
 
+    # The root user account and its password policy - the Edit host profile dialog's
+    # Security Settings > Security > User Configuration > root.
+    $rootUser = New-Node -Type 'UserProfile'
+    $rootUser | Add-Member -MemberType NoteProperty -Name Key -Value 'root'
+    $rootUser.Policy = @([pscustomobject]@{ Id = 'PasswordPolicy'
+        PolicyOption = [pscustomobject]@{ Id = $script:RootPasswordOption; Parameter = @($script:RootPasswordParameter) } })
+    # A second account that must never be touched.
+    $otherUser = New-Node -Type 'UserProfile'
+    $otherUser | Add-Member -MemberType NoteProperty -Name Key -Value 'monitoring'
+    $otherUser.Policy = @([pscustomobject]@{ Id = 'PasswordPolicy'
+        PolicyOption = [pscustomobject]@{ Id = 'DefaultAccountPasswordUnchangedConfigOption'; Parameter = @() } })
+
     $root = New-Node -Type 'HostApplyProfile'
     $root | Add-Member -MemberType NoteProperty -Name Authentication -Value $auth
     $root | Add-Member -MemberType NoteProperty -Name Security -Value $security
     $root | Add-Member -MemberType NoteProperty -Name Firewall -Value (New-Node -Type 'FirewallProfile')
     $root | Add-Member -MemberType NoteProperty -Name Service -Value @((New-Node -Type 'ServiceProfile'))
+    $root | Add-Member -MemberType NoteProperty -Name UserAccount -Value @($rootUser, $otherUser)
     return $root
 }
+
+# "Leave password unchanged for the default account" carries no parameters; a fixed password
+# carries a 'password' one. That is how the two are told apart, rather than by matching an id.
+$script:RootPasswordOption = 'DefaultAccountPasswordUnchangedConfigOption'
+$script:RootPasswordParameter = $null
+$Global:SetRootPasswordInHostProfile = $true
+$Global:HostProfileFixedPasswordOptionId = 'FixedPasswordConfigOption'
+if (-not ('VMware.Vim.KeyAnyValue' -as [type])) {
+    Add-Type -TypeDefinition @'
+namespace VMware.Vim {
+    public class KeyAnyValue { public string Key; public object Value; }
+    public class PolicyOption { public string Id; public object Parameter; }
+}
+'@
+}
+function Get-View { param($Id,$ErrorAction) throw "no vCenter in this test - the fallback option id is used" }
 
 $script:Updates = New-Object System.Collections.Generic.List[object]
 $script:UpdateThrows = ""
@@ -134,7 +165,8 @@ $tree = New-TestProfileTree
 $nodes = @(Get-HostProfileApplyNode -Node $tree)
 # root, authentication, activeDirectory, the AD permission and its principal, the role permission,
 # security, role, user configuration, lockdown, firewall, service.
-Assert-Equal "every node was found" 12 $nodes.Count
+Assert-Equal "every node was found" 14 $nodes.Count
+Assert-Equal "including both user accounts" 2 (@($nodes | Where-Object { $_.ProfileTypeName -eq 'UserProfile' }).Count)
 Assert-Equal "the typed Authentication child is reached" 1 (@($nodes | Where-Object { $_.ProfileTypeName -eq 'AuthenticationProfile' }).Count)
 Assert-Equal "its ActiveDirectory child too" 1 (@($nodes | Where-Object { $_.ProfileTypeName -eq 'ActiveDirectoryProfile' }).Count)
 Assert-Equal "the Permission array is reached" 1 (@($nodes | Where-Object { $_.ProfileTypeName -eq 'PermissionProfile' }).Count)
@@ -227,6 +259,79 @@ Assert-Equal "the re-tick is in a finally" $true ($workflowText -match '(?s)fina
 Assert-Equal "and the untick runs before the rolling upgrade" $true (
     $workflowText.IndexOf('Set-ClusterHostProfileActiveDirectory -Cluster $Cluster -Enable $false') -lt
     $workflowText.IndexOf('Invoke-RollingClusterUpgrade -Cluster $Cluster'))
+
+Write-Host "`n=== A profile that leaves the root password unchanged has it set ===" -ForegroundColor Cyan
+# A profile set to "Leave password unchanged for the default account" asserts nothing about root,
+# so a host that reboots keeps whatever it had - one way it comes back with a password vCenter no
+# longer knows.
+$cred = [pscredential]::new('root', (ConvertTo-SecureString 'S3cret-Passw0rd!' -AsPlainText -Force))
+$script:RootPasswordOption = 'DefaultAccountPasswordUnchangedConfigOption'
+$script:RootPasswordParameter = $null
+$script:Profiles = @(New-TestHostProfile)
+$script:Updates.Clear()
+$tree = $script:Profiles[0].ExtensionData.Config.ApplyProfile
+$before = Get-EnabledSnapshot -Tree $tree
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+
+$rootPolicy = $tree.UserAccount[0].Policy[0]
+Assert-Equal "the option was switched to the fixed-password one" "FixedPasswordConfigOption" $rootPolicy.PolicyOption.Id
+Assert-Equal "carrying one parameter" 1 @($rootPolicy.PolicyOption.Parameter).Count
+Assert-Equal "named password" "password" @($rootPolicy.PolicyOption.Parameter)[0].Key
+Assert-Equal "with the password that was entered" "S3cret-Passw0rd!" @($rootPolicy.PolicyOption.Parameter)[0].Value
+Assert-Equal "one update was written" 1 $script:Updates.Count
+# NOTHING ELSE. The other account, and every enabled flag in the tree.
+Assert-Equal "the other account is untouched" "DefaultAccountPasswordUnchangedConfigOption" $tree.UserAccount[1].Policy[0].PolicyOption.Id
+Assert-Equal "and it still has no password" 0 @($tree.UserAccount[1].Policy[0].PolicyOption.Parameter).Count
+$after = Get-EnabledSnapshot -Tree $tree
+Assert-Equal "no enabled flag anywhere changed" 0 (@($before.Keys | Where-Object { $before[$_] -ne $after[$_] }).Count)
+# The password must not reach the log or the summary.
+$leaked = @($Global:RunSummary.ToArray() | Where-Object { "$($_.Details)" -match 'S3cret' })
+Assert-Equal "the password is not in the run summary" 0 $leaked.Count
+Assert-Equal "recorded as applied" "Applied" (@($Global:RunSummary.ToArray() | Where-Object { $_.Stage -eq 'HostProfileRootPassword' })[-1].Result)
+
+Write-Host "`n=== A profile that already sets a root password is left alone ===" -ForegroundColor Cyan
+# Somebody chose that value. It is not this run's to overwrite, and it may not even be the password
+# that was entered for the cluster.
+$script:RootPasswordOption = 'FixedPasswordConfigOption'
+$script:RootPasswordParameter = [pscustomobject]@{ Key = 'password'; Value = 'SomebodyElsesPassword' }
+$script:Profiles = @(New-TestHostProfile)
+$script:Updates.Clear()
+$tree = $script:Profiles[0].ExtensionData.Config.ApplyProfile
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "nothing was written" 0 $script:Updates.Count
+Assert-Equal "the existing password is still there" "SomebodyElsesPassword" @($tree.UserAccount[0].Policy[0].PolicyOption.Parameter)[0].Value
+Assert-Equal "and it says why" "AlreadySet" (@($Global:RunSummary.ToArray() | Where-Object { $_.Stage -eq 'HostProfileRootPassword' })[-1].Result)
+
+Write-Host "`n=== The two states are told apart by the parameter, not by an id string ===" -ForegroundColor Cyan
+# Option ids move between releases. What does not move is that a fixed password carries a password
+# parameter and "leave unchanged" carries none.
+$script:RootPasswordOption = 'SomeRenamedFixedPasswordOption'
+$script:RootPasswordParameter = [pscustomobject]@{ Key = 'password'; Value = 'x' }
+$found = Get-HostProfileRootPasswordPolicy -ApplyProfile (New-TestProfileTree)
+Assert-Equal "an unfamiliar id with a password reads as set" $true $found.HasPassword
+$script:RootPasswordOption = 'SomeRenamedUnchangedOption'
+$script:RootPasswordParameter = $null
+$found = Get-HostProfileRootPasswordPolicy -ApplyProfile (New-TestProfileTree)
+Assert-Equal "and an unfamiliar id with none reads as unchanged" $false $found.HasPassword
+Assert-Equal "the root account is the one that was found" "root" $found.Node.Key
+
+Write-Host "`n=== No password entered, or turned off, means no change ===" -ForegroundColor Cyan
+$script:Profiles = @(New-TestHostProfile)
+$script:Updates.Clear()
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $null 6>$null
+Assert-Equal "no credential means no write" 0 $script:Updates.Count
+$Global:SetRootPasswordInHostProfile = $false
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "turned off means no write" 0 $script:Updates.Count
+$Global:SetRootPasswordInHostProfile = $true
+
+Write-Host "`n=== DRY RUN sets no password ===" -ForegroundColor Cyan
+$script:Profiles = @(New-TestHostProfile)
+$script:Updates.Clear()
+$Global:RunMode = 'DRYRUN'
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "no update was written" 0 $script:Updates.Count
+$Global:RunMode = 'LIVE'
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

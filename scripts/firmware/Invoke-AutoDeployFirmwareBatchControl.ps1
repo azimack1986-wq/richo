@@ -3,6 +3,24 @@
     ESXi/UCSM/Intersight PVA accepted-batch firmware upgrade controller with hardened login handling.
 
 .DESCRIPTION
+    ############################################################################################
+    #  CHECK THIS BEFORE YOU RUN IT SOMEWHERE NEW                                              #
+    #                                                                                          #
+    #      $Global:AriaOperationsServer = "siepd85vop1110.dpe.protected.mil.au"                 #
+    #                                                                                          #
+    #  That is the D85 appliance. Every cluster this script touches is added to the Aria        #
+    #  Operations custom datacenter "ESXi Patching Hardware Suppression" before its hosts are   #
+    #  rebooted, and taken out again when the cluster finishes - so hardware alerting is        #
+    #  suppressed for the change instead of filling the console with expected noise.            #
+    #                                                                                          #
+    #  AT ANOTHER SITE, POINT IT AT THAT SITE'S APPLIANCE. Left as it is, the run signs in to   #
+    #  D85, does not find the cluster there, reports that it could not be suppressed, and       #
+    #  carries on unsuppressed - so the upgrade still happens, and the alerts still fire.       #
+    #  Setting it to "" turns the whole thing off cleanly.                                      #
+    #                                                                                          #
+    #  See ARIA OPERATIONS in User Settings.                                                    #
+    ############################################################################################
+
     New consolidated script based on the supplied workflow. The main correction is the UCSM
     discovery/login path. It normalises FI CDP/LLDP names, tries the exact same positional
     Connect-Ucs style that works manually, supports credential and interactive fallback, and
@@ -10,8 +28,9 @@
 
     No management platform is assumed up front. CDP/LLDP is the single identity source for every host,
     and supporting infrastructure is detected per host, before any UCSM or Intersight login: each host's
-    CDP/LLDP system name is checked against the Name column in $IntersightCsvPath (default
-    C:\temp\intersightfabric.csv). A match detects that host as Intersight-managed: the script finds the
+    CDP/LLDP system name is checked against the Name column in $IntersightCsvPath, which defaults to
+    intersightfabric.csv BESIDE THIS SCRIPT so the two travel together on the share. A match detects
+    that host as Intersight-managed: the script finds the
     server profile, checks for staged changes (normally "Pending-changes") caused by a firmware policy update, accepts them
     (including the compulsory disruption tick box), and reboots the blade immediately - scoped to the
     current batch only, same as the existing UCSM acknowledgement. Any host with no CSV match is detected
@@ -44,14 +63,23 @@
        You are prompted for these and for the appliance FQDN when a fabric is first detected.
 
     3. INTERSIGHT INPUT FILE - required only if a host in scope is Intersight-managed.
-       Path is set by $IntersightCsvPath in User Settings.
+       Defaults to intersightfabric.csv IN THE SAME FOLDER AS THIS SCRIPT, so the two travel
+         together on the share rather than needing a copy per jump box. $IntersightCsvPath in
+         User Settings overrides it.
        Column "Name" holds the fabric name, matched against each host's CDP/LLDP neighbour.
        Optional columns: ServerProfileName, Moid.
        A host whose CDP/LLDP name matches a row is driven through Intersight; every other host
        falls through to UCS Manager. Matching allows for -A, -B and suffix-less forms, and for
        FQDN or short name on either side.
 
-    4. CREDENTIALS - vCenter and UCS Manager, for the prompts during the run.
+    4. VMWARE ARIA OPERATIONS - the appliance in $Global:AriaOperationsServer, currently the D85
+       one. CHANGE IT FOR ANOTHER SITE, or set it to "" to turn suppression off.
+       A local Aria account is prompted for during the run and used to add this cluster to the
+         "ESXi Patching Hardware Suppression" custom datacenter, then to take it out again.
+       Not fatal: if Aria cannot be reached, or the cluster cannot be resolved there, the run
+         says so, lists it for manual rectification and carries on unsuppressed.
+
+    5. CREDENTIALS - vCenter, UCS Manager and Aria Operations, for the prompts during the run.
 
     None of the above is verified at start-up: probing for it was slow enough on a domain jump
     host to read as a hang. Failures surface where they matter instead - a missing module at its
@@ -350,7 +378,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.14.0"
+$ScriptVersion = "23.15.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -383,7 +411,19 @@ $Global:UcsFirmwarePolicyByTarget = @{}
 # everything else falls through unchanged to the existing UCS Manager logic.
 # Expected CSV columns: Name (the Intersight Fabrics export column matched against CDP/LLDP system
 # name), ServerProfileName (optional - defaults to Name if omitted), Moid (optional, speeds up lookup).
-$IntersightCsvPath = "C:\temp\intersightfabric.csv"
+# BESIDE THE SCRIPT, not at a fixed local path. The script is run from a share
+# (\\server\share\ESXIPatching\...), so the CSV lives next to it and travels with it - one copy to
+# keep current instead of a C:\temp copy per jump box, each quietly going stale.
+#
+# $PSScriptRoot is set when the file is run OR dot-sourced, which is how this is launched. It is
+# empty only when the contents are pasted into a console or piped through Invoke-Expression, and
+# Join-Path throws on an empty first argument, so that case falls back to the working directory
+# rather than failing at line one with a parameter binding error.
+$IntersightCsvPath = if ([string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+    Join-Path (Get-Location).Path 'intersightfabric.csv'
+} else {
+    Join-Path $PSScriptRoot 'intersightfabric.csv'
+}
 # Default offered at the Intersight FQDN prompt. When an Intersight-managed fabric is detected the
 # operator is asked for the appliance address, and their answer replaces this for the rest of the
 # run - so this only needs changing if you want a different default in the prompt.
@@ -591,10 +631,20 @@ $HostReconnectAfterDisconnectMinutes = 5
 # firmware can refuse the reconnect while hostd is still coming up, and the run then wrote it off
 # as unrecoverable when a second attempt two minutes later would have taken it. After the last
 # attempt the operator is asked, rather than the host being silently abandoned.
-# VMWARE ARIA OPERATIONS - ESXi patching hardware suppression.
-# Blank turns the whole thing off, which is the default: a site without Aria, or without this
-# group, runs exactly as it did before. Set the appliance FQDN to enable it.
-$Global:AriaOperationsServer = ""
+# ============================================================================================
+# VMWARE ARIA OPERATIONS - ESXi patching hardware suppression
+# ============================================================================================
+# >>> UPDATE THIS FOR THE SITE YOU ARE RUNNING AGAINST. <<<
+#
+# Every cluster is added to the custom datacenter named below before its hosts are rebooted and
+# removed when the cluster finishes, so the hardware alerting a firmware reflash and power cycle
+# is guaranteed to raise does not fill the console for the length of the change.
+#
+# The value below is the D85 appliance. At another site this is the WRONG appliance: the run will
+# sign in, fail to find the cluster there, report that it could not be suppressed, and carry on
+# unsuppressed - the upgrade still happens, the alerts still fire. Point it at that site's
+# appliance, or set it to "" to turn suppression off entirely and run as if Aria were not there.
+$Global:AriaOperationsServer = "siepd85vop1110.dpe.protected.mil.au"
 # The custom datacenter the cluster joins for the change. Resolved by name each run so the object
 # can be recreated in Aria without editing this script.
 $Global:AriaSuppressionGroupName = "ESXi Patching Hardware Suppression"
@@ -616,6 +666,16 @@ $Global:HostProfileActiveDirectoryPatterns = @(
     '(?i)^authentication',      # the Authentication Configuration node; ActiveDirectory is its child
     '(?i)activedirectory'       # Active Directory Configuration, Active Directory Permission, the principal
 )
+# THE ROOT PASSWORD IN THE HOST PROFILE. A profile set to "Leave password unchanged for the default
+# account" asserts nothing about root, so a host that reboots keeps whatever it had - which is one
+# way it comes back with a password vCenter no longer knows. Where the profile is leaving it
+# unchanged, the password entered for the cluster is put in; where a password is already set,
+# nothing is touched. $false turns the whole thing off.
+$Global:SetRootPasswordInHostProfile = $true
+# Only used when the Profile Engine's own policy metadata cannot be read - see
+# Get-HostProfileFixedPasswordOptionId, which asks the appliance for this first.
+$Global:HostProfileFixedPasswordOptionId = "FixedPasswordConfigOption"
+
 # Which nodes THIS RUN unticked, per profile name, so the re-tick puts back only those and leaves a
 # setting that was already off exactly as it was found.
 $Global:HostProfileAdChanges = @{}
@@ -972,10 +1032,22 @@ function Confirm-RunPrerequisites {
     Write-Host "     Manager. Required only if any host in scope is Intersight-managed." -ForegroundColor Gray
     Write-Host "     $(if (Test-Path $IntersightCsvPath) { 'Present.' } else { 'NOT FOUND at that path.' })" -ForegroundColor $(if (Test-Path $IntersightCsvPath) { 'Gray' } else { 'Red' })
 
-    Write-Host "4. Credentials to hand" -ForegroundColor Yellow
-    Write-Host "     vCenter and UCS Manager, for the prompts that follow." -ForegroundColor Gray
+    Write-Host "4. VMware Aria Operations - hardware alert suppression" -ForegroundColor Yellow
+    if ([string]::IsNullOrWhiteSpace($Global:AriaOperationsServer)) {
+        Write-Host "     Turned OFF - no appliance is set. Suppress the cluster by hand if you want it." -ForegroundColor Gray
+    }
+    else {
+        Write-Host "     Appliance: $Global:AriaOperationsServer" -ForegroundColor Gray
+        Write-Host "     Each cluster joins '$($Global:AriaSuppressionGroupName)' before its hosts" -ForegroundColor Gray
+        Write-Host "     are rebooted, and leaves it when the cluster finishes." -ForegroundColor Gray
+        Write-Host "     CHECK THAT APPLIANCE IS THE RIGHT ONE FOR THIS SITE. If it is not, the run" -ForegroundColor Red
+        Write-Host "     carries on UNSUPPRESSED and the hardware alerts fire as normal." -ForegroundColor Red
+    }
 
-    Write-Host "5. Host profile - Security settings, handled by this run" -ForegroundColor Yellow
+    Write-Host "5. Credentials to hand" -ForegroundColor Yellow
+    Write-Host "     vCenter, UCS Manager, and an Aria Operations account if suppression is on." -ForegroundColor Gray
+
+    Write-Host "6. Host profile - Security settings, handled by this run" -ForegroundColor Yellow
     Write-Host "     In the host profile attached to the cluster, under Security Settings, these" -ForegroundColor Gray
     Write-Host "     are UNTICKED when the cluster starts and RE-TICKED when it finishes:" -ForegroundColor Gray
     Write-Host "       - Authentication Configuration (and Active Directory Configuration under it)" -ForegroundColor Gray
@@ -987,7 +1059,7 @@ function Confirm-RunPrerequisites {
     Write-Host "     RE-ENABLE BOTH AFTER THE UPGRADE IS COMPLETE. This run does not change them" -ForegroundColor Red
     Write-Host "     and does not put them back - that is a manual step at the end of the change." -ForegroundColor Red
 
-    Write-Host "6. Manual health checks and change gates" -ForegroundColor Yellow
+    Write-Host "7. Manual health checks and change gates" -ForegroundColor Yellow
     Write-Host "     Completed and accepted BEFORE starting. The run does not ask again." -ForegroundColor Gray
     Write-Host "     Everything it can check itself it checks per batch - cluster health, capacity," -ForegroundColor Gray
     Write-Host "     datastore free space, host profile compliance - and stops if any of them fail." -ForegroundColor Gray
@@ -6311,6 +6383,223 @@ function Test-HostProfileActiveDirectoryNode {
     return $false
 }
 
+function Get-HostProfileRootPasswordPolicy {
+    <#
+    .SYNOPSIS
+        Finds the root account's password policy in a host profile's apply tree, and says whether a
+        password is already set on it.
+
+    .DESCRIPTION
+        In the Edit host profile dialog this is Security Settings > Security > User Configuration >
+        root, whose Password policy is one of:
+
+            Leave password unchanged for the default account   no parameters on the option
+            Fixed password configuration                       a 'password' parameter on the option
+
+        which is exactly how the two are told apart here - by whether the option in force carries a
+        password parameter, not by matching an option id string that differs between releases.
+
+        Returns the node, the policy and HasPassword, or $null where the profile has no root user
+        account. Never returns the password itself.
+    #>
+    param([Parameter(Mandatory=$true)]$ApplyProfile)
+
+    foreach ($row in (Get-HostProfileApplyNode -Node $ApplyProfile)) {
+        $node = $row.Node
+        $key = ""
+        try { if ($node.PSObject.Properties.Name -contains 'Key') { $key = [string]$node.Key } } catch { }
+        if ($key -ne 'root') { continue }
+        if ([string]$row.ProfileTypeName -notmatch '(?i)user') { continue }
+
+        foreach ($policy in @($node.Policy)) {
+            if ($null -eq $policy) { continue }
+            $option = $null
+            try { $option = $policy.PolicyOption } catch { }
+            if ($null -eq $option) { continue }
+
+            $parameterKeys = @()
+            try { $parameterKeys = @(@($option.Parameter) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Key }) } catch { }
+
+            # The password policy is the one whose options deal in a password - identified by the
+            # parameter it carries when set, or by the policy id naming one when it is not.
+            $isPasswordPolicy = ($parameterKeys -contains 'password') -or ([string]$policy.Id -match '(?i)password')
+            if (-not $isPasswordPolicy) { continue }
+
+            return [pscustomobject]@{
+                Path        = $row.Path
+                Node        = $node
+                Policy      = $policy
+                HasPassword = ($parameterKeys -contains 'password')
+                OptionId    = [string]$option.Id
+            }
+        }
+    }
+
+    return $null
+}
+
+function Get-HostProfileFixedPasswordOptionId {
+    <#
+    .SYNOPSIS
+        The policy option id that means "fixed password", asked of the appliance rather than assumed.
+
+    .DESCRIPTION
+        Switching the root password policy needs the id of the option to switch TO, and that string
+        has moved between releases. The Profile Engine publishes it: QueryPolicyMetadata returns the
+        policy's possible options, and the fixed-password one is the option declaring a parameter
+        called password - or, failing that, one marked securitySensitive.
+
+        Falls back to $Global:HostProfileFixedPasswordOptionId where the metadata cannot be read,
+        and says which route was taken so a wrong id is diagnosable rather than mysterious.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$ProfileView,
+        [Parameter(Mandatory=$true)][string]$PolicyId
+    )
+
+    try {
+        $manager = Get-View -Id $ProfileView.Client.ServiceContent.HostProfileManager -ErrorAction Stop
+        $metadata = @($manager.QueryPolicyMetadata(@($PolicyId), $ProfileView.MoRef))
+        foreach ($policyMeta in $metadata) {
+            foreach ($option in @($policyMeta.PossibleOption)) {
+                foreach ($parameter in @($option.Parameter)) {
+                    $parameterId = [string]$parameter.Id.Key
+                    if ($parameterId -eq 'password' -or [bool]$parameter.SecuritySensitive) {
+                        return [string]$option.Id.Key
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        Write-Host "    The policy metadata could not be read ($($_.Exception.Message)); using the configured option id." -ForegroundColor DarkGray
+    }
+
+    return [string]$Global:HostProfileFixedPasswordOptionId
+}
+
+function Set-ClusterHostProfileRootPassword {
+    <#
+    .SYNOPSIS
+        Sets the root password in the cluster's host profile, but ONLY where the profile is leaving
+        it unchanged.
+
+    .DESCRIPTION
+        A profile set to "Leave password unchanged for the default account" is why a host can come
+        back from a firmware reboot with a root password vCenter no longer knows: the profile
+        applies cleanly and asserts nothing about the account, so whatever the host has is what it
+        keeps. Putting the password the operator has just given into that slot makes the profile
+        assert the password this run will use to reconnect with.
+
+        THE RULE, EXACTLY AS ASKED:
+
+          password already set in the profile   LEFT ALONE. Somebody chose that value; it is not
+                                                this run's to overwrite, and it may not even be the
+                                                password that was entered.
+          "leave password unchanged"            SET to the password the operator entered for this
+                                                cluster.
+
+        AND NOTHING ELSE. One policy, on the root user account, on profiles attached to this
+        cluster. No other account, no other policy, no other node - the same read-modify-write over
+        the profile's own apply tree that the Active Directory settings use, with name and
+        annotation carried through and the disabled expression list untouched.
+
+        The password is never written to the console, the log or the run summary. It goes into the
+        policy option parameter and nowhere else.
+
+        Not fatal. A profile that cannot be written is reported and listed for manual attention -
+        this is a pre-requisite, not the change.
+
+    .PARAMETER Cluster
+        The cluster whose attached host profile is being changed.
+
+    .PARAMETER Credential
+        The ESXi root credential entered for this cluster. Nothing happens without one.
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Cluster,
+        [AllowNull()]$Credential
+    )
+
+    if (-not $Global:SetRootPasswordInHostProfile) { return }
+
+    if ($null -eq $Credential) {
+        Write-Host "  No root password was entered, so the host profile's root password is left as it is." -ForegroundColor Gray
+        return
+    }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "Host profile: checking the root password policy for '$($Cluster.Name)'." -ForegroundColor Cyan
+
+    if (Test-DryRun) {
+        Write-Host "  DRY RUN: no host profile is changed." -ForegroundColor Green
+        Add-SummaryRecord -Stage "HostProfileRootPassword" -Batch "" -HostName "" -Action "Set root password" -Result "DryRun" -Details "$($Cluster.Name) - no change made."
+        return
+    }
+
+    foreach ($hostProfile in @(Get-ClusterHostProfile -Cluster $Cluster)) {
+        $profileName = [string]$hostProfile.Name
+        $view = $null
+        try { $view = $hostProfile.ExtensionData } catch { $view = $null }
+        if ($null -eq $view -or $null -eq $view.Config -or $null -eq $view.Config.ApplyProfile) {
+            Write-Host "  '$profileName' has no readable apply profile - skipped." -ForegroundColor Yellow
+            continue
+        }
+
+        $applyProfile = $view.Config.ApplyProfile
+        $found = Get-HostProfileRootPasswordPolicy -ApplyProfile $applyProfile
+
+        if ($null -eq $found) {
+            Write-Host "  '$profileName' has no root account password policy - nothing to set." -ForegroundColor Gray
+            Add-SummaryRecord -Stage "HostProfileRootPassword" -Batch "" -HostName "" -Action "Set root password" -Result "NoPolicy" -Details "$profileName - no root user account password policy in the apply profile."
+            continue
+        }
+
+        if ($found.HasPassword) {
+            # SOMEBODY CHOSE THAT VALUE. It is not this run's to overwrite, and it may not even be
+            # the password that was entered for the cluster.
+            Write-Host "  '$profileName' already sets a root password - left exactly as it is." -ForegroundColor Green
+            Add-SummaryRecord -Stage "HostProfileRootPassword" -Batch "" -HostName "" -Action "Set root password" -Result "AlreadySet" -Details "$profileName - $($found.Path) already carries a fixed password; not overwritten."
+            continue
+        }
+
+        try {
+            $optionId = Get-HostProfileFixedPasswordOptionId -ProfileView $view -PolicyId ([string]$found.Policy.Id)
+            if ([string]::IsNullOrWhiteSpace($optionId)) { throw "the fixed-password policy option could not be identified" }
+
+            $parameter = New-Object VMware.Vim.KeyAnyValue
+            $parameter.Key = 'password'
+            $parameter.Value = $Credential.GetNetworkCredential().Password
+
+            $option = New-Object VMware.Vim.PolicyOption
+            $option.Id = $optionId
+            $option.Parameter = @($parameter)
+
+            # ONE POLICY OPTION, on one node. Everything else in the tree is the object that was
+            # read, handed straight back.
+            $found.Policy.PolicyOption = $option
+
+            $spec = New-Object VMware.Vim.HostProfileCompleteConfigSpec
+            $spec.Name = $view.Name
+            $spec.Annotation = $view.Config.Annotation
+            $spec.Enabled = $view.Config.Enabled
+            $spec.ApplyProfile = $applyProfile
+            $spec.DisabledExpressionListChanged = $false
+
+            $view.UpdateHostProfile($spec)
+
+            # The password itself appears nowhere here, or in the log, or in the run summary.
+            Write-Host "  '$profileName' was leaving the root password unchanged - it now sets the password entered for this cluster." -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "HostProfileRootPassword" -Batch "" -HostName "" -Action "Set root password" -Result "Applied" -Details "$profileName - $($found.Path) switched from '$($found.OptionId)' to '$optionId'. The password is not recorded."
+        }
+        catch {
+            Write-Host "  '$profileName' could not be updated: $($_.Exception.Message)" -ForegroundColor Red
+            Add-ManualAttentionHost -HostName $profileName -Reason "Host profile root password not set" -Detail "The profile is leaving the root password unchanged and could not be updated: $($_.Exception.Message). Set it by hand under Security Settings > Security > User Configuration > root, or a host that reboots may come back with a password vCenter does not know."
+            Add-SummaryRecord -Stage "HostProfileRootPassword" -Batch "" -HostName "" -Action "Set root password" -Result "Failed" -Details "$profileName - $($_.Exception.Message)"
+        }
+    }
+}
+
 function Get-ClusterHostProfile {
     <#
     .SYNOPSIS
@@ -8230,6 +8519,10 @@ function Invoke-ClusterUpgradeWorkflow {
     # being a manual step that can be forgotten at either end. Nothing else in the profile is read
     # or written - see Set-ClusterHostProfileActiveDirectory.
     Set-ClusterHostProfileActiveDirectory -Cluster $Cluster -Enable $false
+
+    # Same profile, same read-modify-write, one policy. Only where the profile is leaving the root
+    # password unchanged - a password somebody has already set there is not this run's to overwrite.
+    Set-ClusterHostProfileRootPassword -Cluster $Cluster -Credential $Global:EsxiRootCredential
 
     # Hardware alerting for this cluster is suppressed for the duration. Blades are about to be
     # reflashed and power-cycled, which is exactly what the hardware monitors are there to shout

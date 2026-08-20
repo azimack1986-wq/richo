@@ -255,7 +255,17 @@ Assert-Equal "and the cluster is listed for manual attention" 1 (@($Global:Manua
 Assert-Equal "the credential is dropped so it is asked for again" $null $Global:AriaCredential
 $Global:AriaCredential = [pscredential]::new('svc-esxi', (ConvertTo-SecureString 'p' -AsPlainText -Force))
 
-Write-Host "`n=== Off by default, and off in DRY RUN ===" -ForegroundColor Cyan
+Write-Host "`n=== The shipped default names an appliance, and says to change it ===" -ForegroundColor Cyan
+# Suppression is ON out of the box, pointed at D85. That makes the site-specific value the thing a
+# reader has to notice, so the warning is asserted rather than left to survive an edit.
+$sourceText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "an appliance is set by default" $true ($sourceText -match '\$Global:AriaOperationsServer = "siepd85vop1110\.dpe\.protected\.mil\.au"')
+Assert-Equal "the header says to check it before running elsewhere" $true ($sourceText -match 'CHECK THIS BEFORE YOU RUN IT SOMEWHERE NEW')
+Assert-Equal "and the setting itself says to update it for the site" $true ($sourceText -match 'UPDATE THIS FOR THE SITE YOU ARE RUNNING AGAINST')
+Assert-Equal "the pre-flight puts it on screen" $true ($sourceText -match 'CHECK THAT APPLIANCE IS THE RIGHT ONE FOR THIS SITE')
+Assert-Equal "and says an empty value turns it off" $true ($sourceText -match 'set it to "" to turn suppression off')
+
+Write-Host "`n=== Blank turns it off, and DRY RUN never writes ===" -ForegroundColor Cyan
 Reset-Appliance
 $Global:AriaOperationsServer = ''
 Set-ClusterAriaPatchingSuppression -Cluster $cluster -InSuppression $true 6>$null
