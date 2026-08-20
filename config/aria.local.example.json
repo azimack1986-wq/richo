@@ -1,0 +1,5 @@
+{
+  "_comment": "Copy to aria.local.json in this folder and fill in the password. aria.local.json is excluded by .gitignore (config/*.local.json) and must never be committed. Alternative: set the RICHO_ARIA_PASSWORD environment variable for the session instead, which is preferable on a shared jump host. If neither is present the run asks for the password, with the username already filled in.",
+  "userName": "admin",
+  "password": ""
+}

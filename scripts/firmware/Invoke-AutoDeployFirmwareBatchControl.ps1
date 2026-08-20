@@ -80,10 +80,14 @@
          says so, lists it for manual rectification and carries on unsuppressed.
 
     5. CREDENTIALS - vCenter, UCS Manager and Aria Operations, for the prompts during the run.
-       The vCenter one is asked for first and, if it works, is OFFERED as the passthrough for the
-         other two rather than typed again. Offered, not assumed - and a system that refuses it is
+       The vCenter one is asked for first and, if it works, is OFFERED as the passthrough for UCS
+         Manager rather than typed again. Offered, not assumed - and a system that refuses it is
          never offered it again, because a wrong password replayed at each domain in turn is how
          an account gets locked. Nothing is written to disk and nothing survives the run.
+       Aria Operations is the exception: it signs in as a LOCAL Aria account ('admin' by default)
+         against authSource LOCAL, so the vCenter domain credential is never offered for it. Set
+         RICHO_ARIA_PASSWORD or config\aria.local.json to skip that prompt; no password is in
+         this script, and none may be put in it.
 
     None of the above is verified at start-up: probing for it was slow enough on a domain jump
     host to read as a hang. Failures surface where they matter instead - a missing module at its
@@ -382,7 +386,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.20.0"
+$ScriptVersion = "23.21.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -675,22 +679,29 @@ $Global:AriaOperationsServer = "siepd85vop1110.dpe.protected.mil.au"
 # The custom datacenter the cluster joins for the change. Resolved by name each run so the object
 # can be recreated in Aria without editing this script.
 $Global:AriaSuppressionGroupName = "ESXi Patching Hardware Suppression"
-# The Source Display Name from Administration > Authentication Sources, which is what the
-# authSource field of the token request means. It is NOT free text: "LOCAL" is only correct for an
-# account created inside Aria itself, and a domain account signed in against LOCAL is a 401 every
-# time - which is exactly what a run hit here.
+# LOCAL, FIXED. Directory sign-in for Aria was taken out: an AD or vIDM source needs the account
+# spelled a particular way that differs per source, and getting it wrong is a 401 that looks
+# exactly like a bad password. A local Aria account has none of that, and suppression is a
+# courtesy to the monitoring team rather than part of the change, so the simple thing that works
+# is the right trade. This is the authSource field of the token request; "LOCAL" is the source
+# that holds accounts created inside Aria itself, which is what this account is.
+$Global:AriaAuthSource = "LOCAL"
+$Global:AriaLocalUserName = "admin"
 #
-# LEFT BLANK ON PURPOSE. The sources are read from the appliance at sign-in and the operator picks
-# one, so the right answer comes from the appliance being used rather than from a guess baked in
-# here that is wrong at every other site. Set it to a Source Display Name to skip the question.
-$Global:AriaAuthSource = ""
-# The vIDM DOMAIN, needed only when the chosen authentication source is a vIDM / Workspace ONE
-# source. Aria's suite-api will not resolve a bare account name against vIDM: the username has to
-# arrive as user@vIDM-domain@source-name, e.g. nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource.
-# Sending the bare name is a 401 that looks exactly like a wrong password. Set this to skip the
-# question; it is the domain as vIDM itself shows it, which for accounts created inside vIDM is
-# the literal string "System Domain".
-$Global:AriaVidmDomain = ""
+# THE PASSWORD IS NOT IN THIS FILE, AND MUST NOT BE PUT IN IT. This script is in git; a password
+# committed to git is a password in every clone, every fork and every backup of the repository,
+# and it stays in the history after it is deleted. The run ASKS for it, with 'admin' already
+# filled in so only the password is typed - unless one of these is set, in which case it is not
+# asked for at all:
+#
+#   1. $env:RICHO_ARIA_PASSWORD    the house convention for this repo, set per session
+#   2. config\aria.local.json      {"userName":"admin","password":"..."}, which .gitignore
+#                                  already excludes through config/*.local.json
+#
+# Whatever the source, it becomes a SecureString the moment it is read - DPAPI-encrypted in memory
+# for this user and this process on Windows - and is turned back into plain text only for the one
+# token request. Nothing is written to the log or the run summary.
+$Global:AriaCredentialFile = "config\aria.local.json"
 $Global:AriaSkipCertificateCheck = $true
 $Global:AriaCredential = $null
 $Global:AriaSession = $null
@@ -1089,7 +1100,8 @@ function Confirm-RunPrerequisites {
     Write-Host "5. Credentials to hand" -ForegroundColor Yellow
     Write-Host "     vCenter, UCS Manager, and an Aria Operations account if suppression is on." -ForegroundColor Gray
     Write-Host "     The vCenter credential is asked for first, and if it works you are offered it" -ForegroundColor Gray
-    Write-Host "     again for UCS Manager and Aria Operations instead of typing it three times." -ForegroundColor Gray
+    Write-Host "     again for UCS Manager instead of typing it twice." -ForegroundColor Gray
+    Write-Host "     Aria Operations is a LOCAL Aria account ('admin'), asked for separately." -ForegroundColor Gray
 
     Write-Host "6. Host profile - Security settings, handled by this run" -ForegroundColor Yellow
     Write-Host "     In the host profile attached to the cluster, under Security Settings, these" -ForegroundColor Gray
@@ -1437,12 +1449,23 @@ function Get-RunCredential {
     .PARAMETER Message
         Shown on the credential dialog.
 
+    .PARAMETER UserName
+        Pre-filled into the dialog. Used where the account is known and only the password is not -
+        Aria's local 'admin', for instance.
+
+    .PARAMETER NoShared
+        Do not offer the credential proven against vCenter. For a system signed in to with a LOCAL
+        account a domain credential is not a candidate at all, and offering it would only invite a
+        failed sign-in against an account that has nothing to do with it.
+
     .EXAMPLE
         $credential = Get-RunCredential -Purpose "UCS Manager" -Message "Enter UCSM credential"
     #>
     param(
         [Parameter(Mandatory=$true)][string]$Purpose,
-        [Parameter(Mandatory=$true)][string]$Message
+        [Parameter(Mandatory=$true)][string]$Message,
+        [string]$UserName = "",
+        [switch]$NoShared
     )
 
     if ($Global:CredentialBlocked.ContainsKey($Purpose) -and $Global:CredentialBlocked[$Purpose]) {
@@ -1460,7 +1483,7 @@ function Get-RunCredential {
         $heldSource = "Held"
         $heldFrom = "entered for $Purpose earlier in this run"
     }
-    elseif ($null -ne $Global:SharedCredential -and -not ($Global:SharedCredentialRejected.ContainsKey($Purpose) -and $Global:SharedCredentialRejected[$Purpose])) {
+    elseif (-not $NoShared -and $null -ne $Global:SharedCredential -and -not ($Global:SharedCredentialRejected.ContainsKey($Purpose) -and $Global:SharedCredentialRejected[$Purpose])) {
         $held = $Global:SharedCredential
         $heldSource = "Shared"
         $heldFrom = "already accepted by $($Global:SharedCredentialSource)"
@@ -1479,7 +1502,11 @@ function Get-RunCredential {
     }
 
     $credential = $null
-    try { $credential = Get-Credential -Message $Message } catch { $credential = $null }
+    try {
+        if ([string]::IsNullOrWhiteSpace($UserName)) { $credential = Get-Credential -Message $Message }
+        else { $credential = Get-Credential -UserName $UserName -Message $Message }
+    }
+    catch { $credential = $null }
     if ($null -eq $credential -or [string]::IsNullOrWhiteSpace($credential.GetNetworkCredential().Password)) { return $null }
 
     $Global:CredentialCache[$Purpose] = $credential
@@ -5797,192 +5824,101 @@ function Invoke-AriaRestCall {
     return Invoke-RestMethod @params
 }
 
-function Get-AriaAuthSourceName {
+
+
+
+
+function Get-AriaLocalCredential {
     <#
     .SYNOPSIS
-        The Source Display Names configured on the appliance, or an empty list.
+        The local Aria account for this run, resolved without ever prompting. $null when there is
+        none to be had.
 
     .DESCRIPTION
-        GET /suite-api/api/auth/sources. Asked BEFORE signing in, because the answer is what the
-        sign-in needs - the sources list is what the login page itself reads, so it is normally
-        readable without a token. Where it is not, the caller falls back to asking.
+        Aria signs in as a LOCAL account, so there is no source to choose and no username form to
+        get right - the two things that made directory sign-in fail here. What is left is finding
+        the password without putting it in a file that is in git.
 
-        Best effort and never throws: not knowing the list is a reason to ask a question, not to
-        stop a run.
+        WHERE IT COMES FROM, first hit wins:
+
+          1. $env:RICHO_ARIA_PASSWORD    the house convention for this repo, and the one to prefer
+                                         on a shared jump host - it is set per session and dies
+                                         with it.
+          2. $Global:AriaCredentialFile  config\aria.local.json, {"userName":"admin","password":"..."},
+                                         which .gitignore already excludes through config/*.local.json.
+                                         Resolved next to the script, then next to the repo root.
+          3. the operator                asked for it, with 'admin' already filled in, so only the
+                                         password is typed. NOT offered the vCenter credential:
+                                         this is a LOCAL Aria account and a domain one is not a
+                                         candidate for it.
+
+        NO PASSWORD IS STORED IN THIS SCRIPT. One committed to git is one in every clone, fork and
+        backup of the repository, and it stays in the history after it is deleted.
+
+        HOW IT IS HELD. Turned into a SecureString the moment it is read, and carried as a
+        PSCredential from there on - on Windows that is DPAPI-encrypted in memory, keyed to this
+        user and this process, and it is turned back into plain text only for the single token
+        request. Nothing is written to disk by this run, nothing reaches the log or the run
+        summary, and nothing survives the PowerShell session.
+
+        IT NEVER STOPS. Declining the prompt means Aria is skipped and the cluster runs
+        unsuppressed - the same outcome as Aria being unreachable, which is already handled and is
+        not worth halting a change window over.
+
+    .EXAMPLE
+        $credential = Get-AriaLocalCredential
     #>
-    $names = New-Object System.Collections.Generic.List[string]
 
-    try {
-        $response = Invoke-AriaRestCall -Method "GET" -Path "/suite-api/api/auth/sources"
+    $userName = $Global:AriaLocalUserName
+    if ([string]::IsNullOrWhiteSpace($userName)) { $userName = "admin" }
 
-        # The list has been carried under different property names across releases, so take any
-        # array the response holds and read a name off each entry.
-        $entries = @()
-        foreach ($property in @($response.PSObject.Properties)) {
-            if ($property.Value -is [System.Array] -or $property.Value -is [System.Collections.IList]) { $entries += @($property.Value) }
+    $password = ""
+    $from = ""
+
+    if (-not [string]::IsNullOrWhiteSpace($env:RICHO_ARIA_PASSWORD)) {
+        $password = [string]$env:RICHO_ARIA_PASSWORD
+        $from = "the RICHO_ARIA_PASSWORD environment variable"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($password) -and -not [string]::IsNullOrWhiteSpace($Global:AriaCredentialFile)) {
+        # Next to the script first, then next to the repo root - a jump host may run the script
+        # from anywhere, and Join-Path throws on an empty root when this file is pasted rather
+        # than run.
+        $roots = @()
+        if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
+            $roots += $PSScriptRoot
+            try { $roots += (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) } catch { }
         }
-        if ($entries.Count -eq 0) { $entries = @($response) }
+        $roots += (Get-Location).Path
 
-        foreach ($entry in $entries) {
-            if ($null -eq $entry) { continue }
-            foreach ($field in @('name','displayName','sourceName','id')) {
-                $value = ""
-                try { if ($entry.PSObject.Properties.Name -contains $field) { $value = [string]$entry.$field } } catch { }
-                if (-not [string]::IsNullOrWhiteSpace($value)) {
-                    if ($names -notcontains $value) { [void]$names.Add($value) }
+        foreach ($root in $roots) {
+            if ([string]::IsNullOrWhiteSpace($root)) { continue }
+            $candidate = Join-Path $root $Global:AriaCredentialFile
+            if (-not (Test-Path -LiteralPath $candidate)) { continue }
+            try {
+                $json = Get-Content -LiteralPath $candidate -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                if (-not [string]::IsNullOrWhiteSpace([string]$json.password)) {
+                    $password = [string]$json.password
+                    if (-not [string]::IsNullOrWhiteSpace([string]$json.userName)) { $userName = [string]$json.userName }
+                    $from = "$candidate"
                     break
                 }
             }
+            catch { Write-Host "  '$candidate' could not be read: $($_.Exception.Message)" -ForegroundColor Yellow }
         }
     }
-    catch { }
 
-    return @($names.ToArray())
-}
-
-function Test-AriaVidmAuthSource {
-    <#
-    .SYNOPSIS
-        Does this authentication source name look like a vIDM / Workspace ONE source?
-
-    .DESCRIPTION
-        The name is operator-chosen, so this is a heuristic and is treated as one: getting it wrong
-        only means the username is left alone, which is the behaviour every other source wants.
-
-    .PARAMETER Name
-        The Source Display Name.
-
-    .EXAMPLE
-        Test-AriaVidmAuthSource -Name "vIDMAuthSource"   # $true
-    #>
-    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Name)
-    return ($Name -match '(?i)vidm|workspace|ws1|wsone')
-}
-
-function Resolve-AriaUserName {
-    <#
-    .SYNOPSIS
-        The username to actually send to suite-api, qualified for a vIDM source.
-
-    .DESCRIPTION
-        For every source except vIDM, the account is sent as typed and the source goes in the
-        authSource field - the ordinary case, unchanged.
-
-        vIDM is the exception, and it is not guessable. Aria will not resolve a bare account name
-        against a vIDM source; the username field has to carry the whole path:
-
-            vIDM_Username@vIDM_DOMAIN@vIDM_SOURCE_NAME_IN_ARIA
-
-        for example nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource, and for an account created
-        inside vIDM itself the middle part is the literal string "System Domain". Anything else is
-        a 401 - which is indistinguishable, from the outside, from a wrong password, and is exactly
-        what a passthrough of a working vCenter credential produced.
-
-        Already-qualified names are left alone: two @ signs means the operator has done this
-        themselves. A name carrying one @ only has the source appended.
-
-        Returns the name unchanged if no domain is available, rather than inventing one.
-
-    .PARAMETER UserName
-        The account as entered.
-
-    .PARAMETER AuthSource
-        The Source Display Name chosen for this run.
-
-    .EXAMPLE
-        Resolve-AriaUserName -UserName "svc-esxi" -AuthSource "vIDMAuthSource"
-    #>
-    param(
-        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$UserName,
-        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$AuthSource
-    )
-
-    if ([string]::IsNullOrWhiteSpace($UserName)) { return $UserName }
-    if (-not (Test-AriaVidmAuthSource -Name $AuthSource)) { return $UserName }
-
-    # Two @ signs already: user@domain@source. Nothing to add.
-    if (([regex]::Matches($UserName, '@')).Count -ge 2) { return $UserName }
-
-    # One @ sign: user@domain. Only the source is missing.
-    if ($UserName.Contains('@')) {
-        $qualified = "$UserName@$AuthSource"
-        Write-Host "  vIDM source: signing in as '$qualified'." -ForegroundColor DarkGray
-        return $qualified
+    if (-not [string]::IsNullOrWhiteSpace($password)) {
+        Write-Host "  Using the local Aria account '$userName', password from $from." -ForegroundColor DarkGray
+        # SecureString from here on. The plain copy above goes out of scope with this function.
+        $secure = ConvertTo-SecureString -String $password -AsPlainText -Force
+        return (New-Object System.Management.Automation.PSCredential($userName, $secure))
     }
 
-    if ([string]::IsNullOrWhiteSpace($Global:AriaVidmDomain)) {
-        Write-Host "" -ForegroundColor Yellow
-        Write-Host "  '$AuthSource' looks like a vIDM source, and vIDM will not accept a bare account name." -ForegroundColor Yellow
-        Write-Host "  It needs the account as user@vIDM-domain@source-name, so the domain is needed here." -ForegroundColor Yellow
-        Write-Host "  That is the domain as vIDM itself shows it - the AD domain for a federated account," -ForegroundColor Gray
-        Write-Host "  or the literal 'System Domain' for an account created inside vIDM." -ForegroundColor Gray
-        Write-Host "  Leave it blank to send '$UserName' exactly as entered." -ForegroundColor Gray
-        $typed = Read-Host "vIDM domain for '$UserName'"
-        if (-not [string]::IsNullOrWhiteSpace($typed)) { $Global:AriaVidmDomain = $typed.Trim() }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($Global:AriaVidmDomain)) {
-        Write-Host "  No vIDM domain given - sending '$UserName' as entered, which vIDM will probably refuse." -ForegroundColor Yellow
-        return $UserName
-    }
-
-    $qualified = "$UserName@$($Global:AriaVidmDomain)@$AuthSource"
-    Write-Host "  vIDM source: signing in as '$qualified'." -ForegroundColor DarkGray
-    return $qualified
-}
-
-function Select-AriaAuthSource {
-    <#
-    .SYNOPSIS
-        Decides which authentication source to sign in against, once per run.
-
-    .DESCRIPTION
-        Asked BEFORE the credential prompt so the operator picks the right source up front rather
-        than discovering it from a 401 afterwards - and so the credential dialog can name the
-        source it is collecting an account for.
-
-        Configured value wins. Otherwise the appliance's own list is offered, LOCAL included, as a
-        numbered single-key choice; where the list cannot be read the name is typed instead.
-
-        NOTHING IS RETRIED AGAINST ANOTHER SOURCE. A failed sign-in is reported and left alone: the
-        same password sent again at a different source is how an account gets locked out, and this
-        is a courtesy feature, not something worth risking an account over.
-    #>
-    if (-not [string]::IsNullOrWhiteSpace($Global:AriaAuthSource)) { return $Global:AriaAuthSource }
-
-    Write-Host "  Reading the authentication sources from the appliance..." -ForegroundColor Gray
-    $sources = @(Get-AriaAuthSourceName)
-    # LOCAL is always a valid answer and is not always listed, so it is offered either way.
-    if ($sources -notcontains "LOCAL") { $sources = @($sources) + @("LOCAL") }
-
-    if ($sources.Count -le 1) {
-        Write-Host "  The appliance did not return its authentication sources." -ForegroundColor Yellow
-        Write-Host "  Enter the Source Display Name from Administration > Authentication Sources." -ForegroundColor Yellow
-        Write-Host "  LOCAL is only correct for an account created inside Aria itself; a domain" -ForegroundColor Yellow
-        Write-Host "  account needs the name of its Active Directory or vIDM source." -ForegroundColor Yellow
-        $typed = Read-Host "Authentication source for $($Global:AriaOperationsServer)"
-        if ([string]::IsNullOrWhiteSpace($typed)) { return "" }
-        $Global:AriaAuthSource = $typed.Trim()
-        return $Global:AriaAuthSource
-    }
-
-    Write-Host "" -ForegroundColor Cyan
-    Write-Host "  Which authentication source is your Aria account in?" -ForegroundColor Cyan
-    Write-Host "  LOCAL is only for an account created inside Aria itself - a domain account is in" -ForegroundColor Gray
-    Write-Host "  its Active Directory or vIDM source, and signing it in against LOCAL is a 401." -ForegroundColor Gray
-    $choices = New-Object System.Collections.Generic.List[string]
-    $index = 0
-    foreach ($source in $sources) {
-        $index++
-        if ($index -gt 9) { break }
-        Write-Host "    $index. $source" -ForegroundColor Yellow
-        [void]$choices.Add("$index")
-    }
-
-    $picked = Read-ChoiceExit -Message "Select the authentication source" -AllowedChoices $choices.ToArray() -ExitMessage "Stopped at the Aria Operations authentication source."
-    $Global:AriaAuthSource = [string]$sources[([int]$picked - 1)]
-    Write-Host "  Using authentication source '$($Global:AriaAuthSource)'." -ForegroundColor Green
-    return $Global:AriaAuthSource
+    # Nothing configured, so ask - username already filled in, and NOT offered the vCenter
+    # credential, which is a domain account and has no business being sent at a LOCAL source.
+    return (Get-RunCredential -Purpose "Aria Operations" -UserName $userName -NoShared `
+        -Message "Local Aria Operations account on $($Global:AriaOperationsServer) - authSource LOCAL")
 }
 
 function Connect-AriaOperations {
@@ -5992,11 +5928,15 @@ function Connect-AriaOperations {
 
     .DESCRIPTION
         POST /suite-api/api/auth/token/acquire with username, authSource and password; every call
-        afterwards carries "Authorization: vRealizeOpsToken <token>". The token is short-lived and
-        acquired per run, which is why a local service account with a password is a better fit here
-        than a long-lived credential sitting in the script: nothing durable is stored, and a local
-        account keeps working when the directory does not - which matters, since this run unticks
-        Active Directory from the host profile at the same time.
+        afterwards carries "Authorization: vRealizeOpsToken <token>".
+
+        LOCAL ONLY. Directory sign-in was taken out after it cost two change windows: an AD or vIDM
+        source needs the account spelled a particular way that differs per source - vIDM wants
+        user@vIDM-domain@source-name - and getting it wrong returns a 401 that is indistinguishable
+        from a wrong password. A local Aria account has none of that: authSource is the constant
+        "LOCAL", the username is whatever the account is called, and a 401 means the password. It
+        also keeps working when the directory does not, which matters here because this same run
+        unticks Active Directory from the host profile.
 
         The credential is held in memory for the run and never written to the log or the summary.
 
@@ -6022,17 +5962,9 @@ function Connect-AriaOperations {
         Write-Host "  and to take it out again when the cluster finishes." -ForegroundColor Gray
         Write-Host "  Held in memory for this run only, never written to the summary or the log." -ForegroundColor Gray
 
-        # THE SOURCE FIRST. Asked before the password so the operator picks it deliberately, rather
-        # than finding out from a 401 that a domain account was sent to LOCAL.
-        $authSource = Select-AriaAuthSource
-        if ([string]::IsNullOrWhiteSpace($authSource)) {
-            Write-Host "  No authentication source chosen - this cluster will NOT be put into patching suppression." -ForegroundColor Yellow
-            Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "NoAuthSource" -Details "No authentication source was chosen; suppression is not applied."
-            $Global:AriaUnusable = $true
-            return $false
-        }
+        Write-Host "  Signing in as a LOCAL Aria account - authSource '$($Global:AriaAuthSource)'." -ForegroundColor Gray
 
-        $Global:AriaCredential = Get-RunCredential -Purpose "Aria Operations" -Message "Aria Operations account in '$authSource' on $($Global:AriaOperationsServer)"
+        $Global:AriaCredential = Get-AriaLocalCredential
     }
 
     if ($null -eq $Global:AriaCredential -or [string]::IsNullOrWhiteSpace($Global:AriaCredential.GetNetworkCredential().Password)) {
@@ -6042,9 +5974,9 @@ function Connect-AriaOperations {
         return $false
     }
 
-    # The credential is held exactly as entered; only the form sent to the appliance is adjusted,
-    # and only for vIDM. See Resolve-AriaUserName.
-    $sendUser = Resolve-AriaUserName -UserName $Global:AriaCredential.UserName -AuthSource $Global:AriaAuthSource
+    # No rewriting of the account name. A LOCAL source takes it exactly as it is - that was the
+    # point of dropping directory sign-in.
+    $sendUser = [string]$Global:AriaCredential.UserName
 
     try {
         $acquire = Invoke-AriaRestCall -Method "POST" -Path "/suite-api/api/auth/token/acquire" -Body @{
@@ -6064,27 +5996,16 @@ function Connect-AriaOperations {
     catch {
         Write-Host "  Aria Operations sign-in failed: $($_.Exception.Message)" -ForegroundColor Yellow
         if ("$($_.Exception.Message)" -match '401') {
-            Write-Host "  The account was sent as '$sendUser' against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Yellow
-            if (Test-AriaVidmAuthSource -Name $Global:AriaAuthSource) {
-                Write-Host "  For a vIDM source the username must be user@vIDM-domain@source-name - if the domain" -ForegroundColor Yellow
-                Write-Host "  above is wrong, that alone is a 401 even with the right password. Check the domain in" -ForegroundColor Yellow
-                Write-Host "  vIDM (it is 'System Domain' for accounts created inside vIDM), set" -ForegroundColor Yellow
-                Write-Host "  `$Global:AriaVidmDomain at the top of this script, and run again." -ForegroundColor Yellow
-            }
-            else {
-                Write-Host "  A 401 here is usually the SOURCE, not the password: '$($Global:AriaAuthSource)' has to be the" -ForegroundColor Yellow
-                Write-Host "  Source Display Name from Administration > Authentication Sources that holds this account." -ForegroundColor Yellow
-                Write-Host "  LOCAL only ever holds accounts created inside Aria itself; a domain account belongs to its" -ForegroundColor Yellow
-                Write-Host "  Active Directory or vIDM source. Some sources also want the account as user@domain." -ForegroundColor Yellow
-            }
+            # Against LOCAL there is nothing else it can be. The source is a constant and the name
+            # is sent unaltered, so a 401 is the account or the password - not a form to get right.
+            Write-Host "  '$sendUser' was sent against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Yellow
+            Write-Host "  LOCAL holds only accounts created inside Aria itself, under Administration >" -ForegroundColor Yellow
+            Write-Host "  Access Control > User Accounts. Check the account exists there and the password is right." -ForegroundColor Yellow
         }
         Write-Host "  The run continues without suppression." -ForegroundColor Yellow
-        # Both dropped, so a fresh source and password are asked for rather than a wrong pair being
-        # reused. NOT retried automatically against another source: the same password sent again
-        # somewhere else is how an account gets locked out, and this is a courtesy, not the change.
+        # The credential is dropped so a wrong one is not reused. NOT retried: the same password
+        # sent again is how an account gets locked out, and this is a courtesy, not the change.
         $Global:AriaCredential = $null
-        $Global:AriaAuthSource = ""
-        $Global:AriaVidmDomain = ""
         Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $false
         $Global:AriaUnusable = $true
         Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Failed" -Details "$($Global:AriaOperationsServer) - $($_.Exception.Message)"

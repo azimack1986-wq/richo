@@ -12,6 +12,59 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.21.0] — 2026-08-20
+
+#### Changed
+
+- **Aria Operations signs in LOCAL only; directory authentication is gone.** It cost
+  two change windows. An AD or vIDM source needs the account spelled a particular way
+  that differs per source — vIDM wants `user@vIDM-domain@source-name` — and getting it
+  wrong returns a 401 indistinguishable from a wrong password, which is what a
+  passthrough of a known-good vCenter credential produced. A local Aria account has
+  none of that: `authSource` is the constant `LOCAL`, the username is sent unaltered,
+  and a 401 means the account or the password.
+
+  `Select-AriaAuthSource`, `Get-AriaAuthSourceName`, `Resolve-AriaUserName`,
+  `Test-AriaVidmAuthSource` and `$Global:AriaVidmDomain` are **removed**, not bypassed
+  — dead authentication code is the kind that gets switched back on by accident. The
+  source chooser and the vIDM domain question are gone with them, so the sign-in is
+  one prompt.
+
+  This affects Aria's own sign-in only. The host profile Active Directory untick and
+  re-tick are unrelated and unchanged.
+
+- **The vCenter passthrough is no longer offered for Aria**, via a `-NoShared` switch
+  on `Get-RunCredential`. A domain credential is not a candidate for a LOCAL source, so
+  offering it would only invite a failed sign-in against an account that has nothing to
+  do with Aria. **UCS Manager keeps the passthrough** — that was the point of it.
+
+#### Added
+
+- **The Aria password resolves without a prompt where it is configured**, in order:
+  `$env:RICHO_ARIA_PASSWORD`, then `config/aria.local.json`
+  (`{"userName":"admin","password":"..."}`), which `.gitignore` already excludes
+  through `config/*.local.json`. Neither present, the run asks — with `admin` already
+  filled in, so only the password is typed. `config/aria.local.example.json` is the
+  committed template.
+
+  **No password is stored in the script, and the tests assert that it cannot be.** One
+  committed to git is one in every clone, fork and backup of the repository, and it
+  stays in the history after it is deleted. Whatever the source, it becomes a
+  `SecureString` the moment it is read and is turned back into plain text only for the
+  single token request.
+
+- `Get-RunCredential` takes `-UserName` to pre-fill the dialog where the account is
+  known and only the password is not.
+
+#### Tests
+
+- `tests/Test-AriaSuppression.ps1` — 76 assertions, 25 new: `authSource` being the
+  constant LOCAL, the username being sent unaltered, every removed function being
+  **absent from the file**, no inline password setting existing, the password becoming
+  a `SecureString` immediately, each of the three resolution routes, and the vCenter
+  credential never being offered for Aria while UCS Manager still gets it.
+- Full suite: 1073 assertions across 23 files, all passing.
+
 ### [23.20.0] — 2026-08-20
 
 #### Fixed
