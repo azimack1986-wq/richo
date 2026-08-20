@@ -74,22 +74,17 @@ Assert-Equal "and it is held for the run" "first.user" $Global:CredentialCache["
 # The password is a SecureString, not a string on the object.
 Assert-Equal "the password is held as a SecureString" "System.Security.SecureString" $first.Password.GetType().FullName
 
-Write-Host "`n=== Reuse is OFFERED, not assumed ===" -ForegroundColor Cyan
-# While this is being proven, the operator chooses. Silently reusing something they cannot see is
-# the behaviour to earn, not to start with.
-$script:Answers.Enqueue('2')
+Write-Host "`n=== Reuse is silent - no question, no keystroke ===" -ForegroundColor Cyan
+# The 1-type-again / 2-passthrough menu that guarded this while it was being proven is gone. A
+# question whose answer is always 2 is just a keystroke between the operator and the change.
 $again = Get-RunCredential -Purpose "UCS Manager" -Message "Enter UCSM credential" 6>$null
-Assert-Equal "the choice was put to the operator" 1 $script:Prompts.Count
-Assert-Equal "naming the system" $true ($script:Prompts[0] -match 'UCS Manager')
-Assert-Equal "2 reused the held credential" "first.user" $again.UserName
+Assert-Equal "nothing was asked" 0 $script:Prompts.Count
+Assert-Equal "the held credential came straight through" "first.user" $again.UserName
 Assert-Equal "and nothing was typed" 1 $script:TypedCount
-
-$script:TypedUser = 'second.user'
-$script:Answers.Enqueue('1')
-$typed = Get-RunCredential -Purpose "UCS Manager" -Message "Enter UCSM credential" 6>$null
-Assert-Equal "1 types a fresh one" 2 $script:TypedCount
-Assert-Equal "and it replaces what was held" "second.user" $Global:CredentialCache["UCS Manager"].UserName
-$script:TypedUser = 'first.user'
+# It is still SAID, so the operator knows which account is about to be sent where when it 401s.
+$spoken = (Get-RunCredential -Purpose "UCS Manager" -Message "m" 6>&1 | Out-String)
+Assert-Equal "the account in use is named on screen" $true ($spoken -match "using 'first.user'")
+Assert-Equal "and where it came from" $true ($spoken -match 'entered for UCS Manager earlier')
 
 Write-Host "`n=== One system's credential is not the other's ===" -ForegroundColor Cyan
 Reset-Cache
@@ -109,7 +104,7 @@ Assert-Equal "nothing is held any more" $true ($null -eq $Global:CredentialCache
 # So the next call types rather than offering - there is nothing to offer.
 [void](Get-RunCredential -Purpose "UCS Manager" -Message "m" 6>$null)
 Assert-Equal "the next one is typed" 2 $script:TypedCount
-Assert-Equal "with no reuse offered" 0 $script:Prompts.Count
+Assert-Equal "with nothing asked either way" 0 $script:Prompts.Count
 
 Write-Host "`n=== Past the limit, NOTHING further is sent ===" -ForegroundColor Cyan
 # The lockout guard. Three failures and the system is given up on for the run - no prompt, no
@@ -171,6 +166,9 @@ Assert-Equal "an Aria failure is counted" $true ($sourceText -match 'Register-Ru
 Assert-Equal "the cache is cleared in the outermost finally" $true ($sourceText -match '(?s)\} finally \{.*Clear-RunCredential')
 # Nothing is written to disk.
 Assert-Equal "no credential is ever exported" $true (-not ($sourceText -match 'Export-Clixml|ConvertFrom-SecureString'))
+# The passthrough menu is gone and must stay gone - a question whose answer is always the same is
+# a keystroke between the operator and the change.
+Assert-Equal "no passthrough menu remains" $true (-not ($sourceText -match 'Use the one held'))
 
 Write-Host "`n=== The vCenter credential is offered to the systems that follow ===" -ForegroundColor Cyan
 # vCenter is signed in to first and exactly once, so by the time UCS Manager is reached it is the
@@ -178,17 +176,16 @@ Write-Host "`n=== The vCenter credential is offered to the systems that follow =
 # domain account for all three, and the operator should not type it three times.
 Reset-Cache
 Set-SharedRunCredential -Credential ([pscredential]::new('DPE\svc-esxi', (ConvertTo-SecureString 'vc-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
-$script:Answers.Enqueue('2')
 $ucs = Get-RunCredential -Purpose "UCS Manager" -Message "m" 6>$null
 Assert-Equal "nothing was typed" 0 $script:TypedCount
 Assert-Equal "the vCenter credential came through" "DPE\svc-esxi" $ucs.UserName
-Assert-Equal "and the choice was still offered" 1 $script:Prompts.Count
+Assert-Equal "with no question asked" 0 $script:Prompts.Count
 Assert-Equal "the source is recorded as shared" "Shared" $Global:CredentialSource["UCS Manager"]
-# Aria gets the same offer - one proven credential, both systems.
-$script:Answers.Enqueue('2')
+# Any other system that has not refused it gets the same, silently.
 $aria = Get-RunCredential -Purpose "Aria Operations" -Message "m" 6>$null
-Assert-Equal "Aria Operations is offered it too" "DPE\svc-esxi" $aria.UserName
+Assert-Equal "it passes through there too" "DPE\svc-esxi" $aria.UserName
 Assert-Equal "still nothing typed" 0 $script:TypedCount
+Assert-Equal "and still nothing asked" 0 $script:Prompts.Count
 
 Write-Host "`n=== Only a PROVEN credential is shared ===" -ForegroundColor Cyan
 # Set-SharedRunCredential is called after a successful sign-in and nowhere else. Sharing an
@@ -211,30 +208,30 @@ Write-Host "`n=== A system that rejects it is not offered it again ===" -Foregro
 # the same password goes at the next domain, and the next, until the account locks.
 Reset-Cache
 Set-SharedRunCredential -Credential ([pscredential]::new('DPE\svc-esxi', (ConvertTo-SecureString 'p' -AsPlainText -Force))) -Source "vCenter" 6>$null
-$script:Answers.Enqueue('2')
 [void](Get-RunCredential -Purpose "UCS Manager" -Message "m" 6>$null)
 Register-RunCredentialResult -Purpose "UCS Manager" -Succeeded $false 6>$null
 Assert-Equal "UCS Manager is marked as having rejected it" $true $Global:SharedCredentialRejected["UCS Manager"]
 $script:Prompts = New-Object System.Collections.Generic.List[string]
 $next = Get-RunCredential -Purpose "UCS Manager" -Message "m" 6>$null
 Assert-Equal "so the next UCSM sign-in is typed, not replayed" 1 $script:TypedCount
-Assert-Equal "and no choice was offered - there was nothing left to offer" 0 $script:Prompts.Count
 Assert-Equal "it is the typed one" "first.user" $next.UserName
 # Per system: one system refusing a domain account says nothing about the other.
-$script:Answers.Enqueue('2')
 $ariaAfter = Get-RunCredential -Purpose "Aria Operations" -Message "m" 6>$null
-Assert-Equal "Aria Operations is still offered it" "DPE\svc-esxi" $ariaAfter.UserName
+Assert-Equal "another system still passes it through" "DPE\svc-esxi" $ariaAfter.UserName
 
 Write-Host "`n=== A credential typed for a system beats the shared one ===" -ForegroundColor Cyan
+# Reached after the shared one is refused: what the operator then types for UCS Manager is what
+# comes back next time, not the vCenter credential that has already failed there.
 Reset-Cache
 Set-SharedRunCredential -Credential ([pscredential]::new('shared.user', (ConvertTo-SecureString 'p' -AsPlainText -Force))) -Source "vCenter" 6>$null
-$script:Answers.Enqueue('1')   # decline the shared one and type a UCSM-specific account
+[void](Get-RunCredential -Purpose "UCS Manager" -Message "m" 6>$null)
+Register-RunCredentialResult -Purpose "UCS Manager" -Succeeded $false 6>$null
 $script:TypedUser = 'ucs.admin'
 [void](Get-RunCredential -Purpose "UCS Manager" -Message "m" 6>$null)
-$script:Answers.Enqueue('2')
 $second = Get-RunCredential -Purpose "UCS Manager" -Message "m" 6>$null
-Assert-Equal "the UCSM-specific account is what is offered back" "ucs.admin" $second.UserName
+Assert-Equal "the UCSM-specific account is what comes back" "ucs.admin" $second.UserName
 Assert-Equal "and it is recorded as this system's own" "Held" $Global:CredentialSource["UCS Manager"]
+Assert-Equal "with nothing asked at any point" 0 $script:Prompts.Count
 $script:TypedUser = 'first.user'
 
 Write-Host "`n=== Clearing forgets the shared credential too ===" -ForegroundColor Cyan

@@ -12,6 +12,41 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.22.0] — 2026-08-20
+
+#### Changed
+
+- **The UCS Manager credential prompt is gone — the vCenter credential passes
+  straight through.** The `1. Enter it again / 2. Use the one held` menu existed to
+  guard the passthrough while it was unproven. It is proven, and a question whose
+  answer is always `2` is just a keystroke between the operator and the change. A
+  run is now one credential prompt for vCenter and UCS Manager together.
+
+  The credential in use is still **named on screen** each time —
+  `UCS Manager - using 'DPE\svc-esxi', already accepted by vCenter` — so a replay is
+  visible even though it is no longer consented to. That matters when something
+  returns a 401 and the question is which account went where.
+
+  **Nothing about the lockout guards changed**, and they were always the real safety
+  rather than the prompt: only an already-accepted credential is passed through, a
+  system that rejects it never gets it again (per system), a failure discards it and
+  counts against the three-attempt limit, past which nothing further is sent to that
+  system at all, and everything is dropped from the outermost `finally`. A system
+  that has refused the shared credential falls back to a prompt on its next sign-in
+  and what is typed there wins from then on.
+
+  Aria Operations is unaffected — it signs in as a LOCAL account and was already
+  excluded from the passthrough.
+
+#### Tests
+
+- `tests/Test-CredentialCache.ps1` — 62 assertions: reuse now asserted to happen with
+  **nothing asked**, the account in use asserted to be named on screen, and a guard
+  asserting the passthrough menu cannot come back. The refuse-then-type path is
+  re-expressed without the menu and still ends with the system-specific credential
+  winning.
+- Full suite: 1074 assertions across 23 files, all passing.
+
 ### [23.21.0] — 2026-08-20
 
 #### Changed

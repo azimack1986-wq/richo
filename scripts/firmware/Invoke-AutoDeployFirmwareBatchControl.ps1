@@ -80,10 +80,10 @@
          says so, lists it for manual rectification and carries on unsuppressed.
 
     5. CREDENTIALS - vCenter, UCS Manager and Aria Operations, for the prompts during the run.
-       The vCenter one is asked for first and, if it works, is OFFERED as the passthrough for UCS
-         Manager rather than typed again. Offered, not assumed - and a system that refuses it is
-         never offered it again, because a wrong password replayed at each domain in turn is how
-         an account gets locked. Nothing is written to disk and nothing survives the run.
+       The vCenter one is asked for first and, if it works, is PASSED THROUGH to UCS Manager
+         without asking again - so the run is one credential prompt for both. A system that
+         refuses it stops being given it, because a wrong password replayed at each domain in
+         turn is how an account gets locked. Nothing is written to disk, nothing survives the run.
        Aria Operations is the exception: it signs in as a LOCAL Aria account ('admin' by default)
          against authSource LOCAL, so the vCenter domain credential is never offered for it. Set
          RICHO_ARIA_PASSWORD or config\aria.local.json to skip that prompt; no password is in
@@ -386,7 +386,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.21.0"
+$ScriptVersion = "23.22.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -1099,8 +1099,8 @@ function Confirm-RunPrerequisites {
 
     Write-Host "5. Credentials to hand" -ForegroundColor Yellow
     Write-Host "     vCenter, UCS Manager, and an Aria Operations account if suppression is on." -ForegroundColor Gray
-    Write-Host "     The vCenter credential is asked for first, and if it works you are offered it" -ForegroundColor Gray
-    Write-Host "     again for UCS Manager instead of typing it twice." -ForegroundColor Gray
+    Write-Host "     The vCenter credential is asked for first, and if it works it is used for" -ForegroundColor Gray
+    Write-Host "     UCS Manager too - you are not asked for it twice." -ForegroundColor Gray
     Write-Host "     Aria Operations is a LOCAL Aria account ('admin'), asked for separately." -ForegroundColor Gray
 
     Write-Host "6. Host profile - Security settings, handled by this run" -ForegroundColor Yellow
@@ -1430,9 +1430,10 @@ function Get-RunCredential {
         that is known to work; in these estates it is the same domain account for all three. It is
         offered, never assumed, and a system that rejects it is not offered it again.
 
-        WHILE IT IS BEING PROVEN, the choice is explicit - 1 to type it again, 2 to reuse what is
-        held - rather than silently reusing something the operator cannot see. Once it has been
-        trusted for a while the menu is one line to remove.
+        IT IS USED WITHOUT ASKING. The 1-type-again / 2-passthrough menu that guarded this while
+        it was being proven is gone: it has been proven, and a question whose answer is always 2 is
+        just a keystroke between the operator and the change. The credential in use is still named
+        on screen every time, so a replay is visible even though it is not consented to.
 
         LOCKOUT IS THE THING THIS MUST NOT CAUSE. A cached password that is wrong would otherwise
         be replayed at every domain in the cluster, which is how an account gets locked. So:
@@ -1490,15 +1491,14 @@ function Get-RunCredential {
     }
 
     if ($null -ne $held) {
-        Write-Host "" -ForegroundColor Cyan
-        Write-Host "  A credential for '$($held.UserName)' is available for $Purpose - $heldFrom." -ForegroundColor Cyan
-        Write-Host "    1. Enter it again" -ForegroundColor Yellow
-        Write-Host "    2. Use the one held (passthrough)" -ForegroundColor Yellow
-        $choice = Read-ChoiceExit -Message "$Purpose credential" -AllowedChoices @("1","2") -ExitMessage "Stopped at the $Purpose credential."
-        if ($choice -eq "2") {
-            $Global:CredentialSource[$Purpose] = $heldSource
-            return $held
-        }
+        # STRAIGHT THROUGH, no question. Said out loud rather than done silently, because the
+        # operator needs to know WHICH account is about to be sent where when something 401s.
+        # The safety is not the prompt - it is what happens on failure: the credential is dropped,
+        # the attempt is counted, this system stops being offered the shared one, and at three
+        # failures the system is given up on for the run. See Register-RunCredentialResult.
+        Write-Host "  $Purpose - using '$($held.UserName)', $heldFrom." -ForegroundColor DarkGray
+        $Global:CredentialSource[$Purpose] = $heldSource
+        return $held
     }
 
     $credential = $null
