@@ -12,6 +12,76 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.23.0] — 2026-08-20
+
+#### Changed
+
+- **The ESXi target is no longer a string in this script. It is read from the
+  cluster's Auto Deploy rule, every run.** `$TargetEsxiVersion` and
+  `$TargetEsxiBuild` are gone.
+
+  These hosts are stateless: they boot the image profile Auto Deploy hands them, so
+  the deploy rule **is** the target. A version pinned in the script was only ever a
+  copy of it — one that went stale the moment anyone edited the rule, and that agreed
+  with reality by luck rather than by construction. When they disagreed, the script
+  won: hosts marked compliant that were about to boot something else, or hosts
+  rebooted with nothing to gain.
+
+  The flow, in order, per cluster:
+
+  1. read the image profile the cluster's Auto Deploy rule names;
+  2. read the image profile each host is actually running (`esxcli software profile get`);
+  3. the hosts where those differ are the hosts that need updating.
+
+  It is a profile-name comparison, not a build comparison — the rule names a profile
+  and the host is running a profile, so those two strings are the question being asked.
+  A build is still derived from the target name for the reports, and is used as a
+  weaker fallback where a host cannot be asked directly.
+
+  Before anything is decided about scope, the two strings are printed **per host**
+  side by side with the differing ones marked, so which hosts are in scope is not a
+  number to be taken on trust.
+
+#### Added
+
+- `Get-ClusterDeployRuleTarget` finds the rule two ways: `Get-VMHostMatchingRules`
+  per host first — the appliance answering "which rules apply to THIS host", pattern
+  matching included, so nothing here parses a `PatternList` — and failing that, the
+  rule set is scanned for a rule whose own `ItemList` places hosts in this cluster,
+  which also covers a host that is powered off or not yet known to Auto Deploy.
+
+  **Every host is asked, not just the first.** A cluster whose rules name *different*
+  image profiles is reported with both profiles and both rules, and no target is
+  chosen — half a cluster sent to an image it was never meant to have is worse than a
+  run that stops to ask.
+
+- `Get-ImageProfileNameFromItem` identifies the image profile in a rule's mixed
+  `ItemList` **by type**, not by hoping the name looks right, so the host profile or
+  the cluster sitting in the same list is never mistaken for it.
+
+- `VMware.DeployAutomation` joins the modules loaded at start-up.
+
+#### Fixed
+
+- **A host that cannot be asked is no longer treated as compliant.** It stays in
+  scope and is shown as unreadable. Assuming a host that will not answer is already
+  current is how one gets skipped and left behind its cluster.
+
+- **Two test harnesses were passing for the wrong reason.** Their `Get-EsxCli` stub
+  declared `-V2` as a value parameter where the real cmdlet has a switch, so the call
+  errored, the script's `catch` swallowed it, and every host read as unreadable.
+  Caught by the new suite.
+
+#### Tests
+
+- `tests/Test-AutoDeployTarget.ps1` — **new**, 30 assertions: identification by type
+  with the cluster and host profile in the same `ItemList`, the target coming from the
+  rule, the per-host and rule-set routes, conflicting profiles being reported rather
+  than resolved, only the differing hosts being selected, an unreadable host staying in
+  scope, the build fallback, the per-host cache and its `-Refresh` bypass, and a guard
+  that no version can be pinned in the script again.
+- Full suite: 1223 assertions across 24 files, all passing.
+
 ### [23.22.0] — 2026-08-20
 
 #### Changed

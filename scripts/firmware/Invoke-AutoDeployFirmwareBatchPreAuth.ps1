@@ -365,7 +365,7 @@
       treated as the same answer.
     - When the cluster completes, a post-change verification is read back from the platforms
       themselves and written to Post-Change-Verification-<cluster>-<timestamp>.csv:
-        ESXi        - build against $TargetEsxiBuild.
+        ESXi        - image profile against the cluster's Auto Deploy rule.
         Intersight  - ConfigState, and whether anything is still staged.
         UCS Manager - the host firmware package now on the service profile, AND the version the
                       server reports running compared against the version that package name refers
@@ -572,11 +572,26 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.22.0-preauth"
+$ScriptVersion = "23.23.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
-$TargetEsxiVersion = "ESXi-8.0U3j-25429389"
-$TargetEsxiBuild = if ($TargetEsxiVersion -match "(\d{7,})$") { $Matches[1] } else { "" }
+# NOT SET HERE. The ESXi target is whatever the cluster's Auto Deploy rule says it is, read from
+# the appliance at the start of every run - see Resolve-ClusterEsxiTarget.
+#
+# It used to be a string in this file, and that was wrong in the way that is hardest to notice:
+# these hosts are stateless and boot the image profile Auto Deploy hands them, so the rule IS the
+# target. A version pinned here disagreed with the rule the moment anyone updated the rule, and the
+# script would then have been the one deciding what "current" meant - marking hosts compliant that
+# were about to boot something else, or rebooting hosts that had nothing to gain.
+#
+# The comparison is image profile against image profile, not build against build: the rule names a
+# profile, the host is running a profile, and those two strings are the question being asked.
+$Global:TargetImageProfileName = ""
+$Global:TargetEsxiBuild = ""
+# The rule the target came from, for the console and the run summary.
+$Global:TargetDeployRuleName = ""
+# Cached per host so esxcli is asked once each, not once per comparison.
+$Global:HostImageProfileCache = @{}
 $TargetUcsFirmwarePolicyName = ""
 
 # Fabric-derived firmware policy. The FI family is read from the connected UCSM domain and mapped
@@ -1028,6 +1043,7 @@ function Import-RequiredModules {
     # releases - the first one present wins and the rest are not looked at.
     $wanted = @(
         [pscustomobject]@{ Purpose = "vCenter (PowerCLI)"; Names = @("VMware.VimAutomation.Core") }
+        [pscustomobject]@{ Purpose = "Auto Deploy";        Names = @("VMware.DeployAutomation") }
         [pscustomobject]@{ Purpose = "Intersight";         Names = @("Intersight.PowerShell") }
         [pscustomobject]@{ Purpose = "UCS Manager";        Names = @("Cisco.UCSManager", "Cisco.UCS.Core", "CiscoUcsPS") }
     )
@@ -6181,7 +6197,372 @@ function Select-UpgradeMode {
     if ($choice -eq "2") { $Global:UpgradeMode = "ESXI_UCS_FIRMWARE" }
 }
 
-function Test-VMHostOnTargetBuild { param([Parameter(Mandatory=$true)]$VMHostObject) if ([string]::IsNullOrWhiteSpace($TargetEsxiBuild)) { return $false } return ([string]$VMHostObject.Build -eq $TargetEsxiBuild) }
+function Get-ImageProfileNameFromItem {
+    <#
+    .SYNOPSIS
+        The image profile name out of one Auto Deploy rule item, or "" when the item is not one.
+
+    .DESCRIPTION
+        A rule's ItemList is mixed: an image profile, a host profile, a cluster or folder, maybe a
+        script bundle. They are told apart by TYPE first - an image profile is a
+        VMware.ImageBuilder.Types.ImageProfile - because names are not reliably distinguishable and
+        picking the host profile by mistake would silently give the run the wrong target.
+
+        A rule can also hold items as plain strings, which is what a rule built by name looks like.
+        Those are matched on the shape of an ESXi image profile name, and nothing else is guessed.
+
+    .PARAMETER Item
+        One entry from a deploy rule's ItemList.
+
+    .EXAMPLE
+        $name = Get-ImageProfileNameFromItem -Item $rule.ItemList[0]
+    #>
+    param([AllowNull()]$Item)
+
+    if ($null -eq $Item) { return "" }
+
+    if ($Item -is [string]) {
+        # ESXi-8.0U3j-25429389-standard, and the like. A host profile or cluster name will not
+        # look like this, and anything that does not is left alone rather than guessed at.
+        if ($Item -match '(?i)^ESXi-.*\d{6,}') { return [string]$Item }
+        return ""
+    }
+
+    $typeName = ""
+    try { $typeName = [string]$Item.GetType().FullName } catch { $typeName = "" }
+    if ($typeName -match '(?i)ImageProfile') {
+        try { return [string]$Item.Name } catch { return "" }
+    }
+
+    # Some builds hand back a wrapper. An image profile is the only rule item that carries a VIB
+    # list, so that is a safe second signal where the type name is not the giveaway.
+    try {
+        if ($Item.PSObject.Properties.Name -contains 'VibList') { return [string]$Item.Name }
+    }
+    catch { }
+
+    return ""
+}
+
+function Get-ClusterDeployRuleTarget {
+    <#
+    .SYNOPSIS
+        The image profile the cluster's Auto Deploy rule names, and the rule it came from.
+
+    .DESCRIPTION
+        THE POINT OF THIS. These hosts are stateless: they boot whatever image profile Auto Deploy
+        hands them, so the deploy rule IS the target ESXi version. Asking the appliance means the
+        run can never disagree with what the hosts are about to boot, which a version typed into
+        this script did the moment anyone edited the rule.
+
+        TWO WAYS OF FINDING THE RULE, in order:
+
+          1. Get-VMHostMatchingRules, per host. This is the appliance answering "which rules apply
+             to THIS host", pattern matching and all, so nothing here has to parse a PatternList or
+             guess how the estate expresses ipv4=/domain=/vendor= patterns.
+          2. Failing that, the rule set is scanned for a rule whose own ItemList places hosts in
+             this cluster. That is the other direction of the same association and covers a host
+             that is powered off, unreachable, or not yet known to Auto Deploy.
+
+        EVERY HOST IS ASKED, not just the first, and a cluster whose hosts match rules naming
+        DIFFERENT image profiles is reported rather than resolved. Picking one silently would send
+        half the cluster to an image it was never meant to have.
+
+        Returns an object with Name and Rule, both "" when nothing could be read. Never throws:
+        Auto Deploy being unavailable is a question to put to the operator, not a crash.
+
+    .PARAMETER Cluster
+        The cluster being upgraded.
+
+    .PARAMETER Hosts
+        Its hosts, used for the per-host rule match.
+
+    .EXAMPLE
+        $target = Get-ClusterDeployRuleTarget -Cluster $cluster -Hosts $allClusterHosts
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Cluster,
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts
+    )
+
+    $empty = [pscustomobject]@{ Name = ""; Rule = "" }
+
+    if (-not (Get-Command -Name 'Get-DeployRule' -ErrorAction SilentlyContinue)) {
+        Write-Host "  VMware.DeployAutomation is not loaded, so the Auto Deploy rules cannot be read." -ForegroundColor Yellow
+        return $empty
+    }
+
+    # Profile name -> the rule(s) that named it, so a disagreement can be reported with both sides.
+    $found = @{}
+
+    foreach ($hostObj in $Hosts) {
+        $rules = @()
+        try { $rules = @(Get-VMHostMatchingRules -VMHost $hostObj -ErrorAction Stop) }
+        catch { $rules = @() }
+
+        foreach ($rule in $rules) {
+            foreach ($item in @($rule.ItemList)) {
+                $name = Get-ImageProfileNameFromItem -Item $item
+                if ([string]::IsNullOrWhiteSpace($name)) { continue }
+                if (-not $found.ContainsKey($name)) { $found[$name] = New-Object System.Collections.Generic.List[string] }
+                if ($found[$name] -notcontains [string]$rule.Name) { [void]$found[$name].Add([string]$rule.Name) }
+            }
+        }
+    }
+
+    if ($found.Count -eq 0) {
+        # Nothing matched per host. Come at it from the rule end: a rule that places hosts in this
+        # cluster is this cluster's rule, whether or not any host answered.
+        Write-Host "  No Auto Deploy rule matched a host directly; looking for a rule that targets '$($Cluster.Name)'." -ForegroundColor DarkGray
+        $allRules = @()
+        try { $allRules = @(Get-DeployRule -ErrorAction Stop) } catch { $allRules = @() }
+
+        foreach ($rule in $allRules) {
+            $placesHere = $false
+            foreach ($item in @($rule.ItemList)) {
+                if ($null -eq $item) { continue }
+                $itemName = ""
+                try { $itemName = [string]$item.Name } catch { $itemName = "" }
+                if ([string]::IsNullOrWhiteSpace($itemName) -and ($item -is [string])) { $itemName = [string]$item }
+                if ($itemName -eq [string]$Cluster.Name) { $placesHere = $true; break }
+            }
+            if (-not $placesHere) { continue }
+
+            foreach ($item in @($rule.ItemList)) {
+                $name = Get-ImageProfileNameFromItem -Item $item
+                if ([string]::IsNullOrWhiteSpace($name)) { continue }
+                if (-not $found.ContainsKey($name)) { $found[$name] = New-Object System.Collections.Generic.List[string] }
+                if ($found[$name] -notcontains [string]$rule.Name) { [void]$found[$name].Add([string]$rule.Name) }
+            }
+        }
+    }
+
+    if ($found.Count -eq 0) { return $empty }
+
+    if ($found.Count -gt 1) {
+        # NOT resolved silently. Half a cluster sent to an image it was never meant to have is a
+        # worse outcome than a run that stops and asks.
+        Write-Host "  The Auto Deploy rules for this cluster name MORE THAN ONE image profile:" -ForegroundColor Yellow
+        foreach ($name in ($found.Keys | Sort-Object)) {
+            Write-Host "    $name - from rule(s): $($found[$name] -join ', ')" -ForegroundColor Yellow
+        }
+        Write-Host "  That is a rule set question, not something this run can decide." -ForegroundColor Yellow
+        return $empty
+    }
+
+    $profileName = @($found.Keys)[0]
+    return [pscustomobject]@{ Name = [string]$profileName; Rule = ($found[$profileName] -join ', ') }
+}
+
+function Get-VMHostRunningImageProfileName {
+    <#
+    .SYNOPSIS
+        The image profile a host is actually running, or "" where it cannot be read.
+
+    .DESCRIPTION
+        esxcli software profile get, which is the host's own answer to "what am I running" and the
+        same string a deploy rule names - so the two can be compared directly instead of inferred
+        from a build number.
+
+        Cached per host: this is asked once per host per run, not once per comparison, and esxcli
+        over a slow management network is not free.
+
+        Never throws. A host that cannot be asked is not a host that is on the target - the caller
+        treats an empty answer as "needs looking at", which is the safe direction.
+
+    .PARAMETER VMHostObject
+        The host.
+
+    .PARAMETER Refresh
+        Ignore anything cached and ask the host again. Used by the closing verification, which
+        exists precisely to read the state after the change rather than repeat what was read before.
+
+    .EXAMPLE
+        $running = Get-VMHostRunningImageProfileName -VMHostObject $hostObj
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$VMHostObject,
+        [switch]$Refresh
+    )
+
+    $hostName = [string]$VMHostObject.Name
+    if (-not $Refresh -and $Global:HostImageProfileCache.ContainsKey($hostName)) { return [string]$Global:HostImageProfileCache[$hostName] }
+
+    $name = ""
+    try {
+        $esxcli = Get-EsxCli -VMHost $VMHostObject -V2 -ErrorAction Stop
+        $name = [string]$esxcli.software.profile.get.Invoke().Name
+    }
+    catch {
+        $name = ""
+    }
+
+    $Global:HostImageProfileCache[$hostName] = $name
+    return $name
+}
+
+function Test-VMHostOnTargetImageProfile {
+    <#
+    .SYNOPSIS
+        Is this host already running the image profile its Auto Deploy rule names?
+
+    .DESCRIPTION
+        The comparison the whole ESXi side now turns on: the profile the host reports against the
+        profile the rule names. Equal means there is nothing for this run to do to it.
+
+        UNREADABLE IS NOT COMPLIANT. A host that cannot be asked returns $false, so it stays in
+        scope. Assuming a host that will not answer is already current is how a host gets skipped
+        and left behind a cluster.
+
+        Where the host cannot be asked but a build number is known on both sides, the build is used
+        as a fallback signal - it is weaker, since two profiles can share a build, but it beats
+        nothing at all.
+
+    .PARAMETER VMHostObject
+        The host.
+
+    .PARAMETER Refresh
+        Ask the host again rather than using what was read earlier in the run.
+
+    .EXAMPLE
+        if (Test-VMHostOnTargetImageProfile -VMHostObject $hostObj) { ... }
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$VMHostObject,
+        [switch]$Refresh
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Global:TargetImageProfileName)) { return $false }
+
+    $running = Get-VMHostRunningImageProfileName -VMHostObject $VMHostObject -Refresh:$Refresh
+    if (-not [string]::IsNullOrWhiteSpace($running)) {
+        return ($running.Trim() -eq ([string]$Global:TargetImageProfileName).Trim())
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Global:TargetEsxiBuild)) {
+        return ([string]$VMHostObject.Build -eq [string]$Global:TargetEsxiBuild)
+    }
+
+    return $false
+}
+
+function Resolve-ClusterEsxiTarget {
+    <#
+    .SYNOPSIS
+        Works out the ESXi target for this cluster from Auto Deploy, once per cluster.
+
+    .DESCRIPTION
+        THE FLOW, and why it is this way round. These hosts are stateless and boot the image
+        profile Auto Deploy hands them, so the deploy rule is the only thing that can honestly be
+        called the target:
+
+            1. read the image profile the cluster's deploy rule names
+            2. read the image profile each host is actually running
+            3. the hosts where those differ are the hosts that need updating
+
+        A version typed into this script could only ever be a copy of step 1, and a copy that goes
+        stale the moment anyone edits the rule - agreeing with it by luck rather than by
+        construction.
+
+        Where Auto Deploy cannot be read, the operator is asked for the image profile name rather
+        than the run inventing one or carrying on with no target at all. Exiting is offered on the
+        same prompt, because "I do not know what these hosts should be running" is a perfectly good
+        reason to stop before a change window.
+
+    .PARAMETER Cluster
+        The cluster being upgraded.
+
+    .PARAMETER Hosts
+        Its hosts.
+
+    .EXAMPLE
+        Resolve-ClusterEsxiTarget -Cluster $cluster -Hosts $allClusterHosts
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$Cluster,
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts
+    )
+
+    $Global:TargetImageProfileName = ""
+    $Global:TargetEsxiBuild = ""
+    $Global:TargetDeployRuleName = ""
+    $Global:HostImageProfileCache = @{}
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "ESXi target for '$($Cluster.Name)', from Auto Deploy:" -ForegroundColor Cyan
+
+    $target = Get-ClusterDeployRuleTarget -Cluster $Cluster -Hosts $Hosts
+
+    if ([string]::IsNullOrWhiteSpace($target.Name)) {
+        Write-Host "  The Auto Deploy rule for this cluster could not be read." -ForegroundColor Yellow
+        Write-Host "  Enter the image profile name the cluster should be on - exactly as it appears in the" -ForegroundColor Yellow
+        Write-Host "  deploy rule, e.g. ESXi-8.0U3j-25429389-standard - or E to stop." -ForegroundColor Yellow
+        $typed = Read-Host "Image profile for '$($Cluster.Name)' [or E to exit]"
+        if ("$typed".Trim() -match '(?i)^e$') { Stop-SafeExit -Message "Stopped: no ESXi target could be established for '$($Cluster.Name)'." }
+        if ([string]::IsNullOrWhiteSpace($typed)) {
+            Write-Host "  No target given. Every host stays in scope, and nothing is skipped for being current." -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Resolve ESXi target" -Result "Unknown" -Details "$($Cluster.Name) - no Auto Deploy rule readable and no image profile entered; no host is treated as already current."
+            return
+        }
+        $Global:TargetImageProfileName = $typed.Trim()
+        $Global:TargetDeployRuleName = "entered by the operator"
+    }
+    else {
+        $Global:TargetImageProfileName = $target.Name
+        $Global:TargetDeployRuleName = $target.Rule
+        Write-Host "  Rule '$($target.Rule)' names image profile '$($target.Name)'." -ForegroundColor Green
+    }
+
+    if ($Global:TargetImageProfileName -match '(\d{6,})') { $Global:TargetEsxiBuild = $Matches[1] }
+
+    Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Resolve ESXi target" -Result "Resolved" -Details "$($Cluster.Name) - image profile '$($Global:TargetImageProfileName)' from $($Global:TargetDeployRuleName)."
+}
+
+function Show-ClusterEsxiTargetComparison {
+    <#
+    .SYNOPSIS
+        Prints, per host, what it is running against what the rule says - and returns those that differ.
+
+    .DESCRIPTION
+        The whole decision in one table, before anything is touched. Which hosts need updating is
+        not a number the operator has to take on trust; it is the two strings side by side, per
+        host, with the ones that differ marked.
+
+        A host whose profile cannot be read is shown as unreadable and counted as needing work -
+        the safe direction, and visible rather than quietly dropped.
+
+    .PARAMETER Hosts
+        The cluster's hosts.
+
+    .EXAMPLE
+        $needWork = Show-ClusterEsxiTargetComparison -Hosts $allClusterHosts
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts)
+
+    if ([string]::IsNullOrWhiteSpace($Global:TargetImageProfileName)) { return @($Hosts) }
+
+    $differ = New-Object System.Collections.Generic.List[object]
+    $rows = New-Object System.Collections.Generic.List[object]
+
+    foreach ($hostObj in ($Hosts | Sort-Object Name)) {
+        $running = Get-VMHostRunningImageProfileName -VMHostObject $hostObj
+        $onTarget = Test-VMHostOnTargetImageProfile -VMHostObject $hostObj
+        if (-not $onTarget) { [void]$differ.Add($hostObj) }
+
+        [void]$rows.Add([pscustomobject]@{
+            Host    = [string]$hostObj.Name
+            Running = $(if ([string]::IsNullOrWhiteSpace($running)) { "unreadable (build $($hostObj.Build))" } else { $running })
+            Target  = [string]$Global:TargetImageProfileName
+            Needs   = $(if ($onTarget) { "" } else { "UPDATE" })
+        })
+    }
+
+    $rows | Format-Table -AutoSize | Out-String | Write-Host
+    Write-Host "  $($differ.Count) of $(@($Hosts).Count) host(s) are not on '$($Global:TargetImageProfileName)'." -ForegroundColor $(if ($differ.Count -eq 0) { 'Green' } else { 'Yellow' })
+    Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Compare to Auto Deploy target" -Result "Compared" -Details "$($differ.Count) of $(@($Hosts).Count) host(s) not on '$($Global:TargetImageProfileName)' (rule: $($Global:TargetDeployRuleName))."
+
+    return @($differ.ToArray())
+}
 
 function Get-CapacityBasedBatchSize {
     <#
@@ -8709,7 +9090,8 @@ function Show-ClusterFirmwareVerification {
         infrastructure now reports.
 
         Per host:
-          ESXi build     - against $TargetEsxiBuild.
+          ESXi           - the image profile the host is running, against the one the cluster's
+                           Auto Deploy rule names.
           Intersight     - the server profile's ConfigState, and whether anything is still staged.
                            "None" in the Outstanding column is the result being looked for: the
                            deploy landed and nothing is waiting.
@@ -8746,8 +9128,10 @@ function Show-ClusterFirmwareVerification {
         }
         catch {}
 
-        $buildResult = if ([string]::IsNullOrWhiteSpace($TargetEsxiBuild)) { "n/a" }
-                       elseif ($esxiBuild -eq $TargetEsxiBuild) { "On target" }
+        # Read from the host, not from what the run believes it did.
+        $buildResult = if ([string]::IsNullOrWhiteSpace($Global:TargetImageProfileName)) { "n/a" }
+                       elseif ($null -eq $hostObj) { "unreadable" }
+                       elseif (Test-VMHostOnTargetImageProfile -VMHostObject $hostObj -Refresh) { "On target" }
                        else { "NOT on target" }
 
         $platform = "ESXi only"
@@ -9091,7 +9475,12 @@ function Invoke-ClusterUpgradeWorkflow {
 
     if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") { Build-InfrastructureHostMapping -Hosts $allClusterHosts }
 
-    $alreadyTargetHosts = @($allClusterHosts | Where-Object { Test-VMHostOnTargetBuild -VMHostObject $_ })
+    # THE TARGET COMES FROM AUTO DEPLOY, per cluster, before anything is decided about which hosts
+    # are in scope - the rule is what these stateless hosts will boot, so it is the only honest
+    # answer to "what should they be running".
+    Resolve-ClusterEsxiTarget -Cluster $Cluster -Hosts $allClusterHosts
+    $needEsxiUpdateHosts = @(Show-ClusterEsxiTargetComparison -Hosts $allClusterHosts)
+    $alreadyTargetHosts = @($allClusterHosts | Where-Object { $needEsxiUpdateHosts.Name -notcontains $_.Name })
 
     if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") {
         # Firmware-only mode must not exclude hosts just because the ESXi build is already current.

@@ -71,17 +71,19 @@ Write-Host "`n=== A module already in the session is never re-imported ===" -For
 # THE RULE THIS PRESERVES. These jump hosts carry pinned bundles. An unconditional import either
 # duplicates a load or fights a version that was chosen deliberately.
 Reset-ModuleState
-$script:Loaded = @('VMware.VimAutomation.Core','Intersight.PowerShell','Cisco.UCSManager')
-$script:Available = @('VMware.VimAutomation.Core','Intersight.PowerShell','Cisco.UCSManager')
+$script:Loaded = @('VMware.VimAutomation.Core','VMware.DeployAutomation','Intersight.PowerShell','Cisco.UCSManager')
+$script:Available = @('VMware.VimAutomation.Core','VMware.DeployAutomation','Intersight.PowerShell','Cisco.UCSManager')
 Import-RequiredModules 6>$null
 Assert-Equal "nothing was imported" 0 $script:Imported.Count
 
 Write-Host "`n=== A module that is installed but not loaded is loaded once ===" -ForegroundColor Cyan
 Reset-ModuleState
-$script:Available = @('VMware.VimAutomation.Core','Intersight.PowerShell','Cisco.UCSManager')
+$script:Available = @('VMware.VimAutomation.Core','VMware.DeployAutomation','Intersight.PowerShell','Cisco.UCSManager')
 Import-RequiredModules 6>$null
-Assert-Equal "all three were imported" 3 $script:Imported.Count
-Assert-Equal "PowerCLI, Intersight and UCS PowerTool" "VMware.VimAutomation.Core,Intersight.PowerShell,Cisco.UCSManager" ($script:Imported.ToArray() -join ',')
+Assert-Equal "all four were imported" 4 $script:Imported.Count
+# Auto Deploy is in the list because the ESXi target is now read from the deploy rule rather than
+# typed into the script - without it there is no target to compare a host against.
+Assert-Equal "PowerCLI, Auto Deploy, Intersight and UCS PowerTool" "VMware.VimAutomation.Core,VMware.DeployAutomation,Intersight.PowerShell,Cisco.UCSManager" ($script:Imported.ToArray() -join ',')
 
 Write-Host "`n=== It runs once per session, not once per cluster ===" -ForegroundColor Cyan
 $script:Imported = New-Object System.Collections.Generic.List[string]
@@ -112,7 +114,7 @@ Write-Host "`n=== A module that is not installed is not imported ===" -Foregroun
 Reset-ModuleState
 Import-RequiredModules 6>$null
 Assert-Equal "nothing was imported" 0 $script:Imported.Count
-Assert-Equal "all three reported as not loaded" 3 (@($Global:RunSummary.ToArray() | Where-Object { $_.Result -eq 'NotLoaded' }).Count)
+Assert-Equal "all four reported as not loaded" 4 (@($Global:RunSummary.ToArray() | Where-Object { $_.Result -eq 'NotLoaded' }).Count)
 
 Write-Host "`n=== It never installs or updates anything ===" -ForegroundColor Cyan
 # A module load is a decision about this session. Installing is a decision about the machine, and

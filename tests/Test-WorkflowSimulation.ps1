@@ -49,8 +49,12 @@ foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Lan
 # Settings the functions expect, mirroring the script's User Settings block.
 # ---------------------------------------------------------------------------
 $ScriptVersion                          = 'simulation'
-$TargetEsxiVersion                      = 'ESXi-8.0U3j-25429389'
-$TargetEsxiBuild                        = '25429389'
+# The ESXi target is no longer a setting - it is read from the cluster's Auto Deploy rule at the
+# start of each cluster. The simulation's rule and hosts are stubbed further down.
+$Global:TargetImageProfileName          = ''
+$Global:TargetEsxiBuild                 = ''
+$Global:TargetDeployRuleName            = ''
+$Global:HostImageProfileCache           = @{}
 $TargetUcsFirmwarePolicyName            = ''
 $ResourceSafetyBuffer                   = 0.85
 $MinimumCpuHeadroomPercentAfterBatch    = 10
@@ -161,6 +165,24 @@ function Connect-VIServer { param($Server,$ErrorAction) Note-Call 'Connect-VISer
 function Disconnect-VIServer { param($Server,$Confirm) Note-Call 'Disconnect-VIServer' }
 function Set-PowerCLIConfiguration { param($Scope,$WebOperationTimeoutSeconds,$Confirm,$ErrorAction) Note-Call 'Set-PowerCLIConfiguration' }
 function Get-Cluster { param($Name,$ErrorAction) return $script:Cluster }
+
+# --- Auto Deploy ------------------------------------------------------------------------------
+# The ESXi target is no longer typed into the script: it is the image profile the cluster's deploy
+# rule names. The rule here names 8.0U3j and every simulated host is running 8.0U3a, so all four
+# are out of date - which is the same starting position the hard-coded target used to produce.
+$script:DeployRuleProfile = 'ESXi-8.0U3j-25429389-standard'
+$script:HostRunningProfile = 'ESXi-8.0U3a-20000000-standard'
+$script:MatchingRulesFail = $false
+function Get-DeployRule { param($Name,$ErrorAction)
+    return @([pscustomobject]@{ Name = 'TestCluster-rule'; PatternList = @('domain=dpe.example')
+        ItemList = @($script:DeployRuleProfile, 'TestCluster', 'TestCluster_profile') }) }
+function Get-VMHostMatchingRules { param($VMHost,$ErrorAction)
+    if ($script:MatchingRulesFail) { throw "Auto Deploy did not answer" }
+    return @(Get-DeployRule) }
+function Get-EsxCli { param($VMHost,[switch]$V2,$ErrorAction)
+    $name = $script:HostRunningProfile
+    return [pscustomobject]@{ software = [pscustomobject]@{ profile = [pscustomobject]@{
+        get = [pscustomobject]@{} | Add-Member -MemberType ScriptMethod -Name Invoke -Value ([scriptblock]::Create("[pscustomobject]@{ Name = '$name' }")) -PassThru } } } }
 function Get-VMHost {
     param($Name,$Location,$ErrorAction)
     if ($Name) { return $script:HostState[$Name] }
