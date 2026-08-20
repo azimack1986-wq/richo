@@ -12,6 +12,47 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.17.0] — 2026-08-19
+
+#### Fixed
+
+- **The Aria sign-in assumed `LOCAL`, so a domain account got a 401 every time.**
+  `authSource` is not free text: it is the Source Display Name from Administration
+  > Authentication Sources, and `LOCAL` only ever holds accounts created inside
+  Aria itself. My recommendation to default it to `LOCAL` was wrong for an estate
+  that signs in with domain accounts.
+
+  The sources are now read from the appliance — `GET /suite-api/api/auth/sources`,
+  which is what the login page itself reads, so it answers before a token exists —
+  and offered as a numbered choice, `LOCAL` included. **The source is asked before
+  the password**, so the credential dialog names the source it is collecting an
+  account for instead of the operator finding out from a 401 afterwards. Setting
+  `$Global:AriaAuthSource` to a Source Display Name skips the question.
+
+  A 401 now says what it usually means — the source, not the password — and drops
+  both so a fresh pair is asked for. It is deliberately **not** retried against
+  another source: the same password sent again somewhere else is how an account
+  gets locked out, and this is a courtesy feature, not the change.
+
+- **The root password policy was not found on a profile that has one.** A live
+  profile reported *"no root account password policy - nothing to set"* while
+  sitting on "Leave password unchanged for the default account".
+
+  The finder required three things at once: the node's `Key` to be `root`, the
+  profile type name to contain "user", and the **policy** id to name a password.
+  A profile leaving the password unchanged carries no password parameter to give
+  it away, so on that build the giveaway was the **option** id instead — and the
+  type name check was simply wrong to insist on.
+
+  A password policy is now recognised by the policy id, the option id, **or** a
+  password parameter; and the account is recognised by the node key, an account
+  name in a policy parameter, or the path — any one of the three. The profile type
+  name is not consulted at all.
+
+  When it still finds nothing, it now **prints every password policy it did see**
+  with its path, key, policy id and option id. "No root account password policy" on
+  a profile that plainly has one is not something anyone can act on.
+
 ### [23.16.0] — 2026-08-19
 
 #### Fixed
@@ -2899,6 +2940,13 @@ and `$ScriptVersion` from 16.0.0.
 ---
 
 ## Invoke-AutoDeployFirmwareBatchPreAuth.ps1
+
+### [23.17.0-preauth] — 2026-08-19
+
+Tracks `Invoke-AutoDeployFirmwareBatchControl.ps1` 23.17.0 — the Aria
+authentication source is read from the appliance and chosen before the password
+instead of assuming LOCAL, and the host profile's root password policy is found
+however the profile spells it. This is the build to run.
 
 ### [23.16.0-preauth] — 2026-08-19
 

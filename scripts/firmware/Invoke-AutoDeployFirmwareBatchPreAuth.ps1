@@ -564,7 +564,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.16.0-preauth"
+$ScriptVersion = "23.17.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -817,11 +817,15 @@ $Global:AriaOperationsServer = "siepd85vop1110.dpe.protected.mil.au"
 # The custom datacenter the cluster joins for the change. Resolved by name each run so the object
 # can be recreated in Aria without editing this script.
 $Global:AriaSuppressionGroupName = "ESXi Patching Hardware Suppression"
-# The Source Display Name under Administration > Authentication Sources. LOCAL is a local Aria
-# account, which is the recommendation: the token is short-lived and acquired per run, so nothing
-# durable is stored, and a local account still works when the directory does not - which matters
-# here, because this run unticks Active Directory from the host profile at the same time.
-$Global:AriaAuthSource = "LOCAL"
+# The Source Display Name from Administration > Authentication Sources, which is what the
+# authSource field of the token request means. It is NOT free text: "LOCAL" is only correct for an
+# account created inside Aria itself, and a domain account signed in against LOCAL is a 401 every
+# time - which is exactly what a run hit here.
+#
+# LEFT BLANK ON PURPOSE. The sources are read from the appliance at sign-in and the operator picks
+# one, so the right answer comes from the appliance being used rather than from a guess baked in
+# here that is wrong at every other site. Set it to a Source Display Name to skip the question.
+$Global:AriaAuthSource = ""
 $Global:AriaSkipCertificateCheck = $true
 $Global:AriaCredential = $null
 $Global:AriaSession = $null
@@ -5283,6 +5287,103 @@ function Invoke-AriaRestCall {
     return Invoke-RestMethod @params
 }
 
+function Get-AriaAuthSourceName {
+    <#
+    .SYNOPSIS
+        The Source Display Names configured on the appliance, or an empty list.
+
+    .DESCRIPTION
+        GET /suite-api/api/auth/sources. Asked BEFORE signing in, because the answer is what the
+        sign-in needs - the sources list is what the login page itself reads, so it is normally
+        readable without a token. Where it is not, the caller falls back to asking.
+
+        Best effort and never throws: not knowing the list is a reason to ask a question, not to
+        stop a run.
+    #>
+    $names = New-Object System.Collections.Generic.List[string]
+
+    try {
+        $response = Invoke-AriaRestCall -Method "GET" -Path "/suite-api/api/auth/sources"
+
+        # The list has been carried under different property names across releases, so take any
+        # array the response holds and read a name off each entry.
+        $entries = @()
+        foreach ($property in @($response.PSObject.Properties)) {
+            if ($property.Value -is [System.Array] -or $property.Value -is [System.Collections.IList]) { $entries += @($property.Value) }
+        }
+        if ($entries.Count -eq 0) { $entries = @($response) }
+
+        foreach ($entry in $entries) {
+            if ($null -eq $entry) { continue }
+            foreach ($field in @('name','displayName','sourceName','id')) {
+                $value = ""
+                try { if ($entry.PSObject.Properties.Name -contains $field) { $value = [string]$entry.$field } } catch { }
+                if (-not [string]::IsNullOrWhiteSpace($value)) {
+                    if ($names -notcontains $value) { [void]$names.Add($value) }
+                    break
+                }
+            }
+        }
+    }
+    catch { }
+
+    return @($names.ToArray())
+}
+
+function Select-AriaAuthSource {
+    <#
+    .SYNOPSIS
+        Decides which authentication source to sign in against, once per run.
+
+    .DESCRIPTION
+        Asked BEFORE the credential prompt so the operator picks the right source up front rather
+        than discovering it from a 401 afterwards - and so the credential dialog can name the
+        source it is collecting an account for.
+
+        Configured value wins. Otherwise the appliance's own list is offered, LOCAL included, as a
+        numbered single-key choice; where the list cannot be read the name is typed instead.
+
+        NOTHING IS RETRIED AGAINST ANOTHER SOURCE. A failed sign-in is reported and left alone: the
+        same password sent again at a different source is how an account gets locked out, and this
+        is a courtesy feature, not something worth risking an account over.
+    #>
+    if (-not [string]::IsNullOrWhiteSpace($Global:AriaAuthSource)) { return $Global:AriaAuthSource }
+
+    Write-Host "  Reading the authentication sources from the appliance..." -ForegroundColor Gray
+    $sources = @(Get-AriaAuthSourceName)
+    # LOCAL is always a valid answer and is not always listed, so it is offered either way.
+    if ($sources -notcontains "LOCAL") { $sources = @($sources) + @("LOCAL") }
+
+    if ($sources.Count -le 1) {
+        Write-Host "  The appliance did not return its authentication sources." -ForegroundColor Yellow
+        Write-Host "  Enter the Source Display Name from Administration > Authentication Sources." -ForegroundColor Yellow
+        Write-Host "  LOCAL is only correct for an account created inside Aria itself; a domain" -ForegroundColor Yellow
+        Write-Host "  account needs the name of its Active Directory or vIDM source." -ForegroundColor Yellow
+        $typed = Read-Host "Authentication source for $($Global:AriaOperationsServer)"
+        if ([string]::IsNullOrWhiteSpace($typed)) { return "" }
+        $Global:AriaAuthSource = $typed.Trim()
+        return $Global:AriaAuthSource
+    }
+
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "  Which authentication source is your Aria account in?" -ForegroundColor Cyan
+    Write-Host "  LOCAL is only for an account created inside Aria itself - a domain account is in" -ForegroundColor Gray
+    Write-Host "  its Active Directory or vIDM source, and signing it in against LOCAL is a 401." -ForegroundColor Gray
+    $choices = New-Object System.Collections.Generic.List[string]
+    $index = 0
+    foreach ($source in $sources) {
+        $index++
+        if ($index -gt 9) { break }
+        Write-Host "    $index. $source" -ForegroundColor Yellow
+        [void]$choices.Add("$index")
+    }
+
+    $picked = Read-ChoiceExit -Message "Select the authentication source" -AllowedChoices $choices.ToArray() -ExitMessage "Stopped at the Aria Operations authentication source."
+    $Global:AriaAuthSource = [string]$sources[([int]$picked - 1)]
+    Write-Host "  Using authentication source '$($Global:AriaAuthSource)'." -ForegroundColor Green
+    return $Global:AriaAuthSource
+}
+
 function Connect-AriaOperations {
     <#
     .SYNOPSIS
@@ -5317,9 +5418,20 @@ function Connect-AriaOperations {
         Write-Host "" -ForegroundColor Cyan
         Write-Host "Aria Operations sign-in for $($Global:AriaOperationsServer)" -ForegroundColor Cyan
         Write-Host "  Used only to add this cluster to '$($Global:AriaSuppressionGroupName)' for the change," -ForegroundColor Gray
-        Write-Host "  and to take it out again when the cluster finishes. Authentication source: $($Global:AriaAuthSource)." -ForegroundColor Gray
+        Write-Host "  and to take it out again when the cluster finishes." -ForegroundColor Gray
         Write-Host "  Held in memory for this run only, never written to the summary or the log." -ForegroundColor Gray
-        try { $Global:AriaCredential = Get-Credential -Message "Aria Operations account for $($Global:AriaOperationsServer) (authSource $($Global:AriaAuthSource))" }
+
+        # THE SOURCE FIRST. Asked before the password so the operator picks it deliberately, rather
+        # than finding out from a 401 that a domain account was sent to LOCAL.
+        $authSource = Select-AriaAuthSource
+        if ([string]::IsNullOrWhiteSpace($authSource)) {
+            Write-Host "  No authentication source chosen - this cluster will NOT be put into patching suppression." -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "NoAuthSource" -Details "No authentication source was chosen; suppression is not applied."
+            $Global:AriaUnusable = $true
+            return $false
+        }
+
+        try { $Global:AriaCredential = Get-Credential -Message "Aria Operations account in '$authSource' on $($Global:AriaOperationsServer)" }
         catch { $Global:AriaCredential = $null }
     }
 
@@ -5346,10 +5458,18 @@ function Connect-AriaOperations {
     }
     catch {
         Write-Host "  Aria Operations sign-in failed: $($_.Exception.Message)" -ForegroundColor Yellow
-        Write-Host "  Check the account, and that authSource '$($Global:AriaAuthSource)' matches a Source Display Name" -ForegroundColor Yellow
-        Write-Host "  under Administration > Authentication Sources. The run continues without suppression." -ForegroundColor Yellow
-        # Dropped so a wrong password is asked for again rather than reused for the rest of the run.
+        if ("$($_.Exception.Message)" -match '401') {
+            Write-Host "  A 401 here is usually the SOURCE, not the password: '$($Global:AriaAuthSource)' has to be the" -ForegroundColor Yellow
+            Write-Host "  Source Display Name from Administration > Authentication Sources that holds this account." -ForegroundColor Yellow
+            Write-Host "  LOCAL only ever holds accounts created inside Aria itself; a domain account belongs to its" -ForegroundColor Yellow
+            Write-Host "  Active Directory or vIDM source. Some sources also want the account as user@domain." -ForegroundColor Yellow
+        }
+        Write-Host "  The run continues without suppression." -ForegroundColor Yellow
+        # Both dropped, so a fresh source and password are asked for rather than a wrong pair being
+        # reused. NOT retried automatically against another source: the same password sent again
+        # somewhere else is how an account gets locked out, and this is a courtesy, not the change.
         $Global:AriaCredential = $null
+        $Global:AriaAuthSource = ""
         $Global:AriaUnusable = $true
         Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Failed" -Details "$($Global:AriaOperationsServer) - $($_.Exception.Message)"
         return $false
@@ -6297,12 +6417,10 @@ function Get-HostProfileRootPasswordPolicy {
     #>
     param([Parameter(Mandatory=$true)]$ApplyProfile)
 
+    $seen = New-Object System.Collections.Generic.List[string]
+
     foreach ($row in (Get-HostProfileApplyNode -Node $ApplyProfile)) {
         $node = $row.Node
-        $key = ""
-        try { if ($node.PSObject.Properties.Name -contains 'Key') { $key = [string]$node.Key } } catch { }
-        if ($key -ne 'root') { continue }
-        if ([string]$row.ProfileTypeName -notmatch '(?i)user') { continue }
 
         foreach ($policy in @($node.Policy)) {
             if ($null -eq $policy) { continue }
@@ -6310,13 +6428,36 @@ function Get-HostProfileRootPasswordPolicy {
             try { $option = $policy.PolicyOption } catch { }
             if ($null -eq $option) { continue }
 
-            $parameterKeys = @()
-            try { $parameterKeys = @(@($option.Parameter) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Key }) } catch { }
+            $parameters = @()
+            try { $parameters = @(@($option.Parameter) | Where-Object { $null -ne $_ }) } catch { }
+            $parameterKeys = @($parameters | ForEach-Object { [string]$_.Key })
 
-            # The password policy is the one whose options deal in a password - identified by the
-            # parameter it carries when set, or by the policy id naming one when it is not.
-            $isPasswordPolicy = ($parameterKeys -contains 'password') -or ([string]$policy.Id -match '(?i)password')
+            # A PASSWORD POLICY, identified three ways rather than one. The policy id names a
+            # password, or the option id does, or the option carries a password parameter - because
+            # which of those is true depends on the release AND on whether a password is currently
+            # set. Requiring the policy id alone missed a profile that plainly had one.
+            $isPasswordPolicy = ($parameterKeys -contains 'password') -or
+                                ([string]$policy.Id -match '(?i)password') -or
+                                ([string]$option.Id -match '(?i)password')
             if (-not $isPasswordPolicy) { continue }
+
+            # WHICH ACCOUNT. The node's Key is the usual answer, but the account name also turns up
+            # as a policy parameter on some builds, and the path carries it when neither does - so
+            # all three are consulted before deciding this is not root.
+            $key = ""
+            try { if ($node.PSObject.Properties.Name -contains 'Key') { $key = [string]$node.Key } } catch { }
+
+            $namedRoot = ($key -match '(?i)^root$')
+            if (-not $namedRoot) {
+                foreach ($parameter in $parameters) {
+                    if ([string]$parameter.Key -notmatch '(?i)^(name|user|username|userName|account)$') { continue }
+                    if ([string]$parameter.Value -match '(?i)^root$') { $namedRoot = $true; break }
+                }
+            }
+            if (-not $namedRoot -and [string]$row.Path -match '(?i)(^|/)root(\[|/|$)') { $namedRoot = $true }
+
+            [void]$seen.Add("$($row.Path) [$($row.ProfileTypeName)] key='$key' policy='$([string]$policy.Id)' option='$([string]$option.Id)'")
+            if (-not $namedRoot) { continue }
 
             return [pscustomobject]@{
                 Path        = $row.Path
@@ -6326,6 +6467,16 @@ function Get-HostProfileRootPasswordPolicy {
                 OptionId    = [string]$option.Id
             }
         }
+    }
+
+    # Nothing matched. What WAS there is printed, because "no root account password policy" on a
+    # profile that plainly has one is not something anyone can act on.
+    if ($seen.Count -gt 0) {
+        Write-Host "    Password policies found, none of them on an account named root:" -ForegroundColor DarkGray
+        foreach ($entry in $seen.ToArray()) { Write-Host "      $entry" -ForegroundColor DarkGray }
+    }
+    else {
+        Write-Host "    No password policy of any kind was found in the apply profile." -ForegroundColor DarkGray
     }
 
     return $null

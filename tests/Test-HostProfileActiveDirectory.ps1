@@ -333,5 +333,51 @@ Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
 Assert-Equal "no update was written" 0 $script:Updates.Count
 $Global:RunMode = 'LIVE'
 
+Write-Host "`n=== The root account is found however the profile identifies it ===" -ForegroundColor Cyan
+# A live profile reported "no root account password policy" when it plainly had one. The finder
+# required the node's Key to be 'root' AND the profile type to name a user AND the policy id to
+# name a password - three conditions, any of which a real profile can spell differently.
+function New-PasswordNode {
+    param($Key,$PolicyId,$OptionId,$Parameters = @(),$Type = 'UserProfile')
+    $n = New-Node -Type $Type
+    if ($null -ne $Key) { $n | Add-Member -MemberType NoteProperty -Name Key -Value $Key }
+    $n.Policy = @([pscustomobject]@{ Id = $PolicyId
+        PolicyOption = [pscustomobject]@{ Id = $OptionId; Parameter = $Parameters } })
+    return $n
+}
+function New-TreeWith { param($Node)
+    $root = New-Node -Type 'HostApplyProfile'
+    $root | Add-Member -MemberType NoteProperty -Name UserAccount -Value @($Node)
+    return $root
+}
+
+# The policy id does not name a password, but the OPTION id does - which is how an account that is
+# leaving the password unchanged looks, since it carries no password parameter to give it away.
+$found = Get-HostProfileRootPasswordPolicy -ApplyProfile (New-TreeWith (New-PasswordNode -Key 'root' -PolicyId 'security.AccountPolicy' -OptionId 'DefaultAccountPasswordUnchangedConfigOption')) 6>$null
+Assert-Equal "found through the option id alone" $true ($null -ne $found)
+Assert-Equal "and reported as not having a password" $false $found.HasPassword
+
+# The account name in a policy parameter rather than on the node key.
+$found = Get-HostProfileRootPasswordPolicy -ApplyProfile (New-TreeWith (New-PasswordNode -Key $null -PolicyId 'PasswordPolicy' -OptionId 'FixedPasswordConfigOption' -Parameters @(
+    [pscustomobject]@{ Key='name'; Value='root' }, [pscustomobject]@{ Key='password'; Value='x' }))) 6>$null
+Assert-Equal "found through a name parameter" $true ($null -ne $found)
+Assert-Equal "and reported as already set" $true $found.HasPassword
+
+# A profile type that does not say "user" at all.
+$found = Get-HostProfileRootPasswordPolicy -ApplyProfile (New-TreeWith (New-PasswordNode -Key 'root' -PolicyId 'PasswordPolicy' -OptionId 'DefaultAccountPasswordUnchangedConfigOption' -Type 'AccountProfile')) 6>$null
+Assert-Equal "found regardless of the profile type name" $true ($null -ne $found)
+
+# And a non-root account is still not root.
+$found = Get-HostProfileRootPasswordPolicy -ApplyProfile (New-TreeWith (New-PasswordNode -Key 'monitoring' -PolicyId 'PasswordPolicy' -OptionId 'DefaultAccountPasswordUnchangedConfigOption')) 6>$null
+Assert-Equal "another account is not mistaken for root" $true ($null -eq $found)
+
+Write-Host "`n=== A miss says what it did see ===" -ForegroundColor Cyan
+# "No root account password policy" on a profile that has one is not something anyone can act on.
+$output = Get-HostProfileRootPasswordPolicy -ApplyProfile (New-TreeWith (New-PasswordNode -Key 'monitoring' -PolicyId 'PasswordPolicy' -OptionId 'DefaultAccountPasswordUnchangedConfigOption')) 6>&1
+$text = ($output | Out-String)
+Assert-Equal "the policies it found are listed" $true ($text -match 'none of them on an account named root')
+Assert-Equal "with the key it saw" $true ($text -match "key='monitoring'")
+Assert-Equal "and the option id" $true ($text -match 'DefaultAccountPasswordUnchangedConfigOption')
+
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }
