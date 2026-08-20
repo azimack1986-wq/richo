@@ -12,6 +12,67 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.18.0] — 2026-08-20
+
+#### Added
+
+- **The vCenter credential is reused for UCS Manager and Aria Operations.** A run
+  signs in to vCenter once, to UCS Manager once per domain and to Aria Operations
+  once per cluster, and in these estates that is the same domain account each
+  time. Typing it five or six times is how it gets mistyped.
+
+  vCenter is now asked for the credential explicitly — previously `Connect-VIServer`
+  was left to prompt for itself, which meant the run never had the credential to
+  hand on. If the connection succeeds, that credential is held for the run and
+  **offered** at every prompt that follows.
+
+  Offered, never assumed. While this is being proven the choice is a two-line menu
+  — `1` to type it again, `2` to use the one held — so nothing is replayed that the
+  operator cannot see. Once it has been trusted the menu is a few lines to remove.
+
+  Cancelling the vCenter dialog is still allowed and connects the way it always
+  did, as the current Windows user; nothing is then held and the later systems ask
+  for their own.
+
+- **Lockout is the failure this had to not cause**, so the replay is bounded from
+  four directions:
+
+  - only a credential that has ALREADY been accepted is ever offered — the shared
+    slot is written after a successful sign-in and nowhere else;
+  - a system that REJECTS it is never offered it again. Per system, because UCS
+    Manager refusing a domain account says nothing about Aria Operations;
+  - a failed sign-in discards the held credential immediately and counts against
+    the per-system limit; at three, that system is given up on for the run and
+    nothing further is sent to it at all;
+  - everything is dropped when the run ends — completed, exited, stopped or thrown
+    out of — from the script's outermost `finally`.
+
+  Held as a `PSCredential`, so the password is a `SecureString`: DPAPI-encrypted in
+  memory for this user and this process, converted back only where a login call
+  needs it. Nothing is written to disk, nothing reaches the log or the run summary,
+  nothing survives the PowerShell session.
+
+#### Fixed
+
+- **A cancelled vCenter dialog would have hung the run on a prompt nobody asked
+  for.** `Set-SharedRunCredential` first took `[Parameter(Mandatory=$true)]
+  [pscredential]$Credential`; PowerShell tries to coerce `$null` into that type,
+  fails, and falls back to prompting the console for the parameter — and `$null`
+  is exactly what a cancelled dialog passes. Caught by the new tests, which hung
+  until `-NonInteractive` turned the prompt into an error. The parameter is now
+  untyped and optional, and the signature is asserted so it cannot regress.
+
+#### Tests
+
+- `tests/Test-CredentialCache.ps1` — 61 assertions, 24 of them new: the vCenter
+  credential reaching both later systems, only a proven credential being shared,
+  the first proven one winning, a rejection being remembered per system, a
+  system-specific credential beating the shared one, the clear taking the shared
+  slot with it, and the cancel path being unable to prompt.
+- `tests/Test-AriaSuppression.ps1` and `tests/Test-WorkflowSimulation.ps1` seed and
+  reset the new globals, so a blocked system cannot leak between sections.
+- Full suite: 1032 assertions across 23 files, all passing.
+
 ### [23.17.0] — 2026-08-19
 
 #### Fixed

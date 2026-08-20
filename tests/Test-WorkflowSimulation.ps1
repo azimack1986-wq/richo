@@ -78,6 +78,14 @@ $Global:RunMode                         = 'DRYRUN'
 $Global:UpgradeMode                     = 'ESXI_UCS_FIRMWARE'
 $Global:UcsCredential                   = [pscredential]::new('u', (ConvertTo-SecureString 'p' -AsPlainText -Force))
 $Global:UcsSessions                     = @{}
+$Global:CredentialCache                 = @{}
+$Global:CredentialAttempts              = @{}
+$Global:CredentialBlocked               = @{}
+$Global:CredentialSource                = @{}
+$Global:SharedCredential                = $null
+$Global:SharedCredentialSource          = ""
+$Global:SharedCredentialRejected        = @{}
+$Global:MaxCredentialAttempts           = 3
 $Global:UcsHostMap                      = @{}
 $Global:UcsServiceProfileCache          = @{}
 $Global:AutoExitMaintenanceMode         = $true
@@ -371,6 +379,14 @@ function Reset-Simulation {
     $Global:IntersightUnusable = $false
     $Global:IntersightUpgradeSurfaceChecked = $false
     $Global:UcsSessions = @{}
+    $Global:CredentialCache = @{}
+    $Global:CredentialAttempts = @{}
+    $Global:CredentialBlocked = @{}
+    $Global:CredentialSource = @{}
+    $Global:SharedCredential = $null
+    $Global:SharedCredentialSource = ""
+    $Global:SharedCredentialRejected = @{}
+    $Global:MaxCredentialAttempts = 3
     $Global:UcsFirmwarePolicyByTarget = @{}
     # The simulated UCSM remembers the policy each service profile was last set to. Left over from a
     # previous run it would make the next one find nothing to stage, and the run would legitimately

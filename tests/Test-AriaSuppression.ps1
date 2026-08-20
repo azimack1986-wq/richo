@@ -36,7 +36,9 @@ if ($errors) { throw "parse errors" }
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in @('Connect-AriaOperations','Disconnect-AriaOperations','Get-AriaResourceId',
                                  'Invoke-AriaRestCall','Get-AriaCustomDatacenter','Get-AriaMembershipProperty',
-                                 'Set-ClusterAriaPatchingSuppression','Test-DryRun') } |
+                                 'Set-ClusterAriaPatchingSuppression','Test-DryRun',
+                                 'Get-RunCredential','Register-RunCredentialResult','Clear-RunCredential',
+                                 'Set-SharedRunCredential','Select-AriaAuthSource','Get-AriaAuthSourceName') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0
@@ -57,6 +59,14 @@ $Global:AriaSkipCertificateCheck = $true
 $Global:AriaCredential = [pscredential]::new('svc-esxi', (ConvertTo-SecureString 'p' -AsPlainText -Force))
 $Global:AriaSession = $null
 $Global:AriaUnusable = $false
+$Global:CredentialCache = @{}
+$Global:CredentialAttempts = @{}
+$Global:CredentialBlocked = @{}
+$Global:CredentialSource = @{}
+$Global:SharedCredential = $null
+$Global:SharedCredentialSource = ""
+$Global:SharedCredentialRejected = @{}
+$Global:MaxCredentialAttempts = 3
 $ManagementEndpointProbeTimeoutSeconds = 60
 
 function Add-SummaryRecord { param($Stage,$Batch,$HostName,$Action,$Result,$Details)
@@ -95,6 +105,13 @@ function Reset-Appliance {
     $script:ExtraProperty = $null
     $Global:AriaSession = $null
     $Global:AriaUnusable = $false
+    $Global:CredentialCache = @{}
+    $Global:CredentialAttempts = @{}
+    $Global:CredentialBlocked = @{}
+    $Global:CredentialSource = @{}
+    $Global:SharedCredential = $null
+    $Global:SharedCredentialSource = ""
+    $Global:SharedCredentialRejected = @{}
     $Global:RunSummary = New-Object System.Collections.Generic.List[object]
     $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object]
 }

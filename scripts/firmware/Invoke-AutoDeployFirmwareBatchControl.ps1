@@ -80,6 +80,10 @@
          says so, lists it for manual rectification and carries on unsuppressed.
 
     5. CREDENTIALS - vCenter, UCS Manager and Aria Operations, for the prompts during the run.
+       The vCenter one is asked for first and, if it works, is OFFERED as the passthrough for the
+         other two rather than typed again. Offered, not assumed - and a system that refuses it is
+         never offered it again, because a wrong password replayed at each domain in turn is how
+         an account gets locked. Nothing is written to disk and nothing survives the run.
 
     None of the above is verified at start-up: probing for it was slow enough on a domain jump
     host to read as a hang. Failures surface where they matter instead - a missing module at its
@@ -378,7 +382,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.17.0"
+$ScriptVersion = "23.18.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -602,6 +606,29 @@ $Global:RunMode = "DRYRUN"
 $Global:UpgradeMode = "ESXI_UCS_FIRMWARE" # ESXI_ONLY or ESXI_UCS_FIRMWARE
 $Global:UcsCredential = $null
 $Global:UcsSessions = @{}
+# Credentials typed during a run, held as PSCredential objects - the password is a SecureString,
+# which on Windows is DPAPI-encrypted in memory for this user and this process, and is turned back
+# into plain text only where a login call needs it. In memory only: nothing is written to disk and
+# nothing survives the session. Cleared by Clear-RunCredential when the script ends.
+$Global:CredentialCache = @{}
+$Global:CredentialAttempts = @{}
+$Global:CredentialBlocked = @{}
+# Where the credential handed out for a system last came from - "Manual", "Held" or "Shared" - so
+# a failure can discard the right thing. Without it, a shared credential rejected by UCS Manager
+# would be offered again on the next domain and burn another attempt against the same account.
+$Global:CredentialSource = @{}
+# The credential proven against vCenter, offered as the passthrough for the systems that follow.
+# vCenter is signed in to FIRST and exactly ONCE, so it is the one credential in the run that is
+# known good before anything else is contacted - which makes it the safe thing to replay. Held as
+# a PSCredential (SecureString password) in memory only, and dropped by Clear-RunCredential.
+$Global:SharedCredential = $null
+$Global:SharedCredentialSource = ""
+# Systems that have already rejected the shared credential. Per system, because UCS Manager
+# refusing a domain account says nothing about whether Aria Operations will accept it.
+$Global:SharedCredentialRejected = @{}
+# How many failed sign-ins to one system before the run stops trying it altogether. A wrong
+# password replayed at each UCS domain in turn is how an account gets locked out.
+$Global:MaxCredentialAttempts = 3
 $Global:UcsHostMap = @{}
 $Global:UcsServiceProfileCache = @{}
 # ESXi root credential for the cluster being worked on. Collected once when the cluster is
@@ -1050,6 +1077,8 @@ function Confirm-RunPrerequisites {
 
     Write-Host "5. Credentials to hand" -ForegroundColor Yellow
     Write-Host "     vCenter, UCS Manager, and an Aria Operations account if suppression is on." -ForegroundColor Gray
+    Write-Host "     The vCenter credential is asked for first, and if it works you are offered it" -ForegroundColor Gray
+    Write-Host "     again for UCS Manager and Aria Operations instead of typing it three times." -ForegroundColor Gray
 
     Write-Host "6. Host profile - Security settings, handled by this run" -ForegroundColor Yellow
     Write-Host "     In the host profile attached to the cluster, under Security Settings, these" -ForegroundColor Gray
@@ -1354,6 +1383,211 @@ function Confirm-ManagementEndpointReachable {
 }
 
 # -----------------------------
+# Credential cache - Aria Operations and UCS Manager
+# -----------------------------
+
+function Get-RunCredential {
+    <#
+    .SYNOPSIS
+        The credential for one system, from the run's cache or freshly typed. Offers the choice.
+
+    .DESCRIPTION
+        A run signs in to UCS Manager once per domain and to Aria Operations once per cluster, so
+        without a cache the same password is typed over and over - and a password typed six times
+        is a password mistyped once.
+
+        HOW IT IS HELD. As a PSCredential, whose password is a SecureString: on Windows that is
+        encrypted in memory with DPAPI, keyed to this user and this process, and it is converted
+        back to plain text only at the moment a login call needs it. Nothing is written to disk,
+        nothing survives the PowerShell session, and nothing reaches the log or the run summary.
+
+        WHERE THE HELD ONE COMES FROM. Either this system's own earlier sign-in, or - failing that
+        - the credential already proven against vCenter. vCenter is contacted first and once, so by
+        the time UCS Manager or Aria Operations is reached it is the only credential in the run
+        that is known to work; in these estates it is the same domain account for all three. It is
+        offered, never assumed, and a system that rejects it is not offered it again.
+
+        WHILE IT IS BEING PROVEN, the choice is explicit - 1 to type it again, 2 to reuse what is
+        held - rather than silently reusing something the operator cannot see. Once it has been
+        trusted for a while the menu is one line to remove.
+
+        LOCKOUT IS THE THING THIS MUST NOT CAUSE. A cached password that is wrong would otherwise
+        be replayed at every domain in the cluster, which is how an account gets locked. So:
+
+          - a failed sign-in DISCARDS the cached credential immediately, and the next one is typed;
+          - attempts are counted per system, and after $Global:MaxCredentialAttempts the system is
+            given up on for the rest of the run - no further sign-in is attempted at all;
+          - the whole cache is cleared when the script ends, however it ends.
+
+    .PARAMETER Purpose
+        The system this credential is for - "UCS Manager" or "Aria Operations". Cache and attempt
+        count are per purpose, so one system's bad password cannot block the other.
+
+    .PARAMETER Message
+        Shown on the credential dialog.
+
+    .EXAMPLE
+        $credential = Get-RunCredential -Purpose "UCS Manager" -Message "Enter UCSM credential"
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Purpose,
+        [Parameter(Mandatory=$true)][string]$Message
+    )
+
+    if ($Global:CredentialBlocked.ContainsKey($Purpose) -and $Global:CredentialBlocked[$Purpose]) {
+        Write-Host "  $Purpose has already failed $($Global:MaxCredentialAttempts) time(s) this run - not asking again, and not signing in again." -ForegroundColor Yellow
+        return $null
+    }
+
+    # This system's own credential first; the vCenter one only if this system has not already
+    # refused it. Order matters: something typed specifically for UCS Manager beats a replay.
+    $held = $null
+    $heldSource = ""
+    $heldFrom = ""
+    if ($Global:CredentialCache.ContainsKey($Purpose) -and $null -ne $Global:CredentialCache[$Purpose]) {
+        $held = $Global:CredentialCache[$Purpose]
+        $heldSource = "Held"
+        $heldFrom = "entered for $Purpose earlier in this run"
+    }
+    elseif ($null -ne $Global:SharedCredential -and -not ($Global:SharedCredentialRejected.ContainsKey($Purpose) -and $Global:SharedCredentialRejected[$Purpose])) {
+        $held = $Global:SharedCredential
+        $heldSource = "Shared"
+        $heldFrom = "already accepted by $($Global:SharedCredentialSource)"
+    }
+
+    if ($null -ne $held) {
+        Write-Host "" -ForegroundColor Cyan
+        Write-Host "  A credential for '$($held.UserName)' is available for $Purpose - $heldFrom." -ForegroundColor Cyan
+        Write-Host "    1. Enter it again" -ForegroundColor Yellow
+        Write-Host "    2. Use the one held (passthrough)" -ForegroundColor Yellow
+        $choice = Read-ChoiceExit -Message "$Purpose credential" -AllowedChoices @("1","2") -ExitMessage "Stopped at the $Purpose credential."
+        if ($choice -eq "2") {
+            $Global:CredentialSource[$Purpose] = $heldSource
+            return $held
+        }
+    }
+
+    $credential = $null
+    try { $credential = Get-Credential -Message $Message } catch { $credential = $null }
+    if ($null -eq $credential -or [string]::IsNullOrWhiteSpace($credential.GetNetworkCredential().Password)) { return $null }
+
+    $Global:CredentialCache[$Purpose] = $credential
+    $Global:CredentialSource[$Purpose] = "Manual"
+    return $credential
+}
+
+function Set-SharedRunCredential {
+    <#
+    .SYNOPSIS
+        Records a credential that has just been PROVEN, so later systems can be offered it.
+
+    .DESCRIPTION
+        Called only after a sign-in has actually succeeded. That restriction is the whole design:
+        the point of replaying a credential is that it is known good, and replaying an unproven one
+        at three systems in turn is how an account gets locked.
+
+        The first proven credential wins and later ones do not overwrite it, because the first is
+        vCenter's - the one sign-in that happens exactly once in a run, before any per-domain or
+        per-cluster work starts.
+
+    .PARAMETER Credential
+        The credential that just worked.
+
+    .PARAMETER Source
+        What accepted it, for the prompt shown later - "vCenter", for example.
+
+    .EXAMPLE
+        Set-SharedRunCredential -Credential $credential -Source "vCenter"
+    #>
+    # NOT typed [pscredential] and NOT mandatory: PowerShell tries to COERCE $null into the type
+    # and, failing that, prompts the console for the parameter. Connect-VCenterServer passes $null
+    # every time the operator cancels the vCenter dialog, so the strict signature turned a normal
+    # cancel into a hung script waiting on a prompt nobody was expecting.
+    param(
+        [AllowNull()]$Credential,
+        [Parameter(Mandatory=$true)][string]$Source
+    )
+
+    if ($null -eq $Credential) { return }
+    if ($null -ne $Global:SharedCredential) { return }
+
+    $Global:SharedCredential = $Credential
+    $Global:SharedCredentialSource = $Source
+    Write-Host "  '$($Credential.UserName)' worked against $Source and will be offered for UCS Manager and Aria Operations." -ForegroundColor DarkGray
+}
+
+function Register-RunCredentialResult {
+    <#
+    .SYNOPSIS
+        Records whether a sign-in worked, and stops the run using a credential that does not.
+
+    .DESCRIPTION
+        Success resets the count, so a password that works is not on a countdown for the rest of
+        the run.
+
+        Failure discards the cached credential and counts against the limit. At the limit the
+        system is blocked for the run: nothing further is typed and nothing further is sent. That
+        is the whole point - a wrong password replayed at each UCS domain in turn is how an account
+        gets locked out, and no amount of suppression or firmware is worth that.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Purpose,
+        [Parameter(Mandatory=$true)][bool]$Succeeded
+    )
+
+    if ($Succeeded) {
+        $Global:CredentialAttempts[$Purpose] = 0
+        return
+    }
+
+    # A rejected replay of the vCenter credential is not offered to this system again. Only to
+    # THIS system: UCS Manager refusing a domain account says nothing about Aria Operations, and
+    # dropping the shared credential outright would make the operator retype it everywhere.
+    if ($Global:CredentialSource.ContainsKey($Purpose) -and $Global:CredentialSource[$Purpose] -eq "Shared") {
+        $Global:SharedCredentialRejected[$Purpose] = $true
+        Write-Host "  $Purpose rejected the $($Global:SharedCredentialSource) credential, so it will not be offered for $Purpose again." -ForegroundColor Yellow
+    }
+
+    $Global:CredentialCache[$Purpose] = $null
+    $count = 1 + [int]$Global:CredentialAttempts[$Purpose]
+    $Global:CredentialAttempts[$Purpose] = $count
+
+    if ($count -ge [int]$Global:MaxCredentialAttempts) {
+        $Global:CredentialBlocked[$Purpose] = $true
+        Write-Host "" -ForegroundColor Red
+        Write-Host "  $Purpose has now failed $count time(s) this run. NO FURTHER SIGN-IN WILL BE ATTEMPTED." -ForegroundColor Red
+        Write-Host "  Stopping here rather than sending the same password again, which is how an account" -ForegroundColor Yellow
+        Write-Host "  gets locked out. Check the account, then start a fresh run." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "Credential" -Batch "" -HostName "" -Action "Sign in to $Purpose" -Result "Blocked" -Details "Failed $count time(s); no further attempt made this run, to avoid locking the account."
+        return
+    }
+
+    Write-Host "  The held $Purpose credential has been discarded - attempt $count of $($Global:MaxCredentialAttempts)." -ForegroundColor Yellow
+}
+
+function Clear-RunCredential {
+    <#
+    .SYNOPSIS
+        Forgets every cached credential and every attempt count. Called when the script ends.
+
+    .DESCRIPTION
+        However the run ends - completed, exited, stopped, or thrown out of - nothing is left held.
+        A credential that outlives the run it was typed for is one that can be replayed by whatever
+        runs next in the same session, and the attempt counts have to go with it so a fresh run
+        starts from a clean slate rather than inheriting a countdown.
+    #>
+    $Global:CredentialCache = @{}
+    $Global:CredentialAttempts = @{}
+    $Global:CredentialBlocked = @{}
+    $Global:CredentialSource = @{}
+    $Global:SharedCredential = $null
+    $Global:SharedCredentialSource = ""
+    $Global:SharedCredentialRejected = @{}
+    $Global:UcsCredential = $null
+    $Global:AriaCredential = $null
+}
+
+# -----------------------------
 # Hardened UCSM login and discovery
 # -----------------------------
 
@@ -1448,9 +1682,13 @@ function Get-UcsCandidateListFromSystemName {
 }
 
 function Get-UcsCredentialIfNeeded {
+    <#
+    .SYNOPSIS
+        Makes sure a UCS Manager credential is available, from the run's cache or freshly typed.
+    #>
     if ($null -ne $Global:UcsCredential) { return }
-    Write-Host "Enter UCSM credential. Stored in memory only. If your manual Connect-Ucs works only with interactive prompt, choose MANUAL when asked after a failed credential attempt." -ForegroundColor Cyan
-    $Global:UcsCredential = Get-Credential -Message "Enter UCSM credential"
+    Write-Host "UCSM credential. Held in memory only. If your manual Connect-Ucs works only with an interactive prompt, choose MANUAL when asked after a failed credential attempt." -ForegroundColor Cyan
+    $Global:UcsCredential = Get-RunCredential -Purpose "UCS Manager" -Message "Enter UCSM credential"
 }
 
 function Connect-UcsOneAttempt {
@@ -1486,6 +1724,7 @@ function Connect-UcsCached {
         $session = Connect-UcsOneAttempt -UcsTarget $target
         $Global:UcsSessions[$target] = $session
         Set-ActiveUcsSession -UcsSession $session
+        Register-RunCredentialResult -Purpose "UCS Manager" -Succeeded $true
         Write-Host "Connected to UCSM: $target" -ForegroundColor Green
         return $session
     } catch {
@@ -1496,8 +1735,11 @@ function Connect-UcsCached {
         # remaining UCSM domain in turn. Drop it so the next attempt prompts again. Connectivity
         # and name-resolution failures leave the credential alone.
         if ($failureMessage -match 'auth|credential|password|denied|unauthori[sz]ed|login') {
+            # Counted, not just dropped. Replaying a wrong password at each domain in turn is how
+            # the account gets locked, so after $Global:MaxCredentialAttempts nothing further is
+            # attempted for UCS Manager this run.
             $Global:UcsCredential = $null
-            Write-Host "Cached UCSM credential discarded - you will be prompted again on the next attempt." -ForegroundColor Yellow
+            Register-RunCredentialResult -Purpose "UCS Manager" -Succeeded $false
         }
 
         Write-Host "Because manual 'Connect-Ucs '$target'' works in your environment, you can try an interactive UCS login now." -ForegroundColor Yellow
@@ -5688,8 +5930,7 @@ function Connect-AriaOperations {
             return $false
         }
 
-        try { $Global:AriaCredential = Get-Credential -Message "Aria Operations account in '$authSource' on $($Global:AriaOperationsServer)" }
-        catch { $Global:AriaCredential = $null }
+        $Global:AriaCredential = Get-RunCredential -Purpose "Aria Operations" -Message "Aria Operations account in '$authSource' on $($Global:AriaOperationsServer)"
     }
 
     if ($null -eq $Global:AriaCredential -or [string]::IsNullOrWhiteSpace($Global:AriaCredential.GetNetworkCredential().Password)) {
@@ -5709,6 +5950,7 @@ function Connect-AriaOperations {
         if ([string]::IsNullOrWhiteSpace($token)) { throw "the appliance returned no token" }
 
         $Global:AriaSession = $token
+        Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $true
         Write-Host "  Signed in to Aria Operations." -ForegroundColor Green
         Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Connected" -Details "$($Global:AriaOperationsServer) as $($Global:AriaCredential.UserName) via authSource $($Global:AriaAuthSource)."
         return $true
@@ -5727,6 +5969,7 @@ function Connect-AriaOperations {
         # somewhere else is how an account gets locked out, and this is a courtesy, not the change.
         $Global:AriaCredential = $null
         $Global:AriaAuthSource = ""
+        Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $false
         $Global:AriaUnusable = $true
         Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Failed" -Details "$($Global:AriaOperationsServer) - $($_.Exception.Message)"
         return $false
@@ -6033,6 +6276,16 @@ function Connect-VCenterServer {
         before connecting meant a failed connect left the cleanup trying to disconnect a session
         that was never established.
 
+        THE CREDENTIAL IS ASKED FOR HERE, and kept if it works. vCenter is signed in to first and
+        exactly once, so it is the one credential in the run proven before any other system is
+        touched - and in these estates the same domain account gets into UCS Manager and Aria
+        Operations too. Keeping it means those are offered a passthrough instead of a third and
+        fourth prompt for the same password, and offering only something already accepted is what
+        keeps the replay from turning into a lockout.
+
+        Cancelling the prompt is allowed and connects the way it always did, on the current Windows
+        session. Nothing is then held, so the later systems ask for their own credentials.
+
     .PARAMETER Server
         vCenter FQDN or IP.
     #>
@@ -6055,8 +6308,22 @@ function Connect-VCenterServer {
     }
 
     Write-Host "Connecting to vCenter: $Server" -ForegroundColor Cyan
+    Write-Host "  This credential is reused for UCS Manager and Aria Operations if it works here - cancel to sign in as the current Windows user instead." -ForegroundColor DarkGray
+
+    $vcCredential = $null
+    try { $vcCredential = Get-Credential -Message "vCenter account for $Server" } catch { $vcCredential = $null }
+    if ($null -ne $vcCredential -and [string]::IsNullOrWhiteSpace($vcCredential.GetNetworkCredential().Password)) { $vcCredential = $null }
+    if ($null -eq $vcCredential) {
+        Write-Host "  No vCenter credential entered - connecting as the current Windows user, and UCS Manager and Aria Operations will ask for their own." -ForegroundColor Yellow
+    }
+
     try {
-        Connect-VIServer -Server $Server -ErrorAction Stop | Out-Null
+        if ($null -ne $vcCredential) {
+            Connect-VIServer -Server $Server -Credential $vcCredential -ErrorAction Stop | Out-Null
+        }
+        else {
+            Connect-VIServer -Server $Server -ErrorAction Stop | Out-Null
+        }
     }
     catch {
         Add-SummaryRecord -Stage "vCenterConnect" -Batch "" -HostName "" -Action "Connect" -Result "Failed" -Details $_.Exception.Message
@@ -6090,6 +6357,9 @@ function Connect-VCenterServer {
     # Only now is there something to disconnect.
     $global:vCenterConnected = $true
     Write-Host "Connected to vCenter." -ForegroundColor Green
+
+    # Proven, so it is worth offering onward. Only reached on success - see Set-SharedRunCredential.
+    Set-SharedRunCredential -Credential $vcCredential -Source "vCenter"
 }
 
 function Select-ClusterInteractive {
@@ -8903,6 +9173,9 @@ try {
     # is nothing to disconnect. Clear the in-memory key material instead.
     $Global:IntersightSession = $null
     Disconnect-AriaOperations
+    # However the run ended. A credential that outlives the run it was typed for is one that can be
+    # replayed by whatever comes next in the same session.
+    Clear-RunCredential
     $Global:IntersightApiKeyId = ""
     $Global:IntersightApiKeyFilePath = ""
     # Only if a connection was actually established - otherwise this reports a confusing
