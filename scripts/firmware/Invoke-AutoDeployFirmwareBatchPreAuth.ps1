@@ -99,10 +99,10 @@
          turn is how an account gets locked. Nothing is written to disk, nothing survives the run.
        Aria Operations signs in against the vIDM source, which holds the same domain accounts,
          so the vCenter credential is a candidate there too - but it is OFFERED, 1 to type or 2 to
-         pass through, because vIDM needs the name rebuilt as user@domain@source and that
-         composition is still being proven here. CHECK $Global:AriaVidmDomain for your site. Set
-         RICHO_ARIA_PASSWORD or config\aria.local.json to skip the question; no password is in
-         this script, and none may be put in it.
+         pass through, rather than assumed, while that is being proven here. The account is sent
+         bare against authSource vIDMAuthSource. Set RICHO_ARIA_PASSWORD or
+         config\aria.local.json to skip the question; no password is in this script, and none
+         may be put in it.
 
     None of the above is verified at start-up: probing for it was slow enough on a domain jump
     host to read as a hang. Failures surface where they matter instead - a missing module at its
@@ -574,7 +574,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.24.0-preauth"
+$ScriptVersion = "23.25.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 # NOT SET HERE. The ESXi target is whatever the cluster's Auto Deploy rule says it is, read from
@@ -872,20 +872,16 @@ $Global:AriaSuppressionGroupName = "ESXi Patching Hardware Suppression"
 # 401 every time.
 $Global:AriaAuthSource = "vIDMAuthSource"
 #
-# THE vIDM DOMAIN. This is the piece that is not guessable and that a 401 will not tell you about.
-# Aria will NOT resolve a bare account name against a vIDM source: the username field has to carry
-# the whole path,
+# THE USERNAME GOES AS IT IS. This appliance takes the bare account name against that source -
 #
-#     vIDM_Username@vIDM_DOMAIN@vIDM_SOURCE_NAME_IN_ARIA
+#     username   = nick.beare_priv
+#     authSource = vIDMAuthSource
 #
-# e.g. nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource. For an account created inside vIDM
-# itself the middle part is the literal string "System Domain". Sending a bare name is a 401 that
-# is indistinguishable, from the outside, from a wrong password - which is exactly how the first
-# attempt at this looked.
-#
-# CHECK THIS VALUE FOR YOUR SITE. It is the domain as vIDM itself shows it, and the run prints the
-# full composed username before it signs in so a wrong one is visible rather than mysterious.
-$Global:AriaVidmDomain = "dpe.protected.mil.au"
+# - which was established by testing it, and is the one form worth trusting. Broadcom's KB for
+# acquiring a token through a vIDM source describes a qualified user@vIDM-domain@source form, and
+# an earlier build composed that; this appliance does not want it, so nothing is composed. The only
+# thing removed from the name is a NetBIOS DOMAIN\ prefix, which is how a vCenter credential is
+# often entered and is not part of the account.
 #
 # The account, where nothing is passed through and nothing is configured. Only ever a default in
 # the credential dialog.
@@ -5599,58 +5595,39 @@ function Invoke-AriaRestCall {
 
 
 
-function Test-AriaVidmAuthSource {
-    <#
-    .SYNOPSIS
-        Does this authentication source name look like a vIDM / Workspace ONE source?
-
-    .DESCRIPTION
-        Decides whether the username has to be qualified as user@domain@source. The name is
-        operator-chosen, so this is a heuristic and is treated as one: getting it wrong only means
-        the username is sent as entered, which is what every other kind of source wants.
-
-    .PARAMETER Name
-        The Source Display Name.
-
-    .EXAMPLE
-        Test-AriaVidmAuthSource -Name "vIDMAuthSource"   # $true
-    #>
-    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Name)
-    return ($Name -match '(?i)vidm|workspace|ws1|wsone')
-}
-
 function Resolve-AriaUserName {
     <#
     .SYNOPSIS
-        The username to actually send to suite-api, qualified for a vIDM source.
+        The username to send to suite-api: the account, with any NetBIOS domain prefix removed.
 
     .DESCRIPTION
-        For LOCAL and Active Directory sources the account goes as entered and the source goes in
-        the authSource field - the ordinary documented case, unchanged.
+        THE FORM THAT WORKS HERE, established by testing rather than inferred:
 
-        vIDM is the exception, and it is not guessable. Aria will not resolve a bare account name
-        against a vIDM source; the username field has to carry the whole path:
+            username   = nick.beare_priv
+            authSource = vIDMAuthSource
 
-            vIDM_Username@vIDM_DOMAIN@vIDM_SOURCE_NAME_IN_ARIA
+        The account goes bare and the source goes in the authSource field. Broadcom's KB for
+        acquiring a token through a vIDM source describes a qualified
+        user@vIDM-domain@source-name form and an earlier build of this script composed that; this
+        appliance does not want it, so nothing is composed. Sending a form the appliance does not
+        expect is a 401 that looks exactly like a wrong password, which is why this is now the one
+        thing it does and it does it the same way every time.
 
-        for example nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource, and for an account created
-        inside vIDM itself the middle part is the literal string "System Domain". Anything else is
-        a 401 - indistinguishable, from the outside, from a wrong password, and exactly what a
-        passthrough of a working vCenter credential produced the first time this was tried.
-
-        Already-qualified names are left alone: two @ signs means the operator has done this
-        themselves. A name carrying one @ only has the source appended.
-
-        Returns the name unchanged if no domain is available, rather than inventing one.
+        THE ONE TRANSFORM. A vCenter credential is commonly entered as DOMAIN\user, and that prefix
+        is not part of the account - it is how Windows names the directory it came from. It is
+        stripped, so a passthrough of DPE\nick.beare_priv is sent as nick.beare_priv. Nothing else
+        is added, removed or rearranged.
 
     .PARAMETER UserName
         The account as entered, or as passed through from vCenter.
 
     .PARAMETER AuthSource
-        The Source Display Name for this run.
+        The Source Display Name for this run. Sent in the authSource field, never folded into the
+        username.
 
     .EXAMPLE
-        Resolve-AriaUserName -UserName "nick.beare_priv" -AuthSource "vIDMAuthSource"
+        Resolve-AriaUserName -UserName "DPE\nick.beare_priv" -AuthSource "vIDMAuthSource"
+        # nick.beare_priv
     #>
     param(
         [Parameter(Mandatory=$true)][AllowEmptyString()][string]$UserName,
@@ -5658,22 +5635,9 @@ function Resolve-AriaUserName {
     )
 
     if ([string]::IsNullOrWhiteSpace($UserName)) { return $UserName }
-    if (-not (Test-AriaVidmAuthSource -Name $AuthSource)) { return $UserName }
 
-    # A DOMAIN\user passthrough from vCenter carries the domain in the wrong place for this. Take
-    # the account off it; the vIDM domain is a DNS-style name, not the NetBIOS prefix.
-    $account = $UserName
-    if ($account -match '^[^\\]+\\(.+)$') { $account = $Matches[1] }
-
-    # Two @ signs already: user@domain@source. Nothing to add.
-    if (([regex]::Matches($account, '@')).Count -ge 2) { return $account }
-
-    # One @ sign: user@domain. Only the source is missing.
-    if ($account.Contains('@')) { return "$account@$AuthSource" }
-
-    if ([string]::IsNullOrWhiteSpace($Global:AriaVidmDomain)) { return $account }
-
-    return "$account@$($Global:AriaVidmDomain)@$AuthSource"
+    if ($UserName -match '^[^\\]+\\(.+)$') { return $Matches[1] }
+    return $UserName
 }
 
 function Get-AriaRunCredential {
@@ -5823,10 +5787,11 @@ function Connect-AriaOperations {
         domain accounts vCenter does. There is no chooser: the source is a property of the site,
         not of the run, and asking every time only invites the wrong answer.
 
-        THE USERNAME IS REBUILT for that source. vIDM will not resolve a bare account name; it
-        wants user@vIDM-domain@source-name, and anything else is a 401 indistinguishable from a
-        wrong password. See Resolve-AriaUserName. The composed name is printed before the request
-        so a wrong domain is visible rather than mysterious.
+        THE USERNAME GOES BARE - username nick.beare_priv, authSource vIDMAuthSource - which is
+        the form this appliance accepts, established by testing it. Only a NetBIOS DOMAIN\ prefix
+        is taken off, since that is how a vCenter credential is often entered and is not part of
+        the account. See Resolve-AriaUserName. What is about to be sent is printed first, so a 401
+        can be read against the account that actually went.
 
         The credential is held in memory for the run and never written to the log or the summary.
 
@@ -5862,8 +5827,8 @@ function Connect-AriaOperations {
         return $false
     }
 
-    # The credential is held exactly as entered; only the form sent to the appliance is rebuilt,
-    # and only for a vIDM source. See Resolve-AriaUserName.
+    # The credential is held exactly as entered; only a NetBIOS DOMAIN\ prefix is taken off the
+    # name on its way to the appliance. See Resolve-AriaUserName.
     $sendUser = Resolve-AriaUserName -UserName $Global:AriaCredential.UserName -AuthSource $Global:AriaAuthSource
     Write-Host "  Signing in as '$sendUser' against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Gray
 
@@ -5886,18 +5851,10 @@ function Connect-AriaOperations {
         Write-Host "  Aria Operations sign-in failed: $($_.Exception.Message)" -ForegroundColor Yellow
         if ("$($_.Exception.Message)" -match '401') {
             Write-Host "  '$sendUser' was sent against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Yellow
-            if (Test-AriaVidmAuthSource -Name $Global:AriaAuthSource) {
-                Write-Host "  For a vIDM source the username must be user@vIDM-domain@source-name, so if the" -ForegroundColor Yellow
-                Write-Host "  DOMAIN in the middle of that is wrong it is a 401 even with the right password." -ForegroundColor Yellow
-                Write-Host "  Current setting: `$Global:AriaVidmDomain = '$($Global:AriaVidmDomain)'." -ForegroundColor Yellow
-                Write-Host "  Check the domain as vIDM itself shows it - 'System Domain' for accounts created" -ForegroundColor Yellow
-                Write-Host "  inside vIDM - and check '$($Global:AriaAuthSource)' is the Source Display Name from" -ForegroundColor Yellow
-                Write-Host "  Administration > Authentication Sources." -ForegroundColor Yellow
-            }
-            else {
-                Write-Host "  '$($Global:AriaAuthSource)' has to be the Source Display Name from Administration >" -ForegroundColor Yellow
-                Write-Host "  Authentication Sources that holds this account." -ForegroundColor Yellow
-            }
+            Write-Host "  That is the form this appliance expects - the bare account name, with the source in" -ForegroundColor Yellow
+            Write-Host "  authSource - so a 401 here is the account or the password, not the shape of the name." -ForegroundColor Yellow
+            Write-Host "  Check '$($Global:AriaAuthSource)' is still the Source Display Name under Administration >" -ForegroundColor Yellow
+            Write-Host "  Authentication Sources, and that the account can sign in to the Aria UI." -ForegroundColor Yellow
         }
         Write-Host "  The run continues without suppression." -ForegroundColor Yellow
         # The credential is dropped so a wrong one is not reused. NOT retried: the same password
@@ -6402,9 +6359,12 @@ function Get-ClusterDeployRuleTarget {
              this cluster. That is the other direction of the same association and covers a host
              that is powered off, unreachable, or not yet known to Auto Deploy.
 
-        EVERY HOST IS ASKED, not just the first, and a cluster whose hosts match rules naming
-        DIFFERENT image profiles is reported rather than resolved. Picking one silently would send
-        half the cluster to an image it was never meant to have.
+        EVERY HOST IS ASKED, not just the first. A cluster is expected to have ONE image profile
+        across its rules - that is what the rules are for - and every host in it is required to be
+        on that profile. So where more than one turns up, the most-cited one is taken and the rest
+        are reported LOUDLY rather than the run stopping: a cluster split across two images is a
+        rule set that wants tidying, not a reason to abandon a change window. What was chosen and
+        what was ignored both go to the console and the run summary, so it cannot pass unnoticed.
 
         Returns an object with Name and Rule, both "" when nothing could be read. Never throws:
         Auto Deploy being unavailable is a question to put to the operator, not a crash.
@@ -6478,14 +6438,22 @@ function Get-ClusterDeployRuleTarget {
     if ($found.Count -eq 0) { return $empty }
 
     if ($found.Count -gt 1) {
-        # NOT resolved silently. Half a cluster sent to an image it was never meant to have is a
-        # worse outcome than a run that stops and asks.
+        # One cluster, one image. Where the rules disagree, the most-cited profile is taken and the
+        # disagreement is put on the record - the run carries on, because a rule set that wants
+        # tidying is not a reason to abandon a change window, but it is never silent.
+        # Deterministic: most rules citing it, then alphabetical, so two runs never differ.
+        $ranked = @($found.Keys | Sort-Object @{ Expression = { $found[$_].Count }; Descending = $true }, @{ Expression = { $_ } })
+        $chosen = [string]$ranked[0]
+
         Write-Host "  The Auto Deploy rules for this cluster name MORE THAN ONE image profile:" -ForegroundColor Yellow
         foreach ($name in ($found.Keys | Sort-Object)) {
-            Write-Host "    $name - from rule(s): $($found[$name] -join ', ')" -ForegroundColor Yellow
+            $marker = $(if ($name -eq $chosen) { "USING" } else { "ignored" })
+            Write-Host "    [$marker] $name - from rule(s): $($found[$name] -join ', ')" -ForegroundColor Yellow
         }
-        Write-Host "  That is a rule set question, not something this run can decide." -ForegroundColor Yellow
-        return $empty
+        Write-Host "  Every host in this cluster is taken to require '$chosen'. Tidy the rule set if that is wrong." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Resolve ESXi target" -Result "Ambiguous" -Details "Rules named $($found.Count) image profiles ($(($found.Keys | Sort-Object) -join ', ')); '$chosen' used for every host."
+
+        return [pscustomobject]@{ Name = $chosen; Rule = ($found[$chosen] -join ', ') }
     }
 
     $profileName = @($found.Keys)[0]
@@ -6602,6 +6570,11 @@ function Resolve-ClusterEsxiTarget {
         stale the moment anyone edits the rule - agreeing with it by luck rather than by
         construction.
 
+        ONE IMAGE PER CLUSTER, REQUIRED OF EVERY HOST IN IT. The rule is a cluster-wide statement,
+        so the profile it names is what every host in that cluster is expected to be running - not
+        a per-host target worked out host by host. Step 2 exists only to say which of them are not
+        there yet.
+
         Where Auto Deploy cannot be read, the operator is asked for the image profile name rather
         than the run inventing one or carrying on with no target at all. Exiting is offered on the
         same prompt, because "I do not know what these hosts should be running" is a perfectly good
@@ -6650,6 +6623,8 @@ function Resolve-ClusterEsxiTarget {
         $Global:TargetDeployRuleName = $target.Rule
         Write-Host "  Rule '$($target.Rule)' names image profile '$($target.Name)'." -ForegroundColor Green
     }
+
+    Write-Host "  Every host in '$($Cluster.Name)' is required to be on '$($Global:TargetImageProfileName)'." -ForegroundColor Green
 
     if ($Global:TargetImageProfileName -match '(\d{6,})') { $Global:TargetEsxiBuild = $Matches[1] }
 

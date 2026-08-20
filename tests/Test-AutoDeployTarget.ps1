@@ -137,17 +137,35 @@ $script:Rules = @([pscustomobject]@{ Name = 'other-rule'
 $target = Get-ClusterDeployRuleTarget -Cluster $cluster -Hosts $hosts 6>$null
 Assert-Equal "another cluster's rule is ignored" "" $target.Name
 
-Write-Host "`n=== Two different image profiles is reported, not resolved ===" -ForegroundColor Cyan
-# Half a cluster sent to an image it was never meant to have is worse than a run that stops to ask.
+Write-Host "`n=== One image per cluster, required of every host in it ===" -ForegroundColor Cyan
+# A cluster is expected to have one image profile across its rules - that is what the rules are
+# for - and every host in it is required to be on it. Where the rules disagree, the most-cited one
+# is taken and the disagreement goes on the record: a rule set that wants tidying is not a reason
+# to abandon a change window, but it is never silent.
 Reset-Fixture
 $script:Rules = @(
     [pscustomobject]@{ Name = 'rule-a'; ItemList = @((New-ImageProfile -Name 'ESXi-8.0U3j-25429389-standard'), 'd85cvt02') }
-    [pscustomobject]@{ Name = 'rule-b'; ItemList = @((New-ImageProfile -Name 'ESXi-8.0U3k-26000000-standard'), 'd85cvt02') })
+    [pscustomobject]@{ Name = 'rule-b'; ItemList = @((New-ImageProfile -Name 'ESXi-8.0U3j-25429389-standard'), 'd85cvt02') }
+    [pscustomobject]@{ Name = 'rule-c'; ItemList = @((New-ImageProfile -Name 'ESXi-8.0U3k-26000000-standard'), 'd85cvt02') })
+$target = Get-ClusterDeployRuleTarget -Cluster $cluster -Hosts $hosts 6>$null
+Assert-Equal "the most-cited profile is used" "ESXi-8.0U3j-25429389-standard" $target.Name
 $out = Get-ClusterDeployRuleTarget -Cluster $cluster -Hosts $hosts 6>&1
 $text = ($out | Out-String)
-Assert-Equal "no target is chosen" $true ([string]::IsNullOrWhiteSpace(($out | Where-Object { $_ -is [pscustomobject] } | Select-Object -Last 1).Name))
-Assert-Equal "both profiles are named" $true (($text -match '8.0U3j') -and ($text -match '8.0U3k'))
-Assert-Equal "and both rules" $true (($text -match 'rule-a') -and ($text -match 'rule-b'))
+Assert-Equal "the disagreement is reported" $true (($text -match '8.0U3j') -and ($text -match '8.0U3k'))
+Assert-Equal "with the chosen one marked" $true ($text -match '\[USING\] ESXi-8.0U3j')
+Assert-Equal "and the other marked ignored" $true ($text -match '\[ignored\] ESXi-8.0U3k')
+Assert-Equal "and it goes to the run summary" "Ambiguous" (@($Global:RunSummary.ToArray() | Where-Object { $_.Action -eq 'Resolve ESXi target' })[-1].Result)
+# Deterministic on a tie - alphabetical - so two runs of the same rule set never differ.
+Reset-Fixture
+$script:Rules = @(
+    [pscustomobject]@{ Name = 'rule-z'; ItemList = @((New-ImageProfile -Name 'ESXi-8.0U3k-26000000-standard'), 'd85cvt02') }
+    [pscustomobject]@{ Name = 'rule-a'; ItemList = @((New-ImageProfile -Name 'ESXi-8.0U3j-25429389-standard'), 'd85cvt02') })
+Assert-Equal "a tie is broken by name, not by rule order" "ESXi-8.0U3j-25429389-standard" (Get-ClusterDeployRuleTarget -Cluster $cluster -Hosts $hosts 6>$null).Name
+
+# The requirement is stated cluster-wide, not implied.
+Reset-Fixture
+$out = Resolve-ClusterEsxiTarget -Cluster $cluster -Hosts $hosts 6>&1
+Assert-Equal "every host is said to require it" $true (($out | Out-String) -match "Every host in 'd85cvt02' is required to be on 'ESXi-8.0U3j-25429389-standard'")
 
 Write-Host "`n=== The hosts that differ are the hosts that need updating ===" -ForegroundColor Cyan
 Reset-Fixture

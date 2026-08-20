@@ -12,6 +12,55 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.25.0] — 2026-08-20
+
+#### Changed
+
+- **One image profile per cluster, required of every host in it.** Where a cluster's
+  Auto Deploy rules name more than one image profile, the run no longer stops. The
+  most-cited profile is taken, every host in the cluster is held to it, and the
+  disagreement is reported LOUDLY — each profile listed as `[USING]` or `[ignored]`
+  with the rules that named it, plus an `Ambiguous` row in the run summary. A rule set
+  that wants tidying is not a reason to abandon a change window, but it is never
+  silent. The pick is deterministic — most rules citing it, then alphabetical — so two
+  runs of the same rule set never differ.
+
+  `Resolve-ClusterEsxiTarget` now states the requirement outright rather than implying
+  it: *Every host in 'd85cvt02' is required to be on 'ESXi-…'.* The per-host
+  comparison remains, but only to say which of them are not there yet.
+
+- **Aria sends the bare account name.** The logon is now exactly:
+
+  ```
+  username   = nick.beare_priv
+  authSource = vIDMAuthSource
+  ```
+
+  Broadcom's KB for acquiring a token through a vIDM source describes a qualified
+  `user@vIDM-domain@source-name` form, and 23.24.0 composed that. **This appliance
+  does not want it** — established by testing, which beats the documentation here — so
+  nothing is composed and `$Global:AriaVidmDomain` is gone.
+
+  One transform survives: a NetBIOS `DOMAIN\` prefix is stripped, because a vCenter
+  credential is commonly entered as `DPE\nick.beare_priv` and that prefix names the
+  directory it came from rather than the account. So the vCenter passthrough sends
+  exactly `nick.beare_priv`. A UPN or an already-qualified name is passed through
+  untouched.
+
+  A 401 now says plainly that the shape of the name is not the variable — it is the
+  account or the password.
+
+#### Tests
+
+- `tests/Test-AutoDeployTarget.ps1` — 34 assertions: the most-cited profile winning,
+  the alphabetical tie-break, both profiles reported with `[USING]`/`[ignored]`, the
+  summary row, and the cluster-wide requirement being stated.
+- `tests/Test-AriaSuppression.ps1` — 86 assertions: the account sent as-is, the
+  NetBIOS prefix stripped, UPNs and qualified names untouched, the wire-level body
+  carrying the bare username, and a guard that the vIDM domain composition cannot
+  come back.
+- Full suite: 1238 assertions across 24 files, all passing.
+
 ### [23.24.0] — 2026-08-20
 
 #### Changed
