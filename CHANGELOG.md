@@ -12,6 +12,77 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.19.0] — 2026-08-20
+
+#### Fixed
+
+- **The root password was never set, because the root account was being looked
+  for by name and a live profile does not carry one.** A real 8.x profile reports
+  its root password policy as:
+
+  ```
+  security_SecurityProfile_SecurityConfigProfile[0]/security_UserAccountProfile_UserAccountProfile[0]
+    key='41e2edead49279779811277c43cc8987773489efab6fb3a51b0249c159a1f02c'
+    policy='security.UserAccountProfile.PasswordPolicy'
+    option='security.UserAccountProfile.DefaultAccountPasswordUnchangedOption'
+  ```
+
+  The key is a **hash**, not an account name, so nothing anywhere in that node
+  says "root" — and the finder, which required exactly that, reported *"no root
+  account password policy"* against a profile that plainly had one.
+
+  What does identify it is the option in force. The **default account** in an ESXi
+  host profile is root: `DefaultAccountPasswordUnchangedOption` is the UI's "Leave
+  password unchanged for default account", which lives under Security Settings >
+  Security > User Configuration > **root** and nowhere else. That is now a second
+  way of recognising the account, and candidates are **ranked** rather than taken
+  first-come — a node that actually names root beats one merely marked as the
+  default account, and a node naming a *different* account (`key='monitoring'`) is
+  never matched at all. A hashed key counts as no evidence either way, which is
+  the whole case that needed handling.
+
+- **The option it would have switched to was not namespace-qualified.** The
+  fallback was the bare word `FixedPasswordConfigOption`, but a live profile spells
+  these fully — `security.UserAccountProfile.…` — so the write would have been
+  rejected wherever `QueryPolicyMetadata` could not be read. The id is now
+  **derived** from the option already in force (same namespace, always), with the
+  configured value as a last resort and itself corrected to
+  `security.UserAccountProfile.FixedPasswordConfigOption`.
+
+- **Aria Operations 401 on a vIDM source, with a password that was known good.**
+  Passing through the credential that had just authenticated against vCenter still
+  produced a 401, because Aria will not resolve a bare account name against a vIDM
+  source. Per Broadcom's KB on acquiring a token through the vIDM source, the
+  `username` field has to carry the whole path:
+
+  ```
+  vIDM_Username@vIDM_DOMAIN@vIDM_SOURCE_NAME_IN_ARIA
+  ```
+
+  e.g. `nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource`, and for an account
+  created inside vIDM itself the middle part is the literal string `System Domain`.
+  Anything else is a 401 — indistinguishable, from the outside, from a wrong
+  password, which is why the passthrough looked like it had broken something.
+
+  When the chosen source looks like vIDM the username is now qualified before it is
+  sent. A name already carrying two `@` is left alone; one carrying a domain only
+  gains the source; a bare name prompts once for the vIDM domain
+  (`$Global:AriaVidmDomain` skips it). **Every other source is untouched** — LOCAL
+  and Active Directory accounts go exactly as entered, with the source in
+  `authSource`, which is the ordinary documented case. The credential itself is
+  held as typed; only the form sent to the appliance changes. A 401 now names the
+  exact string that was sent, so the next attempt is not guesswork.
+
+#### Tests
+
+- `tests/Test-HostProfileActiveDirectory.ps1` — 76 assertions, 10 new: the live
+  profile's hashed key and default-account option being matched, a named account
+  never being mistaken for root, root beating the default-account node when both
+  are present, and the fixed-password id being derived from the option in force.
+- `tests/Test-AriaSuppression.ps1` — 68 assertions, 17 new, covering every vIDM
+  username form and asserting that LOCAL and AD accounts are sent unchanged.
+- Full suite: 1050 assertions across 23 files, all passing.
+
 ### [23.18.0] — 2026-08-20
 
 #### Added

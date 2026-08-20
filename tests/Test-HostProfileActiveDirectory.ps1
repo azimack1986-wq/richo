@@ -108,7 +108,7 @@ function New-TestProfileTree {
 $script:RootPasswordOption = 'DefaultAccountPasswordUnchangedConfigOption'
 $script:RootPasswordParameter = $null
 $Global:SetRootPasswordInHostProfile = $true
-$Global:HostProfileFixedPasswordOptionId = 'FixedPasswordConfigOption'
+$Global:HostProfileFixedPasswordOptionId = 'security.UserAccountProfile.FixedPasswordConfigOption'
 if (-not ('VMware.Vim.KeyAnyValue' -as [type])) {
     Add-Type -TypeDefinition @'
 namespace VMware.Vim {
@@ -274,7 +274,7 @@ $before = Get-EnabledSnapshot -Tree $tree
 Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
 
 $rootPolicy = $tree.UserAccount[0].Policy[0]
-Assert-Equal "the option was switched to the fixed-password one" "FixedPasswordConfigOption" $rootPolicy.PolicyOption.Id
+Assert-Equal "the option was switched to the fixed-password one" "security.UserAccountProfile.FixedPasswordConfigOption" $rootPolicy.PolicyOption.Id
 Assert-Equal "carrying one parameter" 1 @($rootPolicy.PolicyOption.Parameter).Count
 Assert-Equal "named password" "password" @($rootPolicy.PolicyOption.Parameter)[0].Key
 Assert-Equal "with the password that was entered" "S3cret-Passw0rd!" @($rootPolicy.PolicyOption.Parameter)[0].Value
@@ -371,11 +371,62 @@ Assert-Equal "found regardless of the profile type name" $true ($null -ne $found
 $found = Get-HostProfileRootPasswordPolicy -ApplyProfile (New-TreeWith (New-PasswordNode -Key 'monitoring' -PolicyId 'PasswordPolicy' -OptionId 'DefaultAccountPasswordUnchangedConfigOption')) 6>$null
 Assert-Equal "another account is not mistaken for root" $true ($null -eq $found)
 
+Write-Host "`n=== The LIVE profile: a hashed key and the default-account option ===" -ForegroundColor Cyan
+# What a real 8.x profile actually reports, and what the finder used to miss entirely:
+#
+#   key='41e2edead49279779811277c43cc8987773489efab6fb3a51b0249c159a1f02c'
+#   policy='security.UserAccountProfile.PasswordPolicy'
+#   option='security.UserAccountProfile.DefaultAccountPasswordUnchangedOption'
+#
+# The key is a hash, not an account name, so nothing in the tree says "root". What does say it is
+# the option: the DEFAULT ACCOUNT in an ESXi host profile is root - that option is the UI's "Leave
+# password unchanged for default account" under Security Settings > Security > User Configuration
+# > root, and it exists nowhere else.
+$live = New-TreeWith (New-PasswordNode -Key '41e2edead49279779811277c43cc8987773489efab6fb3a51b0249c159a1f02c' `
+    -PolicyId 'security.UserAccountProfile.PasswordPolicy' `
+    -OptionId 'security.UserAccountProfile.DefaultAccountPasswordUnchangedOption' `
+    -Type 'security_UserAccountProfile_UserAccountProfile')
+$found = Get-HostProfileRootPasswordPolicy -ApplyProfile $live 6>$null
+Assert-Equal "the live profile's root policy is found" $true ($null -ne $found)
+Assert-Equal "and read as leaving the password unchanged" $false $found.HasPassword
+Assert-Equal "matched as the default account, not by name" 2 $found.Rank
+Assert-Equal "the option in force is carried back for the namespace" "security.UserAccountProfile.DefaultAccountPasswordUnchangedOption" $found.OptionId
+
+# A hashed key on its own is not evidence of ANOTHER account, but a real name is - so a named
+# account is never mistaken for root even if it somehow carried the default-account option.
+$named = New-TreeWith (New-PasswordNode -Key 'monitoring' `
+    -PolicyId 'security.UserAccountProfile.PasswordPolicy' `
+    -OptionId 'security.UserAccountProfile.DefaultAccountPasswordUnchangedOption')
+Assert-Equal "a named account still is not root" $true ($null -eq (Get-HostProfileRootPasswordPolicy -ApplyProfile $named 6>$null))
+
+# Where both are present, the one that actually names root wins - the walk does not stop early.
+$both = New-Node -Type 'HostApplyProfile'
+$both | Add-Member -MemberType NoteProperty -Name UserAccount -Value @(
+    (New-PasswordNode -Key 'deadbeefdeadbeefdeadbeefdeadbeef' -PolicyId 'security.UserAccountProfile.PasswordPolicy' -OptionId 'security.UserAccountProfile.DefaultAccountPasswordUnchangedOption'),
+    (New-PasswordNode -Key 'root' -PolicyId 'security.UserAccountProfile.PasswordPolicy' -OptionId 'security.UserAccountProfile.DefaultAccountPasswordUnchangedOption'))
+$found = Get-HostProfileRootPasswordPolicy -ApplyProfile $both 6>$null
+Assert-Equal "the node naming root beats the default-account one" "root" $found.Node.Key
+Assert-Equal "and is ranked accordingly" 3 $found.Rank
+
+Write-Host "`n=== The fixed-password option id is derived, not guessed ===" -ForegroundColor Cyan
+# The option id is fully qualified on a live profile, so the bare word that used to be the fallback
+# would have been rejected. When the metadata cannot be read, the namespace comes from the option
+# already in force - the two always live in the same one.
+function Get-View { param($Id,$ErrorAction) throw "no metadata here" }
+$derived = Get-HostProfileFixedPasswordOptionId -ProfileView ([pscustomobject]@{ Client = $null; MoRef = $null }) `
+    -PolicyId 'security.UserAccountProfile.PasswordPolicy' `
+    -CurrentOptionId 'security.UserAccountProfile.DefaultAccountPasswordUnchangedOption' 6>$null
+Assert-Equal "derived from the option in force" "security.UserAccountProfile.FixedPasswordConfigOption" $derived
+$fallback = Get-HostProfileFixedPasswordOptionId -ProfileView ([pscustomobject]@{ Client = $null; MoRef = $null }) `
+    -PolicyId 'p' -CurrentOptionId '' 6>$null
+Assert-Equal "and the configured id is the last resort" $Global:HostProfileFixedPasswordOptionId $fallback
+Assert-Equal "which is itself fully qualified" $true ($Global:HostProfileFixedPasswordOptionId -match '^security\.UserAccountProfile\.')
+
 Write-Host "`n=== A miss says what it did see ===" -ForegroundColor Cyan
 # "No root account password policy" on a profile that has one is not something anyone can act on.
 $output = Get-HostProfileRootPasswordPolicy -ApplyProfile (New-TreeWith (New-PasswordNode -Key 'monitoring' -PolicyId 'PasswordPolicy' -OptionId 'DefaultAccountPasswordUnchangedConfigOption')) 6>&1
 $text = ($output | Out-String)
-Assert-Equal "the policies it found are listed" $true ($text -match 'none of them on an account named root')
+Assert-Equal "the policies it found are listed" $true ($text -match 'none of them identifiable as root or the default account')
 Assert-Equal "with the key it saw" $true ($text -match "key='monitoring'")
 Assert-Equal "and the option id" $true ($text -match 'DefaultAccountPasswordUnchangedConfigOption')
 

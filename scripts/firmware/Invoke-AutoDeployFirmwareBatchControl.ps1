@@ -382,7 +382,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.18.0"
+$ScriptVersion = "23.19.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -684,6 +684,13 @@ $Global:AriaSuppressionGroupName = "ESXi Patching Hardware Suppression"
 # one, so the right answer comes from the appliance being used rather than from a guess baked in
 # here that is wrong at every other site. Set it to a Source Display Name to skip the question.
 $Global:AriaAuthSource = ""
+# The vIDM DOMAIN, needed only when the chosen authentication source is a vIDM / Workspace ONE
+# source. Aria's suite-api will not resolve a bare account name against vIDM: the username has to
+# arrive as user@vIDM-domain@source-name, e.g. nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource.
+# Sending the bare name is a 401 that looks exactly like a wrong password. Set this to skip the
+# question; it is the domain as vIDM itself shows it, which for accounts created inside vIDM is
+# the literal string "System Domain".
+$Global:AriaVidmDomain = ""
 $Global:AriaSkipCertificateCheck = $true
 $Global:AriaCredential = $null
 $Global:AriaSession = $null
@@ -703,9 +710,13 @@ $Global:HostProfileActiveDirectoryPatterns = @(
 # unchanged, the password entered for the cluster is put in; where a password is already set,
 # nothing is touched. $false turns the whole thing off.
 $Global:SetRootPasswordInHostProfile = $true
-# Only used when the Profile Engine's own policy metadata cannot be read - see
-# Get-HostProfileFixedPasswordOptionId, which asks the appliance for this first.
-$Global:HostProfileFixedPasswordOptionId = "FixedPasswordConfigOption"
+# Only used when the Profile Engine's own policy metadata cannot be read AND the namespace cannot
+# be derived from the option currently in force - see Get-HostProfileFixedPasswordOptionId, which
+# tries both of those first. Fully qualified because that is the form the profile engine uses:
+# a live 8.x profile reports its current option as
+# 'security.UserAccountProfile.DefaultAccountPasswordUnchangedOption', so the bare word
+# "FixedPasswordConfigOption" that used to sit here would have been rejected.
+$Global:HostProfileFixedPasswordOptionId = "security.UserAccountProfile.FixedPasswordConfigOption"
 
 # Which nodes THIS RUN unticked, per profile name, so the re-tick puts back only those and leaves a
 # setting that was already off exactly as it was found.
@@ -5829,6 +5840,97 @@ function Get-AriaAuthSourceName {
     return @($names.ToArray())
 }
 
+function Test-AriaVidmAuthSource {
+    <#
+    .SYNOPSIS
+        Does this authentication source name look like a vIDM / Workspace ONE source?
+
+    .DESCRIPTION
+        The name is operator-chosen, so this is a heuristic and is treated as one: getting it wrong
+        only means the username is left alone, which is the behaviour every other source wants.
+
+    .PARAMETER Name
+        The Source Display Name.
+
+    .EXAMPLE
+        Test-AriaVidmAuthSource -Name "vIDMAuthSource"   # $true
+    #>
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string]$Name)
+    return ($Name -match '(?i)vidm|workspace|ws1|wsone')
+}
+
+function Resolve-AriaUserName {
+    <#
+    .SYNOPSIS
+        The username to actually send to suite-api, qualified for a vIDM source.
+
+    .DESCRIPTION
+        For every source except vIDM, the account is sent as typed and the source goes in the
+        authSource field - the ordinary case, unchanged.
+
+        vIDM is the exception, and it is not guessable. Aria will not resolve a bare account name
+        against a vIDM source; the username field has to carry the whole path:
+
+            vIDM_Username@vIDM_DOMAIN@vIDM_SOURCE_NAME_IN_ARIA
+
+        for example nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource, and for an account created
+        inside vIDM itself the middle part is the literal string "System Domain". Anything else is
+        a 401 - which is indistinguishable, from the outside, from a wrong password, and is exactly
+        what a passthrough of a working vCenter credential produced.
+
+        Already-qualified names are left alone: two @ signs means the operator has done this
+        themselves. A name carrying one @ only has the source appended.
+
+        Returns the name unchanged if no domain is available, rather than inventing one.
+
+    .PARAMETER UserName
+        The account as entered.
+
+    .PARAMETER AuthSource
+        The Source Display Name chosen for this run.
+
+    .EXAMPLE
+        Resolve-AriaUserName -UserName "svc-esxi" -AuthSource "vIDMAuthSource"
+    #>
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$UserName,
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$AuthSource
+    )
+
+    if ([string]::IsNullOrWhiteSpace($UserName)) { return $UserName }
+    if (-not (Test-AriaVidmAuthSource -Name $AuthSource)) { return $UserName }
+
+    # Two @ signs already: user@domain@source. Nothing to add.
+    if (([regex]::Matches($UserName, '@')).Count -ge 2) { return $UserName }
+
+    # One @ sign: user@domain. Only the source is missing.
+    if ($UserName.Contains('@')) {
+        $qualified = "$UserName@$AuthSource"
+        Write-Host "  vIDM source: signing in as '$qualified'." -ForegroundColor DarkGray
+        return $qualified
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Global:AriaVidmDomain)) {
+        Write-Host "" -ForegroundColor Yellow
+        Write-Host "  '$AuthSource' looks like a vIDM source, and vIDM will not accept a bare account name." -ForegroundColor Yellow
+        Write-Host "  It needs the account as user@vIDM-domain@source-name, so the domain is needed here." -ForegroundColor Yellow
+        Write-Host "  That is the domain as vIDM itself shows it - the AD domain for a federated account," -ForegroundColor Gray
+        Write-Host "  or the literal 'System Domain' for an account created inside vIDM." -ForegroundColor Gray
+        Write-Host "  Leave it blank to send '$UserName' exactly as entered." -ForegroundColor Gray
+        $typed = Read-Host "vIDM domain for '$UserName'"
+        if (-not [string]::IsNullOrWhiteSpace($typed)) { $Global:AriaVidmDomain = $typed.Trim() }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($Global:AriaVidmDomain)) {
+        Write-Host "  No vIDM domain given - sending '$UserName' as entered, which vIDM will probably refuse." -ForegroundColor Yellow
+        return $UserName
+    }
+
+    $qualified = "$UserName@$($Global:AriaVidmDomain)@$AuthSource"
+    Write-Host "  vIDM source: signing in as '$qualified'." -ForegroundColor DarkGray
+    return $qualified
+}
+
 function Select-AriaAuthSource {
     <#
     .SYNOPSIS
@@ -5940,9 +6042,13 @@ function Connect-AriaOperations {
         return $false
     }
 
+    # The credential is held exactly as entered; only the form sent to the appliance is adjusted,
+    # and only for vIDM. See Resolve-AriaUserName.
+    $sendUser = Resolve-AriaUserName -UserName $Global:AriaCredential.UserName -AuthSource $Global:AriaAuthSource
+
     try {
         $acquire = Invoke-AriaRestCall -Method "POST" -Path "/suite-api/api/auth/token/acquire" -Body @{
-            username   = $Global:AriaCredential.UserName
+            username   = $sendUser
             authSource = $Global:AriaAuthSource
             password   = $Global:AriaCredential.GetNetworkCredential().Password
         }
@@ -5952,16 +6058,25 @@ function Connect-AriaOperations {
         $Global:AriaSession = $token
         Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $true
         Write-Host "  Signed in to Aria Operations." -ForegroundColor Green
-        Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Connected" -Details "$($Global:AriaOperationsServer) as $($Global:AriaCredential.UserName) via authSource $($Global:AriaAuthSource)."
+        Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Connected" -Details "$($Global:AriaOperationsServer) as $sendUser via authSource $($Global:AriaAuthSource)."
         return $true
     }
     catch {
         Write-Host "  Aria Operations sign-in failed: $($_.Exception.Message)" -ForegroundColor Yellow
         if ("$($_.Exception.Message)" -match '401') {
-            Write-Host "  A 401 here is usually the SOURCE, not the password: '$($Global:AriaAuthSource)' has to be the" -ForegroundColor Yellow
-            Write-Host "  Source Display Name from Administration > Authentication Sources that holds this account." -ForegroundColor Yellow
-            Write-Host "  LOCAL only ever holds accounts created inside Aria itself; a domain account belongs to its" -ForegroundColor Yellow
-            Write-Host "  Active Directory or vIDM source. Some sources also want the account as user@domain." -ForegroundColor Yellow
+            Write-Host "  The account was sent as '$sendUser' against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Yellow
+            if (Test-AriaVidmAuthSource -Name $Global:AriaAuthSource) {
+                Write-Host "  For a vIDM source the username must be user@vIDM-domain@source-name - if the domain" -ForegroundColor Yellow
+                Write-Host "  above is wrong, that alone is a 401 even with the right password. Check the domain in" -ForegroundColor Yellow
+                Write-Host "  vIDM (it is 'System Domain' for accounts created inside vIDM), set" -ForegroundColor Yellow
+                Write-Host "  `$Global:AriaVidmDomain at the top of this script, and run again." -ForegroundColor Yellow
+            }
+            else {
+                Write-Host "  A 401 here is usually the SOURCE, not the password: '$($Global:AriaAuthSource)' has to be the" -ForegroundColor Yellow
+                Write-Host "  Source Display Name from Administration > Authentication Sources that holds this account." -ForegroundColor Yellow
+                Write-Host "  LOCAL only ever holds accounts created inside Aria itself; a domain account belongs to its" -ForegroundColor Yellow
+                Write-Host "  Active Directory or vIDM source. Some sources also want the account as user@domain." -ForegroundColor Yellow
+            }
         }
         Write-Host "  The run continues without suppression." -ForegroundColor Yellow
         # Both dropped, so a fresh source and password are asked for rather than a wrong pair being
@@ -5969,6 +6084,7 @@ function Connect-AriaOperations {
         # somewhere else is how an account gets locked out, and this is a courtesy, not the change.
         $Global:AriaCredential = $null
         $Global:AriaAuthSource = ""
+        $Global:AriaVidmDomain = ""
         Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $false
         $Global:AriaUnusable = $true
         Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Failed" -Details "$($Global:AriaOperationsServer) - $($_.Exception.Message)"
@@ -6939,12 +7055,35 @@ function Get-HostProfileRootPasswordPolicy {
         which is exactly how the two are told apart here - by whether the option in force carries a
         password parameter, not by matching an option id string that differs between releases.
 
+        WHICH NODE IS ROOT. Not the node key. On a live 8.x profile that node reports
+
+            key='41e2edead49279779811277c43cc8987773489efab6fb3a51b0249c159a1f02c'
+
+        - a hash, not an account name - so a matcher that insisted on a key of 'root' could never
+        match it, and reported "no root account password policy" against a profile that plainly
+        had one. What DOES identify it is the option in force:
+
+            security.UserAccountProfile.DefaultAccountPasswordUnchangedOption
+
+        The DEFAULT ACCOUNT in an ESXi host profile is root. That is the whole meaning of the term
+        in this schema: the option is the UI's "Leave password unchanged for default account",
+        which sits under Security Settings > Security > User Configuration > root and nowhere else.
+        So a password policy whose id or option names the default account IS root's.
+
+        Candidates are RANKED rather than taken first-come, because a profile may carry other user
+        accounts and setting a password on the wrong one is worse than setting none:
+
+            3  the node, a parameter or the path names the account root
+            2  the policy or its option names the DEFAULT account
+            (nothing else qualifies - an unidentifiable account is left alone)
+
         Returns the node, the policy and HasPassword, or $null where the profile has no root user
         account. Never returns the password itself.
     #>
     param([Parameter(Mandatory=$true)]$ApplyProfile)
 
     $seen = New-Object System.Collections.Generic.List[string]
+    $best = $null
 
     foreach ($row in (Get-HostProfileApplyNode -Node $ApplyProfile)) {
         $node = $row.Node
@@ -6983,23 +7122,60 @@ function Get-HostProfileRootPasswordPolicy {
             }
             if (-not $namedRoot -and [string]$row.Path -match '(?i)(^|/)root(\[|/|$)') { $namedRoot = $true }
 
-            [void]$seen.Add("$($row.Path) [$($row.ProfileTypeName)] key='$key' policy='$([string]$policy.Id)' option='$([string]$option.Id)'")
-            if (-not $namedRoot) { continue }
+            # THE DEFAULT ACCOUNT IS ROOT. 'security.UserAccountProfile.DefaultAccountPasswordUnchangedOption'
+            # is the UI's "Leave password unchanged for default account", which exists only on
+            # root's password policy - and on the builds where it appears, the node's key is a hash
+            # rather than the account name, so this is the only thing left to recognise it by.
+            $defaultAccount = ([string]$option.Id -match '(?i)defaultaccount') -or
+                              ([string]$policy.Id -match '(?i)defaultaccount')
 
-            return [pscustomobject]@{
+            # ...BUT ONLY WHERE NOTHING NAMES A DIFFERENT ACCOUNT. A key of 'monitoring' is
+            # positive evidence that this is somebody else's account, and outranks an option id.
+            # A key that is a hash is not evidence of anything, which is the case that made the
+            # default-account test necessary in the first place, so hashes do not count here.
+            $namesOtherAccount = $false
+            if (-not $namedRoot) {
+                if (-not [string]::IsNullOrWhiteSpace($key) -and $key -notmatch '^[0-9a-fA-F]{16,}$') { $namesOtherAccount = $true }
+                foreach ($parameter in $parameters) {
+                    if ([string]$parameter.Key -notmatch '(?i)^(name|user|username|userName|account)$') { continue }
+                    if (-not [string]::IsNullOrWhiteSpace([string]$parameter.Value)) { $namesOtherAccount = $true }
+                }
+            }
+
+            $rank = 0
+            if ($namedRoot) { $rank = 3 }
+            elseif ($defaultAccount -and -not $namesOtherAccount) { $rank = 2 }
+
+            [void]$seen.Add("$($row.Path) [$($row.ProfileTypeName)] key='$key' policy='$([string]$policy.Id)' option='$([string]$option.Id)' match=$(if ($rank -eq 3) { 'root' } elseif ($rank -eq 2) { 'default-account' } else { 'none' })")
+            if ($rank -eq 0) { continue }
+
+            $candidate = [pscustomobject]@{
                 Path        = $row.Path
                 Node        = $node
                 Policy      = $policy
                 HasPassword = ($parameterKeys -contains 'password')
                 OptionId    = [string]$option.Id
+                Rank        = $rank
             }
+
+            # A node that actually names root beats one merely marked as the default account, so
+            # the whole tree is walked rather than stopping at the first thing that could be it.
+            if ($null -eq $best -or $candidate.Rank -gt $best.Rank) { $best = $candidate }
+            if ($best.Rank -eq 3) { break }
         }
+
+        if ($null -ne $best -and $best.Rank -eq 3) { break }
+    }
+
+    if ($null -ne $best) {
+        Write-Host "    Root password policy: $($best.Path) - matched $(if ($best.Rank -eq 3) { 'on the account name' } else { 'as the default account, which in an ESXi host profile is root' })." -ForegroundColor DarkGray
+        return $best
     }
 
     # Nothing matched. What WAS there is printed, because "no root account password policy" on a
     # profile that plainly has one is not something anyone can act on.
     if ($seen.Count -gt 0) {
-        Write-Host "    Password policies found, none of them on an account named root:" -ForegroundColor DarkGray
+        Write-Host "    Password policies found, none of them identifiable as root or the default account:" -ForegroundColor DarkGray
         foreach ($entry in $seen.ToArray()) { Write-Host "      $entry" -ForegroundColor DarkGray }
     }
     else {
@@ -7020,12 +7196,30 @@ function Get-HostProfileFixedPasswordOptionId {
         policy's possible options, and the fixed-password one is the option declaring a parameter
         called password - or, failing that, one marked securitySensitive.
 
-        Falls back to $Global:HostProfileFixedPasswordOptionId where the metadata cannot be read,
-        and says which route was taken so a wrong id is diagnosable rather than mysterious.
+        Where the metadata cannot be read, the id is DERIVED from the option currently in force
+        rather than guessed: the two live in the same namespace, so
+        'security.UserAccountProfile.DefaultAccountPasswordUnchangedOption' gives
+        'security.UserAccountProfile.FixedPasswordConfigOption'. That matters because the option id
+        is fully qualified on a live profile, and the bare word that used to be the fallback would
+        have been rejected by the profile engine.
+
+        Falls back to $Global:HostProfileFixedPasswordOptionId only when neither route works, and
+        says which route was taken so a wrong id is diagnosable rather than mysterious.
+
+    .PARAMETER ProfileView
+        The host profile's view, for QueryPolicyMetadata.
+
+    .PARAMETER PolicyId
+        The password policy whose options are wanted.
+
+    .PARAMETER CurrentOptionId
+        The option currently in force, used to derive the namespace when the metadata cannot be
+        read. Optional.
     #>
     param(
         [Parameter(Mandatory=$true)]$ProfileView,
-        [Parameter(Mandatory=$true)][string]$PolicyId
+        [Parameter(Mandatory=$true)][string]$PolicyId,
+        [string]$CurrentOptionId = ""
     )
 
     try {
@@ -7043,9 +7237,18 @@ function Get-HostProfileFixedPasswordOptionId {
         }
     }
     catch {
-        Write-Host "    The policy metadata could not be read ($($_.Exception.Message)); using the configured option id." -ForegroundColor DarkGray
+        Write-Host "    The policy metadata could not be read ($($_.Exception.Message)); deriving the option id instead." -ForegroundColor DarkGray
     }
 
+    # Same namespace as the option in force - the reliable derivation, and the reason the current
+    # option id is passed in at all.
+    if ($CurrentOptionId -match '^(.*)\.[^.]+$') {
+        $derived = "$($Matches[1]).FixedPasswordConfigOption"
+        Write-Host "    Using '$derived', derived from the option currently in force." -ForegroundColor DarkGray
+        return $derived
+    }
+
+    Write-Host "    Using the configured option id '$($Global:HostProfileFixedPasswordOptionId)'." -ForegroundColor DarkGray
     return [string]$Global:HostProfileFixedPasswordOptionId
 }
 
@@ -7122,7 +7325,7 @@ function Set-ClusterHostProfileRootPassword {
 
         if ($null -eq $found) {
             Write-Host "  '$profileName' has no root account password policy - nothing to set." -ForegroundColor Gray
-            Add-SummaryRecord -Stage "HostProfileRootPassword" -Batch "" -HostName "" -Action "Set root password" -Result "NoPolicy" -Details "$profileName - no root user account password policy in the apply profile."
+            Add-SummaryRecord -Stage "HostProfileRootPassword" -Batch "" -HostName "" -Action "Set root password" -Result "NoPolicy" -Details "$profileName - no password policy in the apply profile could be identified as root or the default account."
             continue
         }
 
@@ -7135,7 +7338,7 @@ function Set-ClusterHostProfileRootPassword {
         }
 
         try {
-            $optionId = Get-HostProfileFixedPasswordOptionId -ProfileView $view -PolicyId ([string]$found.Policy.Id)
+            $optionId = Get-HostProfileFixedPasswordOptionId -ProfileView $view -PolicyId ([string]$found.Policy.Id) -CurrentOptionId ([string]$found.OptionId)
             if ([string]::IsNullOrWhiteSpace($optionId)) { throw "the fixed-password policy option could not be identified" }
 
             $parameter = New-Object VMware.Vim.KeyAnyValue

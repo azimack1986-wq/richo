@@ -38,7 +38,8 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
                                  'Invoke-AriaRestCall','Get-AriaCustomDatacenter','Get-AriaMembershipProperty',
                                  'Set-ClusterAriaPatchingSuppression','Test-DryRun',
                                  'Get-RunCredential','Register-RunCredentialResult','Clear-RunCredential',
-                                 'Set-SharedRunCredential','Select-AriaAuthSource','Get-AriaAuthSourceName') } |
+                                 'Set-SharedRunCredential','Select-AriaAuthSource','Get-AriaAuthSourceName',
+                                 'Test-AriaVidmAuthSource','Resolve-AriaUserName') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0
@@ -55,6 +56,7 @@ $Global:AriaOperationsServer = 'siepd85vop1110.dpe.protected.mil.au'
 $Global:AriaSuppressionGroupName = 'ESXi Patching Hardware Suppression'
 $Global:AriaSuppressionGroupId = ''
 $Global:AriaAuthSource = 'LOCAL'
+$Global:AriaVidmDomain = ''
 $Global:AriaSkipCertificateCheck = $true
 $Global:AriaCredential = [pscredential]::new('svc-esxi', (ConvertTo-SecureString 'p' -AsPlainText -Force))
 $Global:AriaSession = $null
@@ -302,6 +304,44 @@ Assert-Equal "suppression goes on before the rolling upgrade" $true (
     $workflowText.IndexOf('Set-ClusterAriaPatchingSuppression -Cluster $Cluster -InSuppression $true') -lt
     $workflowText.IndexOf('Invoke-RollingClusterUpgrade -Cluster $Cluster'))
 Assert-Equal "and comes off in a finally" $true ($workflowText -match '(?s)finally \{[^}]*Set-ClusterAriaPatchingSuppression -Cluster \$Cluster -InSuppression \$false')
+
+Write-Host "`n=== A vIDM source needs the account as user@domain@source ===" -ForegroundColor Cyan
+# A passthrough of a credential that had just worked against vCenter got a 401 from Aria. It was
+# not the password: Aria will not resolve a bare account name against a vIDM source. The username
+# field has to carry the whole path - vIDM_Username@vIDM_DOMAIN@vIDM_SOURCE_NAME_IN_ARIA - and
+# anything else is a 401 that looks exactly like a wrong password from the outside.
+Assert-Equal "a vIDM source is recognised" $true (Test-AriaVidmAuthSource -Name 'vIDMAuthSource')
+Assert-Equal "so is a Workspace ONE one" $true (Test-AriaVidmAuthSource -Name 'Workspace ONE Access')
+Assert-Equal "LOCAL is not" $false (Test-AriaVidmAuthSource -Name 'LOCAL')
+Assert-Equal "nor is an AD source" $false (Test-AriaVidmAuthSource -Name 'DPE Active Directory')
+
+$Global:AriaVidmDomain = 'dpe.protected.mil.au'
+Assert-Equal "a bare name is qualified with domain and source" "nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource" (Resolve-AriaUserName -UserName 'nick.beare_priv' -AuthSource 'vIDMAuthSource' 6>$null)
+# user@domain already: only the source is missing.
+Assert-Equal "a name with a domain only gains the source" "svc@dpe.protected.mil.au@vIDMAuthSource" (Resolve-AriaUserName -UserName 'svc@dpe.protected.mil.au' -AuthSource 'vIDMAuthSource' 6>$null)
+# Fully qualified already - the operator has done this themselves, so nothing is added.
+Assert-Equal "an already-qualified name is left alone" "svc@System Domain@vIDM-1" (Resolve-AriaUserName -UserName 'svc@System Domain@vIDM-1' -AuthSource 'vIDMAuthSource' 6>$null)
+# Every other source is untouched - this is the ordinary case and must not change.
+Assert-Equal "LOCAL is sent exactly as entered" "svc-esxi" (Resolve-AriaUserName -UserName 'svc-esxi' -AuthSource 'LOCAL' 6>$null)
+Assert-Equal "and so is an AD account" "nick.beare_priv" (Resolve-AriaUserName -UserName 'nick.beare_priv' -AuthSource 'DPE Active Directory' 6>$null)
+# No domain known and none typed: send it as entered rather than inventing one.
+$Global:AriaVidmDomain = ''
+function Read-Host { param($Prompt) return '' }
+Assert-Equal "no domain means no invention" "svc-esxi" (Resolve-AriaUserName -UserName 'svc-esxi' -AuthSource 'vIDMAuthSource' 6>$null)
+function Read-Host { param($Prompt) return 'System Domain' }
+Assert-Equal "a typed domain is used" "svc@System Domain@vIDMAuthSource" (Resolve-AriaUserName -UserName 'svc' -AuthSource 'vIDMAuthSource' 6>$null)
+Assert-Equal "and remembered, so it is asked once" "System Domain" $Global:AriaVidmDomain
+$Global:AriaVidmDomain = ''
+
+Write-Host "`n=== The sign-in sends the resolved name, and says so on a 401 ===" -ForegroundColor Cyan
+$sourceText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "the token request uses the resolved name" $true ($sourceText -match 'username\s+= \$sendUser')
+Assert-Equal "which is resolved from the credential as entered" $true ($sourceText -match 'Resolve-AriaUserName -UserName \$Global:AriaCredential.UserName -AuthSource \$Global:AriaAuthSource')
+# The 401 has to name what was actually sent, or the operator is debugging blind.
+Assert-Equal "a 401 reports the exact name sent" $true ($sourceText -match 'The account was sent as ..sendUser.')
+Assert-Equal "and the vIDM format is spelled out" $true ($sourceText -match 'user@vIDM-domain@source-name')
+# The password is never in any of that.
+Assert-Equal "no password is ever printed" $true (-not ($sourceText -match 'Write-Host.*GetNetworkCredential\(\)\.Password'))
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }
