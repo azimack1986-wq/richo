@@ -35,7 +35,8 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
     Where-Object { $_.Name -in @('Get-HostProfileApplyNode','Test-HostProfileActiveDirectoryNode',
                                  'Get-ClusterHostProfile','Set-ClusterHostProfileActiveDirectory',
                                  'Get-HostProfileRootPasswordPolicy','Get-HostProfileFixedPasswordOptionId',
-                                 'Set-ClusterHostProfileRootPassword','Test-DryRun') } |
+                                 'Set-ClusterHostProfileRootPassword','Test-DryRun',
+                                 'Get-HostProfilePasswordParameterValue','Set-HostProfileRootPasswordViaCmdlet') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0
@@ -114,10 +115,17 @@ if (-not ('VMware.Vim.KeyAnyValue' -as [type])) {
 namespace VMware.Vim {
     public class KeyAnyValue { public string Key; public object Value; }
     public class PolicyOption { public string Id; public object Parameter; }
+    // The real one. The password parameter is typed as this, NOT as a string - which is the whole
+    // reason the field came back empty on a live profile.
+    public class PasswordField { public string Value; }
 }
 '@
 }
 function Get-View { param($Id,$ErrorAction) throw "no vCenter in this test - the fallback option id is used" }
+# The supported cmdlets are absent unless a section defines them, so everything below exercises the
+# apply-tree fallback exactly as it did before.
+Remove-Item Function:\Get-VMHostProfileUserConfiguration -ErrorAction SilentlyContinue
+Remove-Item Function:\Set-VMHostProfileUserConfiguration -ErrorAction SilentlyContinue
 
 $script:Updates = New-Object System.Collections.Generic.List[object]
 $script:UpdateThrows = ""
@@ -277,7 +285,12 @@ $rootPolicy = $tree.UserAccount[0].Policy[0]
 Assert-Equal "the option was switched to the fixed-password one" "security.UserAccountProfile.FixedPasswordConfigOption" $rootPolicy.PolicyOption.Id
 Assert-Equal "carrying one parameter" 1 @($rootPolicy.PolicyOption.Parameter).Count
 Assert-Equal "named password" "password" @($rootPolicy.PolicyOption.Parameter)[0].Key
-Assert-Equal "with the password that was entered" "S3cret-Passw0rd!" @($rootPolicy.PolicyOption.Parameter)[0].Value
+# THE VALUE HAS TO BE A PasswordField, NOT A STRING. A live run wrote a bare string here: the
+# option flipped to fixed, the update returned success, and the password field in the Edit host
+# profile dialog was EMPTY - so the profile errored on apply.
+Assert-Equal "the value is a PasswordField" "VMware.Vim.PasswordField" @($rootPolicy.PolicyOption.Parameter)[0].Value.GetType().FullName
+Assert-Equal "with the password that was entered inside it" "S3cret-Passw0rd!" @($rootPolicy.PolicyOption.Parameter)[0].Value.Value
+Assert-Equal "and the helper reads it back out" "S3cret-Passw0rd!" (Get-HostProfilePasswordParameterValue -Parameters $rootPolicy.PolicyOption.Parameter)
 Assert-Equal "one update was written" 1 $script:Updates.Count
 # NOTHING ELSE. The other account, and every enabled flag in the tree.
 Assert-Equal "the other account is untouched" "DefaultAccountPasswordUnchangedConfigOption" $tree.UserAccount[1].Policy[0].PolicyOption.Id
@@ -370,6 +383,125 @@ Assert-Equal "found regardless of the profile type name" $true ($null -ne $found
 # And a non-root account is still not root.
 $found = Get-HostProfileRootPasswordPolicy -ApplyProfile (New-TreeWith (New-PasswordNode -Key 'monitoring' -PolicyId 'PasswordPolicy' -OptionId 'DefaultAccountPasswordUnchangedConfigOption')) 6>$null
 Assert-Equal "another account is not mistaken for root" $true ($null -eq $found)
+
+Write-Host "`n=== Fixed with an EMPTY field is broken, not 'already set' ===" -ForegroundColor Cyan
+# What the earlier version of this script left behind: it flipped the option to fixed and wrote a
+# bare string where a PasswordField was wanted, so the profile says a password is configured, the
+# field is blank, and applying it errors. Reading that as "somebody chose that value" would leave
+# it broken for good, so the VALUE is what counts, not the presence of the parameter.
+$script:RootPasswordOption = 'security.UserAccountProfile.FixedPasswordConfigOption'
+$script:RootPasswordParameter = [pscustomobject]@{ Key = 'password'; Value = $null }
+$script:Profiles = @(New-TestHostProfile)
+$script:Updates.Clear()
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+$tree = $script:Profiles[0].ExtensionData.Config.ApplyProfile
+$found = Get-HostProfileRootPasswordPolicy -ApplyProfile $tree 6>$null
+Assert-Equal "an empty field is not a password that is set" $false $found.HasPassword
+Assert-Equal "it is reported as blank" $true $found.PasswordBlank
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "so the blank one is filled" 1 $script:Updates.Count
+Assert-Equal "with the password entered" "S3cret-Passw0rd!" (Get-HostProfilePasswordParameterValue -Parameters $tree.UserAccount[0].Policy[0].PolicyOption.Parameter)
+Assert-Equal "recorded as applied" "Applied" (@($Global:RunSummary.ToArray() | Where-Object { $_.Stage -eq 'HostProfileRootPassword' })[-1].Result)
+
+# An empty STRING is the same damage by another route.
+$script:RootPasswordParameter = [pscustomobject]@{ Key = 'password'; Value = '' }
+$script:Profiles = @(New-TestHostProfile)
+$script:Updates.Clear()
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "an empty string is filled too" 1 $script:Updates.Count
+
+# And a PasswordField holding nothing - what a half-finished write leaves.
+$empty = New-Object VMware.Vim.PasswordField
+$script:RootPasswordParameter = [pscustomobject]@{ Key = 'password'; Value = $empty }
+$script:Profiles = @(New-TestHostProfile)
+$script:Updates.Clear()
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "an empty PasswordField is filled too" 1 $script:Updates.Count
+
+# A PasswordField that DOES hold a password is somebody's choice and stays.
+$held = New-Object VMware.Vim.PasswordField
+$held.Value = 'SomebodyElsesPassword'
+$script:RootPasswordParameter = [pscustomobject]@{ Key = 'password'; Value = $held }
+$script:Profiles = @(New-TestHostProfile)
+$script:Updates.Clear()
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "a real password is not overwritten" 0 $script:Updates.Count
+Assert-Equal "and it says why" "AlreadySet" (@($Global:RunSummary.ToArray() | Where-Object { $_.Stage -eq 'HostProfileRootPassword' })[-1].Result)
+$script:RootPasswordOption = 'DefaultAccountPasswordUnchangedConfigOption'
+$script:RootPasswordParameter = $null
+
+Write-Host "`n=== PowerCLI's own cmdlets are used when they are there ===" -ForegroundColor Cyan
+# Get-/Set-VMHostProfileUserConfiguration take the account by name, so none of the apply-tree
+# guessing applies - and, crucially, the cmdlet types the password correctly.
+$script:UserConfigPolicy = 'Default'
+$script:UserConfigSets = New-Object System.Collections.Generic.List[object]
+function Get-VMHostProfileUserConfiguration { param($HostProfile,$UserName,$ErrorAction)
+    return @([pscustomobject]@{ UserName = $UserName; PasswordPolicy = $script:UserConfigPolicy }) }
+function Set-VMHostProfileUserConfiguration { param($UserConfiguration,$PasswordPolicy,$Password,$ErrorAction)
+    $script:UserConfigSets.Add([pscustomobject]@{ Policy = $PasswordPolicy; Password = $Password })
+    $script:UserConfigPolicy = "$PasswordPolicy" }
+
+$script:Profiles = @(New-TestHostProfile)
+$script:Updates.Clear()
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "the cmdlet was used" 1 $script:UserConfigSets.Count
+Assert-Equal "switching the policy to Fixed" "Fixed" "$($script:UserConfigSets[0].Policy)"
+Assert-Equal "with the password entered" "S3cret-Passw0rd!" $script:UserConfigSets[0].Password
+Assert-Equal "and the apply tree was not written at all" 0 $script:Updates.Count
+Assert-Equal "recorded as applied" "Applied" (@($Global:RunSummary.ToArray() | Where-Object { $_.Stage -eq 'HostProfileRootPassword' })[-1].Result)
+$leaked = @($Global:RunSummary.ToArray() | Where-Object { "$($_.Details)" -match 'S3cret' })
+Assert-Equal "the password is still not in the summary" 0 $leaked.Count
+
+# Already Fixed, with a real password in the tree: left alone.
+$script:UserConfigPolicy = 'Fixed'
+$script:UserConfigSets.Clear()
+$script:RootPasswordOption = 'security.UserAccountProfile.FixedPasswordConfigOption'
+$held = New-Object VMware.Vim.PasswordField
+$held.Value = 'SomebodyElsesPassword'
+$script:RootPasswordParameter = [pscustomobject]@{ Key = 'password'; Value = $held }
+$script:Profiles = @(New-TestHostProfile)
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "a set password is not touched" 0 $script:UserConfigSets.Count
+Assert-Equal "and it says why" "AlreadySet" (@($Global:RunSummary.ToArray() | Where-Object { $_.Stage -eq 'HostProfileRootPassword' })[-1].Result)
+
+# Fixed but EMPTY - the state the earlier bug left. The cmdlet route must repair it, not respect it.
+$script:UserConfigPolicy = 'Fixed'
+$script:UserConfigSets.Clear()
+$script:RootPasswordParameter = [pscustomobject]@{ Key = 'password'; Value = $null }
+$script:Profiles = @(New-TestHostProfile)
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "Fixed-but-empty is repaired" 1 $script:UserConfigSets.Count
+Assert-Equal "with the password entered" "S3cret-Passw0rd!" $script:UserConfigSets[0].Password
+
+# UserInput is neither, and is not this run's to change.
+$script:UserConfigPolicy = 'UserInput'
+$script:UserConfigSets.Clear()
+$script:Profiles = @(New-TestHostProfile)
+$Global:RunSummary = New-Object System.Collections.Generic.List[object]
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "UserInput is left alone" 0 $script:UserConfigSets.Count
+Assert-Equal "and reported rather than silently skipped" "NotApplicable" (@($Global:RunSummary.ToArray() | Where-Object { $_.Stage -eq 'HostProfileRootPassword' })[-1].Result)
+
+# A cmdlet that throws falls back to the apply tree rather than giving up.
+$script:UserConfigPolicy = 'Default'
+$script:UserConfigSets.Clear()
+$script:RootPasswordOption = 'DefaultAccountPasswordUnchangedConfigOption'
+$script:RootPasswordParameter = $null
+function Set-VMHostProfileUserConfiguration { param($UserConfiguration,$PasswordPolicy,$Password,$ErrorAction) throw "not supported on this appliance" }
+$script:Profiles = @(New-TestHostProfile)
+$script:Updates.Clear()
+$tree = $script:Profiles[0].ExtensionData.Config.ApplyProfile
+Set-ClusterHostProfileRootPassword -Cluster $cluster -Credential $cred 6>$null
+Assert-Equal "the apply tree picked it up" 1 $script:Updates.Count
+Assert-Equal "and the password still went in" "S3cret-Passw0rd!" (Get-HostProfilePasswordParameterValue -Parameters $tree.UserAccount[0].Policy[0].PolicyOption.Parameter)
+
+Remove-Item Function:\Get-VMHostProfileUserConfiguration -ErrorAction SilentlyContinue
+Remove-Item Function:\Set-VMHostProfileUserConfiguration -ErrorAction SilentlyContinue
+$script:RootPasswordOption = 'DefaultAccountPasswordUnchangedConfigOption'
+$script:RootPasswordParameter = $null
 
 Write-Host "`n=== The LIVE profile: a hashed key and the default-account option ===" -ForegroundColor Cyan
 # What a real 8.x profile actually reports, and what the finder used to miss entirely:

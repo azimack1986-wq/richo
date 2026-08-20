@@ -568,7 +568,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.19.0-preauth"
+$ScriptVersion = "23.20.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 $TargetEsxiVersion = "ESXi-8.0U3j-25429389"
@@ -6782,6 +6782,46 @@ function Test-HostProfileActiveDirectoryNode {
     return $false
 }
 
+function Get-HostProfilePasswordParameterValue {
+    <#
+    .SYNOPSIS
+        The value held in a policy option's 'password' parameter, or "" when there is none.
+
+    .DESCRIPTION
+        The value is typed VMware.Vim.PasswordField, whose actual text sits on a .Value property,
+        so the object has to be unwrapped rather than cast to a string - ToString() on it yields
+        the type name, which is not empty and would read as "a password is set".
+
+        Handles a bare string too, because that is what a profile written by the earlier, broken
+        version of this script contains.
+
+    .PARAMETER Parameters
+        The option's Parameter collection.
+
+    .EXAMPLE
+        $value = Get-HostProfilePasswordParameterValue -Parameters $option.Parameter
+    #>
+    param([AllowNull()]$Parameters)
+
+    foreach ($parameter in @($Parameters)) {
+        if ($null -eq $parameter) { continue }
+        if ([string]$parameter.Key -ne 'password') { continue }
+
+        $value = $parameter.Value
+        if ($null -eq $value) { return "" }
+
+        # PasswordField, or anything else carrying the text on a Value property.
+        try {
+            if ($value.PSObject.Properties.Name -contains 'Value') { return [string]$value.Value }
+        } catch { }
+
+        if ($value -is [string]) { return [string]$value }
+        return ""
+    }
+
+    return ""
+}
+
 function Get-HostProfileRootPasswordPolicy {
     <#
     .SYNOPSIS
@@ -6892,13 +6932,21 @@ function Get-HostProfileRootPasswordPolicy {
             [void]$seen.Add("$($row.Path) [$($row.ProfileTypeName)] key='$key' policy='$([string]$policy.Id)' option='$([string]$option.Id)' match=$(if ($rank -eq 3) { 'root' } elseif ($rank -eq 2) { 'default-account' } else { 'none' })")
             if ($rank -eq 0) { continue }
 
+            # A 'password' parameter that is EMPTY is not a password that is set - it is the
+            # damage the earlier version of this script did: it flipped the option to fixed and
+            # wrote a bare string where a PasswordField was wanted, so the option says a password
+            # is configured and the field is blank, and the profile errors on apply. Reading that
+            # as "already set" would leave it broken for good, so the value is what counts.
+            $passwordValue = Get-HostProfilePasswordParameterValue -Parameters $parameters
+
             $candidate = [pscustomobject]@{
-                Path        = $row.Path
-                Node        = $node
-                Policy      = $policy
-                HasPassword = ($parameterKeys -contains 'password')
-                OptionId    = [string]$option.Id
-                Rank        = $rank
+                Path          = $row.Path
+                Node          = $node
+                Policy        = $policy
+                HasPassword   = (-not [string]::IsNullOrEmpty($passwordValue))
+                PasswordBlank = (($parameterKeys -contains 'password') -and [string]::IsNullOrEmpty($passwordValue))
+                OptionId      = [string]$option.Id
+                Rank          = $rank
             }
 
             # A node that actually names root beats one merely marked as the default account, so
@@ -6995,6 +7043,130 @@ function Get-HostProfileFixedPasswordOptionId {
     return [string]$Global:HostProfileFixedPasswordOptionId
 }
 
+function Set-HostProfileRootPasswordViaCmdlet {
+    <#
+    .SYNOPSIS
+        Sets root's password in one host profile with PowerCLI's own cmdlets. Returns $true when
+        the profile was dealt with, $false to fall back to the apply-tree write.
+
+    .DESCRIPTION
+        Get-VMHostProfileUserConfiguration and Set-VMHostProfileUserConfiguration exist for exactly
+        this job and take the account by name, so none of the guessing the apply-tree route has to
+        do applies: no hunting for a node whose key is a hash, no working out the fully-qualified
+        option id for the release in hand, and no hand-typing the password parameter.
+
+        THAT LAST ONE IS WHY THIS FUNCTION EXISTS. The password parameter is typed
+        VMware.Vim.PasswordField, not a string. Write a string into it and UpdateHostProfile
+        returns success while the password field in the Edit host profile dialog stays EMPTY -
+        which is precisely what happened. The cmdlet handles it.
+
+        THE RULE IS UNCHANGED. PasswordPolicy comes back as one of:
+
+            Fixed       a password is already set          LEFT ALONE. Somebody chose that value.
+            Default     leave unchanged for the default    SET to the password entered.
+                        account - the case this exists for
+            UserInput   prompt when the profile is applied LEFT ALONE and reported. Not what was
+                                                           asked for, and not this run's to change.
+
+        The write is confirmed by re-reading the configuration, because "no error" is not evidence
+        after a bug whose entire symptom was a silent success.
+
+        Returns $false, quietly, where the cmdlets are absent or do not know the account - the
+        caller then tries the apply tree. Never throws.
+
+    .PARAMETER HostProfile
+        The host profile to change.
+
+    .PARAMETER Credential
+        The ESXi root credential entered for this cluster.
+
+    .EXAMPLE
+        if (Set-HostProfileRootPasswordViaCmdlet -HostProfile $p -Credential $c) { continue }
+    #>
+    param(
+        [Parameter(Mandatory=$true)]$HostProfile,
+        [Parameter(Mandatory=$true)]$Credential
+    )
+
+    $profileName = [string]$HostProfile.Name
+
+    if (-not (Get-Command -Name 'Get-VMHostProfileUserConfiguration' -ErrorAction SilentlyContinue) -or
+        -not (Get-Command -Name 'Set-VMHostProfileUserConfiguration' -ErrorAction SilentlyContinue)) {
+        Write-Host "    PowerCLI has no Get-/Set-VMHostProfileUserConfiguration; using the apply profile instead." -ForegroundColor DarkGray
+        return $false
+    }
+
+    $config = $null
+    try { $config = @(Get-VMHostProfileUserConfiguration -HostProfile $HostProfile -UserName 'root' -ErrorAction Stop) | Select-Object -First 1 }
+    catch {
+        Write-Host "    The root user configuration could not be read ($($_.Exception.Message)); using the apply profile instead." -ForegroundColor DarkGray
+        return $false
+    }
+
+    if ($null -eq $config) {
+        Write-Host "    PowerCLI reported no root user configuration; using the apply profile instead." -ForegroundColor DarkGray
+        return $false
+    }
+
+    $policy = ""
+    try { $policy = [string]$config.PasswordPolicy } catch { $policy = "" }
+
+    if ($policy -match '(?i)^fixed$') {
+        # FIXED, BUT IS THERE ANYTHING IN IT? A profile written by the earlier, broken version of
+        # this script reports Fixed with an EMPTY password field, and errors on apply. Left as
+        # "already set" it would stay broken for good, so the apply tree is consulted for the
+        # actual value before this is treated as somebody's deliberate choice.
+        $blank = $false
+        try {
+            $treeFound = Get-HostProfileRootPasswordPolicy -ApplyProfile $HostProfile.ExtensionData.Config.ApplyProfile
+            if ($null -ne $treeFound) { $blank = [bool]$treeFound.PasswordBlank }
+        }
+        catch { $blank = $false }
+
+        if (-not $blank) {
+            # SOMEBODY CHOSE THAT VALUE. It is not this run's to overwrite, and it may not even be
+            # the password that was entered for the cluster.
+            Write-Host "  '$profileName' already sets a root password - left exactly as it is." -ForegroundColor Green
+            Add-SummaryRecord -Stage "HostProfileRootPassword" -Batch "" -HostName "" -Action "Set root password" -Result "AlreadySet" -Details "$profileName - root PasswordPolicy is Fixed; not overwritten."
+            return $true
+        }
+
+        Write-Host "  '$profileName' is set to a fixed root password but the field is EMPTY - that profile will error on apply." -ForegroundColor Yellow
+        Write-Host "  Filling it with the password entered for this cluster." -ForegroundColor Yellow
+    }
+    elseif ($policy -notmatch '(?i)^default$') {
+        Write-Host "  '$profileName' has root on PasswordPolicy '$policy', which is neither a set password nor 'leave unchanged' - left alone." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "HostProfileRootPassword" -Batch "" -HostName "" -Action "Set root password" -Result "NotApplicable" -Details "$profileName - root PasswordPolicy is '$policy'; only 'Default' is changed."
+        return $true
+    }
+
+    try {
+        Set-VMHostProfileUserConfiguration -UserConfiguration $config -PasswordPolicy Fixed -Password $Credential.GetNetworkCredential().Password -ErrorAction Stop | Out-Null
+
+        # CONFIRMED BY RE-READING, AND NOT JUST THE POLICY. The bug this replaces set the policy to
+        # Fixed and left the field EMPTY, so a check that only asked "does it say Fixed?" would
+        # have passed on the broken profile it created. The value is read back as well.
+        $after = ""
+        try { $after = [string](@(Get-VMHostProfileUserConfiguration -HostProfile $HostProfile -UserName 'root' -ErrorAction Stop) | Select-Object -First 1).PasswordPolicy } catch { $after = "" }
+        if ($after -notmatch '(?i)^fixed$') { throw "the profile still reports PasswordPolicy '$after' after the change" }
+
+        try { $HostProfile.ExtensionData.UpdateViewData() } catch { }
+        $confirm = $null
+        try { $confirm = Get-HostProfileRootPasswordPolicy -ApplyProfile $HostProfile.ExtensionData.Config.ApplyProfile } catch { $confirm = $null }
+        if ($null -ne $confirm -and $confirm.PasswordBlank) { throw "the password field read back EMPTY, so the profile would still error on apply" }
+
+        # The password itself appears nowhere here, or in the log, or in the run summary.
+        Write-Host "  '$profileName' now sets the root password entered for this cluster$(if ($policy -match '(?i)^fixed$') { ' - the empty field has been filled' } else { ', instead of leaving it unchanged' })." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "HostProfileRootPassword" -Batch "" -HostName "" -Action "Set root password" -Result "Applied" -Details "$profileName - root PasswordPolicy set to Fixed from '$policy', confirmed by re-reading. The password is not recorded."
+        return $true
+    }
+    catch {
+        Write-Host "  '$profileName' could not be updated through PowerCLI: $($_.Exception.Message)" -ForegroundColor Yellow
+        Write-Host "    Trying the apply profile instead." -ForegroundColor DarkGray
+        return $false
+    }
+}
+
 function Set-ClusterHostProfileRootPassword {
     <#
     .SYNOPSIS
@@ -7015,6 +7187,22 @@ function Set-ClusterHostProfileRootPassword {
                                                 password that was entered.
           "leave password unchanged"            SET to the password the operator entered for this
                                                 cluster.
+
+        HOW IT IS WRITTEN. Through PowerCLI's own Get-/Set-VMHostProfileUserConfiguration, which
+        exist for exactly this and take the account by name:
+
+            $cfg = Get-VMHostProfileUserConfiguration -HostProfile $p -UserName root
+            Set-VMHostProfileUserConfiguration -UserConfiguration $cfg -PasswordPolicy Fixed -Password ...
+
+        PasswordPolicy is Default, UserInput or Fixed - Default being the "leave password unchanged
+        for the default account" this exists to replace, and Fixed being a password already set.
+        That is preferred over hand-building the apply tree because the cmdlet knows the things
+        that are easy to get wrong and invisible when you do: the fully-qualified option id for the
+        release in hand, and that the password parameter is typed VMware.Vim.PasswordField rather
+        than a string. Writing a bare string there returns success and leaves the field EMPTY.
+
+        The apply-tree write is kept as a fallback for where the cmdlet is not available or does
+        not know the account, and now wraps the value in a PasswordField for the same reason.
 
         AND NOTHING ELSE. One policy, on the root user account, on profiles attached to this
         cluster. No other account, no other policy, no other node - the same read-modify-write over
@@ -7063,6 +7251,10 @@ function Set-ClusterHostProfileRootPassword {
             continue
         }
 
+        # THE SUPPORTED ROUTE FIRST.
+        $handled = Set-HostProfileRootPasswordViaCmdlet -HostProfile $hostProfile -Credential $Credential
+        if ($handled) { continue }
+
         $applyProfile = $view.Config.ApplyProfile
         $found = Get-HostProfileRootPasswordPolicy -ApplyProfile $applyProfile
 
@@ -7080,13 +7272,25 @@ function Set-ClusterHostProfileRootPassword {
             continue
         }
 
+        if ($found.PasswordBlank) {
+            Write-Host "  '$profileName' is set to a fixed root password but the field is EMPTY - that profile will error on apply." -ForegroundColor Yellow
+            Write-Host "  Filling it with the password entered for this cluster." -ForegroundColor Yellow
+        }
+
         try {
             $optionId = Get-HostProfileFixedPasswordOptionId -ProfileView $view -PolicyId ([string]$found.Policy.Id) -CurrentOptionId ([string]$found.OptionId)
             if ([string]::IsNullOrWhiteSpace($optionId)) { throw "the fixed-password policy option could not be identified" }
 
+            # A PasswordField, NOT a string. This is the whole reason the field came back empty:
+            # the profile engine types this parameter as VMware.Vim.PasswordField, so handing it a
+            # bare string writes a value the Edit host profile dialog does not render and the
+            # profile does not apply - the update returns success and the password field is blank.
+            $passwordField = New-Object VMware.Vim.PasswordField
+            $passwordField.Value = $Credential.GetNetworkCredential().Password
+
             $parameter = New-Object VMware.Vim.KeyAnyValue
             $parameter.Key = 'password'
-            $parameter.Value = $Credential.GetNetworkCredential().Password
+            $parameter.Value = $passwordField
 
             $option = New-Object VMware.Vim.PolicyOption
             $option.Id = $optionId

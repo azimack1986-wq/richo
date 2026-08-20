@@ -12,6 +12,64 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.20.0] — 2026-08-20
+
+#### Fixed
+
+- **The password never reached the field, because it was written as a string.**
+  The policy flipped to fixed, `UpdateHostProfile` returned success, and the
+  password field in the Edit host profile dialog was **empty** — so the profile
+  errored on apply. The profile engine types that parameter as
+  `VMware.Vim.PasswordField`, not `System.String`:
+
+  ```powershell
+  $parameter.Value = New-Object VMware.Vim.PasswordField
+  $parameter.Value.Value = $plainPassword
+  ```
+
+  A bare string is accepted by the API and silently produces nothing. This was
+  my error in the previous version.
+
+- **The write now goes through PowerCLI's own cmdlets first.**
+  `Get-VMHostProfileUserConfiguration` / `Set-VMHostProfileUserConfiguration`
+  exist for exactly this and take the account **by name**, so none of the
+  apply-tree guessing applies — no hunting for a node whose key is a hash, no
+  working out the fully-qualified option id for the release in hand, and no
+  hand-typing the password parameter. `PasswordPolicy` maps cleanly onto the rule:
+
+  | PasswordPolicy | Meaning | What happens |
+  |---|---|---|
+  | `Fixed` | a password is set | left alone — somebody chose that value |
+  | `Default` | leave unchanged for the default account | **set** to the password entered |
+  | `UserInput` | prompt on apply | left alone, and reported |
+
+  The apply-tree write is kept as a fallback for where the cmdlets are absent or
+  do not know the account, and the cmdlet route falls back to it if it throws.
+
+- **"Fixed" with an empty field is now treated as broken, not as "already set".**
+  That is the exact state the previous version left behind, and reading it as
+  somebody's deliberate choice would have made the damage permanent — the profile
+  would sit there erroring on apply and every subsequent run would skip it.
+  `HasPassword` now means the parameter **holds a value**, with the
+  `PasswordField` unwrapped to read it (`ToString()` on one yields the type name,
+  which is not empty and would read as "a password is set"). An empty field is
+  reported as such and filled.
+
+- **The write is confirmed by reading the value back, not just the policy.** After
+  a bug whose entire symptom was a silent success, "no error" is not evidence. A
+  read-back that still reports an empty field now fails the step and lists the
+  profile for manual attention.
+
+#### Tests
+
+- `tests/Test-HostProfileActiveDirectory.ps1` — 101 assertions, 25 new: the value
+  being a `PasswordField` and not a string, every shape of empty field (null,
+  empty string, empty `PasswordField`) being filled, a real password never being
+  overwritten, the cmdlet route being preferred and its `Fixed`/`Default`/
+  `UserInput` handling, Fixed-but-empty being repaired through it, and a throwing
+  cmdlet falling back to the apply tree with the password still landing.
+- Full suite: 1075 assertions across 23 files, all passing.
+
 ### [23.19.0] — 2026-08-20
 
 #### Fixed
