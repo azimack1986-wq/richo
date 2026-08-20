@@ -12,6 +12,55 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.26.0] — 2026-08-20
+
+#### Changed
+
+- **The Aria username is composed as `account@vIDM-domain@source`.** Tested against
+  the appliance and returning a token:
+
+  ```
+  username   = andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource
+  authSource = vIDMAuthSource
+  password   = the vIDM (domain) password
+  ```
+
+  A bare account name does not resolve against a vIDM source. This is also the form
+  Broadcom's KB for acquiring a token through a vIDM source describes, so the tested
+  result and the documentation now agree — 23.25.0's bare-name build was the odd one
+  out and is gone.
+
+  The operator only ever types or passes through the plain account. Everything after
+  the first `@` is added in one place, from `$Global:AriaVidmDomain` and
+  `$Global:AriaAuthSource`, so a site that differs has one value to correct.
+
+  A `DOMAIN\` prefix is replaced rather than kept — vIDM wants the DNS-style domain
+  in the middle, not the NetBIOS name on the front — so a vCenter passthrough of
+  `DPE\andrew.richard1_priv` is sent as
+  `andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource`. A name already carrying
+  two `@` is left exactly as it is; one carrying a domain only gains the source.
+
+  **The password is the vIDM (domain) password**, not an Aria-local one — which is
+  what makes the vCenter credential a genuine passthrough candidate rather than a
+  guess. That is now stated in the script and in the 401 message.
+
+#### Removed
+
+- Every alternative username shape, and the branching that chose between them:
+  `Test-AriaVidmAuthSource` and its per-source heuristic are gone. One composition,
+  one place, applied the same way every time — sending a form the appliance does not
+  expect is a 401 indistinguishable from a wrong password, so having more than one
+  path was itself the hazard.
+
+#### Tests
+
+- `tests/Test-AriaSuppression.ps1` — 85 assertions: the full composition from a plain
+  account, the `DOMAIN\` prefix being replaced, a UPN gaining only the source, an
+  already-qualified name left untouched, no domain meaning no invention, the
+  wire-level body carrying the composed name, the menu preview showing it, and a
+  guard that the source-kind heuristic cannot come back.
+- Full suite: 1237 assertions across 24 files, all passing.
+
 ### [23.25.0] — 2026-08-20
 
 #### Changed

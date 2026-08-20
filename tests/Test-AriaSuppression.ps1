@@ -56,6 +56,7 @@ $Global:AriaOperationsServer = 'siepd85vop1110.dpe.protected.mil.au'
 $Global:AriaSuppressionGroupName = 'ESXi Patching Hardware Suppression'
 $Global:AriaSuppressionGroupId = ''
 $Global:AriaAuthSource = 'vIDMAuthSource'
+$Global:AriaVidmDomain = 'dpe.protected.mil.au'
 $Global:AriaLocalUserName = ''
 $Global:AriaCredentialFile = 'config\aria.local.json'
 $Global:AriaSkipCertificateCheck = $true
@@ -188,7 +189,7 @@ Assert-Equal "POST to the acquire endpoint" "POST" $acquire.Method
 Assert-Equal "on the suite-api, not the UI action API" $true ($acquire.Uri -match '/suite-api/api/auth/token/acquire$')
 $body = $acquire.Body | ConvertFrom-Json
 # The username on the wire is the REBUILT one - vIDM will not resolve a bare account name.
-Assert-Equal "carrying the bare username" "svc-esxi" $body.username
+Assert-Equal "carrying the composed username" "svc-esxi@dpe.protected.mil.au@vIDMAuthSource" $body.username
 Assert-Equal "and the authentication source" "vIDMAuthSource" $body.authSource
 Assert-Equal "the token is held for the run" "tok-123" $Global:AriaSession
 
@@ -319,24 +320,30 @@ Assert-Equal "suppression goes on before the rolling upgrade" $true (
     $workflowText.IndexOf('Invoke-RollingClusterUpgrade -Cluster $Cluster'))
 Assert-Equal "and comes off in a finally" $true ($workflowText -match '(?s)finally \{[^}]*Set-ClusterAriaPatchingSuppression -Cluster \$Cluster -InSuppression \$false')
 
-Write-Host "`n=== The account goes bare, with the source in authSource ===" -ForegroundColor Cyan
-# The form this appliance accepts, established by testing it rather than inferred:
-#     username = nick.beare_priv, authSource = vIDMAuthSource
-# Broadcom's KB for a vIDM source describes a qualified user@vIDM-domain@source form and an earlier
-# build composed that; this appliance does not want it, so nothing is composed. Sending a form the
-# appliance does not expect is a 401 that looks exactly like a wrong password.
-Assert-Equal "the account is sent as it is" "nick.beare_priv" (Resolve-AriaUserName -UserName 'nick.beare_priv' -AuthSource 'vIDMAuthSource')
-# The ONE transform: a vCenter credential is commonly entered as DOMAIN\user, and that prefix is
-# how Windows names the directory it came from - it is not part of the account.
-Assert-Equal "a NetBIOS prefix is stripped" "nick.beare_priv" (Resolve-AriaUserName -UserName 'DPE\nick.beare_priv' -AuthSource 'vIDMAuthSource')
-# Nothing else is touched - no domain appended, no source folded into the name.
-Assert-Equal "no source is folded into the name" "nick.beare_priv" (Resolve-AriaUserName -UserName 'nick.beare_priv' -AuthSource 'vIDMAuthSource')
-Assert-Equal "a UPN is left exactly as given" "svc@dpe.protected.mil.au" (Resolve-AriaUserName -UserName 'svc@dpe.protected.mil.au' -AuthSource 'vIDMAuthSource')
+Write-Host "`n=== The username is composed as account@vIDM-domain@source ===" -ForegroundColor Cyan
+# The form tested against the appliance, which returned a token:
+#     username = andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource
+#     authSource = vIDMAuthSource
+#     password = the vIDM (domain) password
+# A bare account name does not resolve against a vIDM source; it is a 401 that looks exactly like
+# a wrong password. The operator only ever types the plain account - everything after the first @
+# is added here, from one place.
+Assert-Equal "a plain account is composed in full" "andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource" (Resolve-AriaUserName -UserName 'andrew.richard1_priv' -AuthSource 'vIDMAuthSource')
+# A vCenter credential is commonly entered as DOMAIN\user. That NetBIOS prefix names the directory
+# rather than the account, and vIDM wants the DNS-style domain in the middle instead.
+Assert-Equal "a NetBIOS prefix is replaced, not kept" "andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource" (Resolve-AriaUserName -UserName 'DPE\andrew.richard1_priv' -AuthSource 'vIDMAuthSource')
+# account@domain already: only the source is missing.
+Assert-Equal "a UPN only gains the source" "svc@dpe.protected.mil.au@vIDMAuthSource" (Resolve-AriaUserName -UserName 'svc@dpe.protected.mil.au' -AuthSource 'vIDMAuthSource')
+# Spelled out in full by the operator: left exactly as it is.
 Assert-Equal "an already-qualified name is untouched" "svc@System Domain@vIDM-1" (Resolve-AriaUserName -UserName 'svc@System Domain@vIDM-1' -AuthSource 'vIDMAuthSource')
-Assert-Equal "and every other source behaves the same" "admin" (Resolve-AriaUserName -UserName 'admin' -AuthSource 'LOCAL')
-# The composition that used to happen must not come back.
+# No domain configured: send the account rather than invent a domain.
+$savedDomain = $Global:AriaVidmDomain
+$Global:AriaVidmDomain = ''
+Assert-Equal "no domain means no invention" "svc" (Resolve-AriaUserName -UserName 'svc' -AuthSource 'vIDMAuthSource')
+$Global:AriaVidmDomain = $savedDomain
+# One composition, one place - no per-source branching left to get out of step.
 $sourceCheck = [System.IO.File]::ReadAllText($scriptPath)
-Assert-Equal "no vIDM domain setting remains" $false ($sourceCheck -match 'AriaVidmDomain')
+Assert-Equal "no source-kind heuristic remains" $false ($sourceCheck -match 'Test-AriaVidmAuthSource')
 
 Write-Host "`n=== vIDMAuthSource is the source, and it is not asked about ===" -ForegroundColor Cyan
 $sourceText = [System.IO.File]::ReadAllText($scriptPath)
@@ -368,11 +375,11 @@ Assert-Equal "2 passes the vCenter credential through" "DPE\nick.beare_priv" $cr
 Assert-Equal "nothing was typed" 0 $script:AriaPrompts
 Assert-Equal "recorded as a passthrough" "Shared" $Global:CredentialSource["Aria Operations"]
 # ...and it is the REBUILT name that would go to the appliance.
-Assert-Equal "which is sent as the bare account" "nick.beare_priv" (Resolve-AriaUserName -UserName $cred.UserName -AuthSource $Global:AriaAuthSource)
+Assert-Equal "which is sent composed in full" "nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource" (Resolve-AriaUserName -UserName $cred.UserName -AuthSource $Global:AriaAuthSource)
 
 # The menu must show what option 2 would actually send, or it is not a comparison.
 $shown = (Get-AriaRunCredential 6>&1 | Out-String)
-Assert-Equal "the menu previews what would be sent" $true ($shown -match "would be sent as 'nick.beare_priv'")
+Assert-Equal "the menu previews what would be sent" $true ($shown -match "would be sent as 'nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource'")
 
 Clear-RunCredential
 $Global:AriaCredential = $null

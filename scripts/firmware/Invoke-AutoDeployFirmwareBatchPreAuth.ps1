@@ -100,9 +100,9 @@
        Aria Operations signs in against the vIDM source, which holds the same domain accounts,
          so the vCenter credential is a candidate there too - but it is OFFERED, 1 to type or 2 to
          pass through, rather than assumed, while that is being proven here. The account is sent
-         bare against authSource vIDMAuthSource. Set RICHO_ARIA_PASSWORD or
-         config\aria.local.json to skip the question; no password is in this script, and none
-         may be put in it.
+         as account@vIDM-domain@vIDMAuthSource and the password is the vIDM one, so CHECK
+         $Global:AriaVidmDomain for your site. Set RICHO_ARIA_PASSWORD or config\aria.local.json
+         to skip the question; no password is in this script, and none may be put in it.
 
     None of the above is verified at start-up: probing for it was slow enough on a domain jump
     host to read as a hang. Failures surface where they matter instead - a missing module at its
@@ -574,7 +574,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.25.0-preauth"
+$ScriptVersion = "23.26.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 # NOT SET HERE. The ESXi target is whatever the cluster's Auto Deploy rule says it is, read from
@@ -872,16 +872,23 @@ $Global:AriaSuppressionGroupName = "ESXi Patching Hardware Suppression"
 # 401 every time.
 $Global:AriaAuthSource = "vIDMAuthSource"
 #
-# THE USERNAME GOES AS IT IS. This appliance takes the bare account name against that source -
+# THE vIDM DOMAIN, and the reason the username is not sent as typed. Aria will not resolve a bare
+# account name against a vIDM source; the username field has to carry the whole path:
 #
-#     username   = nick.beare_priv
+#     username   = andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource
 #     authSource = vIDMAuthSource
 #
-# - which was established by testing it, and is the one form worth trusting. Broadcom's KB for
-# acquiring a token through a vIDM source describes a qualified user@vIDM-domain@source form, and
-# an earlier build composed that; this appliance does not want it, so nothing is composed. The only
-# thing removed from the name is a NetBIOS DOMAIN\ prefix, which is how a vCenter credential is
-# often entered and is not part of the account.
+# That form was tested against this appliance and returned a token; the bare account name does not.
+# It also matches Broadcom's KB for acquiring a token through a vIDM source. Sending anything else
+# is a 401 that looks exactly like a wrong password from the outside.
+#
+# THE PASSWORD IS THE vIDM (DOMAIN) PASSWORD, not an Aria-local one - which is why the vCenter
+# credential is a genuine passthrough candidate here.
+#
+# CHECK THIS VALUE FOR YOUR SITE. It is the domain as vIDM itself shows it, and is the literal
+# string "System Domain" for accounts created inside vIDM. The composed username is printed before
+# the sign-in so a wrong one is visible rather than mysterious.
+$Global:AriaVidmDomain = "dpe.protected.mil.au"
 #
 # The account, where nothing is passed through and nothing is configured. Only ever a default in
 # the credential dialog.
@@ -5598,36 +5605,42 @@ function Invoke-AriaRestCall {
 function Resolve-AriaUserName {
     <#
     .SYNOPSIS
-        The username to send to suite-api: the account, with any NetBIOS domain prefix removed.
+        The username to send to suite-api: account@vIDM-domain@source.
 
     .DESCRIPTION
-        THE FORM THAT WORKS HERE, established by testing rather than inferred:
+        THE FORM THAT WORKS, tested against this appliance and returning a token:
 
-            username   = nick.beare_priv
+            username   = andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource
             authSource = vIDMAuthSource
+            password   = the vIDM (domain) password
 
-        The account goes bare and the source goes in the authSource field. Broadcom's KB for
-        acquiring a token through a vIDM source describes a qualified
-        user@vIDM-domain@source-name form and an earlier build of this script composed that; this
-        appliance does not want it, so nothing is composed. Sending a form the appliance does not
-        expect is a 401 that looks exactly like a wrong password, which is why this is now the one
-        thing it does and it does it the same way every time.
+        Aria will not resolve a bare account name against a vIDM source. The username field carries
+        the whole path - account, then the vIDM domain, then the Source Display Name as Aria knows
+        it - and the source appears again in its own authSource field. This also matches Broadcom's
+        KB for acquiring a token through a vIDM source. Anything else is a 401, which from the
+        outside is indistinguishable from a wrong password.
 
-        THE ONE TRANSFORM. A vCenter credential is commonly entered as DOMAIN\user, and that prefix
-        is not part of the account - it is how Windows names the directory it came from. It is
-        stripped, so a passthrough of DPE\nick.beare_priv is sent as nick.beare_priv. Nothing else
-        is added, removed or rearranged.
+        The operator only ever types or passes through the plain account. Everything after the
+        first @ is added here, from $Global:AriaVidmDomain and $Global:AriaAuthSource, so there is
+        one place to correct if a site differs.
+
+        WHAT IS TAKEN OFF FIRST. A vCenter credential is commonly entered as DOMAIN\user, and that
+        NetBIOS prefix names the directory rather than the account - vIDM wants the DNS-style
+        domain in the middle instead. So DPE\andrew.richard1_priv becomes
+        andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource.
+
+        A name that already carries two @ is left exactly as it is: the operator has spelled it out
+        themselves. One @ means account@domain, so only the source is appended.
 
     .PARAMETER UserName
         The account as entered, or as passed through from vCenter.
 
     .PARAMETER AuthSource
-        The Source Display Name for this run. Sent in the authSource field, never folded into the
-        username.
+        The Source Display Name, appended to the username as well as sent in authSource.
 
     .EXAMPLE
-        Resolve-AriaUserName -UserName "DPE\nick.beare_priv" -AuthSource "vIDMAuthSource"
-        # nick.beare_priv
+        Resolve-AriaUserName -UserName "DPE\andrew.richard1_priv" -AuthSource "vIDMAuthSource"
+        # andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource
     #>
     param(
         [Parameter(Mandatory=$true)][AllowEmptyString()][string]$UserName,
@@ -5636,8 +5649,18 @@ function Resolve-AriaUserName {
 
     if ([string]::IsNullOrWhiteSpace($UserName)) { return $UserName }
 
-    if ($UserName -match '^[^\\]+\\(.+)$') { return $Matches[1] }
-    return $UserName
+    $account = $UserName
+    if ($account -match '^[^\\]+\\(.+)$') { $account = $Matches[1] }
+
+    # Already spelled out in full - account@domain@source. Nothing to add.
+    if (([regex]::Matches($account, '@')).Count -ge 2) { return $account }
+
+    # account@domain: only the source is missing.
+    if ($account.Contains('@')) { return "$account@$AuthSource" }
+
+    if ([string]::IsNullOrWhiteSpace($Global:AriaVidmDomain)) { return $account }
+
+    return "$account@$($Global:AriaVidmDomain)@$AuthSource"
 }
 
 function Get-AriaRunCredential {
@@ -5787,11 +5810,11 @@ function Connect-AriaOperations {
         domain accounts vCenter does. There is no chooser: the source is a property of the site,
         not of the run, and asking every time only invites the wrong answer.
 
-        THE USERNAME GOES BARE - username nick.beare_priv, authSource vIDMAuthSource - which is
-        the form this appliance accepts, established by testing it. Only a NetBIOS DOMAIN\ prefix
-        is taken off, since that is how a vCenter credential is often entered and is not part of
-        the account. See Resolve-AriaUserName. What is about to be sent is printed first, so a 401
-        can be read against the account that actually went.
+        THE USERNAME IS COMPOSED for that source - account@vIDM-domain@vIDMAuthSource - which is
+        the form this appliance accepts, tested and returning a token; a bare account name does
+        not. The password is the vIDM (domain) password, which is why the vCenter credential is a
+        genuine passthrough candidate. See Resolve-AriaUserName. What is about to be sent is
+        printed first, so a 401 can be read against the exact string that went.
 
         The credential is held in memory for the run and never written to the log or the summary.
 
@@ -5827,8 +5850,8 @@ function Connect-AriaOperations {
         return $false
     }
 
-    # The credential is held exactly as entered; only a NetBIOS DOMAIN\ prefix is taken off the
-    # name on its way to the appliance. See Resolve-AriaUserName.
+    # The credential is held exactly as entered; the username is composed on its way to the
+    # appliance and nowhere else. See Resolve-AriaUserName.
     $sendUser = Resolve-AriaUserName -UserName $Global:AriaCredential.UserName -AuthSource $Global:AriaAuthSource
     Write-Host "  Signing in as '$sendUser' against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Gray
 
@@ -5851,8 +5874,10 @@ function Connect-AriaOperations {
         Write-Host "  Aria Operations sign-in failed: $($_.Exception.Message)" -ForegroundColor Yellow
         if ("$($_.Exception.Message)" -match '401') {
             Write-Host "  '$sendUser' was sent against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Yellow
-            Write-Host "  That is the form this appliance expects - the bare account name, with the source in" -ForegroundColor Yellow
-            Write-Host "  authSource - so a 401 here is the account or the password, not the shape of the name." -ForegroundColor Yellow
+            Write-Host "  The username must be account@vIDM-domain@source, so if the DOMAIN in the middle is" -ForegroundColor Yellow
+            Write-Host "  wrong that alone is a 401 even with the right password." -ForegroundColor Yellow
+            Write-Host "  Current setting: `$Global:AriaVidmDomain = '$($Global:AriaVidmDomain)'." -ForegroundColor Yellow
+            Write-Host "  The password is the vIDM (domain) password, not an Aria-local one." -ForegroundColor Yellow
             Write-Host "  Check '$($Global:AriaAuthSource)' is still the Source Display Name under Administration >" -ForegroundColor Yellow
             Write-Host "  Authentication Sources, and that the account can sign in to the Aria UI." -ForegroundColor Yellow
         }
