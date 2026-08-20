@@ -12,6 +12,61 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.24.0] — 2026-08-20
+
+#### Changed
+
+- **Aria Operations signs in against the vIDM source again, with the vCenter
+  credential offered as a passthrough.** `$Global:AriaAuthSource` is fixed at
+  `vIDMAuthSource` — the source is a property of the site, not of the run, so there
+  is no chooser.
+
+  The username is **rebuilt** for that source. This is the part that is not
+  guessable and that a 401 will not tell you about: Aria will not resolve a bare
+  account name against vIDM, so the username field has to carry the whole path —
+  `vIDM_Username@vIDM_DOMAIN@vIDM_SOURCE_NAME_IN_ARIA`, e.g.
+  `nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource`. A `DOMAIN\user`
+  passthrough from vCenter has the NetBIOS prefix stripped first, since vIDM wants
+  the DNS-style domain in the middle rather than a prefix on the front. A name
+  already carrying two `@` is left alone; one carrying a domain only gains the
+  source. LOCAL and Active Directory sources are still sent exactly as entered.
+
+  `$Global:AriaVidmDomain` defaults to `dpe.protected.mil.au`. **Check it for your
+  site** — it is the domain as vIDM itself shows it, and is the literal string
+  `System Domain` for accounts created inside vIDM. The composed username is printed
+  before the request, and again on a 401 alongside the current setting, so a wrong
+  domain is visible rather than mysterious.
+
+- **Aria keeps a 1-manual / 2-passthrough choice, where UCS Manager's was removed.**
+  Deliberate asymmetry: UCS Manager takes the account exactly as vCenter holds it, so
+  a menu there had no second answer. vIDM rebuilds the name, and until that
+  composition has been seen to work at this site the operator should be able to
+  choose and to compare. **Option 2 previews the exact string it would send.** Asked
+  once per run, not once per cluster.
+
+  The lockout guards apply unchanged: a rejected passthrough is never offered again,
+  a failure discards the credential and counts against the three-attempt limit, and
+  past that nothing further is asked for or sent.
+
+- `RICHO_ARIA_PASSWORD` and `config/aria.local.json` still skip the question
+  entirely, and **no password is in the script**.
+
+#### Removed
+
+- The `-NoShared` switch on `Get-RunCredential`. It existed only for the LOCAL Aria
+  account, which no longer exists — and an unused parameter on a credential function
+  is exactly the sort of thing that gets switched on again by accident.
+
+#### Tests
+
+- `tests/Test-AriaSuppression.ps1` — 90 assertions: every username form including the
+  `DOMAIN\user` passthrough, LOCAL and AD being left alone, the source being fixed
+  with no chooser, the menu previewing what it would send, the choice being asked once
+  per run, a rejected passthrough not being re-offered, the three-attempt block, and
+  the env/file routes still skipping the prompt. The wire-level assertion now expects
+  the qualified username.
+- Full suite: 1238 assertions across 24 files, all passing.
+
 ### [23.23.0] — 2026-08-20
 
 #### Changed

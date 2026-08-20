@@ -38,7 +38,8 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
                                  'Invoke-AriaRestCall','Get-AriaCustomDatacenter','Get-AriaMembershipProperty',
                                  'Set-ClusterAriaPatchingSuppression','Test-DryRun',
                                  'Get-RunCredential','Register-RunCredentialResult','Clear-RunCredential',
-                                 'Set-SharedRunCredential','Get-AriaLocalCredential') } |
+                                 'Set-SharedRunCredential','Get-AriaRunCredential',
+                                 'Test-AriaVidmAuthSource','Resolve-AriaUserName') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0
@@ -54,8 +55,9 @@ $Global:ManualAttentionHosts = New-Object System.Collections.Generic.List[object
 $Global:AriaOperationsServer = 'siepd85vop1110.dpe.protected.mil.au'
 $Global:AriaSuppressionGroupName = 'ESXi Patching Hardware Suppression'
 $Global:AriaSuppressionGroupId = ''
-$Global:AriaAuthSource = 'LOCAL'
-$Global:AriaLocalUserName = 'admin'
+$Global:AriaAuthSource = 'vIDMAuthSource'
+$Global:AriaVidmDomain = 'dpe.protected.mil.au'
+$Global:AriaLocalUserName = ''
 $Global:AriaCredentialFile = 'config\aria.local.json'
 $Global:AriaSkipCertificateCheck = $true
 $Global:AriaCredential = [pscredential]::new('svc-esxi', (ConvertTo-SecureString 'p' -AsPlainText -Force))
@@ -186,8 +188,9 @@ $acquire = @($script:Calls | Where-Object { $_.Uri -match 'token/acquire' })[0]
 Assert-Equal "POST to the acquire endpoint" "POST" $acquire.Method
 Assert-Equal "on the suite-api, not the UI action API" $true ($acquire.Uri -match '/suite-api/api/auth/token/acquire$')
 $body = $acquire.Body | ConvertFrom-Json
-Assert-Equal "carrying the username" "svc-esxi" $body.username
-Assert-Equal "and the authentication source" "LOCAL" $body.authSource
+# The username on the wire is the REBUILT one - vIDM will not resolve a bare account name.
+Assert-Equal "carrying the username, qualified for vIDM" "svc-esxi@dpe.protected.mil.au@vIDMAuthSource" $body.username
+Assert-Equal "and the authentication source" "vIDMAuthSource" $body.authSource
 Assert-Equal "the token is held for the run" "tok-123" $Global:AriaSession
 
 Write-Host "`n=== The member list is READ, modified by one, and written back whole ===" -ForegroundColor Cyan
@@ -317,73 +320,134 @@ Assert-Equal "suppression goes on before the rolling upgrade" $true (
     $workflowText.IndexOf('Invoke-RollingClusterUpgrade -Cluster $Cluster'))
 Assert-Equal "and comes off in a finally" $true ($workflowText -match '(?s)finally \{[^}]*Set-ClusterAriaPatchingSuppression -Cluster \$Cluster -InSuppression \$false')
 
-Write-Host "`n=== Aria signs in LOCAL, as a local account, with nothing rewritten ===" -ForegroundColor Cyan
-# Directory sign-in was taken out after it cost two change windows. An AD or vIDM source needs the
-# account spelled a particular way that differs per source - vIDM wants user@vIDM-domain@source-name
-# - and getting it wrong is a 401 indistinguishable from a wrong password. LOCAL has none of that.
+Write-Host "`n=== The vIDM username is rebuilt as user@domain@source ===" -ForegroundColor Cyan
+# Aria will NOT resolve a bare account name against a vIDM source. The username field has to carry
+# the whole path, and anything else is a 401 indistinguishable from a wrong password - which is
+# exactly what a passthrough of a working vCenter credential produced the first time.
+Assert-Equal "a vIDM source is recognised" $true (Test-AriaVidmAuthSource -Name 'vIDMAuthSource')
+Assert-Equal "so is Workspace ONE" $true (Test-AriaVidmAuthSource -Name 'Workspace ONE Access')
+Assert-Equal "LOCAL is not" $false (Test-AriaVidmAuthSource -Name 'LOCAL')
+Assert-Equal "nor is an AD source" $false (Test-AriaVidmAuthSource -Name 'DPE Active Directory')
+
+Assert-Equal "a bare name gains domain and source" "nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource" (Resolve-AriaUserName -UserName 'nick.beare_priv' -AuthSource 'vIDMAuthSource')
+# A DOMAIN\user passthrough from vCenter carries the domain in the wrong place - vIDM wants the
+# DNS-style domain in the middle, not the NetBIOS prefix on the front.
+Assert-Equal "a DOMAIN\user passthrough is stripped first" "nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource" (Resolve-AriaUserName -UserName 'DPE\nick.beare_priv' -AuthSource 'vIDMAuthSource')
+Assert-Equal "user@domain only gains the source" "svc@dpe.protected.mil.au@vIDMAuthSource" (Resolve-AriaUserName -UserName 'svc@dpe.protected.mil.au' -AuthSource 'vIDMAuthSource')
+Assert-Equal "an already-qualified name is left alone" "svc@System Domain@vIDM-1" (Resolve-AriaUserName -UserName 'svc@System Domain@vIDM-1' -AuthSource 'vIDMAuthSource')
+# Every other source is untouched - that is the documented ordinary case and must not change.
+Assert-Equal "LOCAL is sent exactly as entered" "admin" (Resolve-AriaUserName -UserName 'admin' -AuthSource 'LOCAL')
+Assert-Equal "and so is an AD account" "nick.beare_priv" (Resolve-AriaUserName -UserName 'nick.beare_priv' -AuthSource 'DPE Active Directory')
+# No domain configured: send the account rather than invent a domain.
+$savedDomain = $Global:AriaVidmDomain
+$Global:AriaVidmDomain = ''
+Assert-Equal "no domain means no invention" "svc" (Resolve-AriaUserName -UserName 'svc' -AuthSource 'vIDMAuthSource')
+$Global:AriaVidmDomain = $savedDomain
+
+Write-Host "`n=== vIDMAuthSource is the source, and it is not asked about ===" -ForegroundColor Cyan
 $sourceText = [System.IO.File]::ReadAllText($scriptPath)
-Assert-Equal "authSource is the constant LOCAL" $true ($sourceText -match '\$Global:AriaAuthSource = "LOCAL"')
-Assert-Equal "the account defaults to admin" $true ($sourceText -match '\$Global:AriaLocalUserName = "admin"')
-Assert-Equal "the name is sent unaltered" $true ($sourceText -match '\$sendUser = \[string\]\$Global:AriaCredential.UserName')
-# Every trace of the directory machinery is gone, not just bypassed - dead auth code is the kind
-# that gets re-enabled by accident.
-foreach ($gone in @('Select-AriaAuthSource','Get-AriaAuthSourceName','Resolve-AriaUserName','Test-AriaVidmAuthSource','AriaVidmDomain')) {
-    Assert-Equal "$gone is gone entirely" $false ($sourceText -match [regex]::Escape($gone))
-}
+Assert-Equal "the source is fixed to vIDMAuthSource" $true ($sourceText -match '\$Global:AriaAuthSource = "vIDMAuthSource"')
+Assert-Equal "there is no source chooser" $false ($sourceText -match 'Select-AriaAuthSource')
+Assert-Equal "the token request carries it" $true ($sourceText -match 'authSource = \$Global:AriaAuthSource')
+Assert-Equal "and the sent username is the resolved one" $true ($sourceText -match 'Resolve-AriaUserName -UserName \$Global:AriaCredential.UserName -AuthSource \$Global:AriaAuthSource')
+# The composed name is printed BEFORE the request, so a wrong domain is visible, not mysterious.
+Assert-Equal "the composed name is printed before signing in" $true ($sourceText -match "Signing in as ..sendUser. against authSource")
 
 Write-Host "`n=== NO PASSWORD IS IN THE SCRIPT ===" -ForegroundColor Cyan
-# A password committed to git is a password in every clone, fork and backup of the repository, and
-# it stays in the history after it is deleted. This asserts the file cannot carry one.
 Assert-Equal "no inline password setting exists" $false ($sourceText -match '\$Global:AriaLocalPassword')
 Assert-Equal "nothing is exported to disk" $true (-not ($sourceText -match 'Export-Clixml|ConvertFrom-SecureString'))
-# The plaintext only ever exists on the way into a SecureString.
-Assert-Equal "the password becomes a SecureString immediately" $true ($sourceText -match 'ConvertTo-SecureString -String \$password -AsPlainText -Force')
 
-Write-Host "`n=== The password comes from the environment, a gitignored file, or the operator ===" -ForegroundColor Cyan
+Write-Host "`n=== Manual or passthrough - the operator is asked, while this is being proven ===" -ForegroundColor Cyan
+# UCS Manager takes the account exactly as vCenter holds it, so its menu was removed. vIDM does
+# not: the name is rebuilt, and until that composition has been seen to work here the operator
+# should be able to choose and to compare the two.
+Clear-RunCredential
+$Global:AriaCredential = $null
+$script:AriaPrompts = 0
+$script:Choices = New-Object System.Collections.Generic.List[string]
+Set-SharedRunCredential -Credential ([pscredential]::new('DPE\nick.beare_priv', (ConvertTo-SecureString 'domain-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
+
+$script:ChoiceAnswers.Enqueue('2')
+$cred = Get-AriaRunCredential 6>$null
+Assert-Equal "the choice was put to the operator" 1 $script:Choices.Count
+Assert-Equal "2 passes the vCenter credential through" "DPE\nick.beare_priv" $cred.UserName
+Assert-Equal "nothing was typed" 0 $script:AriaPrompts
+Assert-Equal "recorded as a passthrough" "Shared" $Global:CredentialSource["Aria Operations"]
+# ...and it is the REBUILT name that would go to the appliance.
+Assert-Equal "which is sent as the qualified name" "nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource" (Resolve-AriaUserName -UserName $cred.UserName -AuthSource $Global:AriaAuthSource)
+
+# The menu must show what option 2 would actually send, or it is not a comparison.
+$shown = (Get-AriaRunCredential 6>&1 | Out-String)
+Assert-Equal "the menu previews the composed name" $true ($shown -match 'nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource')
+
+Clear-RunCredential
+$Global:AriaCredential = $null
+$script:AriaPrompts = 0
+$script:Choices = New-Object System.Collections.Generic.List[string]
+Set-SharedRunCredential -Credential ([pscredential]::new('DPE\nick.beare_priv', (ConvertTo-SecureString 'domain-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
+$script:ChoiceAnswers.Enqueue('1')
+$cred = Get-AriaRunCredential 6>$null
+Assert-Equal "1 types one instead" 1 $script:AriaPrompts
+Assert-Equal "and it is what comes back" "typed-password" $cred.GetNetworkCredential().Password
+Assert-Equal "recorded as entered by hand" "Manual" $Global:CredentialSource["Aria Operations"]
+# Asked once per run, not once per cluster.
+$script:Choices = New-Object System.Collections.Generic.List[string]
+[void](Get-AriaRunCredential 6>$null)
+Assert-Equal "the second call asks nothing" 0 $script:Choices.Count
+Assert-Equal "and types nothing" 1 $script:AriaPrompts
+
+Write-Host "`n=== A rejected passthrough is not offered again ===" -ForegroundColor Cyan
+# The lockout guard for the replay. If vIDM refuses the vCenter credential, sending it again at
+# the next cluster is how an account gets locked.
+Clear-RunCredential
+$Global:AriaCredential = $null
+$script:AriaPrompts = 0
+$script:Choices = New-Object System.Collections.Generic.List[string]
+Set-SharedRunCredential -Credential ([pscredential]::new('DPE\nick.beare_priv', (ConvertTo-SecureString 'domain-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
+$script:ChoiceAnswers.Enqueue('2')
+[void](Get-AriaRunCredential 6>$null)
+Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $false 6>$null
+$script:Choices = New-Object System.Collections.Generic.List[string]
+[void](Get-AriaRunCredential 6>$null)
+Assert-Equal "no passthrough is offered the second time" 0 $script:Choices.Count
+Assert-Equal "it is typed instead" 1 $script:AriaPrompts
+# Past the limit nothing further is asked for or sent at all.
+Clear-RunCredential
+$Global:AriaCredential = $null
+$script:AriaPrompts = 0
+for ($i = 1; $i -le $Global:MaxCredentialAttempts; $i++) {
+    [void](Get-AriaRunCredential 6>$null)
+    Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $false 6>$null
+}
+$before = $script:AriaPrompts
+Assert-Equal "past the limit nothing is returned" $true ($null -eq (Get-AriaRunCredential 6>$null))
+Assert-Equal "and nothing further is typed" $before $script:AriaPrompts
+Clear-RunCredential
+
+Write-Host "`n=== The environment and the gitignored file still skip the prompt ===" -ForegroundColor Cyan
+Clear-RunCredential
+$Global:AriaCredential = $null
+$script:AriaPrompts = 0
+$script:Choices = New-Object System.Collections.Generic.List[string]
 $env:RICHO_ARIA_PASSWORD = 'from-the-environment'
-$cred = Get-AriaLocalCredential 6>$null
+$Global:AriaLocalUserName = 'svc-aria'
+$cred = Get-AriaRunCredential 6>$null
 Assert-Equal "the environment variable is used" "from-the-environment" $cred.GetNetworkCredential().Password
-Assert-Equal "as the admin account" "admin" $cred.UserName
+Assert-Equal "as the configured account" "svc-aria" $cred.UserName
 Assert-Equal "held as a SecureString" "System.Security.SecureString" $cred.Password.GetType().FullName
-Assert-Equal "and nothing was asked" 0 $script:AriaPrompts
+Assert-Equal "and nothing was asked" 0 $script:Choices.Count
 $env:RICHO_ARIA_PASSWORD = ''
+$Global:AriaLocalUserName = ''
 
-# The gitignored file, next to the script.
 $fileDir = Join-Path ([IO.Path]::GetTempPath()) ("aria-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path (Join-Path $fileDir 'config') | Out-Null
 '{"userName":"svc-aria","password":"from-the-file"}' | Set-Content -Path (Join-Path $fileDir 'config/aria.local.json') -Encoding UTF8
-$PSScriptRoot_saved = $PSScriptRoot
 Push-Location $fileDir
-$cred = Get-AriaLocalCredential 6>$null
+$cred = Get-AriaRunCredential 6>$null
 Pop-Location
 Assert-Equal "the file is used" "from-the-file" $cred.GetNetworkCredential().Password
 Assert-Equal "including the account it names" "svc-aria" $cred.UserName
-Assert-Equal "and still nothing was asked" 0 $script:AriaPrompts
 Remove-Item -LiteralPath $fileDir -Recurse -Force -ErrorAction SilentlyContinue
-
-# Neither present: ask, with the username already filled in.
-$Global:AriaCredential = $null
-$script:AriaPrompts = 0
-$cred = Get-AriaLocalCredential 6>$null
-Assert-Equal "otherwise the operator is asked" 1 $script:AriaPrompts
-Assert-Equal "with admin already filled in" "admin" $script:AriaPromptUser
-Assert-Equal "and what they typed is used" "typed-password" $cred.GetNetworkCredential().Password
-
-Write-Host "`n=== The vCenter credential is NEVER offered for Aria ===" -ForegroundColor Cyan
-# It is a domain account and this is a LOCAL source, so it is not a candidate - offering it would
-# only invite a failed sign-in against an account that has nothing to do with Aria.
-Clear-RunCredential
-$script:AriaPrompts = 0
-Set-SharedRunCredential -Credential ([pscredential]::new('DPE\nick.beare_priv', (ConvertTo-SecureString 'domain-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
-$cred = Get-AriaLocalCredential 6>$null
-Assert-Equal "the operator is asked anyway" 1 $script:AriaPrompts
-Assert-Equal "and gets the local account, not the domain one" "typed-password" $cred.GetNetworkCredential().Password
-Assert-Equal "no choice was offered" 0 $script:Choices.Count
-# UCS Manager still gets it - that passthrough is deliberate and stays.
-$script:Choices = New-Object System.Collections.Generic.List[string]
-$script:ChoiceAnswers.Enqueue('2')
-$ucs = Get-RunCredential -Purpose "UCS Manager" -Message "m" 6>$null
-Assert-Equal "UCS Manager is still offered the vCenter credential" "DPE\nick.beare_priv" $ucs.UserName
 Clear-RunCredential
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })

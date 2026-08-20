@@ -159,7 +159,11 @@ function Get-Credential { param($Message,$UserName) $script:TypedCount++; return
 Write-Host "`n=== It is wired in, and cleared however the run ends ===" -ForegroundColor Cyan
 $sourceText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "UCS Manager goes through the cache" $true ($sourceText -match 'Get-RunCredential -Purpose "UCS Manager"')
-Assert-Equal "Aria Operations goes through the cache" $true ($sourceText -match 'Get-RunCredential -Purpose "Aria Operations"')
+# Aria has its own resolver - it offers a 1/2 choice where UCS Manager passes straight through,
+# because vIDM rebuilds the username as user@domain@source and that composition is still being
+# proven at this site. It uses the same cache, counters and block.
+Assert-Equal "Aria Operations uses the same cache" $true ($sourceText -match '\$Global:CredentialCache\["Aria Operations"\] = \$credential')
+Assert-Equal "and respects the same block" $true ($sourceText -match '\$Global:CredentialBlocked.ContainsKey\("Aria Operations"\)')
 Assert-Equal "a UCSM failure is counted" $true ($sourceText -match 'Register-RunCredentialResult -Purpose "UCS Manager" -Succeeded \$false')
 Assert-Equal "an Aria failure is counted" $true ($sourceText -match 'Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded \$false')
 # The clear is in the script's outermost finally, so an exit, a stop or a crash all reach it.
