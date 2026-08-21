@@ -12,6 +12,44 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.29.0] — 2026-08-20
+
+#### Changed
+
+- **A firmware run no longer checks the ESXi target at all.** Not read, not printed,
+  not compared. 23.27.0 made it advisory — shown but not acted on — and that was half
+  a step: the work in mode 2 is the UCS firmware, every host is in scope whatever
+  image it is on, and nothing downstream consults the answer. Reading it anyway cost
+  an Auto Deploy call and an `esxcli software profile get` round trip **per host** to
+  produce a table nobody acts on, with a column headed `UPDATE` that nothing was going
+  to update.
+
+  The target globals are cleared on entering a firmware cluster, so the closing
+  verification reports the ESXi column as `n/a` rather than measuring the cluster
+  against a target it never checked — or against one left over from a previous
+  ESXi-only cluster in the same session.
+
+  **Mode 1 is untouched and load-bearing**: the target is resolved before anything is
+  decided about scope, an unreadable Auto Deploy rule still asks for the image profile
+  name with `E` to stop, and hosts already on the target still drop out of scope.
+
+#### Removed
+
+- The `-Advisory` switch on `Resolve-ClusterEsxiTarget` and
+  `Show-ClusterEsxiTargetComparison`, and the information-only labelling that went
+  with it. With the firmware path not calling either function, the switch had no
+  caller — and an unused mode flag on a function that decides which hosts get rebooted
+  is exactly the sort of thing that comes back by accident.
+
+#### Tests
+
+- `tests/Test-AutoDeployTarget.ps1` — 43 assertions: both calls gated on
+  `ESXI_ONLY`, each reachable from exactly one call site, the firmware branch clearing
+  the target globals, no `-Advisory` or information-only text surviving anywhere, no
+  host reading as compliant when there is no target, and an ESXi-only run still asking
+  when Auto Deploy cannot be read.
+- Full suite: 1272 assertions across 24 files, all passing.
+
 ### [23.28.0] — 2026-08-20
 
 #### Added

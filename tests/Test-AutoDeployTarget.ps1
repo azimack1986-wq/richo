@@ -219,45 +219,39 @@ Assert-Equal "before the in-scope decision" $true (
     $sourceText.IndexOf('$patchCandidateHosts = @($allClusterHosts'))
 Assert-Equal "and Auto Deploy is loaded with the other modules" $true ($sourceText -match 'VMware\.DeployAutomation')
 
-Write-Host "`n=== In a FIRMWARE run the ESXi target is advisory - it decides nothing ===" -ForegroundColor Cyan
-# Worth knowing and worth printing, but the work is the UCS firmware: every host is in scope
-# whatever image it is on, and a run must not stop over a target it was never going to act on.
-Reset-Fixture
-$out = Resolve-ClusterEsxiTarget -Cluster $cluster -Hosts $hosts -Advisory 6>&1
-$text = ($out | Out-String)
-Assert-Equal "the target is still read and shown" "ESXi-8.0U3j-25429389-standard" $Global:TargetImageProfileName
-Assert-Equal "and labelled as information only" $true ($text -match 'Shown for information only')
-Assert-Equal "not as a requirement" $false ($text -match 'is required to be on')
-$out = Show-ClusterEsxiTargetComparison -Hosts $hosts -Advisory 6>&1
-Assert-Equal "the comparison says so too" $true (($out | Out-String) -match 'FOR INFORMATION ONLY')
+Write-Host "`n=== A FIRMWARE run does not check the ESXi target at all ===" -ForegroundColor Cyan
+# The work there is the UCS firmware, every host is in scope whatever image it is on, and nothing
+# downstream consults the answer. Reading it anyway would mean an Auto Deploy call and an esxcli
+# round trip per host to produce a table nobody acts on - and a column headed UPDATE that nothing
+# is going to update.
+$sourceText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "the resolve is gated on ESXi-only mode" $true ($sourceText -match '(?s)if \(\$Global:UpgradeMode -eq "ESXI_ONLY"\) \{\s*Resolve-ClusterEsxiTarget -Cluster \$Cluster -Hosts \$allClusterHosts')
+Assert-Equal "and so is the comparison" $true ($sourceText -match '(?s)if \(\$Global:UpgradeMode -eq "ESXI_ONLY"\).*?Show-ClusterEsxiTargetComparison -Hosts \$allClusterHosts')
+# Called in exactly one place each - no second, ungated call anywhere.
+Assert-Equal "resolved once" 1 ([regex]::Matches($sourceText, 'Resolve-ClusterEsxiTarget -Cluster \$Cluster').Count)
+# The assignment form, so the .EXAMPLE line in the function's own help is not counted as a call.
+Assert-Equal "compared once" 1 ([regex]::Matches($sourceText, '\$needEsxiUpdateHosts = @\(Show-ClusterEsxiTargetComparison').Count)
+# Nothing is carried over from a previous cluster, so the closing verification reports n/a rather
+# than measuring a firmware cluster against a target it never checked.
+Assert-Equal "the firmware branch clears the target" $true ($sourceText -match '(?s)else \{[^}]*\$Global:TargetImageProfileName = ""[^}]*\$Global:TargetEsxiBuild = ""')
+# The advisory machinery is gone rather than merely unused.
+Assert-Equal "no advisory switch remains" $false ($sourceText -match '\-Advisory')
+Assert-Equal "and no information-only labelling" $false ($sourceText -match 'FOR INFORMATION ONLY')
+# With no target, nothing reads as compliant - the verification says n/a, it does not guess.
+$Global:TargetImageProfileName = ''
+$Global:TargetEsxiBuild = ''
+Assert-Equal "no target means no host is on target" $false (Test-VMHostOnTargetImageProfile -VMHostObject $hosts[1])
 
-# Auto Deploy unreadable in a firmware run: a line of output, not a prompt and not a stop.
+# An ESXi-only run is unchanged: it resolves, it asks when Auto Deploy cannot be read, and it stops
+# if the operator says so.
 Reset-Fixture
 $script:MatchThrows = $true
 $script:Rules = @()
 $script:AskedForProfile = $false
 function Read-Host { param($Prompt) $script:AskedForProfile = $true; return '' }
-$out = Resolve-ClusterEsxiTarget -Cluster $cluster -Hosts $hosts -Advisory 6>&1
-Assert-Equal "nothing is asked" $false $script:AskedForProfile
-Assert-Equal "and it says why that is fine here" $true (($out | Out-String) -match 'this is a firmware run, so that changes nothing')
-Assert-Equal "recorded as not read" "NotRead" (@($Global:RunSummary.ToArray() | Where-Object { $_.Action -eq 'Resolve ESXi target' })[-1].Result)
-
-# The SAME situation in an ESXi-only run does ask, because there the target is the work.
-Reset-Fixture
-$script:MatchThrows = $true
-$script:Rules = @()
-$script:AskedForProfile = $false
 [void](Resolve-ClusterEsxiTarget -Cluster $cluster -Hosts $hosts 6>$null)
-Assert-Equal "an ESXi-only run asks for the image profile" $true $script:AskedForProfile
-
-# And the caller only acts on the answer when the run is ESXi-only.
-$sourceText = [System.IO.File]::ReadAllText($scriptPath)
-Assert-Equal "advisory is tied to firmware mode" $true ($sourceText -match '\$esxiAdvisory = \(\$Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE"\)')
-Assert-Equal "and passed to both" $true (
-    ($sourceText -match 'Resolve-ClusterEsxiTarget -Cluster \$Cluster -Hosts \$allClusterHosts -Advisory:\$esxiAdvisory') -and
-    ($sourceText -match 'Show-ClusterEsxiTargetComparison -Hosts \$allClusterHosts -Advisory:\$esxiAdvisory'))
-# Firmware mode takes every connected host; only ESXi-only mode drops the ones already on target.
-Assert-Equal "only the ESXi-only branch excludes on-target hosts" 1 ([regex]::Matches($sourceText, '\$alreadyTargetHosts\.Name -notcontains').Count)
+Assert-Equal "an ESXi-only run still asks for the image profile" $true $script:AskedForProfile
+Remove-Item Function:\Read-Host -ErrorAction SilentlyContinue
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

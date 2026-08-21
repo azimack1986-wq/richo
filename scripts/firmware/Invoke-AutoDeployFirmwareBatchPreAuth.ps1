@@ -574,7 +574,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.28.0-preauth"
+$ScriptVersion = "23.29.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 # NOT SET HERE. The ESXi target is whatever the cluster's Auto Deploy rule says it is, read from
@@ -6703,13 +6703,11 @@ function Resolve-ClusterEsxiTarget {
         a per-host target worked out host by host. Step 2 exists only to say which of them are not
         there yet.
 
-        ADVISORY IN FIRMWARE MODE. In a firmware run the ESXi version is worth knowing and worth
-        printing, but it decides nothing: the work is the UCS firmware, every host is in scope
-        regardless of what image it is on, and a run must not stop over an ESXi target it was never
-        going to act on. So in that mode Auto Deploy being unreadable is a line of output and
-        nothing more - no prompt, no exit. In an ESXi-only run the target IS the work, so the
-        operator is asked for the image profile name rather than the run inventing one or carrying
-        on with no target at all, and exiting is offered on the same prompt.
+        ESXi-ONLY RUNS ONLY. A firmware run never calls this - see the caller. The target is the
+        basis of the ESXi work and nothing else, so where Auto Deploy cannot be read the operator
+        is asked for the image profile name rather than the run inventing one or carrying on with
+        no target at all. Exiting is offered on the same prompt, because "I do not know what these
+        hosts should be running" is a perfectly good reason to stop before a change window.
 
     .PARAMETER Cluster
         The cluster being upgraded.
@@ -6717,16 +6715,12 @@ function Resolve-ClusterEsxiTarget {
     .PARAMETER Hosts
         Its hosts.
 
-    .PARAMETER Advisory
-        Read and report the target, but never prompt and never stop for it. Set for a firmware run.
-
     .EXAMPLE
         Resolve-ClusterEsxiTarget -Cluster $cluster -Hosts $allClusterHosts
     #>
     param(
         [Parameter(Mandatory=$true)]$Cluster,
-        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts,
-        [switch]$Advisory
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts
     )
 
     $Global:TargetImageProfileName = ""
@@ -6741,14 +6735,6 @@ function Resolve-ClusterEsxiTarget {
 
     if ([string]::IsNullOrWhiteSpace($target.Name)) {
         Write-Host "  The Auto Deploy rule for this cluster could not be read." -ForegroundColor Yellow
-
-        if ($Advisory) {
-            # A firmware run does not act on this, so it does not stop for it either.
-            Write-Host "  This is a firmware run, so that changes nothing: every host is in scope for the" -ForegroundColor Gray
-            Write-Host "  firmware work regardless of which ESXi image it is on." -ForegroundColor Gray
-            Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Resolve ESXi target" -Result "NotRead" -Details "$($Cluster.Name) - no Auto Deploy rule readable. Advisory only in a firmware run; nothing depends on it."
-            return
-        }
 
         Write-Host "  Enter the image profile name the cluster should be on - exactly as it appears in the" -ForegroundColor Yellow
         Write-Host "  deploy rule, e.g. ESXi-8.0U3j-25429389-standard - or E to stop." -ForegroundColor Yellow
@@ -6768,13 +6754,7 @@ function Resolve-ClusterEsxiTarget {
         Write-Host "  Rule '$($target.Rule)' names image profile '$($target.Name)'." -ForegroundColor Green
     }
 
-    if ($Advisory) {
-        Write-Host "  Shown for information only - this is a firmware run and every host is in scope for it" -ForegroundColor Gray
-        Write-Host "  whatever ESXi image it is on." -ForegroundColor Gray
-    }
-    else {
-        Write-Host "  Every host in '$($Cluster.Name)' is required to be on '$($Global:TargetImageProfileName)'." -ForegroundColor Green
-    }
+    Write-Host "  Every host in '$($Cluster.Name)' is required to be on '$($Global:TargetImageProfileName)'." -ForegroundColor Green
 
     if ($Global:TargetImageProfileName -match '(\d{6,})') { $Global:TargetEsxiBuild = $Matches[1] }
 
@@ -6794,23 +6774,13 @@ function Show-ClusterEsxiTargetComparison {
         A host whose profile cannot be read is shown as unreadable and counted as needing work -
         the safe direction, and visible rather than quietly dropped.
 
-        In a firmware run the same table is printed and the same hosts are named, but the caller
-        does not act on the answer - see Resolve-ClusterEsxiTarget. The heading says so, because a
-        column headed UPDATE that nothing is going to update is worse than no column at all.
-
     .PARAMETER Hosts
         The cluster's hosts.
-
-    .PARAMETER Advisory
-        Label the table as information only. Set for a firmware run.
 
     .EXAMPLE
         $needWork = Show-ClusterEsxiTargetComparison -Hosts $allClusterHosts
     #>
-    param(
-        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts,
-        [switch]$Advisory
-    )
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts)
 
     if ([string]::IsNullOrWhiteSpace($Global:TargetImageProfileName)) { return @($Hosts) }
 
@@ -6832,9 +6802,6 @@ function Show-ClusterEsxiTargetComparison {
 
     $rows | Format-Table -AutoSize | Out-String | Write-Host
     Write-Host "  $($differ.Count) of $(@($Hosts).Count) host(s) are not on '$($Global:TargetImageProfileName)'." -ForegroundColor $(if ($differ.Count -eq 0) { 'Green' } else { 'Yellow' })
-    if ($Advisory) {
-        Write-Host "  FOR INFORMATION ONLY - this run does the UCS firmware, and takes every host either way." -ForegroundColor Gray
-    }
     Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Compare to Auto Deploy target" -Result "Compared" -Details "$($differ.Count) of $(@($Hosts).Count) host(s) not on '$($Global:TargetImageProfileName)' (rule: $($Global:TargetDeployRuleName))."
 
     return @($differ.ToArray())
@@ -9367,7 +9334,8 @@ function Show-ClusterFirmwareVerification {
 
         Per host:
           ESXi           - the image profile the host is running, against the one the cluster's
-                           Auto Deploy rule names.
+                           Auto Deploy rule names. "n/a" in a firmware run, which does not check
+                           the ESXi target at all - see the pre-flight.
           Intersight     - the server profile's ConfigState, and whether anything is still staged.
                            "None" in the Outstanding column is the result being looked for: the
                            deploy landed and nothing is waiting.
@@ -9751,18 +9719,30 @@ function Invoke-ClusterUpgradeWorkflow {
 
     if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") { Build-InfrastructureHostMapping -Hosts $allClusterHosts }
 
-    # THE TARGET COMES FROM AUTO DEPLOY, per cluster, before anything is decided about which hosts
-    # are in scope - the rule is what these stateless hosts will boot, so it is the only honest
-    # answer to "what should they be running".
+    # THE ESXi TARGET IS AN ESXi-ONLY CONCERN. In a firmware run it is not read, not printed and
+    # not compared: the work is the UCS firmware, every host is in scope for it whatever image it
+    # is on, and nothing downstream consults the answer. Reading it anyway would mean an Auto
+    # Deploy call and an esxcli round trip per host to produce a table nobody acts on - and a
+    # column headed UPDATE that nothing is going to update.
     #
-    # ADVISORY IN A FIRMWARE RUN. Worth knowing and worth printing, but it decides nothing there:
-    # the work is the UCS firmware and every host is in scope for it whatever image it is on. So
-    # the read happens either way and the table is printed either way, but in firmware mode it
-    # cannot prompt, cannot stop the run, and cannot take a host out of scope.
-    $esxiAdvisory = ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE")
-    Resolve-ClusterEsxiTarget -Cluster $Cluster -Hosts $allClusterHosts -Advisory:$esxiAdvisory
-    $needEsxiUpdateHosts = @(Show-ClusterEsxiTargetComparison -Hosts $allClusterHosts -Advisory:$esxiAdvisory)
-    $alreadyTargetHosts = @($allClusterHosts | Where-Object { $needEsxiUpdateHosts.Name -notcontains $_.Name })
+    # In an ESXi-only run it is the whole basis of the work: the rule is what these stateless hosts
+    # will boot, so it is the only honest answer to "what should they be running", and it is
+    # resolved before anything is decided about which hosts are in scope.
+    $needEsxiUpdateHosts = @()
+    $alreadyTargetHosts = @()
+    if ($Global:UpgradeMode -eq "ESXI_ONLY") {
+        Resolve-ClusterEsxiTarget -Cluster $Cluster -Hosts $allClusterHosts
+        $needEsxiUpdateHosts = @(Show-ClusterEsxiTargetComparison -Hosts $allClusterHosts)
+        $alreadyTargetHosts = @($allClusterHosts | Where-Object { $needEsxiUpdateHosts.Name -notcontains $_.Name })
+    }
+    else {
+        # Nothing held over from a previous cluster, so the closing verification reports "n/a"
+        # rather than measuring this cluster against something it never checked.
+        $Global:TargetImageProfileName = ""
+        $Global:TargetEsxiBuild = ""
+        $Global:TargetDeployRuleName = ""
+        $Global:HostImageProfileCache = @{}
+    }
 
     if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") {
         # Firmware-only mode must not exclude hosts just because the ESXi build is already current.
