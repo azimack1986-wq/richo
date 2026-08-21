@@ -574,7 +574,7 @@ else {
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.27.0-preauth"
+$ScriptVersion = "23.28.0-preauth"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 # NOT SET HERE. The ESXi target is whatever the cluster's Auto Deploy rule says it is, read from
@@ -907,6 +907,10 @@ $Global:AriaLocalUserName = ""
 # for this user and this process on Windows - and is turned back into plain text only for the one
 # token request. Nothing is written to the log or the run summary.
 $Global:AriaCredentialFile = "config\aria.local.json"
+# Set when the operator has typed the whole username by hand (menu option 3). It then goes to the
+# appliance exactly as typed - nothing composed, nothing stripped - which is the only way to test a
+# specific string and know that what failed or worked is what you actually sent.
+$Global:AriaUserNameIsRaw = $false
 $Global:AriaSkipCertificateCheck = $true
 $Global:AriaCredential = $null
 $Global:AriaSession = $null
@@ -1693,6 +1697,7 @@ function Clear-RunCredential {
     $Global:SharedCredentialRejected = @{}
     $Global:UcsCredential = $null
     $Global:AriaCredential = $null
+    $Global:AriaUserNameIsRaw = $false
 }
 
 # -----------------------------
@@ -5681,7 +5686,14 @@ function Get-AriaRunCredential {
           2. $Global:AriaCredentialFile  config\aria.local.json, {"userName":"...","password":"..."},
                                          which .gitignore already excludes through config/*.local.json.
                                          Resolved next to the script, then next to the repo root.
-          3. the operator, ASKED         1 to type it, 2 to pass the vCenter credential through.
+          3. the operator, ASKED         1 to type an account (composed for the source), 2 to pass
+                                         the vCenter credential through, 3 to type the EXACT
+                                         username that should reach the appliance.
+
+        OPTION 3 EXISTS FOR TESTING, and is always on the menu rather than appearing after a
+        failure. Confirming that a particular username works should not require a different one to
+        fail first - that burns an attempt, marks the passthrough rejected, and proves nothing
+        about the string being tested. What is typed there goes onto the wire unaltered.
 
         THE CHOICE IS DELIBERATE HERE, where UCS Manager's was removed. UCS Manager takes the
         account exactly as vCenter holds it; vIDM does not - the name has to be rebuilt as
@@ -5764,24 +5776,79 @@ function Get-AriaRunCredential {
         return $heldForAria
     }
 
-    # THE CHOICE, while the vIDM username composition is being proven at this site.
+    # THE CHOICE. Always offered, never skipped - option 3 has to be reachable WITHOUT first
+    # burning a passthrough attempt on an account that turns out not to be entitled. Testing a
+    # username by having a different one fail first is not testing it.
     $shared = $null
     if ($null -ne $Global:SharedCredential -and -not ($Global:SharedCredentialRejected.ContainsKey("Aria Operations") -and $Global:SharedCredentialRejected["Aria Operations"])) {
         $shared = $Global:SharedCredential
     }
 
+    Write-Host "" -ForegroundColor Cyan
+    Write-Host "  Aria Operations sign-in - authSource '$($Global:AriaAuthSource)'." -ForegroundColor Cyan
+    Write-Host "    1. Enter the account name and password" -ForegroundColor Yellow
+    Write-Host "       - sent as account@$($Global:AriaVidmDomain)@$($Global:AriaAuthSource)" -ForegroundColor Gray
+    $allowed = @("1","3")
     if ($null -ne $shared) {
         $preview = Resolve-AriaUserName -UserName $shared.UserName -AuthSource $Global:AriaAuthSource
-        Write-Host "" -ForegroundColor Cyan
-        Write-Host "  Aria Operations sign-in - authSource '$($Global:AriaAuthSource)'." -ForegroundColor Cyan
-        Write-Host "    1. Enter the account manually" -ForegroundColor Yellow
         Write-Host "    2. Pass through the $($Global:SharedCredentialSource) credential '$($shared.UserName)'" -ForegroundColor Yellow
         Write-Host "       - which would be sent as '$preview'" -ForegroundColor Gray
-        $choice = Read-ChoiceExit -Message "Aria Operations credential" -AllowedChoices @("1","2") -ExitMessage "Stopped at the Aria Operations credential."
-        if ($choice -eq "2") {
-            $Global:CredentialSource["Aria Operations"] = "Shared"
-            return $shared
+        $allowed = @("1","2","3")
+    }
+    Write-Host "    3. Enter the EXACT username to send, in full" -ForegroundColor Yellow
+    Write-Host "       - typed straight onto the wire, nothing added or removed. Use this to try a" -ForegroundColor Gray
+    Write-Host "         username by hand, e.g. andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource" -ForegroundColor Gray
+
+    $choice = Read-ChoiceExit -Message "Aria Operations credential" -AllowedChoices $allowed -ExitMessage "Stopped at the Aria Operations credential."
+
+    if ($choice -eq "2") {
+        $Global:AriaUserNameIsRaw = $false
+        $Global:CredentialSource["Aria Operations"] = "Shared"
+        return $shared
+    }
+
+    if ($choice -eq "3") {
+        # RAW. Read-Host rather than the credential dialog, because the string wanted here has two
+        # @ signs in it and the Windows CredUI dialog is entitled to have opinions about that. What
+        # is typed is what is sent - no domain appended, no prefix stripped, nothing composed.
+        #
+        # A DEFAULT IS OFFERED so the common case is one keypress: the KB syntax, built from the
+        # account this run already knows about. Enter accepts it; anything typed replaces it whole.
+        # Showing the default also means the syntax is on screen to copy and adjust, which is the
+        # point of this option - it is here to try a string by hand, not to make one up from memory.
+        $suggested = ""
+        if ($null -ne $shared) { $suggested = Resolve-AriaUserName -UserName $shared.UserName -AuthSource $Global:AriaAuthSource }
+        elseif (-not [string]::IsNullOrWhiteSpace($userName)) { $suggested = Resolve-AriaUserName -UserName $userName -AuthSource $Global:AriaAuthSource }
+
+        Write-Host "  The whole username, exactly as it should reach the appliance." -ForegroundColor Yellow
+        if (-not [string]::IsNullOrWhiteSpace($suggested)) {
+            Write-Host "  Press Enter to use '$suggested', or type a different one." -ForegroundColor Gray
         }
+        else {
+            Write-Host "  e.g. andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource" -ForegroundColor Gray
+        }
+
+        $rawUser = Read-Host "Username$(if (-not [string]::IsNullOrWhiteSpace($suggested)) { " [$suggested]" })"
+        if ([string]::IsNullOrWhiteSpace($rawUser)) { $rawUser = $suggested }
+        if ([string]::IsNullOrWhiteSpace($rawUser)) {
+            Write-Host "  Nothing entered and nothing to default to - no credential." -ForegroundColor Yellow
+            return $null
+        }
+        $rawUser = $rawUser.Trim()
+
+        $securePassword = Read-Host "Password for '$rawUser'" -AsSecureString
+        if ($null -eq $securePassword -or $securePassword.Length -eq 0) {
+            Write-Host "  No password entered - no credential." -ForegroundColor Yellow
+            return $null
+        }
+
+        $rawCredential = New-Object System.Management.Automation.PSCredential($rawUser, $securePassword)
+        Write-Host "  Will be sent exactly as '$rawUser'." -ForegroundColor Gray
+
+        $Global:AriaUserNameIsRaw = $true
+        $Global:CredentialCache["Aria Operations"] = $rawCredential
+        $Global:CredentialSource["Aria Operations"] = "Manual"
+        return $rawCredential
     }
 
     $credential = $null
@@ -5792,6 +5859,7 @@ function Get-AriaRunCredential {
     catch { $credential = $null }
     if ($null -eq $credential -or [string]::IsNullOrWhiteSpace($credential.GetNetworkCredential().Password)) { return $null }
 
+    $Global:AriaUserNameIsRaw = $false
     $Global:CredentialCache["Aria Operations"] = $credential
     $Global:CredentialSource["Aria Operations"] = "Manual"
     return $credential
@@ -5866,8 +5934,10 @@ function Connect-AriaOperations {
         }
 
         # The credential is held exactly as entered; the username is composed on its way to the
-        # appliance and nowhere else. See Resolve-AriaUserName.
-        $sendUser = Resolve-AriaUserName -UserName $Global:AriaCredential.UserName -AuthSource $Global:AriaAuthSource
+        # appliance and nowhere else - unless the operator typed the whole thing themselves, in
+        # which case it goes untouched. See Resolve-AriaUserName.
+        $sendUser = if ($Global:AriaUserNameIsRaw) { [string]$Global:AriaCredential.UserName }
+                    else { Resolve-AriaUserName -UserName $Global:AriaCredential.UserName -AuthSource $Global:AriaAuthSource }
         Write-Host "  Signing in as '$sendUser' against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Gray
 
         try {
@@ -5888,7 +5958,7 @@ function Connect-AriaOperations {
         catch {
             Write-Host "  Aria Operations sign-in failed: $($_.Exception.Message)" -ForegroundColor Yellow
             if ("$($_.Exception.Message)" -match '401') {
-                Write-Host "  '$sendUser' was sent against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Yellow
+                Write-Host "  '$sendUser' was sent against authSource '$($Global:AriaAuthSource)'$(if ($Global:AriaUserNameIsRaw) { ' - exactly as typed' })." -ForegroundColor Yellow
                 Write-Host "  THE SHAPE OF THAT NAME IS THE PROVEN ONE - account@vIDM-domain@source - so the" -ForegroundColor Yellow
                 Write-Host "  likeliest cause is the ACCOUNT, not the format:" -ForegroundColor Yellow
                 Write-Host "    - it may not be entitled in Aria. Administration > Access Control > User Accounts;" -ForegroundColor Gray
@@ -5901,6 +5971,7 @@ function Connect-AriaOperations {
 
             # The rejected credential is discarded rather than replayed, and the attempt is counted.
             $Global:AriaCredential = $null
+            $Global:AriaUserNameIsRaw = $false
             Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $false
             Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Failed" -Details "$($Global:AriaOperationsServer) as $sendUser - $($_.Exception.Message)"
 

@@ -12,6 +12,51 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.28.0] — 2026-08-20
+
+#### Added
+
+- **Option 3 on the Aria menu: enter the exact username to send.** For testing a
+  string by hand. What is typed goes onto the wire unaltered — nothing composed, no
+  domain appended, no `DOMAIN\` prefix stripped — so what failed or worked is
+  demonstrably what was sent.
+
+  ```
+    Aria Operations sign-in - authSource 'vIDMAuthSource'.
+      1. Enter the account name and password
+         - sent as account@dpe.protected.mil.au@vIDMAuthSource
+      2. Pass through the vCenter credential 'andrew.iles_priv'
+         - which would be sent as 'andrew.iles_priv@dpe.protected.mil.au@vIDMAuthSource'
+      3. Enter the EXACT username to send, in full
+  ```
+
+  **It pre-fills the KB syntax, so Enter accepts it** and anything typed replaces it
+  whole. The default is composed from the account the run already holds, which also
+  puts the syntax on screen to copy and adjust — the point of the option is to try a
+  string by hand, not to reconstruct one from memory.
+
+  `Read-Host` rather than the credential dialog: the string wanted here carries two
+  `@` signs and the Windows CredUI dialog is entitled to have opinions about that.
+  The password is read as a `SecureString` and never echoes.
+
+- **The menu is now always shown**, rather than appearing only when a passthrough
+  credential exists. Confirming that a particular username works must not require a
+  different one to fail first — that burns an attempt, marks the passthrough
+  rejected, and proves nothing about the string being tested. Option 2 appears only
+  when there is something to pass through; 1 and 3 are always there.
+
+  A 401 on a raw username says so — *exactly as typed* — so it cannot be mistaken for
+  a composition problem.
+
+#### Tests
+
+- `tests/Test-AriaSuppression.ps1` — 111 assertions, 14 new: the exact string reaching
+  the wire including a `DOMAIN\` form the composer would otherwise rewrite, the
+  option being reachable with no passthrough held, Enter taking the composed default,
+  a typed name overriding it, no-default-and-no-input yielding nothing, and options 1
+  and 2 leaving the composer in charge.
+- Full suite: 1274 assertions across 24 files, all passing.
+
 ### [23.27.0] — 2026-08-20
 
 #### Fixed
