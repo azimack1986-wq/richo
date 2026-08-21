@@ -12,6 +12,51 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.30.0] — 2026-08-20
+
+#### Changed
+
+- **The ESXi version check samples one host, not every host.** These hosts are
+  stateless and boot the image profile the cluster's Auto Deploy rule hands them, so
+  what one is running is what they are all running — asking each in turn meant an
+  `esxcli software profile get` round trip per host over a management network to
+  answer the same question repeatedly. The sample now decides for the cluster: differs
+  from the rule and **every** host is taken as needing the update, matches and none
+  are.
+
+  The deploy rule lookup does the same — `Get-VMHostMatchingRules` stops at the first
+  host that yields a rule, rather than polling every host and reconciling.
+
+  Two guards, because "the first host" is not a safe literal reading:
+
+  - **Walked, not indexed.** Hosts are tried in order — Connected ones first — until
+    one answers. Host number one may be powered off, unreachable, or mid-reboot from a
+    previous run, and the sample should not fail because of that.
+  - **Nothing readable means the cluster needs the update.** Doing work that turns out
+    to be unnecessary costs a reboot window; skipping work that was necessary leaves a
+    cluster short of the version it is supposed to be on.
+
+  The sample host, what it is running, the rule's profile and the verdict are all
+  printed — a judgement made from one host is one whose basis should be visible. The
+  run summary records `OnTarget`, `NeedsUpdate` or `NotRead` with the host that was
+  sampled.
+
+  **Trade-off, stated plainly:** a cluster where hosts genuinely differ is now decided
+  by whichever one is sampled. That is the assumption as given — one image per cluster
+  — and a host that has drifted will be missed if the sample happens to be current.
+  The closing verification still reads every host, so drift shows up there rather than
+  passing silently.
+
+#### Tests
+
+- `tests/Test-AutoDeployTarget.ps1` — 51 assertions, 9 new: exactly one `Get-EsxCli`
+  call for a whole cluster, a stale sample putting every host in scope including one
+  that is already current, a matching sample clearing the cluster, an unreachable
+  first host being walked past, nothing readable putting everything in scope, and the
+  rule being read from one host with the walk continuing when that host has no
+  matching rule.
+- Full suite: 1280 assertions across 24 files, all passing.
+
 ### [23.29.0] — 2026-08-20
 
 #### Changed

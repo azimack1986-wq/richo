@@ -167,14 +167,87 @@ Reset-Fixture
 $out = Resolve-ClusterEsxiTarget -Cluster $cluster -Hosts $hosts 6>&1
 Assert-Equal "every host is said to require it" $true (($out | Out-String) -match "Every host in 'd85cvt02' is required to be on 'ESXi-8.0U3j-25429389-standard'")
 
-Write-Host "`n=== The hosts that differ are the hosts that need updating ===" -ForegroundColor Cyan
+Write-Host "`n=== One host is sampled, and it decides for the cluster ===" -ForegroundColor Cyan
+# These hosts are stateless and boot the profile the rule hands them, so what one is running is
+# what they are all running. Asking every host meant an esxcli round trip each over a management
+# network to answer the same question repeatedly.
 Reset-Fixture
 Resolve-ClusterEsxiTarget -Cluster $cluster -Hosts $hosts 6>$null
 Assert-Equal "the host on an older profile needs work" $false (Test-VMHostOnTargetImageProfile -VMHostObject $hosts[0])
 Assert-Equal "the host already on it does not" $true (Test-VMHostOnTargetImageProfile -VMHostObject $hosts[1])
+
+# esx01 is sampled and is out of date, so the WHOLE cluster is taken as needing the update - even
+# esx02, which happens to be current.
+Reset-Fixture
+Resolve-ClusterEsxiTarget -Cluster $cluster -Hosts $hosts 6>$null
+$Global:HostImageProfileCache = @{}
 $differ = @(Show-ClusterEsxiTargetComparison -Hosts $hosts 6>$null)
-Assert-Equal "exactly one host is listed" 1 $differ.Count
-Assert-Equal "and it is the right one" "esx01" $differ[0].Name
+Assert-Equal "every host is listed" 2 $differ.Count
+
+# ...and only one host was asked.
+Reset-Fixture
+$Global:TargetImageProfileName = 'ESXi-8.0U3j-25429389-standard'
+$Global:HostImageProfileCache = @{}
+$script:EsxCliCallCount = 0
+function Get-EsxCli { param($VMHost,[switch]$V2,$ErrorAction)
+    $script:EsxCliCallCount++
+    if ($script:EsxCliThrowsFor -contains [string]$VMHost.Name) { throw "host not reachable" }
+    $name = [string]$script:Running[[string]$VMHost.Name]
+    return [pscustomobject]@{ software = [pscustomobject]@{ profile = [pscustomobject]@{
+        get = [pscustomobject]@{} | Add-Member -MemberType ScriptMethod -Name Invoke -Value ([scriptblock]::Create("[pscustomobject]@{ Name = '$name' }")) -PassThru } } } }
+[void](Show-ClusterEsxiTargetComparison -Hosts $hosts 6>$null)
+Assert-Equal "only one host was asked" 1 $script:EsxCliCallCount
+
+# The sample matching means no ESXi work anywhere in the cluster.
+Reset-Fixture
+$script:Running = @{ 'esx01' = 'ESXi-8.0U3j-25429389-standard'; 'esx02' = 'ESXi-8.0U3a-20000000-standard' }
+$Global:TargetImageProfileName = 'ESXi-8.0U3j-25429389-standard'
+$Global:HostImageProfileCache = @{}
+Assert-Equal "a matching sample clears the whole cluster" 0 (@(Show-ClusterEsxiTargetComparison -Hosts $hosts 6>$null)).Count
+Assert-Equal "recorded as on target" "OnTarget" (@($Global:RunSummary.ToArray() | Where-Object { $_.Action -eq 'Compare to Auto Deploy target' })[-1].Result)
+
+# A host that will not answer is skipped for the sample rather than ending it - host number one
+# may be powered off, unreachable, or mid-reboot from a previous run.
+Reset-Fixture
+$script:EsxCliThrowsFor = @('esx01')
+$script:Running = @{ 'esx02' = 'ESXi-8.0U3j-25429389-standard' }
+$Global:TargetImageProfileName = 'ESXi-8.0U3j-25429389-standard'
+$Global:HostImageProfileCache = @{}
+Assert-Equal "the next host is sampled instead" 0 (@(Show-ClusterEsxiTargetComparison -Hosts $hosts 6>$null)).Count
+
+# NO host answering means the cluster needs the update - the safe direction.
+Reset-Fixture
+$script:EsxCliThrowsFor = @('esx01','esx02')
+$Global:TargetImageProfileName = 'ESXi-8.0U3j-25429389-standard'
+$Global:HostImageProfileCache = @{}
+$differ = @(Show-ClusterEsxiTargetComparison -Hosts $hosts 6>$null)
+Assert-Equal "nothing readable means everything is in scope" 2 $differ.Count
+Assert-Equal "and it says it could not read one" "NotRead" (@($Global:RunSummary.ToArray() | Where-Object { $_.Action -eq 'Compare to Auto Deploy target' })[-1].Result)
+
+Write-Host "`n=== The deploy rule is read from one host too ===" -ForegroundColor Cyan
+# The rule is a cluster-wide statement, so asking the rest is the same question again.
+Reset-Fixture
+$script:MatchingRuleCalls = 0
+function Get-VMHostMatchingRules { param($VMHost,$ErrorAction)
+    $script:MatchingRuleCalls++
+    if ($script:MatchThrows) { throw "Auto Deploy did not answer" }
+    return @($script:Rules) }
+[void](Get-ClusterDeployRuleTarget -Cluster $cluster -Hosts $hosts 6>$null)
+Assert-Equal "one host is asked for the rule" 1 $script:MatchingRuleCalls
+# Unless that host has nothing - then the walk continues.
+Reset-Fixture
+$script:MatchingRuleCalls = 0
+$script:FirstHostHasNoRule = $true
+function Get-VMHostMatchingRules { param($VMHost,$ErrorAction)
+    $script:MatchingRuleCalls++
+    if ([string]$VMHost.Name -eq 'esx01') { return @() }
+    return @($script:Rules) }
+$target = Get-ClusterDeployRuleTarget -Cluster $cluster -Hosts $hosts 6>$null
+Assert-Equal "a host with no matching rule is walked past" 2 $script:MatchingRuleCalls
+Assert-Equal "and the next one answers" "ESXi-8.0U3j-25429389-standard" $target.Name
+function Get-VMHostMatchingRules { param($VMHost,$ErrorAction)
+    if ($script:MatchThrows) { throw "Auto Deploy did not answer" }
+    return @($script:Rules) }
 
 Write-Host "`n=== A host that cannot be asked is NOT compliant ===" -ForegroundColor Cyan
 # Assuming a host that will not answer is already current is how a host gets skipped and left

@@ -388,7 +388,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.29.0"
+$ScriptVersion = "23.30.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 # NOT SET HERE. The ESXi target is whatever the cluster's Auto Deploy rule says it is, read from
@@ -6744,12 +6744,16 @@ function Get-ClusterDeployRuleTarget {
              this cluster. That is the other direction of the same association and covers a host
              that is powered off, unreachable, or not yet known to Auto Deploy.
 
-        EVERY HOST IS ASKED, not just the first. A cluster is expected to have ONE image profile
-        across its rules - that is what the rules are for - and every host in it is required to be
-        on that profile. So where more than one turns up, the most-cited one is taken and the rest
-        are reported LOUDLY rather than the run stopping: a cluster split across two images is a
-        rule set that wants tidying, not a reason to abandon a change window. What was chosen and
-        what was ignored both go to the console and the run summary, so it cannot pass unnoticed.
+        THE FIRST HOST THAT ANSWERS DECIDES. A cluster has one image profile across its rules -
+        that is what the rules are for - so asking every host was asking the same question over and
+        over across a slow management network. The hosts are walked in order and the first one that
+        yields a rule ends it. Walking rather than taking [0] blindly is the whole safety margin:
+        host number one may be powered off, unreachable, or not yet known to Auto Deploy.
+
+        Where that one host matches rules naming more than one image profile, the most-cited is
+        taken and the rest are reported LOUDLY rather than the run stopping: a cluster split across
+        two images is a rule set that wants tidying, not a reason to abandon a change window. What
+        was chosen and what was ignored both go to the console and the run summary.
 
         Returns an object with Name and Rule, both "" when nothing could be read. Never throws:
         Auto Deploy being unavailable is a question to put to the operator, not a crash.
@@ -6790,6 +6794,13 @@ function Get-ClusterDeployRuleTarget {
                 if (-not $found.ContainsKey($name)) { $found[$name] = New-Object System.Collections.Generic.List[string] }
                 if ($found[$name] -notcontains [string]$rule.Name) { [void]$found[$name].Add([string]$rule.Name) }
             }
+        }
+
+        # One host is enough. The rule is a cluster-wide statement, so asking the rest would be the
+        # same question again over a slow management network.
+        if ($found.Count -gt 0) {
+            Write-Host "  Read from '$($hostObj.Name)' - one host is enough, the rule covers the cluster." -ForegroundColor DarkGray
+            break
         }
     }
 
@@ -7021,15 +7032,27 @@ function Resolve-ClusterEsxiTarget {
 function Show-ClusterEsxiTargetComparison {
     <#
     .SYNOPSIS
-        Prints, per host, what it is running against what the rule says - and returns those that differ.
+        Samples one host's image profile against the rule, and returns the hosts needing an update -
+        all of them or none.
 
     .DESCRIPTION
-        The whole decision in one table, before anything is touched. Which hosts need updating is
-        not a number the operator has to take on trust; it is the two strings side by side, per
-        host, with the ones that differ marked.
+        ONE HOST IS SAMPLED, NOT ALL OF THEM. These hosts are stateless and boot the image profile
+        the cluster's Auto Deploy rule hands them, so what one is running is what they are all
+        running - and asking every host meant an esxcli round trip each over a management network,
+        to answer the same question repeatedly. The sample decides for the cluster: differs from
+        the rule and every host needs the update, matches and none do.
 
-        A host whose profile cannot be read is shown as unreadable and counted as needing work -
-        the safe direction, and visible rather than quietly dropped.
+        WHICH HOST. The first one that will answer, walked in cluster order rather than taken
+        blindly as [0] - host number one may be powered off, unreachable, or mid-reboot from a
+        previous run, and "the first host" should not mean "give up if that one is asleep".
+        Connected hosts are preferred over any other state for the same reason.
+
+        NO HOST ANSWERING means the cluster needs the update. That is the safe direction: doing
+        work that turns out to be unnecessary costs a reboot window, and skipping work that was
+        necessary leaves a cluster short of the version it is supposed to be on.
+
+        The sample, the target and the verdict are all printed. A judgement made from one host is
+        one the operator should be able to see the basis of.
 
     .PARAMETER Hosts
         The cluster's hosts.
@@ -7040,28 +7063,41 @@ function Show-ClusterEsxiTargetComparison {
     param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts)
 
     if ([string]::IsNullOrWhiteSpace($Global:TargetImageProfileName)) { return @($Hosts) }
+    if (@($Hosts).Count -eq 0) { return @() }
 
-    $differ = New-Object System.Collections.Generic.List[object]
-    $rows = New-Object System.Collections.Generic.List[object]
+    # Connected first, then anything else, and in cluster order within each - so the sample comes
+    # from a host that can actually answer wherever one exists.
+    $ordered = @(@($Hosts) | Sort-Object @{ Expression = { if ([string]$_.ConnectionState -eq "Connected") { 0 } else { 1 } } }, Name)
 
-    foreach ($hostObj in ($Hosts | Sort-Object Name)) {
+    $sampleHost = $null
+    $running = ""
+    foreach ($hostObj in $ordered) {
         $running = Get-VMHostRunningImageProfileName -VMHostObject $hostObj
-        $onTarget = Test-VMHostOnTargetImageProfile -VMHostObject $hostObj
-        if (-not $onTarget) { [void]$differ.Add($hostObj) }
-
-        [void]$rows.Add([pscustomobject]@{
-            Host    = [string]$hostObj.Name
-            Running = $(if ([string]::IsNullOrWhiteSpace($running)) { "unreadable (build $($hostObj.Build))" } else { $running })
-            Target  = [string]$Global:TargetImageProfileName
-            Needs   = $(if ($onTarget) { "" } else { "UPDATE" })
-        })
+        if (-not [string]::IsNullOrWhiteSpace($running)) { $sampleHost = $hostObj; break }
+        Write-Host "  '$($hostObj.Name)' could not be asked which image profile it is running - trying the next host." -ForegroundColor DarkGray
     }
 
-    $rows | Format-Table -AutoSize | Out-String | Write-Host
-    Write-Host "  $($differ.Count) of $(@($Hosts).Count) host(s) are not on '$($Global:TargetImageProfileName)'." -ForegroundColor $(if ($differ.Count -eq 0) { 'Green' } else { 'Yellow' })
-    Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Compare to Auto Deploy target" -Result "Compared" -Details "$($differ.Count) of $(@($Hosts).Count) host(s) not on '$($Global:TargetImageProfileName)' (rule: $($Global:TargetDeployRuleName))."
+    if ($null -eq $sampleHost) {
+        Write-Host "  No host in this cluster could be asked which image profile it is running." -ForegroundColor Yellow
+        Write-Host "  Treating every host as needing '$($Global:TargetImageProfileName)' - the safe direction." -ForegroundColor Yellow
+        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Compare to Auto Deploy target" -Result "NotRead" -Details "No host could be asked for its image profile; all $(@($Hosts).Count) host(s) treated as needing '$($Global:TargetImageProfileName)'."
+        return @($Hosts)
+    }
 
-    return @($differ.ToArray())
+    $onTarget = ($running.Trim() -eq ([string]$Global:TargetImageProfileName).Trim())
+
+    Write-Host "  Sampled '$($sampleHost.Name)': running '$running'." -ForegroundColor Gray
+    Write-Host "  Auto Deploy rule:  '$($Global:TargetImageProfileName)'." -ForegroundColor Gray
+
+    if ($onTarget) {
+        Write-Host "  Match - the cluster is taken to be on the target image, so there is no ESXi work here." -ForegroundColor Green
+        Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Compare to Auto Deploy target" -Result "OnTarget" -Details "Sampled $($sampleHost.Name) running '$running', which matches the rule ($($Global:TargetDeployRuleName)). All $(@($Hosts).Count) host(s) taken as current."
+        return @()
+    }
+
+    Write-Host "  DIFFERENT - all $(@($Hosts).Count) host(s) in this cluster are taken to need '$($Global:TargetImageProfileName)'." -ForegroundColor Yellow
+    Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Compare to Auto Deploy target" -Result "NeedsUpdate" -Details "Sampled $($sampleHost.Name) running '$running' against '$($Global:TargetImageProfileName)' (rule: $($Global:TargetDeployRuleName)). All $(@($Hosts).Count) host(s) taken as needing it."
+    return @($Hosts)
 }
 
 function Get-CapacityBasedBatchSize {
