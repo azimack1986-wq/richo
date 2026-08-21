@@ -388,7 +388,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.30.0"
+$ScriptVersion = "23.31.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 # NOT SET HERE. The ESXi target is whatever the cluster's Auto Deploy rule says it is, read from
@@ -738,6 +738,10 @@ $Global:AriaLocalUserName = ""
 # for this user and this process on Windows - and is turned back into plain text only for the one
 # token request. Nothing is written to the log or the run summary.
 $Global:AriaCredentialFile = "config\aria.local.json"
+# The Authorization scheme every call after the token request carries. 8.x uses "OpsToken", which
+# is what a live sign-in against this appliance was proven with; "vRealizeOpsToken" is the older
+# name and is still accepted, so it is the value to fall back to against an older appliance.
+$Global:AriaTokenPrefix = "OpsToken"
 # Set when the operator has typed the whole username by hand (menu option 3). It then goes to the
 # appliance exactly as typed - nothing composed, nothing stripped - which is the only way to test a
 # specific string and know that what failed or worked is what you actually sent.
@@ -5846,7 +5850,7 @@ function Invoke-AriaRestCall {
 
     $uri = "https://$($Global:AriaOperationsServer)$Path"
     $headers = @{ "Accept" = "application/json"; "Content-Type" = "application/json" }
-    if (-not [string]::IsNullOrWhiteSpace($Token)) { $headers["Authorization"] = "vRealizeOpsToken $Token" }
+    if (-not [string]::IsNullOrWhiteSpace($Token)) { $headers["Authorization"] = "$($Global:AriaTokenPrefix) $Token" }
 
     $params = @{ Uri = $uri; Method = $Method; Headers = $headers; ErrorAction = "Stop" }
     if ($null -ne $Body) { $params["Body"] = ($Body | ConvertTo-Json -Depth 6 -Compress) }
@@ -6195,27 +6199,41 @@ function Connect-AriaOperations {
         # which case it goes untouched. See Resolve-AriaUserName.
         $sendUser = if ($Global:AriaUserNameIsRaw) { [string]$Global:AriaCredential.UserName }
                     else { Resolve-AriaUserName -UserName $Global:AriaCredential.UserName -AuthSource $Global:AriaAuthSource }
-        Write-Host "  Signing in as '$sendUser' against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Gray
+        Write-Host "  Signing in as '$sendUser'." -ForegroundColor Gray
+
+        # authSource IS DELIBERATELY ABSENT for a vIDM sign-in, and its presence was the 401.
+        #
+        # The username already carries the source - account@vIDM-domain@vIDMAuthSource - and per
+        # Broadcom KB 389225 a vIDM token request sends username and password ONLY. Including the
+        # authSource field routes the request to the LOCAL handler instead, which then cannot find
+        # a local account by that name and returns 401. Sending it as an empty string does the same
+        # thing, so it is omitted from the payload entirely rather than blanked.
+        #
+        # A name that does NOT carry the source - a LOCAL account, say - still needs the field,
+        # which is the only reason this is a condition rather than a deletion.
+        $acquireBody = [ordered]@{
+            username = $sendUser
+            password = $Global:AriaCredential.GetNetworkCredential().Password
+        }
+        if (([regex]::Matches([string]$sendUser, '@')).Count -lt 2) {
+            $acquireBody["authSource"] = $Global:AriaAuthSource
+        }
 
         try {
-            $acquire = Invoke-AriaRestCall -Method "POST" -Path "/suite-api/api/auth/token/acquire" -Body @{
-                username   = $sendUser
-                authSource = $Global:AriaAuthSource
-                password   = $Global:AriaCredential.GetNetworkCredential().Password
-            }
+            $acquire = Invoke-AriaRestCall -Method "POST" -Path "/suite-api/api/auth/token/acquire" -Body $acquireBody
             $token = [string]$acquire.token
             if ([string]::IsNullOrWhiteSpace($token)) { throw "the appliance returned no token" }
 
             $Global:AriaSession = $token
             Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $true
             Write-Host "  Signed in to Aria Operations." -ForegroundColor Green
-            Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Connected" -Details "$($Global:AriaOperationsServer) as $sendUser via authSource $($Global:AriaAuthSource)."
+            Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Connected" -Details "$($Global:AriaOperationsServer) as $sendUser (authSource field $(if ($acquireBody.Contains('authSource')) { "sent as $($Global:AriaAuthSource)" } else { 'omitted - the username carries the source' }))."
             return $true
         }
         catch {
             Write-Host "  Aria Operations sign-in failed: $($_.Exception.Message)" -ForegroundColor Yellow
             if ("$($_.Exception.Message)" -match '401') {
-                Write-Host "  '$sendUser' was sent against authSource '$($Global:AriaAuthSource)'$(if ($Global:AriaUserNameIsRaw) { ' - exactly as typed' })." -ForegroundColor Yellow
+                Write-Host "  '$sendUser' was sent$(if ($Global:AriaUserNameIsRaw) { ' exactly as typed' }), with the authSource field $(if ($acquireBody.Contains('authSource')) { "set to '$($Global:AriaAuthSource)'" } else { 'omitted' })." -ForegroundColor Yellow
                 Write-Host "  THE SHAPE OF THAT NAME IS THE PROVEN ONE - account@vIDM-domain@source - so the" -ForegroundColor Yellow
                 Write-Host "  likeliest cause is the ACCOUNT, not the format:" -ForegroundColor Yellow
                 Write-Host "    - it may not be entitled in Aria. Administration > Access Control > User Accounts;" -ForegroundColor Gray

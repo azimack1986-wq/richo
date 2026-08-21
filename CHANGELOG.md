@@ -12,6 +12,46 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.31.0] — 2026-08-21
+
+#### Fixed
+
+- **The `authSource` field was the 401.** The username was right — the same string
+  that succeeded in the standalone test — and the sign-in still failed, because the
+  payload carried `authSource` alongside it.
+
+  Per Broadcom KB 389225, a vIDM token request sends **username and password only**.
+  The username already names its source (`account@vIDM-domain@vIDMAuthSource`), and
+  including the `authSource` field routes the request to the **LOCAL** handler
+  instead, which then cannot find a local account by that name and returns 401.
+  Sending it as an empty string does the same thing, so the key is omitted from the
+  payload entirely rather than blanked.
+
+  This is why the standalone `Test-AriaOpsVidmAuth.ps1` succeeded with a byte-identical
+  username: its `Invoke-TokenAcquire` only adds `authSource` when explicitly asked to,
+  and the raw-username path never asks.
+
+  The omission is conditional, not a deletion: a username that does **not** carry its
+  source — a LOCAL account, with no `@` — still needs the field, and still gets it.
+
+- **The Authorization scheme is now `OpsToken`.** 8.x uses it, and it is what the
+  successful test actually carried on its follow-up `GET /resources` call.
+  `vRealizeOpsToken` is the older name and remains accepted, so
+  `$Global:AriaTokenPrefix` is the one value to change against an older appliance.
+
+- The sign-in and 401 lines now report whether the `authSource` field was sent or
+  omitted, so this specific failure can be recognised from the console rather than
+  diagnosed twice.
+
+#### Tests
+
+- `tests/Test-AriaSuppression.ps1` — 116 assertions, 8 new: the acquire payload
+  carrying **no** `authSource` key for a source-qualified username, carrying only
+  username and password, a bare account name still sending the field, the condition
+  being on the username shape rather than unconditional, and the token prefix being
+  `OpsToken` on every request after the sign-in.
+- Full suite: 1288 assertions across 24 files, all passing.
+
 ### [23.30.0] — 2026-08-20
 
 #### Changed

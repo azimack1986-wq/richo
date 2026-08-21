@@ -199,7 +199,12 @@ Assert-Equal "on the suite-api, not the UI action API" $true ($acquire.Uri -matc
 $body = $acquire.Body | ConvertFrom-Json
 # The username on the wire is the REBUILT one - vIDM will not resolve a bare account name.
 Assert-Equal "carrying the composed username" "svc-esxi@dpe.protected.mil.au@vIDMAuthSource" $body.username
-Assert-Equal "and the authentication source" "vIDMAuthSource" $body.authSource
+# authSource IS DELIBERATELY ABSENT. The username carries the source, and per Broadcom KB 389225 a
+# vIDM token request sends username and password ONLY - including the field routes the request to
+# the LOCAL handler, which cannot find a local account by that name and returns 401. That is the
+# fault this build was seeing, so the assertion is that the key is not in the payload at all.
+Assert-Equal "and NO authSource field at all" $false ($acquire.Body -match '"authSource"')
+Assert-Equal "just username and password" $true (($acquire.Body -match '"username"') -and ($acquire.Body -match '"password"'))
 Assert-Equal "the token is held for the run" "tok-123" $Global:AriaSession
 
 Write-Host "`n=== The member list is READ, modified by one, and written back whole ===" -ForegroundColor Cyan
@@ -358,10 +363,28 @@ Write-Host "`n=== vIDMAuthSource is the source, and it is not asked about ===" -
 $sourceText = [System.IO.File]::ReadAllText($scriptPath)
 Assert-Equal "the source is fixed to vIDMAuthSource" $true ($sourceText -match '\$Global:AriaAuthSource = "vIDMAuthSource"')
 Assert-Equal "there is no source chooser" $false ($sourceText -match 'Select-AriaAuthSource')
-Assert-Equal "the token request carries it" $true ($sourceText -match 'authSource = \$Global:AriaAuthSource')
+# The field is only added for a name that does NOT carry the source - a LOCAL account, say.
+Assert-Equal "the field is conditional, not unconditional" $true ($sourceText.Contains('if (([regex]::Matches([string]$sendUser, ''@'')).Count -lt 2) {'))
+Assert-Equal "and every call after it uses the 8.x token scheme" $true ($sourceText.Contains('$Global:AriaTokenPrefix = "OpsToken"'))
+Assert-Equal "carried on every request" $true ($sourceText.Contains('"$($Global:AriaTokenPrefix) $Token"'))
 Assert-Equal "and the sent username is the resolved one" $true ($sourceText -match 'Resolve-AriaUserName -UserName \$Global:AriaCredential.UserName -AuthSource \$Global:AriaAuthSource')
 # The composed name is printed BEFORE the request, so a wrong domain is visible, not mysterious.
-Assert-Equal "the composed name is printed before signing in" $true ($sourceText -match "Signing in as ..sendUser. against authSource")
+Assert-Equal "the composed name is printed before signing in" $true ($sourceText -match "Signing in as ..sendUser..")
+
+Write-Host "`n=== A name that does NOT carry the source still sends authSource ===" -ForegroundColor Cyan
+# The omission is specific to a username that already names its source. A LOCAL account has no @
+# in it and the appliance has nothing else to go on, so the field is still required there - which
+# is the only reason this is a condition rather than a deletion.
+Reset-Appliance
+$Global:AriaSession = $null
+$Global:AriaCredential = [pscredential]::new('admin', (ConvertTo-SecureString 'p' -AsPlainText -Force))
+$Global:AriaUserNameIsRaw = $true          # sent exactly as given: 'admin', no composition
+[void](Connect-AriaOperations 6>$null)
+$localAcquire = @($script:Calls | Where-Object { $_.Uri -match 'token/acquire' })[-1]
+Assert-Equal "a bare account name still carries authSource" $true ($localAcquire.Body -match '"authSource"')
+Assert-Equal "set to the configured source" "vIDMAuthSource" (($localAcquire.Body | ConvertFrom-Json).authSource)
+$Global:AriaUserNameIsRaw = $false
+$Global:AriaCredential = [pscredential]::new('svc-esxi', (ConvertTo-SecureString 'p' -AsPlainText -Force))
 
 Write-Host "`n=== NO PASSWORD IS IN THE SCRIPT ===" -ForegroundColor Cyan
 Assert-Equal "no inline password setting exists" $false ($sourceText -match '\$Global:AriaLocalPassword')
