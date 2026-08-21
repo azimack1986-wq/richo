@@ -12,6 +12,56 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.27.0] — 2026-08-20
+
+#### Fixed
+
+- **One rejected Aria account no longer costs the whole run.** A single 401 marked
+  Aria unusable for the session, so a passthrough that turned out not to be entitled
+  in Aria meant no suppression on any cluster afterwards — with the operator standing
+  right there, able to supply an account that would have worked. Seen live:
+  `andrew.iles_priv` was passed through, returned 401, and the run continued
+  unsuppressed with no way back.
+
+  The sign-in is now a loop. A failure offers **1. Try a different Aria account** /
+  **2. Carry on without suppression**, and only a declined offer or the attempt limit
+  gives up. The limit is what keeps this from being the lockout it resembles: the
+  rejected credential is discarded rather than replayed, attempts are counted, and
+  past `$Global:MaxCredentialAttempts` nothing further is asked for or sent — no
+  matter how many times `1` is answered.
+
+  The 401 message now leads with the likeliest cause rather than the format. The name
+  sent was `account@vIDM-domain@source`, which is the proven shape, so what is left is
+  the account: not entitled in Aria, or a password that differs from the one this run
+  holds — Aria wants the vIDM password.
+
+#### Changed
+
+- **In a firmware run the ESXi target is advisory.** It is read, the per-host table is
+  printed, and it decides nothing: the work is the UCS firmware and every host is in
+  scope whatever image it is on. Critically, Auto Deploy being unreadable in that mode
+  is now **a line of output rather than a prompt and a possible exit** — a firmware run
+  must not stop over a target it was never going to act on.
+
+  In an ESXi-only run it is unchanged and load-bearing: the target is the work, an
+  unreadable rule still asks for the image profile name with `E` to stop, and hosts
+  already on the target still drop out of scope.
+
+  The output says which mode it is in, because a column headed `UPDATE` that nothing
+  is going to update is worse than no column at all.
+
+#### Tests
+
+- `tests/Test-AriaSuppression.ps1` — 97 assertions, 12 new: a second account getting
+  in after a 401 with Aria still usable, declining the retry recording `GivenUp`
+  without sending a second password, and the retry loop stopping at exactly the
+  attempt limit however many times `1` is answered.
+- `tests/Test-AutoDeployTarget.ps1` — 45 assertions, 11 new: the advisory labelling,
+  a firmware run never prompting when Auto Deploy cannot be read, the same situation
+  still asking in an ESXi-only run, the switch being tied to the mode, and only the
+  ESXi-only branch excluding on-target hosts.
+- Full suite: 1260 assertions across 24 files, all passing.
+
 ### [23.26.0] — 2026-08-20
 
 #### Changed

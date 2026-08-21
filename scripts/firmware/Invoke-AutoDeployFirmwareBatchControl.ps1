@@ -388,7 +388,7 @@
 # and firmware verification CSVs, so any change record can be traced back to the exact revision
 # that produced it. Bump this in the same commit as the change, and tag the commit to match
 # (see CHANGELOG.md). Do not version by filename - git holds the history.
-$ScriptVersion = "23.26.0"
+$ScriptVersion = "23.27.0"
 
 $DefaultVCenter = "siepd24vsp0002.dpe.protected.mil.au"
 # NOT SET HERE. The ESXi target is whatever the cluster's Auto Deploy rule says it is, read from
@@ -6090,62 +6090,94 @@ function Connect-AriaOperations {
 
     [void](Confirm-ManagementEndpointReachable -Target $Global:AriaOperationsServer -DeviceKind "Aria Operations" -TimeoutSeconds $ManagementEndpointProbeTimeoutSeconds)
 
-    if ($null -eq $Global:AriaCredential) {
-        Write-Host "" -ForegroundColor Cyan
-        Write-Host "Aria Operations sign-in for $($Global:AriaOperationsServer)" -ForegroundColor Cyan
-        Write-Host "  Used only to add this cluster to '$($Global:AriaSuppressionGroupName)' for the change," -ForegroundColor Gray
-        Write-Host "  and to take it out again when the cluster finishes." -ForegroundColor Gray
-        Write-Host "  Held in memory for this run only, never written to the summary or the log." -ForegroundColor Gray
+    $announced = $false
 
-        $Global:AriaCredential = Get-AriaRunCredential
-    }
+    # ONE BAD ACCOUNT USED TO COST THE WHOLE RUN. A single 401 marked Aria unusable for the
+    # session, so a passthrough that turned out not to be entitled in Aria meant no suppression on
+    # any cluster afterwards - with the operator standing right there, able to give an account that
+    # would have worked. The sign-in is now a loop: a failure offers another account, and only a
+    # declined offer or the attempt limit gives up.
+    #
+    # The limit is what keeps this from becoming the lockout risk it looks like: attempts are
+    # counted by Register-RunCredentialResult, the rejected credential is discarded rather than
+    # replayed, and past $Global:MaxCredentialAttempts nothing further is asked for or sent.
+    while ($true) {
+        if ($null -eq $Global:AriaCredential) {
+            if (-not $announced) {
+                Write-Host "" -ForegroundColor Cyan
+                Write-Host "Aria Operations sign-in for $($Global:AriaOperationsServer)" -ForegroundColor Cyan
+                Write-Host "  Used only to add this cluster to '$($Global:AriaSuppressionGroupName)' for the change," -ForegroundColor Gray
+                Write-Host "  and to take it out again when the cluster finishes." -ForegroundColor Gray
+                Write-Host "  Held in memory for this run only, never written to the summary or the log." -ForegroundColor Gray
+                $announced = $true
+            }
 
-    if ($null -eq $Global:AriaCredential -or [string]::IsNullOrWhiteSpace($Global:AriaCredential.GetNetworkCredential().Password)) {
-        Write-Host "  No Aria Operations credential given - this cluster will NOT be put into patching suppression." -ForegroundColor Yellow
-        Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "NotProvided" -Details "No credential entered; suppression is not applied."
-        $Global:AriaUnusable = $true
-        return $false
-    }
-
-    # The credential is held exactly as entered; the username is composed on its way to the
-    # appliance and nowhere else. See Resolve-AriaUserName.
-    $sendUser = Resolve-AriaUserName -UserName $Global:AriaCredential.UserName -AuthSource $Global:AriaAuthSource
-    Write-Host "  Signing in as '$sendUser' against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Gray
-
-    try {
-        $acquire = Invoke-AriaRestCall -Method "POST" -Path "/suite-api/api/auth/token/acquire" -Body @{
-            username   = $sendUser
-            authSource = $Global:AriaAuthSource
-            password   = $Global:AriaCredential.GetNetworkCredential().Password
+            $Global:AriaCredential = Get-AriaRunCredential
         }
-        $token = [string]$acquire.token
-        if ([string]::IsNullOrWhiteSpace($token)) { throw "the appliance returned no token" }
 
-        $Global:AriaSession = $token
-        Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $true
-        Write-Host "  Signed in to Aria Operations." -ForegroundColor Green
-        Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Connected" -Details "$($Global:AriaOperationsServer) as $sendUser via authSource $($Global:AriaAuthSource)."
-        return $true
-    }
-    catch {
-        Write-Host "  Aria Operations sign-in failed: $($_.Exception.Message)" -ForegroundColor Yellow
-        if ("$($_.Exception.Message)" -match '401') {
-            Write-Host "  '$sendUser' was sent against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Yellow
-            Write-Host "  The username must be account@vIDM-domain@source, so if the DOMAIN in the middle is" -ForegroundColor Yellow
-            Write-Host "  wrong that alone is a 401 even with the right password." -ForegroundColor Yellow
-            Write-Host "  Current setting: `$Global:AriaVidmDomain = '$($Global:AriaVidmDomain)'." -ForegroundColor Yellow
-            Write-Host "  The password is the vIDM (domain) password, not an Aria-local one." -ForegroundColor Yellow
-            Write-Host "  Check '$($Global:AriaAuthSource)' is still the Source Display Name under Administration >" -ForegroundColor Yellow
-            Write-Host "  Authentication Sources, and that the account can sign in to the Aria UI." -ForegroundColor Yellow
+        if ($null -eq $Global:AriaCredential -or [string]::IsNullOrWhiteSpace($Global:AriaCredential.GetNetworkCredential().Password)) {
+            Write-Host "  No Aria Operations credential given - this cluster will NOT be put into patching suppression." -ForegroundColor Yellow
+            Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "NotProvided" -Details "No credential entered; suppression is not applied."
+            $Global:AriaUnusable = $true
+            return $false
         }
-        Write-Host "  The run continues without suppression." -ForegroundColor Yellow
-        # The credential is dropped so a wrong one is not reused. NOT retried: the same password
-        # sent again is how an account gets locked out, and this is a courtesy, not the change.
-        $Global:AriaCredential = $null
-        Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $false
-        $Global:AriaUnusable = $true
-        Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Failed" -Details "$($Global:AriaOperationsServer) - $($_.Exception.Message)"
-        return $false
+
+        # The credential is held exactly as entered; the username is composed on its way to the
+        # appliance and nowhere else. See Resolve-AriaUserName.
+        $sendUser = Resolve-AriaUserName -UserName $Global:AriaCredential.UserName -AuthSource $Global:AriaAuthSource
+        Write-Host "  Signing in as '$sendUser' against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Gray
+
+        try {
+            $acquire = Invoke-AriaRestCall -Method "POST" -Path "/suite-api/api/auth/token/acquire" -Body @{
+                username   = $sendUser
+                authSource = $Global:AriaAuthSource
+                password   = $Global:AriaCredential.GetNetworkCredential().Password
+            }
+            $token = [string]$acquire.token
+            if ([string]::IsNullOrWhiteSpace($token)) { throw "the appliance returned no token" }
+
+            $Global:AriaSession = $token
+            Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $true
+            Write-Host "  Signed in to Aria Operations." -ForegroundColor Green
+            Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Connected" -Details "$($Global:AriaOperationsServer) as $sendUser via authSource $($Global:AriaAuthSource)."
+            return $true
+        }
+        catch {
+            Write-Host "  Aria Operations sign-in failed: $($_.Exception.Message)" -ForegroundColor Yellow
+            if ("$($_.Exception.Message)" -match '401') {
+                Write-Host "  '$sendUser' was sent against authSource '$($Global:AriaAuthSource)'." -ForegroundColor Yellow
+                Write-Host "  THE SHAPE OF THAT NAME IS THE PROVEN ONE - account@vIDM-domain@source - so the" -ForegroundColor Yellow
+                Write-Host "  likeliest cause is the ACCOUNT, not the format:" -ForegroundColor Yellow
+                Write-Host "    - it may not be entitled in Aria. Administration > Access Control > User Accounts;" -ForegroundColor Gray
+                Write-Host "      an account that cannot sign in to the Aria UI cannot get a token either." -ForegroundColor Gray
+                Write-Host "    - the password sent is the one this run holds for it, and Aria wants the vIDM" -ForegroundColor Gray
+                Write-Host "      (domain) password. If they differ, use option 1 and type the vIDM one." -ForegroundColor Gray
+                Write-Host "    - `$Global:AriaVidmDomain is '$($Global:AriaVidmDomain)' and the source is" -ForegroundColor Gray
+                Write-Host "      '$($Global:AriaAuthSource)'. Both are per-site; check them if no account works." -ForegroundColor Gray
+            }
+
+            # The rejected credential is discarded rather than replayed, and the attempt is counted.
+            $Global:AriaCredential = $null
+            Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $false
+            Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "Failed" -Details "$($Global:AriaOperationsServer) as $sendUser - $($_.Exception.Message)"
+
+            if ($Global:CredentialBlocked.ContainsKey("Aria Operations") -and $Global:CredentialBlocked["Aria Operations"]) {
+                Write-Host "  The run continues without suppression." -ForegroundColor Yellow
+                $Global:AriaUnusable = $true
+                return $false
+            }
+
+            Write-Host "" -ForegroundColor Yellow
+            Write-Host "    1. Try a different Aria account" -ForegroundColor Yellow
+            Write-Host "    2. Carry on without suppression for the rest of this run" -ForegroundColor Yellow
+            $choice = Read-ChoiceExit -Message "Aria Operations sign-in" -AllowedChoices @("1","2") -ExitMessage "Stopped after an Aria Operations sign-in failure."
+            if ($choice -eq "2") {
+                Write-Host "  The run continues without suppression." -ForegroundColor Yellow
+                $Global:AriaUnusable = $true
+                Add-SummaryRecord -Stage "AriaSuppression" -Batch "" -HostName "" -Action "Sign in" -Result "GivenUp" -Details "Operator chose to continue without suppression after a failed sign-in."
+                return $false
+            }
+        }
     }
 }
 
@@ -6857,10 +6889,13 @@ function Resolve-ClusterEsxiTarget {
         a per-host target worked out host by host. Step 2 exists only to say which of them are not
         there yet.
 
-        Where Auto Deploy cannot be read, the operator is asked for the image profile name rather
-        than the run inventing one or carrying on with no target at all. Exiting is offered on the
-        same prompt, because "I do not know what these hosts should be running" is a perfectly good
-        reason to stop before a change window.
+        ADVISORY IN FIRMWARE MODE. In a firmware run the ESXi version is worth knowing and worth
+        printing, but it decides nothing: the work is the UCS firmware, every host is in scope
+        regardless of what image it is on, and a run must not stop over an ESXi target it was never
+        going to act on. So in that mode Auto Deploy being unreadable is a line of output and
+        nothing more - no prompt, no exit. In an ESXi-only run the target IS the work, so the
+        operator is asked for the image profile name rather than the run inventing one or carrying
+        on with no target at all, and exiting is offered on the same prompt.
 
     .PARAMETER Cluster
         The cluster being upgraded.
@@ -6868,12 +6903,16 @@ function Resolve-ClusterEsxiTarget {
     .PARAMETER Hosts
         Its hosts.
 
+    .PARAMETER Advisory
+        Read and report the target, but never prompt and never stop for it. Set for a firmware run.
+
     .EXAMPLE
         Resolve-ClusterEsxiTarget -Cluster $cluster -Hosts $allClusterHosts
     #>
     param(
         [Parameter(Mandatory=$true)]$Cluster,
-        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts,
+        [switch]$Advisory
     )
 
     $Global:TargetImageProfileName = ""
@@ -6888,6 +6927,15 @@ function Resolve-ClusterEsxiTarget {
 
     if ([string]::IsNullOrWhiteSpace($target.Name)) {
         Write-Host "  The Auto Deploy rule for this cluster could not be read." -ForegroundColor Yellow
+
+        if ($Advisory) {
+            # A firmware run does not act on this, so it does not stop for it either.
+            Write-Host "  This is a firmware run, so that changes nothing: every host is in scope for the" -ForegroundColor Gray
+            Write-Host "  firmware work regardless of which ESXi image it is on." -ForegroundColor Gray
+            Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Resolve ESXi target" -Result "NotRead" -Details "$($Cluster.Name) - no Auto Deploy rule readable. Advisory only in a firmware run; nothing depends on it."
+            return
+        }
+
         Write-Host "  Enter the image profile name the cluster should be on - exactly as it appears in the" -ForegroundColor Yellow
         Write-Host "  deploy rule, e.g. ESXi-8.0U3j-25429389-standard - or E to stop." -ForegroundColor Yellow
         $typed = Read-Host "Image profile for '$($Cluster.Name)' [or E to exit]"
@@ -6906,7 +6954,13 @@ function Resolve-ClusterEsxiTarget {
         Write-Host "  Rule '$($target.Rule)' names image profile '$($target.Name)'." -ForegroundColor Green
     }
 
-    Write-Host "  Every host in '$($Cluster.Name)' is required to be on '$($Global:TargetImageProfileName)'." -ForegroundColor Green
+    if ($Advisory) {
+        Write-Host "  Shown for information only - this is a firmware run and every host is in scope for it" -ForegroundColor Gray
+        Write-Host "  whatever ESXi image it is on." -ForegroundColor Gray
+    }
+    else {
+        Write-Host "  Every host in '$($Cluster.Name)' is required to be on '$($Global:TargetImageProfileName)'." -ForegroundColor Green
+    }
 
     if ($Global:TargetImageProfileName -match '(\d{6,})') { $Global:TargetEsxiBuild = $Matches[1] }
 
@@ -6926,13 +6980,23 @@ function Show-ClusterEsxiTargetComparison {
         A host whose profile cannot be read is shown as unreadable and counted as needing work -
         the safe direction, and visible rather than quietly dropped.
 
+        In a firmware run the same table is printed and the same hosts are named, but the caller
+        does not act on the answer - see Resolve-ClusterEsxiTarget. The heading says so, because a
+        column headed UPDATE that nothing is going to update is worse than no column at all.
+
     .PARAMETER Hosts
         The cluster's hosts.
+
+    .PARAMETER Advisory
+        Label the table as information only. Set for a firmware run.
 
     .EXAMPLE
         $needWork = Show-ClusterEsxiTargetComparison -Hosts $allClusterHosts
     #>
-    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts)
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][array]$Hosts,
+        [switch]$Advisory
+    )
 
     if ([string]::IsNullOrWhiteSpace($Global:TargetImageProfileName)) { return @($Hosts) }
 
@@ -6954,6 +7018,9 @@ function Show-ClusterEsxiTargetComparison {
 
     $rows | Format-Table -AutoSize | Out-String | Write-Host
     Write-Host "  $($differ.Count) of $(@($Hosts).Count) host(s) are not on '$($Global:TargetImageProfileName)'." -ForegroundColor $(if ($differ.Count -eq 0) { 'Green' } else { 'Yellow' })
+    if ($Advisory) {
+        Write-Host "  FOR INFORMATION ONLY - this run does the UCS firmware, and takes every host either way." -ForegroundColor Gray
+    }
     Add-SummaryRecord -Stage "PreFlight" -Batch "" -HostName "" -Action "Compare to Auto Deploy target" -Result "Compared" -Details "$($differ.Count) of $(@($Hosts).Count) host(s) not on '$($Global:TargetImageProfileName)' (rule: $($Global:TargetDeployRuleName))."
 
     return @($differ.ToArray())
@@ -9873,8 +9940,14 @@ function Invoke-ClusterUpgradeWorkflow {
     # THE TARGET COMES FROM AUTO DEPLOY, per cluster, before anything is decided about which hosts
     # are in scope - the rule is what these stateless hosts will boot, so it is the only honest
     # answer to "what should they be running".
-    Resolve-ClusterEsxiTarget -Cluster $Cluster -Hosts $allClusterHosts
-    $needEsxiUpdateHosts = @(Show-ClusterEsxiTargetComparison -Hosts $allClusterHosts)
+    #
+    # ADVISORY IN A FIRMWARE RUN. Worth knowing and worth printing, but it decides nothing there:
+    # the work is the UCS firmware and every host is in scope for it whatever image it is on. So
+    # the read happens either way and the table is printed either way, but in firmware mode it
+    # cannot prompt, cannot stop the run, and cannot take a host out of scope.
+    $esxiAdvisory = ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE")
+    Resolve-ClusterEsxiTarget -Cluster $Cluster -Hosts $allClusterHosts -Advisory:$esxiAdvisory
+    $needEsxiUpdateHosts = @(Show-ClusterEsxiTargetComparison -Hosts $allClusterHosts -Advisory:$esxiAdvisory)
     $alreadyTargetHosts = @($allClusterHosts | Where-Object { $needEsxiUpdateHosts.Name -notcontains $_.Name })
 
     if ($Global:UpgradeMode -eq "ESXI_UCS_FIRMWARE") {

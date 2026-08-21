@@ -109,6 +109,10 @@ $script:Members = @()
 $script:Calls = New-Object System.Collections.Generic.List[object]
 $script:DuplicateCluster = $false
 $script:TokenFails = $false
+# How many token requests have been made, and up to which attempt they are rejected - so a retry
+# can be shown to SUCCEED on the second account, not merely to be attempted.
+$script:TokenAttempts = 0
+$script:FailUntilAttempt = 99
 $script:PutLags = 0
 $script:ExtraProperty = $null
 
@@ -117,6 +121,8 @@ function Reset-Appliance {
     $script:Calls = New-Object System.Collections.Generic.List[object]
     $script:DuplicateCluster = $false
     $script:TokenFails = $false
+    $script:TokenAttempts = 0
+    $script:FailUntilAttempt = 99
     $script:PutLags = 0
     $script:ExtraProperty = $null
     $Global:AriaSession = $null
@@ -150,7 +156,8 @@ function Invoke-RestMethod {
     $script:Calls.Add([pscustomobject]@{ Uri=$Uri; Method=$Method; Body=$Body; Auth=$Headers['Authorization'] })
 
     if ($Uri -match '/auth/token/acquire$') {
-        if ($script:TokenFails) { throw "Invalid credentials" }
+        $script:TokenAttempts++
+        if ($script:TokenFails -and $script:TokenAttempts -le $script:FailUntilAttempt) { throw "Response status code does not indicate success: 401 (401)." }
         return [pscustomobject]@{ token = 'tok-123'; validity = 999 }
     }
     if ($Uri -match '/auth/token/release$') { return $null }
@@ -450,6 +457,51 @@ Assert-Equal "the file is used" "from-the-file" $cred.GetNetworkCredential().Pas
 Assert-Equal "including the account it names" "svc-aria" $cred.UserName
 Remove-Item -LiteralPath $fileDir -Recurse -Force -ErrorAction SilentlyContinue
 Clear-RunCredential
+
+Write-Host "`n=== A failed sign-in offers another account instead of killing the run ===" -ForegroundColor Cyan
+# ONE BAD ACCOUNT USED TO COST THE WHOLE RUN. A single 401 marked Aria unusable for the session, so
+# a passthrough that turned out not to be entitled in Aria meant no suppression on any cluster
+# afterwards - with the operator standing right there, able to give an account that would work.
+Reset-Appliance
+Clear-RunCredential
+$Global:AriaCredential = $null
+$script:AriaPrompts = 0
+$script:TokenFails = $true
+$script:FailUntilAttempt = 1          # the appliance rejects the first account and accepts the next
+$script:ChoiceAnswers.Enqueue('1')    # after the 401: try a different account
+Assert-Equal "the second account got in" $true (Connect-AriaOperations 6>$null)
+Assert-Equal "it took two sign-ins" 2 $script:TokenAttempts
+Assert-Equal "and Aria is still usable" $false $Global:AriaUnusable
+Assert-Equal "the failure is on the record" 1 (@($Global:RunSummary.ToArray() | Where-Object { $_.Action -eq 'Sign in' -and $_.Result -eq 'Failed' }).Count)
+Assert-Equal "and so is the success" 1 (@($Global:RunSummary.ToArray() | Where-Object { $_.Action -eq 'Sign in' -and $_.Result -eq 'Connected' }).Count)
+
+Write-Host "`n=== Declining the retry gives up cleanly ===" -ForegroundColor Cyan
+Reset-Appliance
+Clear-RunCredential
+$Global:AriaCredential = $null
+$script:TokenFails = $true
+$script:ChoiceAnswers.Enqueue('2')    # after the 401: carry on without suppression
+Assert-Equal "the sign-in gives up" $false (Connect-AriaOperations 6>$null)
+Assert-Equal "without sending a second password" 1 $script:TokenAttempts
+Assert-Equal "Aria is marked unusable" $true $Global:AriaUnusable
+Assert-Equal "recorded as given up, not just failed" 1 (@($Global:RunSummary.ToArray() | Where-Object { $_.Result -eq 'GivenUp' }).Count)
+
+Write-Host "`n=== Retrying cannot outrun the attempt limit ===" -ForegroundColor Cyan
+# The limit is what keeps a retry loop from becoming the lockout it looks like: the rejected
+# credential is discarded rather than replayed, attempts are counted, and past the limit nothing
+# further is asked for or sent - no matter how many times the operator answers 1.
+Reset-Appliance
+Clear-RunCredential
+$Global:AriaCredential = $null
+$script:TokenFails = $true
+for ($i = 0; $i -lt 10; $i++) { $script:ChoiceAnswers.Enqueue('1') }
+Assert-Equal "it gives up on its own" $false (Connect-AriaOperations 6>$null)
+Assert-Equal "after exactly the attempt limit" $Global:MaxCredentialAttempts $script:TokenAttempts
+Assert-Equal "and the system is blocked for the run" $true $Global:CredentialBlocked["Aria Operations"]
+$script:ChoiceAnswers.Clear()
+Reset-Appliance
+Clear-RunCredential
+$Global:AriaCredential = [pscredential]::new('svc-esxi', (ConvertTo-SecureString 'p' -AsPlainText -Force))
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }
