@@ -371,6 +371,56 @@ Assert-Equal "and the sent username is the resolved one" $true ($sourceText -mat
 # The composed name is printed BEFORE the request, so a wrong domain is visible, not mysterious.
 Assert-Equal "the composed name is printed before signing in" $true ($sourceText -match "Signing in as ..sendUser..")
 
+Write-Host "`n=== Passthrough sends byte for byte what typing it by hand sends ===" -ForegroundColor Cyan
+# Typing the account manually is the path that has been PROVEN against the appliance. The
+# passthrough has to be the same request or it is a second, untested path pretending to be the
+# first - so the payloads are compared directly rather than the code being eyeballed.
+#
+# Both options hand back a plain account name; the composition into account@vIDM-domain@source and
+# the omission of authSource happen once, in Connect-AriaOperations, on whatever they return.
+$account = 'andrew.richard1_priv'
+
+# Option 1: typed by hand.
+Reset-Appliance
+Clear-RunCredential
+$Global:AriaCredential = $null
+$Global:AriaSession = $null
+$Global:AriaCredential = [pscredential]::new($account, (ConvertTo-SecureString 'the-vidm-password' -AsPlainText -Force))
+[void](Connect-AriaOperations 6>$null)
+$typedBody = @($script:Calls | Where-Object { $_.Uri -match 'token/acquire' })[-1].Body
+
+# Option 2: the vCenter credential passed through, entered the way Windows usually holds it.
+Reset-Appliance
+Clear-RunCredential
+$Global:AriaCredential = $null
+$Global:AriaSession = $null
+Set-SharedRunCredential -Credential ([pscredential]::new("DPE\$account", (ConvertTo-SecureString 'the-vidm-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
+[void](Connect-AriaOperations 6>$null)
+$passedBody = @($script:Calls | Where-Object { $_.Uri -match 'token/acquire' })[-1].Body
+
+Assert-Equal "the two payloads are identical" $typedBody $passedBody
+Assert-Equal "carrying the composed username" "andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource" (($passedBody | ConvertFrom-Json).username)
+Assert-Equal "and no authSource field" $false ($passedBody -match '"authSource"')
+Assert-Equal "the passthrough signed in" $true ($null -ne $Global:AriaSession)
+Assert-Equal "recorded as connected" "Connected" (@($Global:RunSummary.ToArray() | Where-Object { $_.Action -eq 'Sign in' })[-1].Result)
+
+# A UPN-shaped vCenter login lands on the same string too - the source is appended, not the domain.
+Reset-Appliance
+Clear-RunCredential
+$Global:AriaCredential = $null
+$Global:AriaSession = $null
+Set-SharedRunCredential -Credential ([pscredential]::new("$account@dpe.protected.mil.au", (ConvertTo-SecureString 'the-vidm-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
+[void](Connect-AriaOperations 6>$null)
+$upnBody = @($script:Calls | Where-Object { $_.Uri -match 'token/acquire' })[-1].Body
+Assert-Equal "a UPN passthrough lands on the same payload" $typedBody $upnBody
+
+# One path, not two that happen to agree today - the composition lives in Connect-AriaOperations
+# and both routes just hand it an account.
+$oneText = [System.IO.File]::ReadAllText($scriptPath)
+Assert-Equal "the username is composed in exactly one place" 1 ([regex]::Matches($oneText, '\$sendUser = Resolve-AriaUserName').Count)
+Clear-RunCredential
+$Global:AriaCredential = [pscredential]::new('svc-esxi', (ConvertTo-SecureString 'p' -AsPlainText -Force))
+
 Write-Host "`n=== A name that does NOT carry the source still sends authSource ===" -ForegroundColor Cyan
 # The omission is specific to a username that already names its source. A LOCAL account has no @
 # in it and the appliance has nothing else to go on, so the field is still required there - which
@@ -378,56 +428,53 @@ Write-Host "`n=== A name that does NOT carry the source still sends authSource =
 Reset-Appliance
 $Global:AriaSession = $null
 $Global:AriaCredential = [pscredential]::new('admin', (ConvertTo-SecureString 'p' -AsPlainText -Force))
-$Global:AriaUserNameIsRaw = $true          # sent exactly as given: 'admin', no composition
+$savedVidmDomain = $Global:AriaVidmDomain
+$Global:AriaVidmDomain = ''                # no vIDM domain: 'admin' stays 'admin'
 [void](Connect-AriaOperations 6>$null)
 $localAcquire = @($script:Calls | Where-Object { $_.Uri -match 'token/acquire' })[-1]
+Assert-Equal "the name reaches the appliance unqualified" "admin" (($localAcquire.Body | ConvertFrom-Json).username)
 Assert-Equal "a bare account name still carries authSource" $true ($localAcquire.Body -match '"authSource"')
 Assert-Equal "set to the configured source" "vIDMAuthSource" (($localAcquire.Body | ConvertFrom-Json).authSource)
-$Global:AriaUserNameIsRaw = $false
+$Global:AriaVidmDomain = $savedVidmDomain
 $Global:AriaCredential = [pscredential]::new('svc-esxi', (ConvertTo-SecureString 'p' -AsPlainText -Force))
 
 Write-Host "`n=== NO PASSWORD IS IN THE SCRIPT ===" -ForegroundColor Cyan
 Assert-Equal "no inline password setting exists" $false ($sourceText -match '\$Global:AriaLocalPassword')
 Assert-Equal "nothing is exported to disk" $true (-not ($sourceText -match 'Export-Clixml|ConvertFrom-SecureString'))
 
-Write-Host "`n=== Manual or passthrough - the operator is asked, while this is being proven ===" -ForegroundColor Cyan
-# UCS Manager takes the account exactly as vCenter holds it, so its menu was removed. vIDM does
-# not: the name is rebuilt, and until that composition has been seen to work here the operator
-# should be able to choose and to compare the two.
+Write-Host "`n=== The vCenter credential passes straight through, no question ===" -ForegroundColor Cyan
+# The vIDM source holds the same domain accounts vCenter does, and the composed request is proven
+# against the appliance - so the menu that stood here while that was unproven is gone. A question
+# whose answer is always the same is a keystroke between the operator and the change.
 Clear-RunCredential
 $Global:AriaCredential = $null
 $script:AriaPrompts = 0
 $script:Choices = New-Object System.Collections.Generic.List[string]
-Set-SharedRunCredential -Credential ([pscredential]::new('DPE\nick.beare_priv', (ConvertTo-SecureString 'domain-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
-
-$script:ChoiceAnswers.Enqueue('2')
+Set-SharedRunCredential -Credential ([pscredential]::new('DPE\andrew.richard1_priv', (ConvertTo-SecureString 'domain-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
 $cred = Get-AriaRunCredential 6>$null
-Assert-Equal "the choice was put to the operator" 1 $script:Choices.Count
-Assert-Equal "2 passes the vCenter credential through" "DPE\nick.beare_priv" $cred.UserName
-Assert-Equal "nothing was typed" 0 $script:AriaPrompts
+Assert-Equal "nothing was asked" 0 $script:Choices.Count
+Assert-Equal "and nothing was typed" 0 $script:AriaPrompts
+Assert-Equal "the vCenter credential came through" "DPE\andrew.richard1_priv" $cred.UserName
 Assert-Equal "recorded as a passthrough" "Shared" $Global:CredentialSource["Aria Operations"]
-# ...and it is the REBUILT name that would go to the appliance.
-Assert-Equal "which is sent composed in full" "nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource" (Resolve-AriaUserName -UserName $cred.UserName -AuthSource $Global:AriaAuthSource)
+# It is SAID, so the operator knows which account is about to be sent where when something 401s -
+# and the composed string is named, not just the account.
+$spoken = (Get-AriaRunCredential 6>&1 | Out-String)
+Assert-Equal "the account in use is named" $true ($spoken.Contains("using 'DPE\andrew.richard1_priv'"))
+Assert-Equal "and what will actually be sent" $true ($spoken -match "Sent as 'andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource'")
 
-# The menu must show what option 2 would actually send, or it is not a comparison.
-$shown = (Get-AriaRunCredential 6>&1 | Out-String)
-Assert-Equal "the menu previews what would be sent" $true ($shown -match "would be sent as 'nick.beare_priv@dpe.protected.mil.au@vIDMAuthSource'")
-
+Write-Host "`n=== With nothing to pass through, it asks ===" -ForegroundColor Cyan
 Clear-RunCredential
 $Global:AriaCredential = $null
 $script:AriaPrompts = 0
 $script:Choices = New-Object System.Collections.Generic.List[string]
-Set-SharedRunCredential -Credential ([pscredential]::new('DPE\nick.beare_priv', (ConvertTo-SecureString 'domain-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
-$script:ChoiceAnswers.Enqueue('1')
 $cred = Get-AriaRunCredential 6>$null
-Assert-Equal "1 types one instead" 1 $script:AriaPrompts
-Assert-Equal "and it is what comes back" "typed-password" $cred.GetNetworkCredential().Password
+Assert-Equal "an account is asked for" 1 $script:AriaPrompts
+Assert-Equal "still with no menu" 0 $script:Choices.Count
+Assert-Equal "and what is typed is used" "typed-password" $cred.GetNetworkCredential().Password
 Assert-Equal "recorded as entered by hand" "Manual" $Global:CredentialSource["Aria Operations"]
 # Asked once per run, not once per cluster.
-$script:Choices = New-Object System.Collections.Generic.List[string]
 [void](Get-AriaRunCredential 6>$null)
-Assert-Equal "the second call asks nothing" 0 $script:Choices.Count
-Assert-Equal "and types nothing" 1 $script:AriaPrompts
+Assert-Equal "the second call asks nothing" 1 $script:AriaPrompts
 
 Write-Host "`n=== A rejected passthrough is not offered again ===" -ForegroundColor Cyan
 # The lockout guard for the replay. If vIDM refuses the vCenter credential, sending it again at
@@ -437,14 +484,10 @@ $Global:AriaCredential = $null
 $script:AriaPrompts = 0
 $script:Choices = New-Object System.Collections.Generic.List[string]
 Set-SharedRunCredential -Credential ([pscredential]::new('DPE\nick.beare_priv', (ConvertTo-SecureString 'domain-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
-$script:ChoiceAnswers.Enqueue('2')
 [void](Get-AriaRunCredential 6>$null)
 Register-RunCredentialResult -Purpose "Aria Operations" -Succeeded $false 6>$null
-$script:ChoiceAnswers.Enqueue('1')
 [void](Get-AriaRunCredential 6>$null)
-# The menu is always shown - what changes is that option 2 is no longer on it.
-Assert-Equal "no passthrough is offered the second time" $false ($script:LastAllowed -contains '2')
-Assert-Equal "it is typed instead" 1 $script:AriaPrompts
+Assert-Equal "it is typed instead of replayed" 1 $script:AriaPrompts
 # Past the limit nothing further is asked for or sent at all.
 Clear-RunCredential
 $Global:AriaCredential = $null
@@ -484,90 +527,6 @@ Assert-Equal "including the account it names" "svc-aria" $cred.UserName
 Remove-Item -LiteralPath $fileDir -Recurse -Force -ErrorAction SilentlyContinue
 Clear-RunCredential
 
-Write-Host "`n=== Option 3 sends the username exactly as typed ===" -ForegroundColor Cyan
-# FOR TESTING A STRING BY HAND. Confirming a particular username works must not require a
-# different one to fail first - that burns an attempt, marks the passthrough rejected, and proves
-# nothing about the string being tested. So option 3 is always on the menu, and what is typed goes
-# onto the wire unaltered: nothing composed, no domain appended, no prefix stripped.
-Reset-Appliance
-Clear-RunCredential
-$Global:AriaCredential = $null
-$script:AriaPrompts = 0
-$script:ReadHostAnswers = New-Object System.Collections.Generic.Queue[string]
-$script:ReadHostAnswers.Enqueue('andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource')
-function Read-Host { param($Prompt,[switch]$AsSecureString)
-    if ($AsSecureString) { return (ConvertTo-SecureString 'raw-password' -AsPlainText -Force) }
-    if ($script:ReadHostAnswers.Count -eq 0) { return '' }
-    return $script:ReadHostAnswers.Dequeue() }
-$script:ChoiceAnswers.Enqueue('3')
-$cred = Get-AriaRunCredential 6>$null
-Assert-Equal "the exact string is held" "andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource" $cred.UserName
-Assert-Equal "with the password typed" "raw-password" $cred.GetNetworkCredential().Password
-Assert-Equal "and it is flagged as raw" $true $Global:AriaUserNameIsRaw
-Assert-Equal "the credential dialog was not used" 0 $script:AriaPrompts
-
-# On the wire: unaltered. Not re-composed, which for a name that already has two @ would be a
-# no-op anyway - but a DOMAIN\ prefix would NOT be, and raw has to mean raw.
-Reset-Appliance
-$script:ReadHostAnswers.Enqueue('DPE\andrew.richard1_priv')
-$Global:AriaCredential = $null
-Clear-RunCredential
-$script:ChoiceAnswers.Enqueue('3')
-$Global:AriaCredential = Get-AriaRunCredential 6>$null
-Assert-Equal "even a form the composer would rewrite is left alone" "DPE\andrew.richard1_priv" $Global:AriaCredential.UserName
-[void](Connect-AriaOperations 6>$null)
-$acquire = @($script:Calls | Where-Object { $_.Uri -match 'token/acquire' })[-1]
-Assert-Equal "and that is what reaches the appliance" "DPE\andrew.richard1_priv" (($acquire.Body | ConvertFrom-Json).username)
-Assert-Equal "with the source still in authSource" "vIDMAuthSource" (($acquire.Body | ConvertFrom-Json).authSource)
-
-# Option 3 is reachable with no passthrough available at all - it does not depend on one existing.
-Reset-Appliance
-Clear-RunCredential
-$Global:AriaCredential = $null
-$script:ChoiceAnswers.Enqueue('3')
-$script:ReadHostAnswers.Enqueue('svc@System Domain@vIDM-1')
-$cred = Get-AriaRunCredential 6>$null
-Assert-Equal "offered with no shared credential held" $true ($script:LastAllowed -contains '3')
-Assert-Equal "and it works" "svc@System Domain@vIDM-1" $cred.UserName
-# THE DEFAULT: the KB syntax built from the account this run already knows, so the common case is
-# one keypress and the syntax is on screen to copy and adjust.
-Reset-Appliance
-Clear-RunCredential
-$Global:AriaCredential = $null
-Set-SharedRunCredential -Credential ([pscredential]::new('DPE\andrew.iles_priv', (ConvertTo-SecureString 'domain-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
-$script:ChoiceAnswers.Enqueue('3')
-$script:ReadHostAnswers.Clear()          # nothing typed at the username prompt: Enter
-$cred = Get-AriaRunCredential 6>$null
-Assert-Equal "Enter takes the composed default" "andrew.iles_priv@dpe.protected.mil.au@vIDMAuthSource" $cred.UserName
-Assert-Equal "and it is still raw from there on" $true $Global:AriaUserNameIsRaw
-# Typing one replaces the default whole.
-Reset-Appliance
-Clear-RunCredential
-$Global:AriaCredential = $null
-Set-SharedRunCredential -Credential ([pscredential]::new('DPE\andrew.iles_priv', (ConvertTo-SecureString 'domain-password' -AsPlainText -Force))) -Source "vCenter" 6>$null
-$script:ChoiceAnswers.Enqueue('3')
-$script:ReadHostAnswers.Enqueue('andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource')
-$cred = Get-AriaRunCredential 6>$null
-Assert-Equal "a typed username wins over the default" "andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource" $cred.UserName
-# Nothing typed and nothing to default to is not a credential.
-Reset-Appliance
-Clear-RunCredential
-$Global:AriaCredential = $null
-$script:ChoiceAnswers.Enqueue('3')
-$script:ReadHostAnswers.Clear()
-Assert-Equal "no default and no input is no credential" $true ($null -eq (Get-AriaRunCredential 6>$null))
-
-# Options 1 and 2 leave the raw flag off, so the composer is back in charge.
-Reset-Appliance
-Clear-RunCredential
-$Global:AriaCredential = $null
-$script:ChoiceAnswers.Enqueue('1')
-[void](Get-AriaRunCredential 6>$null)
-Assert-Equal "a normal entry is not raw" $false $Global:AriaUserNameIsRaw
-Remove-Item Function:\Read-Host -ErrorAction SilentlyContinue
-Clear-RunCredential
-$Global:AriaCredential = [pscredential]::new('svc-esxi', (ConvertTo-SecureString 'p' -AsPlainText -Force))
-
 Write-Host "`n=== A failed sign-in offers another account instead of killing the run ===" -ForegroundColor Cyan
 # ONE BAD ACCOUNT USED TO COST THE WHOLE RUN. A single 401 marked Aria unusable for the session, so
 # a passthrough that turned out not to be entitled in Aria meant no suppression on any cluster
@@ -578,9 +537,7 @@ $Global:AriaCredential = $null
 $script:AriaPrompts = 0
 $script:TokenFails = $true
 $script:FailUntilAttempt = 1          # the appliance rejects the first account and accepts the next
-$script:ChoiceAnswers.Enqueue('1')    # the credential menu: type an account
 $script:ChoiceAnswers.Enqueue('1')    # after the 401: try a different account
-$script:ChoiceAnswers.Enqueue('1')    # the credential menu again
 Assert-Equal "the second account got in" $true (Connect-AriaOperations 6>$null)
 Assert-Equal "it took two sign-ins" 2 $script:TokenAttempts
 Assert-Equal "and Aria is still usable" $false $Global:AriaUnusable
@@ -592,7 +549,6 @@ Reset-Appliance
 Clear-RunCredential
 $Global:AriaCredential = $null
 $script:TokenFails = $true
-$script:ChoiceAnswers.Enqueue('1')    # the credential menu: type an account
 $script:ChoiceAnswers.Enqueue('2')    # after the 401: carry on without suppression
 Assert-Equal "the sign-in gives up" $false (Connect-AriaOperations 6>$null)
 Assert-Equal "without sending a second password" 1 $script:TokenAttempts

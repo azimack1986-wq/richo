@@ -12,6 +12,53 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
+### [23.32.0] — 2026-08-21
+
+#### Changed
+
+- **The Aria credential menu is gone — the vCenter credential passes straight
+  through.** With the payload fixed in 23.31.0, typing the account by hand worked
+  against the appliance, and a passthrough is the *same request*: both routes produce
+  a plain account name, and the composition into `account@vIDM-domain@source` plus the
+  omission of `authSource` happen once, in `Connect-AriaOperations`, on whatever they
+  hand it. The menu existed while that was unproven; a question whose answer is always
+  the same is a keystroke between the operator and the change.
+
+  One credential prompt now covers vCenter, UCS Manager and Aria Operations.
+
+  It is still **said** rather than done silently — both the account and the string
+  that will actually be sent:
+
+  ```
+    Aria Operations - using 'DPE\andrew.richard1_priv', already accepted by vCenter.
+    Sent as 'andrew.richard1_priv@dpe.protected.mil.au@vIDMAuthSource'.
+  ```
+
+  An account is asked for only when there is nothing to pass through, or when Aria has
+  already refused the shared one. The failure behaviour is unchanged and is where the
+  safety lives: a rejected credential is discarded rather than replayed, the attempt is
+  counted, Aria stops being offered the shared one, and the retry prompt still offers a
+  different account or carrying on unsuppressed.
+
+#### Removed
+
+- **Option 3, the raw-username entry**, and `$Global:AriaUserNameIsRaw` with it. It
+  existed to test a string by hand while the request shape was in doubt. The shape is
+  settled, the composition is proven, and a second username path that bypasses the
+  composer is exactly the thing that drifts out of step with the one everything else
+  uses.
+
+#### Tests
+
+- `tests/Test-AriaSuppression.ps1` — 109 assertions: the passthrough happening with
+  nothing asked and nothing typed, the account **and** the composed string both being
+  named on screen, an account being asked for only when there is nothing to pass
+  through, and the byte-for-byte equality of the passthrough and hand-typed payloads
+  (including a `DOMAIN\user` and a UPN-shaped vCenter login both landing on the same
+  request) — now with an assertion that the username is composed in exactly **one**
+  place, so the two routes cannot become two implementations.
+- Full suite: 1278 assertions across 24 files, all passing.
+
 ### [23.31.0] — 2026-08-21
 
 #### Fixed
