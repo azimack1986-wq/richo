@@ -57,6 +57,14 @@
     badly configured domain cannot produce a ten thousand row CSV. Defaults to 50. When a check is
     capped it says so in its aggregate row - the truncation is never silent.
 
+.PARAMETER IgnoreCertificateError
+    Tell UCS PowerTool to accept the fabric interconnect's certificate without validating it.
+
+    UCS Manager normally presents a self-signed certificate, and PowerTool refuses it by default -
+    which is the most common reason a first run gets no further than Connect-Ucs. Off by default,
+    because a script that silently stops validating certificates is worse than one that fails
+    clearly; the connection failure names this switch when the error looks certificate-shaped.
+
 .PARAMETER Transcript
     Start a PowerShell transcript in logs/ for the run.
 
@@ -134,6 +142,8 @@ param(
     [ValidateRange(1, 100000)]
     [int]$MaxDetailRowsPerCheck = 50,
 
+    [switch]$IgnoreCertificateError,
+
     [switch]$Transcript
 )
 
@@ -142,7 +152,7 @@ $ErrorActionPreference = 'Stop'
 
 Import-Module (Join-Path $PSScriptRoot '..\..\modules\Richo.Common\Richo.Common.psd1') -Force
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 
 # ---------------------------------------------------------------------------------------------
 # Run state
@@ -2873,6 +2883,481 @@ function Test-UcsBpPools {
 }
 
 # ---------------------------------------------------------------------------------------------
+# Checks - what actually breaks when one fabric interconnect goes away
+# ---------------------------------------------------------------------------------------------
+
+function Get-UcsBpFabricOf {
+    <#
+    .SYNOPSIS
+        Works out which fabric interconnect an object belongs to.
+
+    .DESCRIPTION
+        Different UCSM classes say this differently - SwitchId on most fabric objects, Id on an
+        IO module, and for anything else the fabric is embedded in the Dn as /A/ or /B/. Rather
+        than every check knowing all three, they ask here.
+
+        A vNIC reports A, B, A-B or B-A, where the pair form means fabric failover is on and the
+        first letter is the primary. Only the first letter is returned, because for the question
+        this section asks - what is lost when a fabric goes - the primary is what matters.
+
+    .PARAMETER Mo
+        The managed object.
+
+    .PARAMETER NumericIdIsFabric
+        Treat Id 1 as fabric A and Id 2 as fabric B. IO modules number themselves that way rather
+        than lettering themselves, and nothing else does - so it is opt-in. Left on by default it
+        would resolve a port channel with Id 1 to fabric A, silently and wrongly.
+
+    .EXAMPLE
+        $fabric = Get-UcsBpFabricOf -Mo $uplink
+
+    .EXAMPLE
+        $fabric = Get-UcsBpFabricOf -Mo $ioModule -NumericIdIsFabric
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [AllowNull()]
+        $Mo,
+
+        [switch]$NumericIdIsFabric
+    )
+
+    foreach ($property in @('SwitchId', 'Fabric', 'Id')) {
+        $value = [string](Get-UcsBpProperty -InputObject $Mo -Name $property -Default '')
+        if ($value -match '^([AaBb])') { return $Matches[1].ToUpperInvariant() }
+    }
+
+    $dn = [string](Get-UcsBpProperty -InputObject $Mo -Name 'Dn' -Default '')
+    if ($dn -match '/(?:sw-)?([AB])(?:/|$)') { return $Matches[1].ToUpperInvariant() }
+
+    if ($NumericIdIsFabric) {
+        $id = [string](Get-UcsBpProperty -InputObject $Mo -Name 'Id' -Default '')
+        if ($id -eq '1') { return 'A' }
+        if ($id -eq '2') { return 'B' }
+    }
+
+    return ''
+}
+
+function Test-UcsBpFabricFailover {
+    <#
+    .SYNOPSIS
+        Audits what the domain loses when a single fabric interconnect is rebooted.
+
+    .DESCRIPTION
+        A subordinate fabric interconnect reboot is supposed to be a non-event: the surviving
+        fabric carries everything until the other comes back. When it is not a non-event, the
+        cause is almost always one of a small number of configurations, and every one of them is
+        visible here while both fabrics are up. That is the point - none of these show as a fault,
+        and the domain looks healthy right up until the reboot.
+
+        The section asks one question per fabric: if this one disappeared right now, what would
+        have no path? It looks at six ways the answer can be "everything":
+
+          1. THE SURVIVING FABRIC HAS NO WORKING UPLINKS. If one fabric's uplinks are already down
+             or were never configured, the domain has been running on a single fabric without
+             anyone noticing, and rebooting that one is a total outage rather than a failover.
+             This is the first thing to rule out and the most commonly missed, because the domain
+             raises no fault for it - the traffic is flowing, just all through one side.
+
+          2. THE FABRIC INTERCONNECTS ARE IN SWITCHING MODE. In end-host mode a fabric interconnect
+             does not run spanning tree; it is invisible to the upstream topology, and rebooting
+             one changes nothing outside the domain. In switching mode it joins the spanning tree,
+             and a reboot triggers a topology change the upstream network has to reconverge around.
+             That is how a subordinate reboot takes out things that are nothing to do with UCS.
+
+          3. A VLAN, OR A WHOLE VLAN GROUP, LIVES ON ONE FABRIC ONLY. A VLAN defined on one fabric
+             disappears with it. A VLAN group bound only to uplinks on one fabric is worse: the
+             VLANs in it have no upstream path from the other fabric at all, so the traffic dies
+             even for servers whose vNIC is on the surviving side.
+
+          4. TRAFFIC IS PINNED TO ONE FABRIC. A LAN pin group targeting a single fabric's uplink
+             overrides dynamic pinning, so the vNICs using it do not repin to the surviving fabric.
+
+          5. SERVERS HAVE NO SECOND PATH. A service profile whose vNICs are all on one fabric has
+             nothing to fail over to, whatever the network above it does.
+
+          6. THE FAILURE IS SILENT. This is the one that turns a survivable event into an outage.
+             A network control policy with Action on Uplink Fail set to warning leaves the vNIC UP
+             when its fabric loses its uplinks. The operating system sees a live link, keeps using
+             it, and never fails over - so instead of a brief repin, the host blackholes for as
+             long as the fabric is gone. ESXi and Windows teaming both depend on the link going
+             down to react.
+
+        Where a check cannot read what it needs it says so rather than passing. On this question in
+        particular, an absent row is worse than useless: it reads as "checked, fine".
+
+    .EXAMPLE
+        Test-UcsBpFabricFailover
+    #>
+    [CmdletBinding()]
+    param()
+
+    $category = 'Fabric Failover'
+    $reference = 'Cisco UCS Manager Network Management Guide - LAN Connectivity, LAN Uplinks Manager, Pin Groups'
+    $fabrics = @('A', 'B')
+
+    # --- Which fabric is subordinate right now --------------------------------------------------
+    $mgmtEntities = @(Get-UcsBpMo -ClassId 'mgmtEntity')
+    $leadership = @($mgmtEntities | ForEach-Object {
+            "$(Get-UcsBpProperty -InputObject $_ -Name 'Id' -Default '?')=$(Get-UcsBpProperty -InputObject $_ -Name 'LeadershipState' -Default '?')"
+        })
+    Add-UcsBpRow -Category $category -CheckId 'UCS-FO-001' -Setting 'Cluster leadership (which fabric interconnect is subordinate)' `
+        -ObjectDn 'sys' -CurrentValue ($leadership -join ', ') `
+        -RecommendedValue 'One primary and one subordinate. Recorded so a reboot can be correlated with the fabric it happened on' `
+        -Basis 'Site Policy' -Result 'Review' -Severity 'Info' -Reference $reference `
+        -Remediation 'Equipment > Fabric Interconnects. Leadership moves on failover, so the fabric that was subordinate during an incident is not necessarily the subordinate now.'
+
+    # --- 1. Is either fabric already carrying everything? ----------------------------------------
+    $uplinkPcs = @(Get-UcsBpMo -ClassId 'fabricEthLanPc')
+    $uplinkPcMembers = @(Get-UcsBpMo -ClassId 'fabricEthLanPcEp')
+    $standaloneUplinks = @(Get-UcsBpMo -ClassId 'fabricEthLanEp')
+
+    $upCountByFabric = @{}
+    foreach ($fabric in $fabrics) {
+        # Members of an operationally up port channel, plus any standalone uplink that is up.
+        $upPcs = @($uplinkPcs | Where-Object {
+                ((Get-UcsBpFabricOf -Mo $_) -eq $fabric) -and
+                ([string](Get-UcsBpProperty -InputObject $_ -Name 'OperState' -Default '') -imatch '^(up|indeterminate)$')
+            })
+        $upPcNames = @($upPcs | ForEach-Object { [string](Get-UcsBpProperty -InputObject $_ -Name 'Dn' -Default '') })
+
+        $upMembers = @($uplinkPcMembers | Where-Object {
+                $memberDn = [string](Get-UcsBpProperty -InputObject $_ -Name 'Dn' -Default '')
+                $parent = $memberDn -replace '/[^/]+$', ''
+                ($upPcNames -contains $parent)
+            })
+
+        $upStandalone = @($standaloneUplinks | Where-Object {
+                ((Get-UcsBpFabricOf -Mo $_) -eq $fabric) -and
+                ([string](Get-UcsBpProperty -InputObject $_ -Name 'OperState' -Default '') -imatch '^up$')
+            })
+
+        $upCount = $upPcs.Count + $upStandalone.Count
+        $upCountByFabric[$fabric] = $upCount
+
+        Add-UcsBpRow -Category $category -CheckId 'UCS-FO-002' -Setting "Fabric $fabric - working northbound uplinks" `
+            -ObjectDn "fabric/lan/$fabric" `
+            -CurrentValue "$upCount up ($($upPcs.Count) port channel(s) with $($upMembers.Count) member port(s), $($upStandalone.Count) standalone)" `
+            -RecommendedValue 'At least one operationally up uplink per fabric. A fabric with none is not a redundant path - the domain is already running on one side' `
+            -Basis 'Best Practice' -Result $(if ($upCount -ge 1) { 'Meets' } else { 'Does Not Meet' }) `
+            -Severity 'Critical' -Reference $reference `
+            -Remediation "LAN > LAN Cloud > Fabric $fabric > Port Channels. If this fabric has no working uplink, every server is reaching the network through the other one - and rebooting THAT one is a total outage, not a failover. UCS Manager raises no fault for this: the traffic is flowing, just all through one side."
+    }
+
+    # The cross-check that matters most for a subordinate reboot that took everything down.
+    $fabricsWithUplinks = @($fabrics | Where-Object { $upCountByFabric[$_] -ge 1 })
+    Add-UcsBpRow -Category $category -CheckId 'UCS-FO-003' -Setting 'Both fabrics have a working northbound path' `
+        -ObjectDn 'fabric/lan' `
+        -CurrentValue "A: $($upCountByFabric['A']) up, B: $($upCountByFabric['B']) up" `
+        -RecommendedValue 'Both fabrics with at least one working uplink, so either can be rebooted without taking the domain off the network' `
+        -Basis 'Best Practice' -Result $(if ($fabricsWithUplinks.Count -eq 2) { 'Meets' } else { 'Does Not Meet' }) `
+        -Severity 'Critical' -Reference $reference `
+        -Remediation 'If only one fabric has working uplinks, that fabric is a single point of failure for the whole domain and rebooting it explains a complete downstream outage exactly. Fix the dead fabric''s uplinks before the next reboot of either.'
+
+    # --- 2. Switching mode and spanning tree -----------------------------------------------------
+    $lanCloud = @(Get-UcsBpMo -ClassId 'fabricLanCloud') | Select-Object -First 1
+    $switchingMode = [string](Get-UcsBpProperty -InputObject $lanCloud -Name 'Mode' -Default '')
+    $isEndHost = ($switchingMode -imatch 'end-host')
+    Add-UcsBpRow -Category $category -CheckId 'UCS-FO-010' -Setting 'Ethernet switching mode, and whether a reboot disturbs the upstream network' `
+        -ObjectDn 'fabric/lan' -Owner ([string](Get-UcsBpProperty -InputObject $lanCloud -Name 'PolicyOwner' -Default '')) `
+        -CurrentValue $switchingMode `
+        -RecommendedValue 'end-host - the fabric interconnects stay out of the spanning tree, so rebooting one changes nothing outside the domain' `
+        -Basis 'Best Practice' -Result $(if ($isEndHost) { 'Meets' } else { 'Does Not Meet' }) `
+        -Severity 'Critical' `
+        -Reference 'https://www.cisco.com/c/en/us/solutions/collateral/data-center-virtualization/unified-computing/whitepaper_c11-701962.html' `
+        -Remediation 'LAN > LAN Cloud > Fabric A/B. In switching mode the fabric interconnect participates in spanning tree, so rebooting one raises a topology change the upstream network must reconverge around - which is how a subordinate reboot takes down things unrelated to UCS. Changing the mode reboots the fabric interconnect, so it is a change-window job.'
+
+    if (-not $isEndHost) {
+        $stpInstances = @(Get-UcsBpMo -ClassId 'stpInstance')
+        Add-UcsBpRow -Category $category -CheckId 'UCS-FO-011' -Setting 'Spanning tree instances (switching mode only)' `
+            -ObjectDn 'fabric/lan' -CurrentValue $stpInstances.Count `
+            -RecommendedValue 'Reviewed against the upstream design - in switching mode the fabric interconnect is part of the L2 topology and its priority, root placement and port roles all matter' `
+            -Basis 'Site Policy' -Result 'Review' -Severity 'High' -Reference $reference `
+            -Remediation 'Confirm with the network team where the root bridge sits and what happens to it when a fabric interconnect reboots. This is the most likely explanation for an upstream outage triggered by a UCS reboot.' `
+            -Detail (@($stpInstances | ForEach-Object { "$(Get-UcsBpProperty -InputObject $_ -Name 'Dn' -Default '?')" }) -join ', ')
+    }
+
+    # --- 3. VLANs and VLAN groups that live on one fabric only -----------------------------------
+    $vlans = @(Get-UcsBpMo -ClassId 'fabricVlan')
+    $singleFabricVlans = @($vlans | Where-Object {
+            $switchId = [string](Get-UcsBpProperty -InputObject $_ -Name 'SwitchId' -Default 'dual')
+            $switchId -ieq 'A' -or $switchId -ieq 'B'
+        })
+    Add-UcsBpRow -Category $category -CheckId 'UCS-FO-020' -Setting 'VLANs that disappear with a single fabric' `
+        -ObjectDn 'fabric/lan' -CurrentValue $singleFabricVlans.Count `
+        -RecommendedValue '0 - a VLAN defined on one fabric only ceases to exist while that fabric is rebooting' `
+        -Basis 'Best Practice' -Result $(if ($singleFabricVlans.Count -eq 0) { 'Meets' } else { 'Does Not Meet' }) `
+        -Severity 'High' -Reference $reference `
+        -Remediation 'LAN > LAN Cloud > VLANs. See UCS-VLAN-003 for the same finding with the offending VLANs named.' `
+        -Detail (@($singleFabricVlans | Select-Object -First 20 | ForEach-Object { "$(Get-UcsBpProperty -InputObject $_ -Name 'Name' -Default '?')(id $(Get-UcsBpProperty -InputObject $_ -Name 'Id' -Default '?')) on $(Get-UcsBpProperty -InputObject $_ -Name 'SwitchId' -Default '?')" }) -join ', ')
+
+    # A VLAN group bound only to one fabric's uplinks is the nastier version: the VLANs in it have
+    # no upstream path from the other fabric at all, so traffic dies even for servers on the
+    # surviving side. The binding objects differ across releases, so several are tried.
+    $vlanGroups = @(Get-UcsBpMo -ClassId 'fabricNetGroup')
+    if ($vlanGroups.Count -eq 0) {
+        Add-UcsBpRow -Category $category -CheckId 'UCS-FO-021' -Setting 'VLAN groups bound to one fabric only' `
+            -ObjectDn 'fabric/lan' -CurrentValue 'no VLAN groups defined' `
+            -RecommendedValue 'Where VLAN groups are used, each should be bound to uplinks on both fabrics' `
+            -Basis 'Best Practice' -Result 'Not Applicable' -Severity 'Info' -Reference $reference `
+            -Remediation 'Without VLAN groups every VLAN is trunked on every uplink, so there is no per-group fabric binding to get wrong.'
+    }
+    else {
+        $groupRefs = @()
+        $refClassUsed = ''
+        foreach ($refClass in @('fabricNetGroupRef', 'fabricPooledVlan', 'fabricVlanReq')) {
+            $candidate = @(Get-UcsBpMo -ClassId $refClass)
+            if ($candidate.Count -gt 0) { $groupRefs = $candidate; $refClassUsed = $refClass; break }
+        }
+
+        if ($groupRefs.Count -eq 0) {
+            Add-UcsBpRow -Category $category -CheckId 'UCS-FO-021' -Setting 'VLAN groups bound to one fabric only' `
+                -ObjectDn 'fabric/lan' -CurrentValue '(bindings could not be read)' `
+                -RecommendedValue 'Each VLAN group bound to uplinks on BOTH fabrics' -Basis 'Best Practice' `
+                -Result 'Unknown' -Severity 'High' -Reference $reference `
+                -Remediation 'Check this by hand: LAN > LAN Cloud > LAN Uplinks Manager > VLAN Groups, and confirm every group lists uplinks on fabric A and fabric B. A group bound to one fabric only leaves its VLANs with no upstream path from the other fabric - traffic dies even for servers whose vNIC is on the surviving side.' `
+                -Detail "None of fabricNetGroupRef, fabricPooledVlan or fabricVlanReq returned objects on this UCSM version, so the group-to-uplink binding could not be determined."
+        }
+        else {
+            foreach ($group in $vlanGroups) {
+                $groupName = [string](Get-UcsBpProperty -InputObject $group -Name 'Name' -Default '?')
+                $groupDn = [string](Get-UcsBpProperty -InputObject $group -Name 'Dn' -Default '')
+
+                # A binding that names this group, wherever it hangs. The fabric comes from the Dn
+                # of the object the binding sits under - an uplink port or port channel.
+                $bindings = @($groupRefs | Where-Object {
+                        ([string](Get-UcsBpProperty -InputObject $_ -Name 'Name' -Default '') -ieq $groupName) -and
+                        ([string](Get-UcsBpProperty -InputObject $_ -Name 'Dn' -Default '') -notlike "$groupDn/*")
+                    })
+                $boundFabrics = @($bindings | ForEach-Object { Get-UcsBpFabricOf -Mo $_ } | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+
+                if ($bindings.Count -eq 0) {
+                    Add-UcsBpRow -Category $category -CheckId 'UCS-FO-021' -Setting "VLAN group '$groupName' - uplink bindings" `
+                        -ObjectDn $groupDn -Owner ([string](Get-UcsBpProperty -InputObject $group -Name 'PolicyOwner' -Default '')) `
+                        -CurrentValue '(no uplink binding found)' -RecommendedValue 'Bound to uplinks on both fabric A and fabric B' `
+                        -Basis 'Best Practice' -Result 'Review' -Severity 'High' -Reference $reference `
+                        -Remediation "LAN > LAN Cloud > LAN Uplinks Manager > VLAN Groups > $groupName. No binding was found for this group by reading $refClassUsed - confirm by hand which uplinks it is associated with."
+                    continue
+                }
+
+                Add-UcsBpRow -Category $category -CheckId 'UCS-FO-021' -Setting "VLAN group '$groupName' - uplink bindings span both fabrics" `
+                    -ObjectDn $groupDn -Owner ([string](Get-UcsBpProperty -InputObject $group -Name 'PolicyOwner' -Default '')) `
+                    -CurrentValue ("bound on fabric(s): " + ($boundFabrics -join ', ')) `
+                    -RecommendedValue 'Bound to uplinks on both fabric A and fabric B' -Basis 'Best Practice' `
+                    -Result $(if ($boundFabrics.Count -ge 2) { 'Meets' } else { 'Does Not Meet' }) `
+                    -Severity 'Critical' -Reference $reference `
+                    -Remediation "LAN > LAN Cloud > LAN Uplinks Manager > VLAN Groups > $groupName. A group bound to one fabric only leaves every VLAN in it with no upstream path from the other fabric, so rebooting the bound fabric drops that traffic for ALL servers - including those whose vNIC is on the surviving side." `
+                    -Detail "Read from $refClassUsed; $($bindings.Count) binding(s)."
+            }
+        }
+    }
+
+    # --- 4. Static pinning ------------------------------------------------------------------------
+    $pinGroups = @(Get-UcsBpMo -ClassId 'fabricLanPinGroup')
+    $pinTargets = @(Get-UcsBpMo -ClassId 'fabricLanPinTarget')
+    if ($pinGroups.Count -eq 0) {
+        Add-UcsBpRow -Category $category -CheckId 'UCS-FO-030' -Setting 'LAN pin groups (static uplink pinning)' `
+            -ObjectDn 'fabric/lan' -CurrentValue 'none defined' `
+            -RecommendedValue 'None - dynamic pinning repins a vNIC to a surviving uplink automatically; a static pin does not' `
+            -Basis 'Best Practice' -Result 'Meets' -Severity 'Info' -Reference $reference `
+            -Remediation 'Nothing to do. Dynamic pinning is what lets a vNIC move to another uplink when its own goes away.'
+    }
+    else {
+        foreach ($pinGroup in $pinGroups) {
+            $pinName = [string](Get-UcsBpProperty -InputObject $pinGroup -Name 'Name' -Default '?')
+            $pinDn = [string](Get-UcsBpProperty -InputObject $pinGroup -Name 'Dn' -Default '')
+            $targets = @($pinTargets | Where-Object { [string](Get-UcsBpProperty -InputObject $_ -Name 'Dn' -Default '') -like "$pinDn/*" })
+            $targetFabrics = @($targets | ForEach-Object {
+                    $epDn = [string](Get-UcsBpProperty -InputObject $_ -Name 'EpDn' -Default '')
+                    $fabricFromEp = if ($epDn -match '/(?:sw-)?([AB])(?:/|$)') { $Matches[1].ToUpperInvariant() } else { Get-UcsBpFabricOf -Mo $_ }
+                    $fabricFromEp
+                } | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+
+            Add-UcsBpRow -Category $category -CheckId 'UCS-FO-030' -Setting "LAN pin group '$pinName' - fabrics targeted" `
+                -ObjectDn $pinDn -Owner ([string](Get-UcsBpProperty -InputObject $pinGroup -Name 'PolicyOwner' -Default '')) `
+                -CurrentValue $(if ($targetFabrics.Count -gt 0) { $targetFabrics -join ', ' } else { '(no target found)' }) `
+                -RecommendedValue 'A target on both fabrics, or no pin group at all so dynamic pinning applies' `
+                -Basis 'Best Practice' -Result $(if ($targetFabrics.Count -ge 2) { 'Meets' } else { 'Does Not Meet' }) `
+                -Severity 'High' -Reference $reference `
+                -Remediation "LAN > LAN Cloud > LAN Pin Groups > $pinName. A vNIC pinned to one fabric's uplink does not repin to the surviving fabric when that uplink goes away - it simply loses its path." `
+                -Detail "$($targets.Count) target(s): $(@($targets | ForEach-Object { Get-UcsBpProperty -InputObject $_ -Name 'EpDn' -Default '?' }) -join ', ')"
+        }
+    }
+
+    # --- 5. Servers with no second path -----------------------------------------------------------
+    $vnics = @(Get-UcsBpMo -ClassId 'vnicEther')
+    $byProfile = @{}
+    foreach ($vnic in $vnics) {
+        $dn = [string](Get-UcsBpProperty -InputObject $vnic -Name 'Dn' -Default '')
+        if ([string]::IsNullOrWhiteSpace($dn)) { continue }
+        $profileDn = $dn -replace '/ether-[^/]+$', ''
+        if (-not $byProfile.ContainsKey($profileDn)) { $byProfile[$profileDn] = New-Object System.Collections.Generic.List[object] }
+        $byProfile[$profileDn].Add($vnic)
+    }
+
+    $strandedByFabric = @{ 'A' = 0; 'B' = 0 }
+    $strandedProfiles = New-Object System.Collections.Generic.List[object]
+    foreach ($profileDn in $byProfile.Keys) {
+        $profileVnics = $byProfile[$profileDn].ToArray()
+        $profileFabrics = @($profileVnics | ForEach-Object { Get-UcsBpFabricOf -Mo $_ } | Where-Object { $_ } | Select-Object -Unique)
+        if ($profileFabrics.Count -eq 1) {
+            $only = $profileFabrics[0]
+            if ($strandedByFabric.ContainsKey($only)) { $strandedByFabric[$only]++ }
+            $strandedProfiles.Add([pscustomobject]@{ Dn = $profileDn; Fabric = $only })
+        }
+    }
+
+    Add-UcsBpRow -Category $category -CheckId 'UCS-FO-040' -Setting 'Service profiles that lose all networking with one fabric' `
+        -ObjectDn 'org-root' `
+        -CurrentValue "$($strandedProfiles.Count) (A only: $($strandedByFabric['A']), B only: $($strandedByFabric['B']))" `
+        -RecommendedValue '0 - every service profile with vNICs on both fabrics' -Basis 'Best Practice' `
+        -Result $(if ($strandedProfiles.Count -eq 0) { 'Meets' } else { 'Does Not Meet' }) `
+        -Severity 'Critical' -Reference $reference `
+        -Remediation 'Servers > Service Profiles > vNICs. A server whose vNICs are all on one fabric has nothing to fail over to, whatever the network above it does.' `
+        -Detail (@($strandedProfiles | Select-Object -First 20 | ForEach-Object { "$($_.Dn) [fabric $($_.Fabric) only]" }) -join ', ')
+
+    if ($strandedProfiles.Count -gt 0) {
+        $emitted = Add-UcsBpOffenderRows -Offender $strandedProfiles.ToArray() -Category $category -CheckId 'UCS-FO-040' `
+            -Setting 'Service profile with vNICs on one fabric only' `
+            -CurrentValueScript { param($mo, $arg) "$($mo.Dn) has vNICs on fabric $($mo.Fabric) only" } `
+            -RecommendedValue 'vNICs on both fabric A and fabric B' -Basis 'Best Practice' -Severity 'Critical' `
+            -Remediation 'Servers > Service Profiles > vNICs.' -Reference $reference
+        if ($emitted -lt $strandedProfiles.Count) {
+            Add-UcsBpRow -Category $category -CheckId 'UCS-FO-040-CAP' -Setting 'Stranded service profile detail rows truncated' `
+                -CurrentValue "$emitted of $($strandedProfiles.Count) listed" -RecommendedValue 'n/a' -Basis 'Site Policy' `
+                -Result 'Review' -Severity 'Info' `
+                -Remediation "Re-run with -MaxDetailRowsPerCheck $($strandedProfiles.Count) to list them all."
+        }
+    }
+
+    # --- 6. Whether the loss is signalled to the operating system ----------------------------------
+    # The one that turns a survivable event into an outage.
+    $nwPolicies = @(Get-UcsBpMo -ClassId 'nwctrlDefinition')
+    $silentPolicies = @($nwPolicies | Where-Object {
+            [string](Get-UcsBpProperty -InputObject $_ -Name 'UplinkFailAction' -Default '') -inotmatch '^link-down$'
+        })
+    $silentPolicyNames = @($silentPolicies | ForEach-Object { [string](Get-UcsBpProperty -InputObject $_ -Name 'Name' -Default '?') })
+    $vnicsOnSilentPolicy = @($vnics | Where-Object {
+            $policyName = [string](Get-UcsBpProperty -InputObject $_ -Name 'NwCtrlPolicyName' -Default '')
+            $policyName -and ($silentPolicyNames -contains $policyName)
+        })
+
+    Add-UcsBpRow -Category $category -CheckId 'UCS-FO-050' -Setting 'Uplink loss is signalled to the server (Action on Uplink Fail)' `
+        -ObjectDn 'org-root' `
+        -CurrentValue "$($silentPolicies.Count) of $($nwPolicies.Count) network control policies set to warning; $($vnicsOnSilentPolicy.Count) vNIC(s) using them" `
+        -RecommendedValue 'link-down on every network control policy, so a vNIC whose fabric loses its uplinks goes down and the operating system fails over' `
+        -Basis 'Best Practice' -Result $(if ($silentPolicies.Count -eq 0) { 'Meets' } else { 'Does Not Meet' }) `
+        -Severity 'Critical' -Reference $reference `
+        -Remediation 'LAN > Policies > Network Control Policies. Set to warning, the vNIC stays UP when its fabric has no northbound path. ESXi and Windows teaming both react to the link going down, so with warning they keep sending into a fabric that has nowhere to send it - which turns a brief repin into a blackhole lasting as long as the reboot.' `
+        -Detail "Policies set to warning: $($silentPolicyNames -join ', ')"
+
+    # --- Do the two fabrics reach the same upstream switch? ----------------------------------------
+    # Only visible when the information policy is enabled, which is why that check is not cosmetic.
+    $neighbours = @()
+    $neighbourClass = ''
+    foreach ($candidateClass in @('networkLanNeighborEntry', 'lldpAdjEp', 'cdpAdjEp')) {
+        $candidate = @(Get-UcsBpMo -ClassId $candidateClass)
+        if ($candidate.Count -gt 0) { $neighbours = $candidate; $neighbourClass = $candidateClass; break }
+    }
+
+    if ($neighbours.Count -eq 0) {
+        Add-UcsBpRow -Category $category -CheckId 'UCS-FO-060' -Setting 'Upstream switches each fabric connects to' `
+            -ObjectDn 'fabric/lan' -CurrentValue '(no neighbour information)' `
+            -RecommendedValue 'Each fabric uplinked to a different upstream switch, so one upstream device is not a single point of failure for both' `
+            -Basis 'Best Practice' -Result 'Unknown' -Severity 'High' -Reference $reference `
+            -Remediation 'Enable Equipment > Policies > Global Policies > Info Policy (see UCS-EQP-012), then re-run - without it UCS Manager reports no LAN neighbours and this cannot be answered from here. Otherwise trace the uplink cabling by hand: if both fabrics land on the same upstream switch, that switch is a single point of failure for the whole domain.'
+    }
+    else {
+        $neighboursByFabric = @{}
+        foreach ($fabric in $fabrics) {
+            $names = @($neighbours | Where-Object { (Get-UcsBpFabricOf -Mo $_) -eq $fabric } | ForEach-Object {
+                    $name = ''
+                    foreach ($property in @('SysName', 'DeviceId', 'SystemName', 'ChassisId', 'Name')) {
+                        $value = [string](Get-UcsBpProperty -InputObject $_ -Name $property -Default '')
+                        if ($value) { $name = $value; break }
+                    }
+                    $name
+                } | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+            $neighboursByFabric[$fabric] = $names
+
+            Add-UcsBpRow -Category $category -CheckId 'UCS-FO-060' -Setting "Fabric $fabric - upstream switches seen" `
+                -ObjectDn "fabric/lan/$fabric" -CurrentValue $(if ($names.Count) { $names -join ', ' } else { '(none seen)' }) `
+                -RecommendedValue 'At least one upstream neighbour, and not the same single device as the other fabric' `
+                -Basis 'Best Practice' -Result $(if ($names.Count -ge 1) { 'Meets' } else { 'Review' }) `
+                -Severity 'Medium' -Reference $reference `
+                -Remediation "Read from $neighbourClass. LAN > LAN Cloud > LAN Uplinks Manager shows the same view."
+        }
+
+        $sharedUpstream = @($neighboursByFabric['A'] | Where-Object { $neighboursByFabric['B'] -contains $_ })
+        $bothHaveNeighbours = (($neighboursByFabric['A'].Count -gt 0) -and ($neighboursByFabric['B'].Count -gt 0))
+        if ($bothHaveNeighbours) {
+            $onlyShared = (($sharedUpstream.Count -gt 0) -and
+                           ($neighboursByFabric['A'].Count -eq $sharedUpstream.Count) -and
+                           ($neighboursByFabric['B'].Count -eq $sharedUpstream.Count))
+            Add-UcsBpRow -Category $category -CheckId 'UCS-FO-061' -Setting 'Both fabrics depend on the same upstream switch' `
+                -ObjectDn 'fabric/lan' `
+                -CurrentValue $(if ($sharedUpstream.Count -gt 0) { "shared: $($sharedUpstream -join ', ')" } else { 'no shared upstream device' }) `
+                -RecommendedValue 'Each fabric reaching the network through a different upstream switch, so no single upstream device carries both' `
+                -Basis 'Best Practice' -Result $(if ($onlyShared) { 'Does Not Meet' } else { 'Meets' }) `
+                -Severity 'High' -Reference $reference `
+                -Remediation 'If both fabrics reach the network only through one upstream switch, that switch - not the fabric interconnect - is the single point of failure, and work on it looks exactly like a UCS outage.'
+        }
+    }
+
+    # --- Chassis reachable from both fabrics -------------------------------------------------------
+    $ioCards = @(Get-UcsBpMo -ClassId 'equipmentIOCard')
+    if ($ioCards.Count -gt 0) {
+        $chassisWithOneSide = New-Object System.Collections.Generic.List[string]
+        foreach ($chassisGroup in ($ioCards | Group-Object -Property { [string](Get-UcsBpProperty -InputObject $_ -Name 'ChassisId' -Default '?') })) {
+            $sides = @($chassisGroup.Group |
+                    Where-Object { [string](Get-UcsBpProperty -InputObject $_ -Name 'OperState' -Default 'operable') -inotmatch 'removed|inoperable' } |
+                    ForEach-Object { Get-UcsBpFabricOf -Mo $_ -NumericIdIsFabric } | Where-Object { $_ } | Select-Object -Unique)
+            if ($sides.Count -lt 2) { $chassisWithOneSide.Add("chassis $($chassisGroup.Name) [$($sides -join ',')]") }
+        }
+
+        Add-UcsBpRow -Category $category -CheckId 'UCS-FO-070' -Setting 'Chassis reachable from one fabric only' `
+            -ObjectDn 'sys' -CurrentValue $chassisWithOneSide.Count `
+            -RecommendedValue '0 - every chassis with a working IO module on both fabrics' -Basis 'Best Practice' `
+            -Result $(if ($chassisWithOneSide.Count -eq 0) { 'Meets' } else { 'Does Not Meet' }) `
+            -Severity 'Critical' -Reference $reference `
+            -Remediation 'Equipment > Chassis > IO Modules. A chassis with only one working IO module loses every blade in it when that fabric reboots, regardless of how the service profiles are configured.' `
+            -Detail ($chassisWithOneSide.ToArray() -join ', ')
+    }
+
+    # --- Appliance ports ---------------------------------------------------------------------------
+    $appliancePorts = @(Get-UcsBpMo -ClassId 'fabricEthEstcEp')
+    $appliancePcs = @(Get-UcsBpMo -ClassId 'fabricEthEstcPc')
+    $applianceTotal = $appliancePorts.Count + $appliancePcs.Count
+    if ($applianceTotal -gt 0) {
+        $applianceFabrics = @(@($appliancePorts) + @($appliancePcs) | ForEach-Object { Get-UcsBpFabricOf -Mo $_ } | Where-Object { $_ } | Select-Object -Unique | Sort-Object)
+        Add-UcsBpRow -Category $category -CheckId 'UCS-FO-080' -Setting 'Appliance ports present on both fabrics' `
+            -ObjectDn 'fabric/eth-estc' -CurrentValue ("$applianceTotal appliance port(s)/port channel(s) on fabric(s): " + ($applianceFabrics -join ', ')) `
+            -RecommendedValue 'Appliance connectivity on both fabrics, so directly attached storage or services survive one fabric rebooting' `
+            -Basis 'Best Practice' -Result $(if ($applianceFabrics.Count -ge 2) { 'Meets' } else { 'Does Not Meet' }) `
+            -Severity 'High' -Reference $reference `
+            -Remediation 'LAN > Appliances. Anything cabled to appliance ports on one fabric only goes away with that fabric.'
+    }
+
+    # --- vNIC templates -----------------------------------------------------------------------------
+    $vnicTemplates = @(Get-UcsBpMo -ClassId 'vnicLanConnTempl')
+    if ($vnicTemplates.Count -gt 0 -and (Test-UcsBpPropertyPresent -InputObject $vnicTemplates[0] -Name 'RedundancyPairType')) {
+        $unpaired = @($vnicTemplates | Where-Object {
+                [string](Get-UcsBpProperty -InputObject $_ -Name 'RedundancyPairType' -Default 'none') -ieq 'none'
+            })
+        Add-UcsBpRow -Category $category -CheckId 'UCS-FO-090' -Setting 'vNIC templates without a redundancy pair' `
+            -ObjectDn 'org-root' -CurrentValue "$($unpaired.Count) of $($vnicTemplates.Count)" `
+            -RecommendedValue 'Templates paired primary/secondary across the fabrics, so an A-side and B-side vNIC stay in step' `
+            -Basis 'Best Practice' -Result $(if ($unpaired.Count -eq 0) { 'Meets' } else { 'Review' }) `
+            -Severity 'Medium' -Reference $reference `
+            -Remediation 'LAN > Policies > vNIC Templates. Unpaired templates drift: a VLAN added to the A-side template and forgotten on the B-side is invisible until the A fabric reboots.' `
+            -Detail (@($unpaired | Select-Object -First 20 | ForEach-Object { Get-UcsBpProperty -InputObject $_ -Name 'Name' -Default '?' }) -join ', ')
+    }
+}
+
+# ---------------------------------------------------------------------------------------------
 # Checks - UCS Central
 # ---------------------------------------------------------------------------------------------
 
@@ -3113,6 +3598,27 @@ try {
     }
     if (-not $Credential) { throw 'No credential was supplied.' }
 
+    # --- Where the CSV will go ------------------------------------------------------------------
+    # Resolved and said out loud before the audit rather than after it. A run that spends two
+    # minutes reading a domain and only then mentions where it put the file has already made the
+    # operator hunt for it, and a bad path fails here instead of at the very end.
+    if ([string]::IsNullOrWhiteSpace($OutputPath)) {
+        $repoRoot = Split-Path $PSScriptRoot -Parent | Split-Path -Parent
+        $outputDir = Join-Path $repoRoot 'output'
+        $safeFabric = ($Fabric -replace '[^A-Za-z0-9._-]', '_')
+        $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+        $OutputPath = Join-Path $outputDir "UcsBestPractice-$safeFabric-$stamp.csv"
+    }
+
+    $outputParent = Split-Path -Path $OutputPath -Parent
+    if ($outputParent -and -not (Test-Path $outputParent)) {
+        if ($PSCmdlet.ShouldProcess($outputParent, 'Create output directory')) {
+            New-Item -Path $outputParent -ItemType Directory -Force | Out-Null
+        }
+    }
+
+    Write-RichoLog "CSV will be written to: $OutputPath" -Level INFO
+
     # --- PowerTool ------------------------------------------------------------------------------
     # Whatever PowerTool the host already carries is what gets used. The test is whether Connect-Ucs
     # resolves, not whether a particular module name is installed: Cisco.UCSManager, the older
@@ -3140,8 +3646,34 @@ try {
     }
 
     # --- Connect --------------------------------------------------------------------------------
+    if ($IgnoreCertificateError) {
+        if (Get-Command -Name 'Set-UcsPowerToolConfiguration' -ErrorAction SilentlyContinue) {
+            Set-UcsPowerToolConfiguration -InvalidCertificateAction Ignore -ErrorAction Stop | Out-Null
+            Write-RichoLog 'Certificate validation is switched off for this session, at your instruction.' -Level WARN
+        }
+        else {
+            Write-RichoLog 'Set-UcsPowerToolConfiguration is not available, so -IgnoreCertificateError could not be applied.' -Level WARN
+        }
+    }
+
     Write-RichoLog "Connecting to UCS Manager '$Fabric' as '$($Credential.UserName)'." -Level INFO
-    $script:UcsHandle = Connect-Ucs -Name $Fabric -Credential $Credential -ErrorAction Stop
+    try {
+        $script:UcsHandle = Connect-Ucs -Name $Fabric -Credential $Credential -ErrorAction Stop
+    }
+    catch {
+        # A fabric interconnect normally presents a self-signed certificate, and PowerTool refuses
+        # it by default. That failure says "could not establish trust relationship", which reads
+        # like a network problem and is not one - so name the actual remedy rather than leaving it
+        # to be worked out.
+        if ($_.Exception.Message -match '(?i)certificate|SSL|TLS|trust relationship|secure channel') {
+            throw ("Could not connect to '$Fabric': $($_.Exception.Message)`n" +
+                   "This looks like certificate validation. UCS Manager normally presents a self-signed " +
+                   "certificate. Either install the fabric interconnect's certificate into the trusted " +
+                   "root store on this host, or re-run with -IgnoreCertificateError to skip validation " +
+                   "for this session.")
+        }
+        throw
+    }
     Write-RichoLog "Connected. This audit only reads - nothing on the domain is changed." -Level INFO
 
     # --- Audit ----------------------------------------------------------------------------------
@@ -3150,6 +3682,7 @@ try {
     # nowhere else is a gap nobody spots while filtering.
     $sections = @(
         @{ Name = 'System';                 Action = { Test-UcsBpSystem } },
+        @{ Name = 'Fabric Failover';        Action = { Test-UcsBpFabricFailover } },
         @{ Name = 'Firmware';               Action = { Test-UcsBpFirmware } },
         @{ Name = 'Time and Name Services'; Action = { Test-UcsBpTimeAndNameServices } },
         @{ Name = 'Monitoring';             Action = { Test-UcsBpMonitoring } },
@@ -3187,21 +3720,6 @@ try {
     }
 
     # --- Output ---------------------------------------------------------------------------------
-    if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-        $repoRoot = Split-Path $PSScriptRoot -Parent | Split-Path -Parent
-        $outputDir = Join-Path $repoRoot 'output'
-        $safeFabric = ($Fabric -replace '[^A-Za-z0-9._-]', '_')
-        $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
-        $OutputPath = Join-Path $outputDir "UcsBestPractice-$safeFabric-$stamp.csv"
-    }
-
-    $outputParent = Split-Path -Path $OutputPath -Parent
-    if ($outputParent -and -not (Test-Path $outputParent)) {
-        if ($PSCmdlet.ShouldProcess($outputParent, 'Create output directory')) {
-            New-Item -Path $outputParent -ItemType Directory -Force | Out-Null
-        }
-    }
-
     if ($PSCmdlet.ShouldProcess($OutputPath, "Write $($script:Rows.Count) audit rows to CSV")) {
         $script:Rows | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
         Write-RichoLog "Wrote $($script:Rows.Count) rows to $OutputPath" -Level INFO
@@ -3224,8 +3742,24 @@ try {
     $script:Rows
 }
 catch {
-    Write-RichoLog "Failed: $($_.Exception.Message)" -Level ERROR
-    throw
+    $failure = $_
+
+    # Write-RichoLog at ERROR level writes to the error stream, and $ErrorActionPreference is Stop,
+    # so logging the failure here would itself throw - replacing the real failure with the log call
+    # that reported it, and losing both the message and the line number that matter. Logging is done
+    # with that preference relaxed, and the ORIGINAL error record is what gets rethrown.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    Write-RichoLog "Failed: $($failure.Exception.Message)" -Level ERROR
+    if ($failure.InvocationInfo -and $failure.InvocationInfo.ScriptLineNumber) {
+        Write-RichoLog "  raised at line $($failure.InvocationInfo.ScriptLineNumber): $($failure.InvocationInfo.Line.Trim())" -Level ERROR
+    }
+    if ($script:Rows.Count -gt 0) {
+        Write-RichoLog "  $($script:Rows.Count) row(s) had been collected before the failure." -Level WARN
+    }
+    $ErrorActionPreference = $previousPreference
+
+    throw $failure
 }
 finally {
     if ($script:UcsHandle) {

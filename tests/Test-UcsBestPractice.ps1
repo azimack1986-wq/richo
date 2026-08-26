@@ -52,6 +52,7 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
             'Add-UcsBpRow', 'Add-UcsBpPropertyCheck', 'Add-UcsBpUnreadableClassRow', 'Add-UcsBpOffenderRows',
             'Get-UcsBpFabricFamily', 'Get-UcsBpSummaryText',
             'Test-UcsBpEquipment', 'Test-UcsBpQos', 'Test-UcsBpVlan', 'Test-UcsBpSan',
+            'Get-UcsBpFabricOf', 'Test-UcsBpFabricFailover',
             'Test-UcsBpServiceProfile', 'Test-UcsBpUcsCentral'
         )
     } |
@@ -308,6 +309,142 @@ Assert-Equal 'four controls found in total'                     4 @($script:Rows
 Reset-Run @{ commNtpProvider = @(); commDateTime = @() }
 Test-UcsBpUcsCentral
 Assert-Equal 'an unreadable registration object is Unknown, not "not registered"' 'Unknown' (Get-Row 'UCS-UCSC-001').Result
+
+Write-Host "`n=== Which fabric an object belongs to ===" -ForegroundColor Cyan
+Assert-Equal 'SwitchId wins'                          'A' (Get-UcsBpFabricOf -Mo (New-Mo @{ SwitchId = 'A'; Dn = 'x' }))
+Assert-Equal 'a failover pair reports its primary'    'A' (Get-UcsBpFabricOf -Mo (New-Mo @{ SwitchId = 'A-B'; Dn = 'x' }))
+Assert-Equal 'B-A reports B'                          'B' (Get-UcsBpFabricOf -Mo (New-Mo @{ SwitchId = 'B-A'; Dn = 'x' }))
+Assert-Equal 'the Dn is the fallback'                 'B' (Get-UcsBpFabricOf -Mo (New-Mo @{ Dn = 'fabric/lan/B/pc-10' }))
+Assert-Equal 'and sw-A in a Dn resolves'              'A' (Get-UcsBpFabricOf -Mo (New-Mo @{ Dn = 'fabric/server/sw-A/slot-1-port-1' }))
+Assert-Equal 'unresolvable is empty, not a guess'     ''  (Get-UcsBpFabricOf -Mo (New-Mo @{ Dn = 'org-root/thing' }))
+# An IO module numbers itself 1 or 2. Nothing else does, so the mapping is opt-in - left on by
+# default it would resolve port channel Id 1 to fabric A, silently and wrongly.
+Assert-Equal 'a numeric Id is NOT a fabric by default' '' (Get-UcsBpFabricOf -Mo (New-Mo @{ Id = '1'; Dn = 'sys/chassis-1/slot-1' }))
+Assert-Equal 'IO module Id 1 is fabric A when asked'  'A' (Get-UcsBpFabricOf -Mo (New-Mo @{ Id = '1'; Dn = 'sys/chassis-1/slot-1' }) -NumericIdIsFabric)
+Assert-Equal 'IO module Id 2 is fabric B when asked'  'B' (Get-UcsBpFabricOf -Mo (New-Mo @{ Id = '2'; Dn = 'sys/chassis-1/slot-2' }) -NumericIdIsFabric)
+
+Write-Host "`n=== Fabric failover: what breaks when one fabric goes away ===" -ForegroundColor Cyan
+# The domain that explains a subordinate reboot taking everything down: fabric A's uplink is
+# already dead, so all traffic has been going through B and nobody knew.
+Reset-Run @{
+    mgmtEntity     = @(
+        New-Mo @{ Dn = 'sys/mgmt-entity-A'; Id = 'A'; LeadershipState = 'primary' }
+        New-Mo @{ Dn = 'sys/mgmt-entity-B'; Id = 'B'; LeadershipState = 'subordinate' }
+    )
+    fabricLanCloud = @( New-Mo @{ Dn = 'fabric/lan'; Mode = 'switch' } )
+    stpInstance    = @( New-Mo @{ Dn = 'fabric/lan/stp-inst-1' } )
+    fabricEthLanPc = @(
+        New-Mo @{ Dn = 'fabric/lan/A/pc-10'; Name = 'uplink-A'; SwitchId = 'A'; OperState = 'down'; AdminState = 'enabled' }
+        New-Mo @{ Dn = 'fabric/lan/B/pc-10'; Name = 'uplink-B'; SwitchId = 'B'; OperState = 'up'; AdminState = 'enabled' }
+    )
+    fabricEthLanPcEp = @( New-Mo @{ Dn = 'fabric/lan/B/pc-10/ep-slot-1-port-49'; SwitchId = 'B' } )
+    fabricEthLanEp   = @()
+    fabricVlan       = @(
+        New-Mo @{ Dn = 'fabric/lan/net-mgmt'; Id = '100'; Name = 'mgmt'; SwitchId = 'dual' }
+        New-Mo @{ Dn = 'fabric/lan/A/net-legacy'; Id = '300'; Name = 'legacy-a'; SwitchId = 'A' }
+    )
+    fabricNetGroup    = @( New-Mo @{ Dn = 'fabric/lan/net-group-prod'; Name = 'prod' } )
+    fabricNetGroupRef = @( New-Mo @{ Dn = 'fabric/lan/B/pc-10/net-group-ref-prod'; Name = 'prod'; SwitchId = 'B' } )
+    fabricLanPinGroup  = @( New-Mo @{ Dn = 'fabric/lan/pin-group-storage'; Name = 'storage-pin' } )
+    fabricLanPinTarget = @( New-Mo @{ Dn = 'fabric/lan/pin-group-storage/target-B'; EpDn = 'fabric/lan/B/pc-10' } )
+    vnicEther = @(
+        New-Mo @{ Dn = 'org-root/ls-esx01/ether-vnic0'; SwitchId = 'A'; NwCtrlPolicyName = 'esx' }
+        New-Mo @{ Dn = 'org-root/ls-esx01/ether-vnic1'; SwitchId = 'B'; NwCtrlPolicyName = 'esx' }
+        New-Mo @{ Dn = 'org-root/ls-win01/ether-vnic0'; SwitchId = 'B'; NwCtrlPolicyName = 'esx' }
+    )
+    nwctrlDefinition = @( New-Mo @{ Dn = 'org-root/nwctrl-esx'; Name = 'esx'; UplinkFailAction = 'warning'; Cdp = 'enabled' } )
+    networkLanNeighborEntry = @(
+        New-Mo @{ Dn = 'sys/switch-A/lan-neighbor-1'; SwitchId = 'A'; SysName = 'n9k-core-01' }
+        New-Mo @{ Dn = 'sys/switch-B/lan-neighbor-1'; SwitchId = 'B'; SysName = 'n9k-core-01' }
+    )
+    equipmentIOCard = @( New-Mo @{ Dn = 'sys/chassis-1/slot-1'; ChassisId = '1'; Id = '1'; OperState = 'operable' } )
+    fabricEthEstcEp = @(); fabricEthEstcPc = @(); vnicLanConnTempl = @()
+}
+Test-UcsBpFabricFailover
+
+$fabricARow = @($script:Rows | Where-Object { $_.CheckId -eq 'UCS-FO-002' -and $_.Setting -like '*Fabric A*' })[0]
+$fabricBRow = @($script:Rows | Where-Object { $_.CheckId -eq 'UCS-FO-002' -and $_.Setting -like '*Fabric B*' })[0]
+Assert-Equal 'a fabric whose uplink is down has no working northbound path' 'Does Not Meet' $fabricARow.Result
+Assert-Equal 'the fabric carrying everything passes'                        'Meets'         $fabricBRow.Result
+Assert-Equal 'and the domain is flagged as running on one side'             'Does Not Meet' (Get-Row 'UCS-FO-003').Result
+Assert-Equal 'which is Critical - it is the whole outage'                   'Critical'      (Get-Row 'UCS-FO-003').Severity
+
+Assert-Equal 'switching mode is a finding, not a preference'  'Does Not Meet' (Get-Row 'UCS-FO-010').Result
+Assert-True  'and it explains the upstream reconvergence'     ((Get-Row 'UCS-FO-010').Remediation -like '*spanning tree*')
+Assert-True  'spanning tree instances are reported in switch mode' ($null -ne (Get-Row 'UCS-FO-011'))
+
+Assert-Equal 'a VLAN on one fabric only is counted'      'Does Not Meet' (Get-Row 'UCS-FO-020').Result
+Assert-Equal 'a VLAN group bound to one fabric fails'    'Does Not Meet' (Get-Row 'UCS-FO-021').Result
+Assert-Equal 'and it is Critical - it strands the other fabric too' 'Critical' (Get-Row 'UCS-FO-021').Severity
+Assert-Equal 'a pin group targeting one fabric fails'    'Does Not Meet' (Get-Row 'UCS-FO-030').Result
+Assert-Equal 'a service profile on one fabric is found'  'Does Not Meet' (Get-Row 'UCS-FO-040').Result
+Assert-True  'and named'                                 (@($script:Rows | Where-Object { $_.CheckId -eq 'UCS-FO-040-D' })[0].CurrentValue -like '*win01*')
+Assert-Equal 'uplink fail action warning is Critical'    'Does Not Meet' (Get-Row 'UCS-FO-050').Result
+Assert-Equal 'both fabrics on one upstream switch fails' 'Does Not Meet' (Get-Row 'UCS-FO-061').Result
+Assert-Equal 'a chassis with one IO module fails'        'Does Not Meet' (Get-Row 'UCS-FO-070').Result
+
+Write-Host "`n=== Fabric failover: a domain that would survive the reboot ===" -ForegroundColor Cyan
+Reset-Run @{
+    mgmtEntity     = @( New-Mo @{ Dn = 'sys/mgmt-entity-A'; Id = 'A'; LeadershipState = 'primary' } )
+    fabricLanCloud = @( New-Mo @{ Dn = 'fabric/lan'; Mode = 'end-host' } )
+    fabricEthLanPc = @(
+        New-Mo @{ Dn = 'fabric/lan/A/pc-10'; Name = 'uplink-A'; SwitchId = 'A'; OperState = 'up'; AdminState = 'enabled' }
+        New-Mo @{ Dn = 'fabric/lan/B/pc-10'; Name = 'uplink-B'; SwitchId = 'B'; OperState = 'up'; AdminState = 'enabled' }
+    )
+    fabricEthLanPcEp = @(
+        New-Mo @{ Dn = 'fabric/lan/A/pc-10/ep-1'; SwitchId = 'A' }
+        New-Mo @{ Dn = 'fabric/lan/B/pc-10/ep-1'; SwitchId = 'B' }
+    )
+    fabricEthLanEp = @()
+    fabricVlan     = @( New-Mo @{ Dn = 'fabric/lan/net-mgmt'; Id = '100'; Name = 'mgmt'; SwitchId = 'dual' } )
+    fabricNetGroup    = @( New-Mo @{ Dn = 'fabric/lan/net-group-prod'; Name = 'prod' } )
+    fabricNetGroupRef = @(
+        New-Mo @{ Dn = 'fabric/lan/A/pc-10/net-group-ref-prod'; Name = 'prod'; SwitchId = 'A' }
+        New-Mo @{ Dn = 'fabric/lan/B/pc-10/net-group-ref-prod'; Name = 'prod'; SwitchId = 'B' }
+    )
+    fabricLanPinGroup = @(); fabricLanPinTarget = @()
+    vnicEther = @(
+        New-Mo @{ Dn = 'org-root/ls-esx01/ether-vnic0'; SwitchId = 'A'; NwCtrlPolicyName = 'esx' }
+        New-Mo @{ Dn = 'org-root/ls-esx01/ether-vnic1'; SwitchId = 'B'; NwCtrlPolicyName = 'esx' }
+    )
+    nwctrlDefinition = @( New-Mo @{ Dn = 'org-root/nwctrl-esx'; Name = 'esx'; UplinkFailAction = 'link-down' } )
+    networkLanNeighborEntry = @(
+        New-Mo @{ Dn = 'sys/switch-A/lan-neighbor-1'; SwitchId = 'A'; SysName = 'n9k-core-01' }
+        New-Mo @{ Dn = 'sys/switch-B/lan-neighbor-1'; SwitchId = 'B'; SysName = 'n9k-core-02' }
+    )
+    equipmentIOCard = @(
+        New-Mo @{ Dn = 'sys/chassis-1/slot-1'; ChassisId = '1'; Id = '1'; OperState = 'operable' }
+        New-Mo @{ Dn = 'sys/chassis-1/slot-2'; ChassisId = '1'; Id = '2'; OperState = 'operable' }
+    )
+    fabricEthEstcEp = @(); fabricEthEstcPc = @(); vnicLanConnTempl = @()
+}
+Test-UcsBpFabricFailover
+Assert-Equal 'both fabrics have a path'                    'Meets' (Get-Row 'UCS-FO-003').Result
+Assert-Equal 'end-host mode keeps UCS out of spanning tree' 'Meets' (Get-Row 'UCS-FO-010').Result
+Assert-True  'and no spanning tree row is emitted'          ($null -eq (Get-Row 'UCS-FO-011'))
+Assert-Equal 'no single-fabric VLANs'                       'Meets' (Get-Row 'UCS-FO-020').Result
+Assert-Equal 'the VLAN group spans both fabrics'            'Meets' (Get-Row 'UCS-FO-021').Result
+Assert-Equal 'no pin groups is the good answer'             'Meets' (Get-Row 'UCS-FO-030').Result
+Assert-Equal 'every profile has both fabrics'               'Meets' (Get-Row 'UCS-FO-040').Result
+Assert-Equal 'uplink loss is signalled'                     'Meets' (Get-Row 'UCS-FO-050').Result
+Assert-Equal 'the fabrics reach different upstream switches' 'Meets' (Get-Row 'UCS-FO-061').Result
+Assert-Equal 'both IO modules present'                      'Meets' (Get-Row 'UCS-FO-070').Result
+
+Write-Host "`n=== Fabric failover: what cannot be read is not passed ===" -ForegroundColor Cyan
+Reset-Run @{
+    fabricLanCloud = @( New-Mo @{ Dn = 'fabric/lan'; Mode = 'end-host' } )
+    fabricEthLanPc = @( New-Mo @{ Dn = 'fabric/lan/A/pc-10'; SwitchId = 'A'; OperState = 'up' } )
+    fabricEthLanPcEp = @(); fabricEthLanEp = @(); fabricVlan = @()
+    fabricNetGroup = @( New-Mo @{ Dn = 'fabric/lan/net-group-prod'; Name = 'prod' } )
+    fabricLanPinGroup = @(); fabricLanPinTarget = @(); vnicEther = @(); nwctrlDefinition = @()
+    equipmentIOCard = @(); fabricEthEstcEp = @(); fabricEthEstcPc = @(); vnicLanConnTempl = @()
+    mgmtEntity = @()
+}
+Test-UcsBpFabricFailover
+Assert-Equal 'a VLAN group whose bindings cannot be read is Unknown' 'Unknown' (Get-Row 'UCS-FO-021').Result
+Assert-Equal 'and it is not quietly downgraded'                     'High'    (Get-Row 'UCS-FO-021').Severity
+Assert-Equal 'no neighbour data is Unknown, not "different switches"' 'Unknown' (Get-Row 'UCS-FO-060').Result
+Assert-True  'and it says to turn the info policy on'               ((Get-Row 'UCS-FO-060').Remediation -like '*Info Policy*')
 
 Write-Host "`n=== Display values ===" -ForegroundColor Cyan
 Assert-Equal 'null renders explicitly'        '(not set)' (ConvertTo-UcsBpDisplayValue -Value $null)

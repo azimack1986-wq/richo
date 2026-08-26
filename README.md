@@ -73,6 +73,34 @@ One domain per run — point it at the cluster VIP, not an individual fabric
 interconnect. It reads and nothing else; the only thing it creates is the CSV,
 which is what `-WhatIf` skips.
 
+### Diagnosing a fabric interconnect reboot that caused an outage
+
+The `Fabric Failover` category answers one question per fabric: *if this one disappeared right
+now, what would have no path?* Rebooting a subordinate fabric interconnect is supposed to be a
+non-event, and when it is not, the cause is nearly always one of these — none of which raises a
+fault, so the domain looks healthy right up until the reboot:
+
+| Check | What it catches |
+| --- | --- |
+| `UCS-FO-002/003` | One fabric already has no working uplinks, so the domain has been running on a single side and rebooting *that* side is a total outage, not a failover |
+| `UCS-FO-010/011` | The fabric interconnects are in **switching mode**, so they sit in the spanning tree and a reboot forces the upstream network to reconverge |
+| `UCS-FO-020` | VLANs defined on one fabric only — they cease to exist while it reboots |
+| `UCS-FO-021` | A VLAN group bound to one fabric's uplinks only, leaving its VLANs with no upstream path from the other fabric *even for servers on the surviving side* |
+| `UCS-FO-030` | LAN pin groups statically pinning traffic to one fabric, so it never repins |
+| `UCS-FO-040` | Service profiles whose vNICs are all on one fabric |
+| `UCS-FO-050` | Action on Uplink Fail set to `warning`, which leaves the vNIC **up** with nowhere to send — the host blackholes instead of failing over |
+| `UCS-FO-060/061` | Both fabrics reaching the network through the same upstream switch (needs the Info Policy enabled — see `UCS-EQP-012`) |
+| `UCS-FO-070` | A chassis with a working IO module on one fabric only |
+| `UCS-FO-080/090` | Appliance ports on one fabric only; vNIC templates with no redundancy pair |
+
+Start with the `Critical` rows in that category:
+
+```powershell
+$rows = .\dist\Test-UcsBestPractice-Standalone.ps1 -Fabric ucsm-prod-01
+$rows | Where-Object { $_.Category -eq 'Fabric Failover' -and $_.Result -eq 'Does Not Meet' } |
+    Sort-Object Severity | Format-Table CheckId, Severity, Setting, CurrentValue -AutoSize
+```
+
 ### Running it away from the repo
 
 `dist/Test-UcsBestPractice-Standalone.ps1` is the same audit as one file — the Richo.Common

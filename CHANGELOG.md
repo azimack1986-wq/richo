@@ -12,6 +12,83 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Test-UcsBestPractice.ps1
 
+### [1.1.0] — 2026-08-26
+
+#### Added
+
+- **A Fabric Failover section, for diagnosing a fabric interconnect reboot that caused an outage.**
+  Rebooting a subordinate fabric interconnect is supposed to be a non-event. When it is not, the
+  cause is almost always one of a small set of configurations — and every one of them is visible
+  while both fabrics are up. That is the point: none of them raises a fault, so the domain looks
+  healthy right until the reboot.
+
+  The section asks one question per fabric — if this one disappeared right now, what would have no
+  path? — and covers the six ways the answer is "everything":
+
+  1. `UCS-FO-002/003` — **one fabric already has no working uplinks.** The domain has been running
+     on a single side and nobody noticed, because the traffic is flowing; rebooting that side is a
+     total outage rather than a failover. Critical, and the first thing to rule out.
+  2. `UCS-FO-010/011` — **switching mode.** In end-host mode a fabric interconnect is invisible to
+     the upstream spanning tree and a reboot changes nothing outside the domain. In switching mode
+     it joins the tree, and a reboot raises a topology change the upstream network reconverges
+     around — which is how a UCS reboot takes down things unrelated to UCS.
+  3. `UCS-FO-020/021` — **a VLAN, or a whole VLAN group, on one fabric only.** The group case is
+     the nastier one: its VLANs have no upstream path from the other fabric at all, so the traffic
+     dies even for servers whose vNIC is on the surviving side.
+  4. `UCS-FO-030` — **static pinning.** A LAN pin group targeting one fabric overrides dynamic
+     pinning, so those vNICs never repin to the survivor.
+  5. `UCS-FO-040` — **service profiles with vNICs on one fabric**, which have nothing to fail over
+     to whatever the network above them does.
+  6. `UCS-FO-050` — **the failure being silent.** Action on Uplink Fail set to `warning` leaves the
+     vNIC up when its fabric loses its uplinks. ESXi and Windows teaming both react to the link
+     going down, so the host keeps sending into a fabric with nowhere to send it — a brief repin
+     becomes a blackhole lasting as long as the reboot.
+
+  Plus `UCS-FO-060/061` (both fabrics reaching the network through the same upstream switch — which
+  needs the Info Policy on, and says so when it is not), `UCS-FO-070` (a chassis with a working IO
+  module on one fabric only), `UCS-FO-080` (appliance ports on one fabric), and `UCS-FO-090` (vNIC
+  templates with no redundancy pair, which is how an A-side VLAN gets added and the B-side
+  forgotten).
+
+- **`Get-UcsBpFabricOf`**, because UCSM says which fabric an object belongs to three different ways
+  — `SwitchId` on fabric objects, a numeric `Id` on an IO module, and otherwise the letter in the
+  Dn. The numeric mapping is opt-in: left on by default it would resolve a port channel with Id 1
+  to fabric A, silently and wrongly.
+
+#### Changed
+
+- **The CSV path is resolved and announced before the audit runs**, not after it. A run that spends
+  two minutes reading a domain and only then says where it put the file has already made the
+  operator hunt for it, and a bad path now fails in seconds rather than at the very end.
+
+- **A failure no longer hides itself.** `Write-RichoLog` at ERROR level writes to the error stream,
+  and `$ErrorActionPreference` is `Stop`, so the top-level catch logging a failure would itself
+  throw — replacing the real error with the log call that reported it, and losing the message and
+  line number that mattered. Logging now happens with that preference relaxed, the original error
+  record is what gets rethrown, and the number of rows collected before the failure is reported.
+
+- **`-IgnoreCertificateError`**, and a connection failure that names it. A fabric interconnect
+  normally presents a self-signed certificate and PowerTool refuses it, producing "could not
+  establish trust relationship" — which reads like a network problem and is not one. Off by
+  default, because a script that silently stops validating certificates is worse than one that
+  fails clearly.
+
+- **The UCS PowerTool in use is reported.** The test was always whether `Connect-Ucs` resolves
+  rather than whether a particular module is installed, so an existing PowerTool satisfies it; the
+  run now logs which module provided the cmdlet and its version.
+
+#### Tests
+
+- `tests/Test-UcsBestPractice.ps1` — now 113 assertions. The failover section is exercised against
+  two synthetic domains: one that reproduces the outage (fabric A's uplink already down, switching
+  mode, a VLAN group bound to B only, a pin group on B, a service profile stranded on B, and
+  Action on Uplink Fail set to warning) and one that would survive the reboot, so every check is
+  asserted in both directions rather than only when it fires. A third domain asserts that
+  unreadable VLAN group bindings and absent neighbour data come back `Unknown` — on this question
+  above all, a missing row reads as "checked, fine".
+
+## Test-UcsBestPractice.ps1
+
 ### [1.0.0] — 2026-08-26
 
 #### Added
