@@ -78,7 +78,37 @@ versioning is [semantic](https://semver.org/) per script.
   `-MaxDetailRowsPerCheck` (50 by default), and a capped check says how many it
   listed of how many there were, and what to re-run to see them all.
 
+- **A self-contained build, generated rather than hand-maintained.**
+  `dist/Test-UcsBestPractice-Standalone.ps1` carries the four Richo.Common helpers inline, so it
+  runs from a jump host or a file share with no module to install and nothing beside it — which is
+  where this script is actually used, and where the repo copy fails on its `Import-Module` before a
+  single check has run.
+
+  It is produced by `tools/Build-UcsBestPracticeStandalone.ps1`, not edited by hand. Two copies of
+  a three thousand line audit drift, and the copy that drifts is the one on the share — the one an
+  operator runs months later against production, believing it is the reviewed version.
+
+  Output follows the directory the operator is *in* rather than the one the script sits in, with a
+  fallback to Documents when the current location is not a filesystem one. A copy on a WSUS
+  distribution point or a read-only share is not where audit CSVs should accumulate, and often not
+  somewhere they can be written at all.
+
+- **The Cisco dependency is now reported rather than assumed.** The check was always whether
+  `Connect-Ucs` resolves rather than whether a particular module name is installed — so an existing
+  PowerTool, including the older `CiscoUcsPS` or a vendored bundle already on `$env:PSModulePath`,
+  satisfies it. The run now logs which module actually provided the cmdlet and its version, so
+  "do I need to install anything?" is answered by the transcript instead of by guesswork, and a
+  cmdlet behaving differently from the one it was written against has its version on the record.
+
 #### Tests
+
+- `tests/Test-UcsBestPracticeStandalone.ps1` — 21 assertions. The generated build is regenerated in
+  memory and compared against the committed file (line endings normalised, because `.gitattributes`
+  checks `.ps1` out as CRLF while the builder writes LF); it must parse, import Richo.Common
+  nowhere, and inline all four helpers. Every check function and every `UCS-*` check ID is compared
+  between the two copies, so generation cannot quietly drop a row. And the output-location
+  behaviour is asserted in both directions — the build resolves from `$PWD`, the repo script still
+  resolves from the repo root.
 
 - `tests/Test-UcsBestPractice.ps1` — 74 assertions, standalone, no PowerTool and
   no infrastructure. They target the way an audit actually fails, which is by

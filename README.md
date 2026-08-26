@@ -73,6 +73,47 @@ One domain per run — point it at the cluster VIP, not an individual fabric
 interconnect. It reads and nothing else; the only thing it creates is the CSV,
 which is what `-WhatIf` skips.
 
+### Running it away from the repo
+
+`dist/Test-UcsBestPractice-Standalone.ps1` is the same audit as one file — the Richo.Common
+helpers are carried inline, so there is nothing to install beside it and nothing to import. Copy
+it to a jump host or a share and run it.
+
+```powershell
+# Windows blocks scripts copied from a network location.
+Unblock-File .\Test-UcsBestPractice-Standalone.ps1
+.\Test-UcsBestPractice-Standalone.ps1
+```
+
+Output goes to the directory you run it **from**, not the directory the script sits in — a copy on
+a read-only or shared location is not where audit CSVs should accumulate.
+
+It is generated, not maintained by hand:
+
+```powershell
+.\tools\Build-UcsBestPracticeStandalone.ps1
+```
+
+`tests/Test-UcsBestPracticeStandalone.ps1` regenerates it in memory and compares it against the
+committed file, so the copy on the share cannot quietly stop being the copy that was reviewed.
+
+### The one Cisco module it needs
+
+Cisco UCS PowerTool — the `Cisco.UCSManager` module, which brings `Cisco.UCS.Core` with it:
+
+```powershell
+Install-Module -Name Cisco.UCSManager -Scope CurrentUser
+```
+
+That is the only Cisco module involved. There is no Intersight or UCS Central module in the
+picture, because a registered domain still answers for its own configuration over the UCSM XML API.
+
+Nothing is imported explicitly — PowerShell auto-loads on the first `Connect-Ucs` — and the check
+is whether `Connect-Ucs` resolves, not whether a particular module name is installed, so an
+existing PowerTool (including the older `CiscoUcsPS`, or a vendored bundle already on
+`$env:PSModulePath`) satisfies it. The run logs which module actually provided the cmdlet, and its
+version, so there is no need to guess whether anything needs installing.
+
 Two columns are worth knowing about before reading the output:
 
 - **Basis** separates advice by weight. `Best Practice` is something Cisco

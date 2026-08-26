@@ -50,7 +50,8 @@
     variables, then a prompt) instead of prompting directly. Use this for scheduled runs.
 
 .PARAMETER OutputPath
-    CSV to write. Defaults to output/UcsBestPractice-<fabric>-<utc timestamp>.csv at the repo root.
+    CSV to write. Defaults to UcsBestPractice-<fabric>-<utc timestamp>.csv in the directory you run
+    the script FROM - not the directory the script itself sits in, which is often a read-only share.
 
 .PARAMETER MaxDetailRowsPerCheck
     Cap on the number of per-object rows a single check may emit for non-compliant objects, so one
@@ -79,7 +80,22 @@
     The rows are returned on the pipeline as well as written to CSV.
 
 .NOTES
+    THIS IS THE SELF-CONTAINED BUILD. One file, no module to install alongside it, nothing needed
+    beside it. Copy it wherever is convenient and run it. It is generated from the repo copy by
+    tools/Build-UcsBestPracticeStandalone.ps1, so make changes there - anything edited into this
+    file is lost the next time it is regenerated.
+
+    RUNNING IT FROM A FILE SHARE. Windows marks files copied from a network location as coming
+    from another computer, and PowerShell refuses to run them. If it will not start:
+
+        Unblock-File .\Test-UcsBestPractice-Standalone.ps1
+        powershell.exe -ExecutionPolicy Bypass -File .\Test-UcsBestPractice-Standalone.ps1
+
+    Better still, copy it to a local folder and run it from there - that is also where the CSV
+    lands, since output follows the directory you are in rather than the one the script sits in.
+
     REQUIREMENTS
+
 
       - Cisco UCS PowerTool Suite - the Cisco.UCSManager module, which brings Cisco.UCS.Core with
         it. That is the only Cisco module needed; there is no Intersight or UCS Central module
@@ -140,7 +156,263 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path $PSScriptRoot '..\..\modules\Richo.Common\Richo.Common.psd1') -Force
+# =============================================================================================
+# Richo.Common helpers, inlined
+#
+# In the repo these come from modules/Richo.Common and are imported. This build is meant to be
+# copied somewhere on its own - a jump host, a file share - where there is no module to import,
+# so they are carried here verbatim. Edit them in the module, not here: this file is generated
+# by tools/Build-UcsBestPracticeStandalone.ps1 and anything changed here is lost on the next
+# regeneration.
+# =============================================================================================
+
+function Write-RichoLog {
+    <#
+    .SYNOPSIS
+        Writes a timestamped, levelled log line to the host and optionally to a file.
+
+    .DESCRIPTION
+        Every script in this repo logs through this function so output is consistent
+        and greppable. Lines are formatted as:
+
+            2026-08-10 14:32:07Z [INFO ] Connecting to vcenter01.example.com
+
+        INFO and DEBUG go to the information/verbose streams, WARN to the warning
+        stream, and ERROR to the error stream, so redirection and -ErrorAction still
+        behave the way callers expect.
+
+    .PARAMETER Message
+        The text to log.
+
+    .PARAMETER Level
+        Severity: DEBUG, INFO, WARN, or ERROR. Defaults to INFO.
+
+    .PARAMETER Path
+        Optional log file to append to. Defaults to $env:RICHO_LOG_FILE when set.
+
+    .EXAMPLE
+        Write-RichoLog "Server profile deployed" -Level INFO
+
+    .EXAMPLE
+        Write-RichoLog "vCenter unreachable" -Level ERROR -Path .\logs\run.log
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string]$Message,
+
+        [Parameter(Position = 1)]
+        [ValidateSet('DEBUG', 'INFO', 'WARN', 'ERROR')]
+        [string]$Level = 'INFO',
+
+        [string]$Path = $env:RICHO_LOG_FILE
+    )
+
+    process {
+        $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ')
+        $line = '{0} [{1,-5}] {2}' -f $stamp, $Level, $Message
+
+        switch ($Level) {
+            'DEBUG' { Write-Verbose $line }
+            'INFO'  { Write-Information $line -InformationAction Continue }
+            'WARN'  { Write-Warning $line }
+            'ERROR' { Write-Error $line }
+        }
+
+        if ($Path) {
+            $dir = Split-Path -Path $Path -Parent
+            if ($dir -and -not (Test-Path $dir)) {
+                New-Item -Path $dir -ItemType Directory -Force | Out-Null
+            }
+            Add-Content -Path $Path -Value $line -Encoding UTF8
+        }
+    }
+}
+
+function Get-RichoCredential {
+    <#
+    .SYNOPSIS
+        Resolves a PSCredential for a named target without hardcoding secrets.
+
+    .DESCRIPTION
+        Resolution order:
+
+          1. SecretManagement -- Get-Secret -Name $Name, if the module is present.
+          2. Environment variables -- RICHO_<NAME>_USER / RICHO_<NAME>_PASSWORD,
+             with the name upper-cased and non-alphanumerics replaced by '_'.
+             Suits CI and scheduled runs.
+          3. Interactive prompt, unless -NoPrompt is given.
+
+        Nothing here reads a plaintext file, and nothing is ever written back to
+        disk. If you need unattended auth, prefer SecretManagement.
+
+    .PARAMETER Name
+        Logical credential name, e.g. 'vcenter-prod' or 'ucsm-lab'.
+
+    .PARAMETER NoPrompt
+        Throw instead of prompting when no stored credential is found. Use this
+        in scheduled or CI runs so they fail loudly rather than hanging.
+
+    .EXAMPLE
+        $cred = Get-RichoCredential -Name 'vcenter-prod'
+        Connect-VIServer -Server $vc -Credential $cred
+    #>
+    [CmdletBinding()]
+    [OutputType([pscredential])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name,
+
+        [switch]$NoPrompt
+    )
+
+    if (Get-Command -Name 'Get-Secret' -ErrorAction SilentlyContinue) {
+        $secret = Get-Secret -Name $Name -ErrorAction SilentlyContinue
+        if ($secret -is [pscredential]) {
+            Write-RichoLog "Resolved credential '$Name' from SecretManagement." -Level DEBUG
+            return $secret
+        }
+    }
+
+    $slug = ($Name -replace '[^A-Za-z0-9]', '_').ToUpperInvariant()
+    $user = [Environment]::GetEnvironmentVariable("RICHO_${slug}_USER")
+    $pass = [Environment]::GetEnvironmentVariable("RICHO_${slug}_PASSWORD")
+
+    if ($user -and $pass) {
+        Write-RichoLog "Resolved credential '$Name' from environment variables." -Level DEBUG
+        return [pscredential]::new($user, (ConvertTo-SecureString $pass -AsPlainText -Force))
+    }
+
+    if ($NoPrompt) {
+        throw "No credential found for '$Name'. Store it with Set-Secret -Name '$Name', or set RICHO_${slug}_USER and RICHO_${slug}_PASSWORD."
+    }
+
+    Write-RichoLog "Prompting for credential '$Name'." -Level DEBUG
+    Get-Credential -Message "Credentials for '$Name'"
+}
+
+function Assert-RichoModule {
+    <#
+    .SYNOPSIS
+        Verifies required modules are installed, and fails with an actionable message.
+
+    .DESCRIPTION
+        Scripts here depend on large vendor modules (VMware.PowerCLI,
+        Intersight.PowerShell, Cisco.UCS.Core, VMware.Sdk.Srm) that are not
+        installed by default. Call this at the top of a script so a missing
+        dependency fails immediately with the install command, rather than
+        halfway through as a confusing "term not recognized" error.
+
+    .PARAMETER Name
+        One or more module names to require.
+
+    .PARAMETER MinimumVersion
+        Optional minimum version. Only meaningful with a single -Name.
+
+    .PARAMETER Import
+        Import each module after the check. Off by default -- importing
+        VMware.PowerCLI is slow, and most callers only need a submodule.
+
+    .EXAMPLE
+        Assert-RichoModule -Name Intersight.PowerShell -MinimumVersion 1.0.11
+
+    .EXAMPLE
+        Assert-RichoModule -Name VMware.VimAutomation.Core, VMware.Sdk.Srm -Import
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$Name,
+
+        [version]$MinimumVersion,
+
+        [switch]$Import
+    )
+
+    if ($MinimumVersion -and $Name.Count -gt 1) {
+        throw '-MinimumVersion applies to a single module; call Assert-RichoModule once per module instead.'
+    }
+
+    foreach ($moduleName in $Name) {
+        $found = Get-Module -Name $moduleName -ListAvailable |
+            Sort-Object Version -Descending |
+            Select-Object -First 1
+
+        if (-not $found) {
+            throw "Required module '$moduleName' is not installed. Install it with: Install-Module -Name $moduleName -Scope CurrentUser"
+        }
+
+        if ($MinimumVersion -and $found.Version -lt $MinimumVersion) {
+            throw "Module '$moduleName' is version $($found.Version) but $MinimumVersion or newer is required. Update it with: Update-Module -Name $moduleName"
+        }
+
+        Write-RichoLog "Module '$moduleName' $($found.Version) available." -Level DEBUG
+
+        if ($Import) {
+            Import-Module -Name $moduleName -ErrorAction Stop
+        }
+    }
+}
+
+function Start-RichoTranscript {
+    <#
+    .SYNOPSIS
+        Starts a PowerShell transcript in logs/ and returns the file path.
+
+    .DESCRIPTION
+        Change work usually needs an artifact showing exactly what ran and what
+        came back. This starts a transcript named for the calling script and the
+        UTC start time, and sets $env:RICHO_LOG_FILE so Write-RichoLog appends to
+        a matching .log file alongside it.
+
+        Remember to call Stop-Transcript in a finally block.
+
+    .PARAMETER Name
+        Base name for the transcript. Defaults to the calling script's file name.
+
+    .PARAMETER Directory
+        Where to write. Defaults to a logs/ folder at the repo root.
+
+    .EXAMPLE
+        $transcript = Start-RichoTranscript
+        try   { ... }
+        finally { Stop-Transcript }
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Position = 0)]
+        [string]$Name,
+
+        [string]$Directory
+    )
+
+    if (-not $Name) {
+        $caller = (Get-PSCallStack | Select-Object -Skip 1 -First 1).ScriptName
+        $Name = if ($caller) { [IO.Path]::GetFileNameWithoutExtension($caller) } else { 'richo' }
+    }
+
+    if (-not $Directory) {
+        $repoRoot = Split-Path $PSScriptRoot -Parent | Split-Path -Parent | Split-Path -Parent
+        $Directory = Join-Path $repoRoot 'logs'
+    }
+
+    if (-not (Test-Path $Directory)) {
+        New-Item -Path $Directory -ItemType Directory -Force | Out-Null
+    }
+
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+    $base = Join-Path $Directory "$Name-$stamp"
+
+    $env:RICHO_LOG_FILE = "$base.log"
+    Start-Transcript -Path "$base.transcript" -Force | Out-Null
+
+    Write-RichoLog "Transcript started: $base.transcript" -Level INFO
+    "$base.transcript"
+}
 
 $ScriptVersion = '1.0.0'
 
@@ -3087,7 +3359,15 @@ function Get-UcsBpSummaryText {
     return ($lines -join [Environment]::NewLine)
 }
 
-$transcriptPath = if ($Transcript) { Start-RichoTranscript } else { $null }
+# --- Where this build writes ------------------------------------------------------------------
+# The CSV and the transcript go to the directory the operator is IN, not the one the script is in.
+# This build exists to be copied somewhere - a jump host, a file share, a WSUS distribution point -
+# and those are places output must not accumulate, and often places it cannot be written at all.
+# If the current location is not a filesystem one (a registry or certificate drive), fall back to
+# the user's Documents folder rather than failing at the very end of a long audit.
+$script:BpOutputDirectory = if ($PWD.Provider.Name -eq 'FileSystem') { $PWD.ProviderPath } else { [Environment]::GetFolderPath('MyDocuments') }
+
+$transcriptPath = if ($Transcript) { Start-RichoTranscript -Directory $script:BpOutputDirectory } else { $null }
 
 try {
     # --- Fabric ---------------------------------------------------------------------------------
@@ -3188,8 +3468,7 @@ try {
 
     # --- Output ---------------------------------------------------------------------------------
     if ([string]::IsNullOrWhiteSpace($OutputPath)) {
-        $repoRoot = Split-Path $PSScriptRoot -Parent | Split-Path -Parent
-        $outputDir = Join-Path $repoRoot 'output'
+        $outputDir = $script:BpOutputDirectory
         $safeFabric = ($Fabric -replace '[^A-Za-z0-9._-]', '_')
         $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
         $OutputPath = Join-Path $outputDir "UcsBestPractice-$safeFabric-$stamp.csv"
