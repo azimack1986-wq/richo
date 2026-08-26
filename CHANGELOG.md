@@ -10,6 +10,92 @@ versioning is [semantic](https://semver.org/) per script.
 
 ---
 
+## Test-UcsBestPractice.ps1
+
+### [1.0.0] — 2026-08-26
+
+#### Added
+
+- **A read-only best practice audit of a single UCS Manager 6400-family domain,
+  written to CSV.** One domain per run: it prompts for the fabric address and for
+  a username and password, connects, walks every readable setting, and emits one
+  row per setting checked — the value found, the value Cisco recommends, and a
+  verdict of Meets, Does Not Meet, Review, Not Applicable or Unknown. A failing
+  row always states the value to set; the row builder refuses to record one that
+  does not, because a failing row with nothing in RecommendedValue tells the
+  operator nothing.
+
+  Around 170 rows on a typical domain, across eighteen sections: system and
+  cluster HA, firmware, NTP/DNS/time zone, syslog, SNMP, Call Home, SEL and core
+  export, fault policy, management interface monitoring, communication services
+  and certificates, authentication realms and password policy, backup and export
+  policies, equipment policies, LAN uplinks and port channels, VLANs, QoS, SAN,
+  server policies, BIOS, vNICs and adapter policies, service profiles, identity
+  pools, and UCS Central.
+
+- **A Basis column, because these are not all the same weight of advice.**
+  `Best Practice` is something Cisco recommends explicitly, and the row's
+  `Reference` says where. `Cisco Default` is a value Cisco ships — a deviation
+  means somebody changed it, which is worth knowing without being a finding.
+  `Site Policy` is a local design decision, reported for confirmation rather than
+  judged. Collapsing the three into one verdict is how an audit produces
+  authoritative-looking findings it cannot actually support.
+
+- **UCS Central ownership on every row.** These domains are registered, so a
+  setting may be resolved centrally rather than locally. Each row carries the
+  object's `PolicyOwner`, and where UCS Central owns it the remediation says so —
+  a change made in UCS Manager against a globally owned object is either refused
+  or reverted at the next policy push, so a remediation naming the wrong console
+  is a remediation nobody can carry out. The UCS Central section reports each
+  Policy Resolution Control, discovered by reading every property of the
+  registration object whose value is `global` or `local` rather than by asking
+  for a fixed list of names — UCS Manager has gained controls across releases,
+  and a fixed list silently stops reporting the ones it does not know about.
+
+- **Unknown as a first-class verdict.** A property the connected UCSM or
+  PowerTool version does not expose, and a class that will not read, both produce
+  an `Unknown` row naming what could not be read and why. Neither is allowed to
+  become a pass or a missing row: an absent row reads as "nothing to see" to
+  whoever reviews the CSV, and concluding "not configured" from a property that
+  was never there is how an audit invents findings. Reads go through
+  `Get-UcsManagedObject -ClassId` rather than the sixty-odd class-specific
+  cmdlets, so one class the installed PowerTool does not expose costs one row
+  rather than the run, and a section that throws is recorded as a row too.
+
+- **Checks matched to this estate.** Ethernet only, so the Fibre Channel section
+  confirms there is no SAN configuration and reports any it finds — a stray FC
+  uplink or VSAN is the finding there — and audits it properly if it exists.
+  VLANs get their own section: defined on one fabric only, one VLAN ID under two
+  names, VLANs no vNIC references, more than one native VLAN, and local versus
+  global ownership. ESXi 8.x and Windows Server, so the BIOS checks look for
+  VT-x and VT-d, the vNIC checks assert two vNICs split across both fabrics and
+  flag the built-in `default` adapter policy, and fabric failover is reported
+  with its counts rather than failed — the right answer differs between a
+  vSwitch-teamed ESXi host and a bare metal Windows server, and UCS Manager does
+  not know which is which.
+
+- **No silent truncation.** Per-object detail rows are capped by
+  `-MaxDetailRowsPerCheck` (50 by default), and a capped check says how many it
+  listed of how many there were, and what to re-run to see them all.
+
+#### Tests
+
+- `tests/Test-UcsBestPractice.ps1` — 74 assertions, standalone, no PowerTool and
+  no infrastructure. They target the way an audit actually fails, which is by
+  producing a confident answer that is not true: a Does Not Meet row with no
+  recommended value is refused; a property absent from the schema is Unknown
+  rather than a verdict; a class that will not read produces a row rather than
+  silence, and is distinguished from one that reads and is empty; a globally
+  owned setting is sent to UCS Central and a local one is not; truncation is
+  reported; policy resolution controls are found by value so one added in a later
+  release is still reported; an Ethernet-only domain produces Not Applicable
+  rather than failures while stray FC configuration is found; and a service
+  profile pointing at a non-compliant maintenance policy fails even though a
+  compliant policy exists elsewhere in the domain — the policy list passing is
+  not the same question as the servers using it.
+
+---
+
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
 ### [23.32.0] — 2026-08-21

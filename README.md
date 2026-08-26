@@ -54,6 +54,42 @@ Copy `scripts/_template.ps1` into the right platform folder and rename it
 `Verb-Noun.ps1` using an approved verb (`Get-Verb`). The template already wires
 up the conventions below.
 
+## Auditing a UCS domain against Cisco's recommendations
+
+[`scripts/ucs/Test-UcsBestPractice.ps1`](scripts/ucs/Test-UcsBestPractice.ps1)
+walks every readable setting on one UCS Manager domain, compares it against
+Cisco's published guidance, and writes the result to CSV — one row per setting,
+each carrying the value found, the value Cisco recommends, and a verdict.
+
+```powershell
+# Prompts for the fabric address, then for a username and password.
+.\scripts\ucs\Test-UcsBestPractice.ps1
+
+# Or unattended, against a stored credential.
+.\scripts\ucs\Test-UcsBestPractice.ps1 -Fabric ucsm-prod-01 -CredentialName ucsm-prod -Transcript
+```
+
+One domain per run — point it at the cluster VIP, not an individual fabric
+interconnect. It reads and nothing else; the only thing it creates is the CSV,
+which is what `-WhatIf` skips.
+
+Two columns are worth knowing about before reading the output:
+
+- **Basis** separates advice by weight. `Best Practice` is something Cisco
+  recommends explicitly and the row's `Reference` says where. `Cisco Default` is
+  a value Cisco ships — a deviation there means somebody changed it, not that it
+  is wrong. `Site Policy` is a local design decision, reported for confirmation.
+- **Owner** is the object's `PolicyOwner`. These domains are registered with UCS
+  Central, so a setting may be owned centrally; where it is, the remediation says
+  to change it in UCS Central, because a change made in UCS Manager is refused or
+  reverted at the next policy push. The `UCS Central` category reports each
+  Policy Resolution Control, which is what decides that ownership.
+
+A setting the connected UCS Manager or PowerTool version does not expose is
+reported as `Unknown`, never as a pass — an absent row reads as "nothing to see"
+to whoever reviews the CSV, and a confident verdict on a setting that was never
+read is worse than no verdict at all.
+
 ## Conventions
 
 - **`ShouldProcess` on anything that mutates.** Every script declares
