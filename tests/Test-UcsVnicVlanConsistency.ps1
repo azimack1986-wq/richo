@@ -38,7 +38,8 @@ $underTest = @(
     'ConvertTo-PolicyName', 'Get-VnicMemberDetail', 'Get-QosClassMtu',
     'Test-NetworkControlPolicyBestPractice', 'Test-VnicBestPractice',
     'Test-PortGroupBestPractice', 'Test-VdsBestPractice', 'Test-ServiceProfileBestPractice',
-    'Test-VnicNativeVlan'
+    'Test-VnicNativeVlan', 'Compare-VdsObservedVlan', 'Test-VnicTemplateBinding',
+    'Test-VnicFabricAssignment'
 )
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
@@ -321,11 +322,62 @@ $expected = @(
 Assert-Equal 'a matched pair still fails an explicit MTU' 2 (Get-Check (Compare-VnicGroup -Member $expected -ExpectedMtu 9000) 'VnicMtuUnexpected').Count
 Assert-Equal 'and passes when it matches'                 0 (Get-Check (Compare-VnicGroup -Member $expected -ExpectedMtu 1500) 'VnicMtuUnexpected').Count
 
+# Template binding moved out of the pair comparison: there it only fired when
+# one leg had a template and the other did not, and said nothing at all about a
+# profile whose vNICs were ALL built by hand - the worst case.
 $untemplated = @(
     (New-Member 0 'eth0' @(10) 'A' 9000 0 'tmpl-a')
     (New-Member 1 'eth1' @(10) 'B' 9000 0 '')
 )
-Assert-Equal 'a vNIC configured off-template is reported' 1 (Get-Check (Compare-VnicGroup -Member $untemplated) 'VnicNotTemplated').Count
+Assert-Equal 'the pair check no longer claims this' 0 (Get-Check (Compare-VnicGroup -Member $untemplated) 'VnicNotTemplated').Count
+
+Write-Host "`n=== Even vNICs on fabric A, odd on fabric B ===" -ForegroundColor Cyan
+Assert-Equal 'eth0 on A is correct' 0 @(Test-VnicFabricAssignment -Member (New-Member 0 'eth0' @(10) 'A')).Count
+Assert-Equal 'eth1 on B is correct' 0 @(Test-VnicFabricAssignment -Member (New-Member 1 'eth1' @(10) 'B')).Count
+Assert-Equal 'eth4 on A is correct' 0 @(Test-VnicFabricAssignment -Member (New-Member 4 'eth4' @(10) 'A')).Count
+Assert-Equal 'eth5 on B is correct' 0 @(Test-VnicFabricAssignment -Member (New-Member 5 'eth5' @(10) 'B')).Count
+
+$findings = @(Test-VnicFabricAssignment -Member (New-Member 0 'eth0' @(10) 'B'))
+Assert-Equal 'an even vNIC on B is reported' 1 (Get-Check $findings 'VnicWrongFabric').Count
+Assert-Equal 'and it says which is expected' 'fabric A' (Get-Check $findings 'VnicWrongFabric')[0].Expected
+Assert-Equal 'as a mismatch'                 'Consistency' (Get-Check $findings 'VnicWrongFabric')[0].Category
+Assert-Equal 'an odd vNIC on A is reported'  1 (Get-Check (Test-VnicFabricAssignment -Member (New-Member 3 'eth3' @(10) 'A')) 'VnicWrongFabric').Count
+
+# THE CASE THE PAIR CHECK CANNOT SEE. Reversed but still split across both
+# fabrics: redundant, breaks nothing, and every "vmnic0 is fabric A" runbook is
+# wrong on this blade.
+$reversed = @(
+    (New-Member 0 'eth0' @(10) 'B')
+    (New-Member 1 'eth1' @(10) 'A')
+)
+Assert-Equal 'the pair check passes a reversed pair' 0 (Get-Check (Compare-VnicGroup -Member $reversed) 'VnicPairSameFabric').Count
+Assert-Equal 'and this one catches both legs'        2 @(
+    @(Test-VnicFabricAssignment -Member $reversed[0]) + @(Test-VnicFabricAssignment -Member $reversed[1])).Count
+
+# Fabric failover ids are judged on their primary fabric; whether failover
+# should be on at all is a separate finding.
+Assert-Equal "'A-B' on an even vNIC is correct"  0 @(Test-VnicFabricAssignment -Member (New-Member 0 'eth0' @(10) 'A-B')).Count
+Assert-Equal "'B-A' on an even vNIC is not"      1 (Get-Check (Test-VnicFabricAssignment -Member (New-Member 0 'eth0' @(10) 'B-A')) 'VnicWrongFabric').Count
+
+Assert-Equal 'the convention can be flipped' 0 @(Test-VnicFabricAssignment -Member (New-Member 0 'eth0' @(10) 'B') -EvenFabric 'B').Count
+Assert-Equal 'and turned off entirely'       0 @(Test-VnicFabricAssignment -Member (New-Member 0 'eth0' @(10) 'B') -EvenFabric 'None').Count
+# Nothing to judge against is not a finding.
+Assert-Equal 'a vNIC with no fabric id is skipped' 0 @(Test-VnicFabricAssignment -Member (New-Member 0 'eth0' @(10) '')).Count
+
+Write-Host "`n=== Every vNIC must be bound to a template ===" -ForegroundColor Cyan
+Assert-Equal 'a templated vNIC is clean' 0 @(Test-VnicTemplateBinding -Member (New-Member 0 'eth0' @(10) 'A' 9000 0 'eth0-tmpl')).Count
+
+$findings = @(Test-VnicTemplateBinding -Member (New-Member 0 'eth0' @(10) 'A' 9000 0 ''))
+Assert-Equal 'an untemplated vNIC is reported'  1 (Get-Check $findings 'VnicNotTemplated').Count
+Assert-Equal 'and it names the vNIC'            'eth0' (Get-Check $findings 'VnicNotTemplated')[0].Subject
+# It is the mechanism behind most of the drift the rest of the report finds, so
+# it is a mismatch rather than a recommendation - and must survive
+# -SkipBestPractice, which only drops the BestPractice category.
+Assert-Equal 'as a consistency finding'         'Consistency' (Get-Check $findings 'VnicNotTemplated')[0].Category
+# Both legs built by hand: the case the old pair-relative check stayed silent on.
+Assert-Equal 'both legs untemplated are both reported' 2 @(
+    @(Test-VnicTemplateBinding -Member (New-Member 0 'eth0' @(10) 'A' 9000 0 '')) +
+    @(Test-VnicTemplateBinding -Member (New-Member 1 'eth1' @(10) 'B' 9000 0 ''))).Count
 
 Write-Host "`n=== Port group VLAN specs ===" -ForegroundColor Cyan
 # Three unrelated shapes. Read the wrong one and a trunk port group looks like
@@ -348,6 +400,41 @@ Assert-Equal 'a trunk-everything range drops the invalid ids' 4094 $wide.Count
 Assert-Equal 'VLAN 0 is untagged, not VLAN 0' 'None'  (ConvertTo-VlanIdList -VlanSpec ([pscustomobject]@{ VlanId = 0 })).Kind
 Assert-Equal 'a null spec is untagged'        'None'  (ConvertTo-VlanIdList -VlanSpec $null).Kind
 Assert-Equal 'a pvlan is recognised'          'Pvlan' (ConvertTo-VlanIdList -VlanSpec ([pscustomobject]@{ PvlanId = 501 })).Kind
+
+Write-Host "`n=== What the host actually sees arriving - the only runtime evidence ===" -ForegroundColor Cyan
+# Configured, trunked and seen: nothing to say.
+Assert-Equal 'everything lines up, nothing reported' 0 @(Compare-VdsObservedVlan -VdsName 'dvs-prod' -ObservedVlanId @(10, 250) -RequiredVlanId @(10, 250) -TrunkedVlanId @(10, 250) -Vmnic @('vmnic2', 'vmnic3')).Count
+
+# ARRIVING AND UNUSED. Strong evidence: the frames are on the wire.
+$findings = @(Compare-VdsObservedVlan -VdsName 'dvs-prod' -ObservedVlanId @(10, 250, 300) -RequiredVlanId @(10, 250) -TrunkedVlanId @(10, 250, 300))
+Assert-Equal 'a VLAN arriving that no port group uses' 1 (Get-Check $findings 'VlanObservedNotOnVds').Count
+Assert-Equal 'and it is a warning, not a hint'         'WARN' (Get-Check $findings 'VlanObservedNotOnVds')[0].Severity
+Assert-Equal 'and it names the VLAN'                   'dvs-prod / VLAN 300' (Get-Check $findings 'VlanObservedNotOnVds')[0].Subject
+# Per VLAN, not per host, so forty hosts seeing the same stray VLAN fold into
+# one row rather than forty.
+$many = @(Compare-VdsObservedVlan -VdsName 'dvs-prod' -ObservedVlanId @(300, 301) -RequiredVlanId @() -TrunkedVlanId @(300, 301))
+Assert-Equal 'one row per VLAN'                        2 (Get-Check $many 'VlanObservedNotOnVds').Count
+
+# ARRIVING BUT NOT IN THE UCS CONFIG: the two readings of the same vNIC
+# disagree, and the wire is the one that is not a reading.
+$findings = @(Compare-VdsObservedVlan -VdsName 'dvs-prod' -ObservedVlanId @(10, 900) -RequiredVlanId @(10, 900) -TrunkedVlanId @(10))
+Assert-Equal 'a VLAN arriving outside the trunk list' 1 (Get-Check $findings 'VlanObservedNotTrunked').Count
+# With no UCS side to compare against, that check has nothing to say.
+Assert-Equal 'and not claimed when UCS was not read'  0 (Get-Check (Compare-VdsObservedVlan -VdsName 'dvs' -ObservedVlanId @(10, 900) -RequiredVlanId @(10, 900) -TrunkedVlanId @()) 'VlanObservedNotTrunked').Count
+
+# CONFIGURED AND NEVER SEEN. Weak: a quiet VLAN and an undelivered one look
+# identical to ESXi, so this must never be an error.
+$findings = @(Compare-VdsObservedVlan -VdsName 'dvs-prod' -ObservedVlanId @(10) -RequiredVlanId @(10, 250) -TrunkedVlanId @(10, 250))
+Assert-Equal 'a configured VLAN never seen is noted'   1 (Get-Check $findings 'VlanOnVdsNotObserved').Count
+Assert-Equal 'as INFO only'                            'INFO' (Get-Check $findings 'VlanOnVdsNotObserved')[0].Severity
+Assert-Equal 'and it says why it is weak'              $true ((Get-Check $findings 'VlanOnVdsNotObserved')[0].Detail -match 'quiet VLAN')
+
+# A host with nothing running on it observes nothing. Reporting every VLAN as
+# missing there would be worse than useless.
+$findings = @(Compare-VdsObservedVlan -VdsName 'dvs-prod' -ObservedVlanId @() -RequiredVlanId @(10, 250) -TrunkedVlanId @(10, 250))
+Assert-Equal 'nothing observed says so, once'          1 (Get-Check $findings 'NoVlanObserved').Count
+Assert-Equal 'and claims nothing else'                 1 $findings.Count
+Assert-Equal 'as INFO'                                 'INFO' (Get-Check $findings 'NoVlanObserved')[0].Severity
 
 Write-Host "`n=== Uplink port groups are excluded ===" -ForegroundColor Cyan
 # The uplink port group trunks everything by design. Measured against UCS it

@@ -12,6 +12,51 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Test-UcsVnicVlanConsistency.ps1
 
+### [2.2.0] — 2026-09-01
+
+#### Added
+
+- **What the host actually sees on the wire.** `PhysicalNicHintInfo.Subnet` is
+  the VLANs ESXi has observed arriving on an uplink, and it is the only runtime
+  evidence in the whole script — everything else compares one configuration
+  against another and can be wrong the same way twice.
+
+  The evidence is asymmetric and the findings say so. `VlanObservedNotOnVds`
+  (WARN) is strong: the frames are on the wire and no port group uses them.
+  `VlanObservedNotTrunked` (WARN) means the UCS config and the wire disagree
+  about what a vNIC carries. `VlanOnVdsNotObserved` is INFO only, because ESXi
+  records a VLAN only once it has watched traffic with an IP subnet on it — a
+  quiet VLAN and an undelivered one look identical, and a check that calls the
+  first an outage gets switched off within a week. A host that has seen nothing
+  at all says so once rather than reporting every VLAN as missing.
+
+  Findings are per VLAN, so forty hosts seeing the same stray VLAN fold into one
+  row naming them. `-SkipObservedVlan` turns it off: it costs one
+  QueryNetworkHint call per physical NIC, the slowest thing the script does.
+
+- **`VnicWrongFabric`** — even ordinals belong on fabric A, odd on fabric B
+  (`-EvenVnicFabric`, `None` to disable). This is not the pair check: a reversed
+  pair (0 on B, 1 on A) passes that one, stays redundant and breaks nothing,
+  right up until fabric A is drained for firmware and a different uplink moves on
+  that blade than on every other — and every "vmnic0 is fabric A" runbook is
+  wrong on exactly the hosts nobody checked. Fabric-failover ids are judged on
+  their primary fabric.
+
+#### Changed
+
+- **`VnicNotTemplated` is now checked per vNIC, unconditionally.** It lived in
+  the pair comparison, where it fired only when one leg had a template and the
+  other did not — and so said nothing at all about a service profile whose vNICs
+  were *all* built by hand, the worst case. It is a Consistency finding rather
+  than a best-practice one, and survives `-SkipBestPractice`: an untemplated vNIC
+  is the mechanism behind most of the drift the rest of the report finds, and a
+  report that lists the drift without the reason sends someone to fix the same
+  blade twice.
+
+---
+
+## Test-UcsVnicVlanConsistency.ps1
+
 ### [2.1.0] — 2026-09-01
 
 #### Changed

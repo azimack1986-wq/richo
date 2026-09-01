@@ -91,27 +91,47 @@
          configuration says it is; none at all means untagged frames on that
          uplink have nowhere to land.
 
-      4. vNIC pair symmetry. The two legs of a pair are the same connection over
+      4. Which fabric each vNIC is on. Even ordinals belong on fabric A and odd
+         on fabric B (-EvenVnicFabric). This is not the pair check: a reversed
+         pair - 0 on B, 1 on A - passes that one, stays redundant, and breaks
+         nothing, right up until fabric A is drained for firmware and a different
+         uplink moves on that blade than on every other.
+
+      5. vNIC pair symmetry. The two legs of a pair are the same connection over
          two fabrics, so everything about them must match except the fabric. By
          default vNICs 0/1, 2/3 and 4/5 are compared as pairs (-VnicPairGroup);
          the VLAN set, the native VLAN, the MTU, the network control, QoS and
          adapter policies and the template type must agree, and the two legs must
          sit on different fabric interconnects.
 
-      5. A vNIC that has drifted from its own template, which an initial-template
+      6. A vNIC not bound to a vNIC template at all. Every vNIC here is template
+         bound; one configured directly on a service profile has nothing holding
+         it to its peers and no template change will ever reach it. It is the
+         mechanism behind most of the rest of this list, so it is reported as a
+         mismatch rather than a recommendation.
+
+      7. A vNIC that has drifted from its own template, which an initial-template
          edited after the profile was stamped produces silently.
 
-      6. The vSphere cross-check. For each host, the physical NICs are mapped to
+      8. The vSphere cross-check. For each host, the physical NICs are mapped to
          the distributed switch that owns them, and the VLANs the vDS port groups
          actually need are checked against the VLANs UCS trunks to those same
          vmnics. A port group VLAN that UCS does not trunk is a black hole; the
          reverse is only noise, so it is reported as INFO. The vDS MTU is checked
          against the vNIC MTU behind it.
 
-      7. Discovery protocol agreement. A vDS set to CDP in front of a network
+      9. What the host actually sees. The VLANs ESXi has observed arriving on a
+         vDS's uplinks, against the VLANs its port groups need and the VLANs UCS
+         says it trunks there. This is the only runtime evidence in the report -
+         everything else compares one configuration against another and can be
+         wrong the same way twice. A VLAN arriving that no port group uses is a
+         real finding; a configured VLAN never seen is only a hint, because a
+         quiet VLAN and an undelivered one look identical to ESXi.
+
+     10. Discovery protocol agreement. A vDS set to CDP in front of a network
          control policy with CDP disabled is why hosts report no neighbour.
 
-      8. What neither side accounts for. A service profile with no host in this
+     11. What neither side accounts for. A service profile with no host in this
          vCenter, a host that is registered but disconnected, a profile with no
          vNICs, an uplink with no vNIC behind it, and a host sharing a cluster
          with this domain's blades while cabled to a different fabric.
@@ -120,29 +140,29 @@
 
       Skipped entirely with -SkipBestPractice.
 
-      9. Network control policy. Action on Uplink Fail must be link-down: set to
+     12. Network control policy. Action on Uplink Fail must be link-down: set to
          'warning' the vNIC stays up when the fabric loses its uplinks, so ESXi
          keeps the uplink in the team and keeps sending traffic into a hole, and
          nothing fails over or alarms. MAC register mode should be all-host-vlans
          wherever a blade trunks more than its native VLAN. CDP or LLDP should be
          advertising something.
 
-     10. vNIC settings. Fabric failover should be OFF on a vNIC presented to
+     13. vNIC settings. Fabric failover should be OFF on a vNIC presented to
          ESXi - the host's teaming already handles a failed uplink, and with both
          in play the fabric moves the MAC while the host still believes its
          uplink is healthy. Templates should be updating, not initial. A vNIC's
          MTU must fit the QoS system class its policy maps to, or jumbo frames
          are dropped with no error anywhere.
 
-     11. Service profiles should come from a service profile template; one built
+     14. Service profiles should come from a service profile template; one built
          by hand has nothing holding it to its peers.
 
-     12. Port group teaming. IP hash is not supported in front of UCS - it needs
+     15. Port group teaming. IP hash is not supported in front of UCS - it needs
          a port channel to the host, and a blade's two vNICs terminate on two
          independent fabric interconnects. Beacon probing cannot attribute a
          failure across only two uplinks. Notify Switches should be on.
 
-     13. Each vDS should have two uplinks on the host, one per fabric, and should
+     16. Each vDS should have two uplinks on the host, one per fabric, and should
          be listening for CDP or LLDP.
 
 .PARAMETER UcsManager
@@ -173,9 +193,21 @@
     Report only the things that do not match each other, and skip the
     recommended-configuration checks entirely.
 
+.PARAMETER SkipObservedVlan
+    Skip the runtime comparison. It asks each host which VLANs it has actually
+    seen arriving, which means one QueryNetworkHint call per physical NIC - the
+    slowest thing this script does. Skip it on a large cluster when you only want
+    the configuration compared.
+
 .PARAMETER VnicPairGroup
     Groups of vNIC ordinals that must be identical to each other. Defaults to
     '0,1', '2,3', '4,5'.
+
+.PARAMETER EvenVnicFabric
+    The fabric interconnect even-numbered vNICs belong to. Defaults to 'A', so
+    vNIC 0, 2 and 4 are expected on fabric A and 1, 3 and 5 on fabric B. 'None'
+    turns the check off, leaving only the weaker requirement that the two legs of
+    a pair are on different fabrics.
 
 .PARAMETER ExpectedMtu
     When set, every vNIC in a compared group must carry this MTU. Left at 0 the
@@ -267,8 +299,13 @@ param(
 
     [switch]$SkipBestPractice,
 
+    [switch]$SkipObservedVlan,
+
     [ValidateNotNullOrEmpty()]
     [string[]]$VnicPairGroup = @('0,1', '2,3', '4,5'),
+
+    [ValidateSet('A', 'B', 'None')]
+    [string]$EvenVnicFabric = 'A',
 
     [ValidateRange(0, 9216)]
     [int]$ExpectedMtu = 0,
@@ -1324,19 +1361,10 @@ function Compare-VnicGroup {
         }
     }
 
-    # --- a vNIC with no template behind it -----------------------------------
-    $templated = @($Member | Where-Object { "$($_.TemplateName)" -ne '' })
-    if ($templated.Count -gt 0 -and $templated.Count -lt $Member.Count) {
-        foreach ($entry in @($Member | Where-Object { "$($_.TemplateName)" -eq '' })) {
-            [void]$results.Add([pscustomobject]@{
-                Severity = 'WARN'; Check = 'VnicNotTemplated'
-                Subject  = $entry.VnicName
-                Expected = 'a vNIC template, as its partner has'
-                Actual   = 'configured directly on the service profile'
-                Detail   = ("{0} is configured on the service profile itself while its partner comes from a template. Its VLANs will not follow a template change." -f $entry.VnicName)
-            })
-        }
-    }
+    # Template binding is NOT checked here. It used to be, and only fired when
+    # one leg had a template and the other did not - which said nothing about a
+    # profile whose vNICs were all built by hand, the worst case of all.
+    # Test-VnicTemplateBinding checks every vNIC on its own instead.
 
     return $results.ToArray()
 }
@@ -1678,6 +1706,135 @@ function Compare-VdsVlanCoverage {
     return $results.ToArray()
 }
 
+function Compare-VdsObservedVlan {
+    <#
+    .SYNOPSIS
+        Findings for the VLANs a host actually sees on a vDS's uplinks, against
+        what that vDS is configured for and what UCS says it trunks.
+
+    .DESCRIPTION
+        The only runtime evidence in this script. Everything else compares one
+        configuration to another and can be wrong in the same way twice; this
+        compares configuration to what arrived on the wire.
+
+        EVIDENCE IS ASYMMETRIC, AND THE FINDINGS SAY SO.
+
+        Observed is strong. If ESXi has seen traffic tagged for a VLAN on that
+        uplink, the fabric is delivering it, whatever any configuration says. So
+        a VLAN arriving that no port group uses is a real finding, and a VLAN
+        arriving that the UCS vNIC does not list means the two readings of the
+        vNIC disagree and one of them is wrong.
+
+        Not-observed is weak. ESXi only records a VLAN once it has watched
+        traffic with an IP subnet on it, so a genuinely quiet VLAN and a VLAN
+        that is not being delivered look exactly the same. That case is INFO,
+        never an error, and its text says why - a check that calls a quiet VLAN
+        an outage gets switched off within a week.
+
+        Findings are per VLAN rather than per host, so forty hosts observing the
+        same stray VLAN produce one row naming them rather than forty rows.
+
+    .PARAMETER VdsName
+        The switch the uplinks belong to.
+
+    .PARAMETER ObservedVlanId
+        VLAN ids seen arriving on this vDS's uplinks on this host.
+
+    .PARAMETER RequiredVlanId
+        VLAN ids this vDS's port groups need.
+
+    .PARAMETER TrunkedVlanId
+        VLAN ids UCS says it trunks to those vmnics.
+
+    .PARAMETER Vmnic
+        The uplinks, for the finding text.
+
+    .EXAMPLE
+        Compare-VdsObservedVlan -VdsName dvs-prod -ObservedVlanId $seen `
+            -RequiredVlanId $needed -TrunkedVlanId $trunked -Vmnic @('vmnic2','vmnic3')
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$VdsName,
+
+        [Parameter(Position = 1)]
+        [AllowEmptyCollection()]
+        [int[]]$ObservedVlanId = @(),
+
+        [Parameter(Position = 2)]
+        [AllowEmptyCollection()]
+        [int[]]$RequiredVlanId = @(),
+
+        [Parameter(Position = 3)]
+        [AllowEmptyCollection()]
+        [int[]]$TrunkedVlanId = @(),
+
+        [Parameter(Position = 4)]
+        [AllowEmptyCollection()]
+        [string[]]$Vmnic = @()
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $observed = @($ObservedVlanId | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+    $required = @($RequiredVlanId | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+    $trunked = @($TrunkedVlanId | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+    $uplinks = $(if ($Vmnic.Count -gt 0) { $Vmnic -join ', ' } else { 'its uplinks' })
+
+    # Nothing seen at all is a statement about the check, not about the fabric -
+    # a host with no VM traffic yet, or an uplink ESXi has not watched long
+    # enough. Saying "every VLAN is missing" here would be worse than useless.
+    if ($observed.Count -eq 0) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'INFO'; Category = 'Consistency'; Check = 'NoVlanObserved'
+            Subject  = $VdsName
+            Expected = ''
+            Actual   = 'no tagged traffic seen on these uplinks'
+            Detail   = ("The host has observed no VLAN-tagged traffic on {0} for '{1}', so there is no runtime evidence to compare the vDS against. That is normal on a host with no running VMs, and on uplinks ESXi has not watched for long." -f $uplinks, $VdsName)
+        })
+        return $results.ToArray()
+    }
+
+    # ARRIVING AND UNUSED. Strong: the frames are on the wire.
+    foreach ($vlanId in @($observed | Where-Object { $required -notcontains $_ })) {
+        $inTrunk = $(if ($trunked -contains $vlanId) { "UCS trunks it" } else { "UCS does not list it either" })
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'Consistency'; Check = 'VlanObservedNotOnVds'
+            Subject  = "$VdsName / VLAN $vlanId"
+            Expected = 'a port group for every VLAN delivered to the uplinks'
+            Actual   = "arriving on $uplinks, used by no port group"
+            Detail   = ("VLAN {0} is arriving on {1} and no port group on '{2}' uses it - {3}. Either a port group is missing, or the fabric is trunking a VLAN this vDS has no business seeing." -f $vlanId, $uplinks, $VdsName, $inTrunk)
+        })
+    }
+
+    # ARRIVING AND NOT IN THE UCS CONFIG. The two readings of the same vNIC
+    # disagree, and the wire is the one that is not a reading.
+    foreach ($vlanId in @($observed | Where-Object { $trunked.Count -gt 0 -and $trunked -notcontains $_ })) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'Consistency'; Check = 'VlanObservedNotTrunked'
+            Subject  = "$VdsName / VLAN $vlanId"
+            Expected = ('VLAN {0} among the VLANs UCS trunks to {1}' -f $vlanId, $uplinks)
+            Actual   = 'arriving anyway'
+            Detail   = ("VLAN {0} is arriving on {1} but is not among the VLANs the UCS vNICs behind '{2}' are configured to carry. The configuration and the wire disagree - check the vNICs really are the ones this host uses before trusting the rest of this report for it." -f $vlanId, $uplinks, $VdsName)
+        })
+    }
+
+    # CONFIGURED AND NEVER SEEN. Weak, and labelled as such.
+    foreach ($vlanId in @($required | Where-Object { $observed -notcontains $_ })) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'INFO'; Category = 'Consistency'; Check = 'VlanOnVdsNotObserved'
+            Subject  = "$VdsName / VLAN $vlanId"
+            Expected = ''
+            Actual   = "no traffic seen on $uplinks"
+            Detail   = ("A port group on '{0}' uses VLAN {1} and the host has never seen traffic on it. Not evidence of a fault: ESXi only records a VLAN once it has watched traffic with an IP subnet on it, so a quiet VLAN looks exactly like one that is not being delivered. Worth a look if that VLAN should be busy." -f $VdsName, $vlanId)
+        })
+    }
+
+    return $results.ToArray()
+}
+
 # ============================================================================
 # Best practice - the recommended configuration, as opposed to a mismatch
 # ============================================================================
@@ -1943,6 +2100,132 @@ function Test-VnicBestPractice {
             Expected = 'no VLAN 1 on a data vNIC'
             Actual   = 'VLAN 1 trunked'
             Detail   = ("{0} trunks VLAN 1. The default VLAN carries whatever anything untagged puts on it, and is conventionally kept off data uplinks." -f $name)
+        })
+    }
+
+    return $results.ToArray()
+}
+
+function Test-VnicFabricAssignment {
+    <#
+    .SYNOPSIS
+        Reports a vNIC that is not on the fabric its ordinal says it should be.
+
+    .DESCRIPTION
+        EVEN ORDINALS ON FABRIC A, ODD ON FABRIC B. vNIC 0, 2 and 4 take fabric
+        A; 1, 3 and 5 take fabric B.
+
+        THIS IS NOT THE SAME AS THE PAIR CHECK, and it is the reason both exist.
+        Compare-VnicGroup asks whether the two legs are on DIFFERENT fabrics,
+        which a reversed pair - 0 on B and 1 on A - passes perfectly. Traffic is
+        still redundant, so nothing breaks and nothing shows it.
+
+        What it costs is the assumption everything operational rests on. Draining
+        fabric A for a firmware upgrade is supposed to move a known set of
+        uplinks on every blade at once. Where some blades are reversed it moves a
+        different uplink on those, and the host that loses connectivity is not
+        the one anybody was watching. The same reversal makes every "vmnic0 is
+        fabric A" runbook wrong on exactly the hosts nobody checked.
+
+        Fabric failover ids - 'A-B' and 'B-A' - are judged on their primary
+        fabric, the first letter. Whether failover should be enabled at all is a
+        separate finding.
+
+    .PARAMETER Member
+        A resolved vNIC: Ordinal, VnicName, SwitchId.
+
+    .PARAMETER EvenFabric
+        The fabric even ordinals belong to - 'A' or 'B'. Odd ordinals take the
+        other. 'None' turns the check off, leaving only the pair comparison's
+        weaker "they must differ".
+
+    .EXAMPLE
+        Test-VnicFabricAssignment -Member $member -EvenFabric A
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        $Member,
+
+        [Parameter(Position = 1)]
+        [ValidateSet('A', 'B', 'None')]
+        [string]$EvenFabric = 'A'
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    if ($EvenFabric -eq 'None') { return $results.ToArray() }
+
+    $ordinal = [int]$Member.Ordinal
+    if ($ordinal -lt 0) { return $results.ToArray() }
+
+    # Nothing to judge against. A vNIC with no fabric id at all is a different
+    # problem, and the pair comparison is where it surfaces.
+    $switchId = ([string]$Member.SwitchId).Trim()
+    if (-not $switchId) { return $results.ToArray() }
+
+    $oddFabric = $(if ($EvenFabric -eq 'A') { 'B' } else { 'A' })
+    $expected = $(if ($ordinal % 2 -eq 0) { $EvenFabric } else { $oddFabric })
+    $primary = $switchId.Substring(0, 1).ToUpperInvariant()
+
+    if ($primary -ne $expected) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'Consistency'; Check = 'VnicWrongFabric'
+            Subject  = $Member.VnicName
+            Expected = "fabric $expected"
+            Actual   = "fabric $switchId"
+            Detail   = ("{0} is vNIC {1}, which belongs on fabric {2}, and it is on fabric {3}. The pair may still be split across both fabrics, so nothing breaks - but draining fabric {2} for firmware now moves a different uplink on this blade than on the rest, and every runbook that says which vmnic is which fabric is wrong here." -f $Member.VnicName, $ordinal, $expected, $switchId)
+        })
+    }
+
+    return $results.ToArray()
+}
+
+function Test-VnicTemplateBinding {
+    <#
+    .SYNOPSIS
+        Reports a vNIC that is not bound to a vNIC template.
+
+    .DESCRIPTION
+        EVERY vNIC IS TEMPLATE BOUND HERE. A vNIC configured directly on a
+        service profile has nothing holding it to its peers: its VLANs, MTU and
+        policies were set by hand once and will never change again unless someone
+        remembers this blade. It does not drift because it was edited - it drifts
+        because everything else was.
+
+        That makes it the mechanism behind most of what the rest of this report
+        finds, which is why it is a mismatch rather than a recommendation and why
+        -SkipBestPractice does not suppress it. A report that lists the drift but
+        not the reason for it sends someone to fix the same blade twice.
+
+        Checked per vNIC, unconditionally. The pair comparison used to raise this
+        only when one leg had a template and the other did not, which said
+        nothing at all about a profile whose vNICs were all built by hand - the
+        worst case, and the one it stayed silent on.
+
+    .PARAMETER Member
+        A resolved vNIC: VnicName, TemplateName, TemplateType.
+
+    .EXAMPLE
+        Test-VnicTemplateBinding -Member $member
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        $Member
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $name = [string]$Member.VnicName
+
+    if ([string]::IsNullOrWhiteSpace([string]$Member.TemplateName)) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'Consistency'; Check = 'VnicNotTemplated'
+            Subject  = $name
+            Expected = 'a vNIC template'
+            Actual   = 'configured directly on the service profile'
+            Detail   = ("{0} is not bound to a vNIC template - its VLANs, MTU and policies were set on the service profile by hand. Nothing holds it to the other blades, and no template change will ever reach it." -f $name)
         })
     }
 
@@ -2332,30 +2615,42 @@ function Convert-FiSystemNameToUcsCandidate {
     return $candidate
 }
 
-function Get-EsxiDiscoveryCandidate {
+function Get-EsxiNetworkHint {
     <#
     .SYNOPSIS
-        Every CDP and LLDP neighbour name a host's physical NICs report, best first.
+        Everything a host's physical NICs report about what is on the other end -
+        neighbours and the VLANs actually seen arriving.
 
     .DESCRIPTION
-        BOTH PROTOCOLS. Reading only ConnectedSwitchPort - CDP - finds nothing on
-        a domain running LLDP with CDP disabled, which is ordinary on 6400-series
-        fabric interconnects, and every host then falls through to needing
-        -UcsManager by hand.
+        ONE READ, TWO ANSWERS. QueryNetworkHint is issued per physical NIC and is
+        the slowest call in the run, so both things that come out of it are taken
+        at once and cached per host.
 
-        BOTH CDP NAME FIELDS. PhysicalNicCdpInfo carries DevId and SystemName and
-        they are not always the same string, so both are returned as separate
-        candidates and whichever resolves, resolves.
+        NEIGHBOURS. Both protocols, and both of CDP's name fields. Reading only
+        ConnectedSwitchPort finds nothing on a domain running LLDP with CDP
+        disabled, which is ordinary on 6400-series fabric interconnects.
+        PhysicalNicCdpInfo carries DevId and SystemName and they are not always
+        the same string, so both are returned and whichever resolves, resolves.
 
-        QueryNetworkHint is issued per physical NIC and is the slowest call in
-        the run, so the answer is cached per host. The low-numbered uplinks come
-        first because those are the ones cabled to the fabric.
+        OBSERVED VLANS. PhysicalNicHintInfo.Subnet is what ESXi has actually seen
+        arriving on that uplink - a VLAN id per IP subnet it has watched traffic
+        for. That is the only runtime evidence in this whole script; everything
+        else compares one configuration against another. It answers a question no
+        amount of config reading can: is the VLAN really being delivered.
+
+        WHAT IT IS NOT. Absence of a VLAN here is not proof it is not trunked. A
+        VLAN with no broadcast or multicast traffic on it is simply never
+        observed, so a quiet VLAN and a missing one look identical. Presence is
+        strong - the frames arrived - and absence is a hint. Every finding built
+        on this has to say which of the two it is.
 
     .PARAMETER VMHostObject
         The host.
 
     .EXAMPLE
-        Get-EsxiDiscoveryCandidate -VMHostObject $esx
+        $hint = Get-EsxiNetworkHint -VMHostObject $esx
+        $hint.Neighbours
+        $hint.Observed
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -2365,9 +2660,11 @@ function Get-EsxiDiscoveryCandidate {
     )
 
     $hostName = [string]$VMHostObject.Name
-    if ($script:DiscoveryCache.ContainsKey($hostName)) { return @($script:DiscoveryCache[$hostName]) }
+    if ($script:DiscoveryCache.ContainsKey($hostName)) { return $script:DiscoveryCache[$hostName] }
 
     $found = New-Object System.Collections.Generic.List[object]
+    $observed = New-Object System.Collections.Generic.List[object]
+
     try {
         $hostView = Get-View -Id $VMHostObject.Id -ErrorAction Stop
         $networkSystem = Get-View -Id $hostView.ConfigManager.NetworkSystem -ErrorAction Stop
@@ -2406,6 +2703,20 @@ function Get-EsxiDiscoveryCandidate {
                             })
                         }
                     }
+
+                    # VLAN 0 here is untagged traffic, which arrives on the
+                    # uplink's native VLAN rather than on a VLAN of its own. It
+                    # is not a VLAN id and comparing it as one would report the
+                    # native VLAN missing on every host.
+                    foreach ($subnet in @(Get-MoProperty $hint 'Subnet' @())) {
+                        $vlanId = [int](Get-MoProperty $subnet 'VlanId' 0)
+                        if ($vlanId -le 0 -or $vlanId -gt 4094) { continue }
+                        [void]$observed.Add([pscustomobject]@{
+                            HostName = $hostName; Vmnic = $pnic.Device
+                            VlanId = $vlanId
+                            IpSubnet = [string](Get-MoProperty $subnet 'IpSubnet' '')
+                        })
+                    }
                 }
             }
             catch {
@@ -2414,16 +2725,78 @@ function Get-EsxiDiscoveryCandidate {
         }
     }
     catch {
-        Write-Log "Could not read CDP/LLDP for ${hostName}: $($_.Exception.Message)" -Level WARN
+        Write-Log "Could not read the network hints for ${hostName}: $($_.Exception.Message)" -Level WARN
     }
 
+    # Neighbours ordered so the most likely answer is first: the low-numbered
+    # uplinks before the rest, since those are the ones cabled to the fabric.
     $rows = $found.ToArray()
     $front = @($rows | Where-Object { $_.Vmnic -in @('vmnic0', 'vmnic1', 'vmnic2', 'vmnic3') })
     $rest = @($rows | Where-Object { $_.Vmnic -notin @('vmnic0', 'vmnic1', 'vmnic2', 'vmnic3') })
-    $ordered = @($front) + @($rest)
 
-    $script:DiscoveryCache[$hostName] = $ordered
-    return @($ordered)
+    $result = [pscustomobject]@{
+        HostName   = $hostName
+        Neighbours = @(@($front) + @($rest))
+        Observed   = $observed.ToArray()
+    }
+    $script:DiscoveryCache[$hostName] = $result
+    return $result
+}
+
+function Get-EsxiDiscoveryCandidate {
+    <#
+    .SYNOPSIS
+        Every CDP and LLDP neighbour name a host's physical NICs report, best first.
+
+    .PARAMETER VMHostObject
+        The host.
+
+    .EXAMPLE
+        Get-EsxiDiscoveryCandidate -VMHostObject $esx
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        $VMHostObject
+    )
+
+    return @((Get-EsxiNetworkHint -VMHostObject $VMHostObject).Neighbours)
+}
+
+function Get-EsxiObservedVlan {
+    <#
+    .SYNOPSIS
+        The VLAN ids a host has actually seen arriving on the given uplinks.
+
+    .DESCRIPTION
+        Runtime evidence rather than configuration. Restricted to the vmnics
+        given, so the answer belongs to one distributed switch rather than to the
+        host as a whole.
+
+    .PARAMETER VMHostObject
+        The host.
+
+    .PARAMETER Vmnic
+        The uplinks to count, e.g. vmnic2 and vmnic3.
+
+    .EXAMPLE
+        Get-EsxiObservedVlan -VMHostObject $esx -Vmnic @('vmnic2', 'vmnic3')
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        $VMHostObject,
+
+        [Parameter(Position = 1)]
+        [AllowEmptyCollection()]
+        [string[]]$Vmnic = @()
+    )
+
+    $rows = @((Get-EsxiNetworkHint -VMHostObject $VMHostObject).Observed)
+    if ($Vmnic.Count -gt 0) { $rows = @($rows | Where-Object { $Vmnic -contains $_.Vmnic }) }
+    return @($rows | ForEach-Object { [int]$_.VlanId } | Sort-Object -Unique)
 }
 
 function Get-UcsTargetForHost {
@@ -3185,6 +3558,17 @@ try {
                     -Actual (Format-IdList -Id @($member.VlanIds)) `
                     -Detail "$($member.VnicName) does not carry the same VLANs as its template '$($member.TemplateName)' - they differ by $(Format-IdList -Id @($member.TemplateDriftIds)). An initial-template edited after the profile was stamped shows the change in UCS Manager without applying it to the blade."
             }
+            Add-CheckResult -Finding @(Test-VnicFabricAssignment -Member $member -EvenFabric $EvenVnicFabric) `
+                -Scope 'UCS' -Domain $target -HostName $hostName -Check 'VnicFabric' -Subject $member.VnicName `
+                -Detail ("{0} is vNIC {1} and is on fabric {2}, which is where that ordinal belongs." -f $member.VnicName, $member.Ordinal, $member.SwitchId)
+
+            # Every vNIC is template bound here, and an untemplated one is the
+            # mechanism behind most of the drift the rest of this report finds -
+            # so it is a mismatch, not a recommendation, and always runs.
+            Add-CheckResult -Finding @(Test-VnicTemplateBinding -Member $member) `
+                -Scope 'UCS' -Domain $target -HostName $hostName -Check 'VnicTemplateBinding' -Subject $member.VnicName `
+                -Detail ("{0} is bound to vNIC template '{1}' ({2})." -f $member.VnicName, $member.TemplateName, $member.TemplateType)
+
             # Always run, best practice or not: two natives is a misconfiguration
             # whatever the design, and only the missing-native finding is the
             # part that rests on this estate's own convention.
@@ -3271,6 +3655,18 @@ try {
                     -TrunkedVlanId $trunked -NativeVlanId $nativeId -LargeTrunkThreshold $LargeTrunkThreshold) `
                 -Scope 'CrossCheck' -Domain $target -HostName $hostName -Check 'VdsVlanCoverage' -Subject $vdsName `
                 -Detail ("Every VLAN the {0} port group(s) on '{1}' need is trunked to the vmnics behind it ({2})." -f @($portGroupsByVds[$vdsName]).Count, $vdsName, (Format-IdList -Id $trunked))
+
+            # --- what the host actually sees arriving --------------------------
+            # The one place this script compares configuration against something
+            # other than more configuration.
+            if (-not $SkipObservedVlan) {
+                $requiredVlan = @(@($portGroupsByVds[$vdsName] | ForEach-Object { $_.VlanIds }) | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+                $observedVlan = @(Get-EsxiObservedVlan -VMHostObject $esx -Vmnic $vmnics)
+                Add-CheckResult -Finding @(Compare-VdsObservedVlan -VdsName $vdsName -ObservedVlanId $observedVlan `
+                        -RequiredVlanId $requiredVlan -TrunkedVlanId $trunked -Vmnic $vmnics) `
+                    -Scope 'CrossCheck' -Domain $target -HostName $hostName -Check 'ObservedVlan' -Subject $vdsName `
+                    -Detail ("Every VLAN seen arriving on {0} for '{1}' ({2}) has a port group that uses it, and every one of them is in the UCS trunk." -f ($vmnics -join ', '), $vdsName, (Format-IdList -Id $observedVlan))
+            }
 
             if (-not $SkipBestPractice) {
                 Add-CheckResult -Finding @(Test-VdsBestPractice -VdsName $vdsName -UplinkCount $vmnics.Count -DiscoveryOperation $discovery.Operation) `

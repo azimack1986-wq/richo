@@ -118,10 +118,31 @@ function Get-VMHost {
 
 # CDP on vmnic0 only, reporting fabric A. The script must reduce that to the
 # UCS Manager cluster name on its own.
+# Subnet[] is what ESXi has actually seen arriving on the uplink - the only
+# runtime evidence in the whole script.
+function New-Observed { param([int[]]$VlanId)
+    @($VlanId | ForEach-Object { [pscustomobject]@{ VlanId = $_; IpSubnet = "10.$_.0.0/24" } }) }
+
 $global:Hints = @{
     'vmnic0' = [pscustomobject]@{
         ConnectedSwitchPort = [pscustomobject]@{ SystemName = 'ucs01-A.example.com(FD0261301D1)'; DevId = 'ucs01-A'; PortId = 'Eth1/1' }
         LldpInfo = $null
+        # dvs-mgmt needs VLAN 10 and sees it.
+        Subnet = (New-Observed @(10))
+    }
+    'vmnic1' = [pscustomobject]@{
+        ConnectedSwitchPort = $null; LldpInfo = $null
+        Subnet = (New-Observed @(10))
+    }
+    # dvs-prod: VLAN 250 is needed and arrives. VLAN 600 arrives and no port
+    # group uses it - the fabric is delivering something nobody consumes.
+    'vmnic2' = [pscustomobject]@{
+        ConnectedSwitchPort = $null; LldpInfo = $null
+        Subnet = (New-Observed @(250, 600))
+    }
+    'vmnic3' = [pscustomobject]@{
+        ConnectedSwitchPort = $null; LldpInfo = $null
+        Subnet = (New-Observed @(250))
     }
 }
 
@@ -211,7 +232,6 @@ function Get-UcsVnicTemplate { param($Ucs, $ErrorAction) @(
     # Outside the configured pair groups, so nothing compares them to each
     # other - but the per-vNIC checks still have to run on them.
     (New-Template 'eth6-tmpl' 'A' '1500' 'CDP-ON')
-    (New-Template 'eth7-tmpl' 'B' '1500' 'CDP-ON')
 ) }
 
 function New-Vnic { param($Name, $Order, $Template)
@@ -226,7 +246,10 @@ function Get-UcsVnic { param($Ucs, $ErrorAction) @(
     (New-Vnic 'eth4' '5' 'eth4-tmpl')
     (New-Vnic 'eth5' '6' 'eth5-tmpl')
     (New-Vnic 'eth6' '7' 'eth6-tmpl')
-    (New-Vnic 'eth7' '8' 'eth7-tmpl')
+    # Built by hand: no template behind it at all. Nothing holds it to the other
+    # blades and no template change will ever reach it.
+    [pscustomobject]@{ Dn = 'org-root/ls-esx01/ether-eth7'; Name = 'eth7'; Order = '8'
+        NwTemplName = ''; Mtu = '1500'; SwitchId = 'B' }
 ) }
 
 function New-Interface { param($Parent, $Name, $Vnet, $Native = 'no')
@@ -251,8 +274,6 @@ function Get-UcsVnicInterface { param($Ucs, $ErrorAction) @(
     (New-Interface 'org-root/lan-conn-templ-eth5-tmpl' 'MGMT-10' 10)
     (New-Interface 'org-root/lan-conn-templ-eth6-tmpl' 'PROD-250' 250 'yes')
     (New-Interface 'org-root/lan-conn-templ-eth6-tmpl' 'MGMT-10' 10 'yes')
-    (New-Interface 'org-root/lan-conn-templ-eth7-tmpl' 'PROD-250' 250 'yes')
-    (New-Interface 'org-root/lan-conn-templ-eth7-tmpl' 'MGMT-10' 10)
 
     # --- below the service profile's vNICs ---
     # The design: several VLANs trunked per vNIC, exactly one of them native.
@@ -408,12 +429,43 @@ Assert-Equal 'and it names eth3'                    'eth3' (Get-Check 'VnicNoNat
 # configured pair groups, which must not stop the per-vNIC checks running.
 $nativeOk = @((Get-Check 'VnicNativeVlan') | Where-Object { $_.Severity -eq 'OK' } | ForEach-Object { $_.Subject } | Sort-Object)
 Assert-Equal 'the correctly-natived vNICs are clean' 'eth0; eth1; eth2; eth4; eth5; eth7' ($nativeOk -join '; ')
+# -SkipObservedVlan must not change any of the above.
+Assert-Equal 'the runtime check is separable'       $true ([bool]@($findings | Where-Object { $_.Check -eq 'ObservedVlan' -or $_.Check -like 'Vlan*Observed*' }).Count)
 # eth4/eth5 are built exactly the way this estate builds a vNIC: two VLANs
 # trunked, one of them native, one leg per fabric. Nothing may be said about
 # them - if trunking several VLANs were ever treated as suspect, this is where
 # it would show up.
 $referenceFaults = @($findings | Where-Object { $_.Severity -in @('ERROR', 'WARN') -and $_.Subject -in @('eth4', 'eth5', 'eth4/eth5') })
 Assert-Equal 'a correctly-built multi-VLAN trunk draws no comment' 0 $referenceFaults.Count
+
+Write-Host "`n=== Even vNICs on fabric A, odd on fabric B ===" -ForegroundColor Cyan
+# eth3 is an odd ordinal sitting on fabric A. Its pair is ALSO flagged as being
+# on one fabric - the two checks say different things about the same blade, and
+# both are worth saying: one is a lost redundancy, the other a lost convention.
+Assert-Equal 'the odd vNIC on fabric A is reported' 1 (Get-Check 'VnicWrongFabric').Count
+Assert-Equal 'and it names eth3'                    'eth3' (Get-Check 'VnicWrongFabric')[0].Subject
+Assert-Equal 'and says which fabric it belongs on'  'fabric B' (Get-Check 'VnicWrongFabric')[0].Expected
+$fabricOk = @((Get-Check 'VnicFabric') | Where-Object { $_.Severity -eq 'OK' }).Count
+Assert-Equal 'the correctly-placed vNICs are clean'  7 $fabricOk
+
+Write-Host "`n=== Every vNIC must be template bound ===" -ForegroundColor Cyan
+Assert-Equal 'the hand-built vNIC is reported'  1 (Get-Check 'VnicNotTemplated').Count
+Assert-Equal 'and it names eth7'                'eth7' (Get-Check 'VnicNotTemplated')[0].Subject
+Assert-Equal 'as a mismatch, not a recommendation' 'Consistency' (Get-Check 'VnicNotTemplated')[0].Category
+$boundOk = @((Get-Check 'VnicTemplateBinding') | Where-Object { $_.Severity -eq 'OK' }).Count
+Assert-Equal 'and the bound ones are recorded clean' 7 $boundOk
+
+Write-Host "`n=== What the host sees on the wire ===" -ForegroundColor Cyan
+# VLAN 600 arrives on dvs-prod's uplinks and no port group uses it. Strong
+# evidence - the frames are there - so it is a warning, not a hint.
+Assert-Equal 'a VLAN arriving that nothing uses' 1 (Get-Check 'VlanObservedNotOnVds').Count
+Assert-Equal 'and it names the VLAN'             'dvs-prod / VLAN 600' (Get-Check 'VlanObservedNotOnVds')[0].Subject
+Assert-Equal 'as a warning'                      'WARN' (Get-Check 'VlanObservedNotOnVds')[0].Severity
+# 600 is not in the UCS trunk list either, so the config and the wire disagree.
+Assert-Equal 'and that it is outside the trunk'  1 (Get-Check 'VlanObservedNotTrunked').Count
+# dvs-mgmt trunks 10 and 250 but only 10 is needed and only 10 is seen. The
+# unseen 250 is a hint, never an error.
+Assert-Equal 'a configured VLAN never seen is INFO' $false ([bool]@((Get-Check 'VlanOnVdsNotObserved') | Where-Object { $_.Severity -ne 'INFO' }).Count)
 
 Write-Host "`n=== Checks that ran clean are recorded, not just omitted ===" -ForegroundColor Cyan
 Assert-Equal 'the clean vNIC pair is recorded'  1     (Get-Check 'VnicPair').Count
@@ -474,6 +526,18 @@ finally {
     Remove-Item -Path $csvPath -Force -ErrorAction SilentlyContinue
 }
 
+Write-Host "`n=== -SkipObservedVlan ===" -ForegroundColor Cyan
+try {
+    $noRuntime = @(& $scriptPath -UcsManager 'ucs01.example.com' -VIServer 'vcenter01.example.com' `
+        -Credential $credential -SkipObservedVlan -IncludeInformational 6>$null 3>$null)
+    Assert-Equal 'the configuration checks still run' $true (@($noRuntime | Where-Object { $_.Check -eq 'VdsVlanCoverage' }).Count -gt 0)
+    Assert-Equal 'and nothing is claimed from the wire' 0 @($noRuntime | Where-Object { $_.Check -in @('ObservedVlan', 'VlanObservedNotOnVds', 'VlanObservedNotTrunked', 'VlanOnVdsNotObserved', 'NoVlanObserved') }).Count
+}
+catch {
+    Write-Host "  The -SkipObservedVlan run threw: $($_.Exception.Message)" -ForegroundColor Red
+    $script:fail++
+}
+
 Write-Host "`n=== -SkipBestPractice ===" -ForegroundColor Cyan
 try {
     $consistencyOnly = @(& $scriptPath -UcsManager 'ucs01.example.com' -VIServer 'vcenter01.example.com' `
@@ -484,6 +548,8 @@ try {
     # native rests on this estate's convention and must not.
     Assert-Equal 'two natives survives -SkipBestPractice' 1 @($consistencyOnly | Where-Object { $_.Check -eq 'VnicMultipleNativeVlans' }).Count
     Assert-Equal 'a missing native does not'              0 @($consistencyOnly | Where-Object { $_.Check -eq 'VnicNoNativeVlan' }).Count
+    # An untemplated vNIC is the mechanism behind the drift, not a style note.
+    Assert-Equal 'an untemplated vNIC survives it too'    1 @($consistencyOnly | Where-Object { $_.Check -eq 'VnicNotTemplated' }).Count
 }
 catch {
     Write-Host "  The -SkipBestPractice run threw: $($_.Exception.Message)" -ForegroundColor Red
