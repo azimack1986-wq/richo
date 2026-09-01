@@ -4490,3 +4490,19 @@ of it immediately.
   fails if a LUN is missing, or is a different device or a different size from the RDM
   being moved. Worth it the first time through a new cluster; skippable once the
   presentation is routine.
+
+### [2.10.0] — 2026-09-01
+
+#### Changed
+
+- **Host eligibility no longer asks every host what it mounts.** It was one vCenter round
+  trip per host — about a second each, so the better part of a minute on a 42-host
+  cluster, every group, every run. A datastore knows which hosts have it mounted, so the
+  mount tables of the destination datastore cluster and the RDM datastore are read
+  instead: two queries, whatever the cluster size. The checks are unchanged — connected,
+  powered on, out of maintenance mode, mounts both — and a host that cannot mount the RDM
+  datastore is still excluded, because a VM placed there fails at re-attach, after it has
+  moved.
+
+- Exclusions are summarised by reason with the hosts named, rather than one line per
+  host. On a large cluster the list is the noise and the reason is the signal.

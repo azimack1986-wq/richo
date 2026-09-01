@@ -184,7 +184,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.9.0'
+$ScriptVersion = '2.10.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -1264,6 +1264,11 @@ function Get-EligibleDestinationHosts {
         every host to re-confirm it was the slowest thing this script did. What must be
         presented is printed instead, and -VerifyLunPresentation reads it back on request.
 
+        The mounts are read from the datastores, not from the hosts. Asking each host what
+        it mounts is one round trip per host - a minute of them on a 42-host cluster - and
+        answers a question two queries already answer: a datastore knows which hosts have
+        it mounted.
+
     .PARAMETER Cluster
         The destination cluster.
 
@@ -1285,21 +1290,33 @@ function Get-EligibleDestinationHosts {
         $RdmDatastore
     )
 
-    $datastoreClusterIds = @(Get-Datastore -Location $DatastoreCluster | ForEach-Object { [string]$_.Id })
     $eligible = [System.Collections.Generic.List[object]]::new()
     $exclusions = [System.Collections.Generic.List[string]]::new()
-
-    $candidateHosts = @(Get-VMHost -Location $Cluster)
-    $activity = "Checking hosts in '$($Cluster.Name)'"
-    Write-RichoLog "  Checking $($candidateHosts.Count) host(s) in '$($Cluster.Name)' for datastore access." -Level INFO
-
-    $hostIndex = 0
     $scanStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
-    foreach ($candidateHost in $candidateHosts) {
-        $hostIndex++
-        Write-Progress -Activity $activity -Status "$hostIndex of $($candidateHosts.Count): $($candidateHost.Name)" -PercentComplete ([int](($hostIndex / [math]::Max(1, $candidateHosts.Count)) * 100))
+    $candidateHosts = @(Get-VMHost -Location $Cluster)
+    $podDatastores = @(Get-Datastore -Location $DatastoreCluster)
+    Write-RichoLog "  Checking $($candidateHosts.Count) host(s) in '$($Cluster.Name)' against the mount tables of $($podDatastores.Count + 1) datastore(s)." -Level INFO
 
+    # Two reads, whatever the cluster size: a datastore's own mount table names every host
+    # that has it. MoRef values are prefixed with the type so they compare directly with
+    # the Id PowerCLI puts on a VMHost.
+    $podHostIds = @(
+        Get-View -Id @($podDatastores | ForEach-Object { $_.Id }) -Property Host |
+            ForEach-Object { $_.Host } |
+            Where-Object { $_.MountInfo.Mounted -and $_.MountInfo.Accessible } |
+            ForEach-Object { "$($_.Key.Type)-$($_.Key.Value)" } |
+            Select-Object -Unique
+    )
+    $rdmHostIds = @(
+        Get-View -Id $RdmDatastore.Id -Property Host |
+            ForEach-Object { $_.Host } |
+            Where-Object { $_.MountInfo.Mounted -and $_.MountInfo.Accessible } |
+            ForEach-Object { "$($_.Key.Type)-$($_.Key.Value)" } |
+            Select-Object -Unique
+    )
+
+    foreach ($candidateHost in $candidateHosts) {
         if ($candidateHost.ConnectionState -ne 'Connected') {
             $exclusions.Add("$($candidateHost.Name): connection state is $($candidateHost.ConnectionState)")
             continue
@@ -1312,26 +1329,26 @@ function Get-EligibleDestinationHosts {
             $exclusions.Add("$($candidateHost.Name): in maintenance mode")
             continue
         }
-
-        $hostDatastoreIds = @(Get-Datastore -VMHost $candidateHost | ForEach-Object { [string]$_.Id })
-        if (@($datastoreClusterIds | Where-Object { $_ -in $hostDatastoreIds }).Count -eq 0) {
+        if ([string]$candidateHost.Id -notin $podHostIds) {
             $exclusions.Add("$($candidateHost.Name): mounts no datastore from '$($DatastoreCluster.Name)'")
             continue
         }
-        if ($RdmDatastore.Id -notin $hostDatastoreIds) {
+        if ([string]$candidateHost.Id -notin $rdmHostIds) {
             $exclusions.Add("$($candidateHost.Name): does not mount RDM datastore '$($RdmDatastore.Name)'")
             continue
         }
 
         $eligible.Add([pscustomobject]@{ VMHost = $candidateHost })
-        Write-RichoLog "    [$hostIndex/$($candidateHosts.Count)] $($candidateHost.Name): eligible." -Level INFO
     }
 
-    Write-Progress -Activity $activity -Completed
     $scanStopwatch.Stop()
-    Write-RichoLog "  $($eligible.Count) of $($candidateHosts.Count) host(s) can take these VMs ($(Format-Elapsed -Elapsed $scanStopwatch.Elapsed))." -Level INFO
-    foreach ($exclusion in $exclusions) {
-        Write-RichoLog "    excluded - $exclusion" -Level WARN
+    Write-RichoLog "  $($eligible.Count) of $($candidateHosts.Count) host(s) can take these VMs ($(Format-Elapsed -Elapsed $scanStopwatch.Elapsed)). $($exclusions.Count) excluded." -Level INFO
+
+    # Named, not listed one per line: on a large cluster the exclusions are the noise and
+    # the reason is the signal.
+    foreach ($reason in @($exclusions | ForEach-Object { ($_ -split ': ', 2)[1] } | Select-Object -Unique)) {
+        $affected = @($exclusions | Where-Object { $_ -like "*: $reason" } | ForEach-Object { ($_ -split ': ', 2)[0] })
+        Write-RichoLog "    $($affected.Count) host(s) excluded - $reason : $($affected -join ', ')" -Level WARN
     }
 
     return [pscustomobject]@{

@@ -412,6 +412,29 @@ function Get-View {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Id, $Property)
 
+    # A datastore's mount table, the way eligibility reads it now: one query for all of
+    # them, each entry naming a host by managed object reference.
+    $datastoreIds = @(@($Id) | Where-Object { [string]$_ -like 'Datastore-*' })
+    if ($datastoreIds.Count -gt 0) {
+        return @(
+            $datastoreIds | ForEach-Object {
+                $datastoreId = [string]$_
+                $datastore = @($global:Sim.Datastores.Values | Where-Object { $_.Id -eq $datastoreId })[0]
+                $mounts = @(
+                    $global:Sim.Hosts.Values |
+                        Where-Object { $datastore.Name -in $global:Sim.HostDatastores[[string]$_.Name] } |
+                        ForEach-Object {
+                            [pscustomobject]@{
+                                Key       = [pscustomobject]@{ Type = 'HostSystem'; Value = ([string]$_.Id -replace '^HostSystem-', '') }
+                                MountInfo = [pscustomobject]@{ Mounted = $true; Accessible = $true }
+                            }
+                        }
+                )
+                [pscustomobject]@{ Id = $datastoreId; Host = $mounts }
+            }
+        )
+    }
+
     $identifier = [string]$Id
 
     if ($identifier -like 'ResourcePool-*') {
@@ -848,6 +871,14 @@ try {
         Assert-Equal $manifest.RdmDatastore 'simsql02sit_i_rdm' 'The RDM datastore was not derived from the cluster and workload type.'
         Assert-True ([bool]$manifest.RdmDatastoreDerived) 'The manifest does not record that the datastore name was derived.'
         Assert-True (($manifest.ExcludedHosts -join ' ') -like '*sim-esx03*') 'The host that does not mount the RDM datastore was not reported as excluded.'
+    }
+
+    Invoke-SimTest 'Host eligibility does not ask every host what it mounts' {
+        # A 42-host cluster made this one round trip per host. The datastore's own mount
+        # table answers it in two.
+        $log = Get-Content -LiteralPath $executeLog -Raw
+        Assert-True ($log -match 'against the mount tables of') 'Eligibility is not reading the datastore mount tables.'
+        Assert-True ($log -notmatch 'eligible\.') 'Eligibility is still logging one line per host.'
     }
 
     Invoke-SimTest 'The presentation prerequisite is stated, device by device' {

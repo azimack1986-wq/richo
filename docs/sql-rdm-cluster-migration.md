@@ -210,8 +210,10 @@ still up:
 - Destination cluster, resource pool, datastore cluster and RDM datastore each
   resolve to exactly one object, matched case-sensitively.
 - Every eligible destination host is connected, powered on, out of maintenance mode and
-  mounts both the destination datastore cluster and the RDM datastore. Hosts that fail
-  are logged with the reason; if none qualifies, the reasons are in the error.
+  mounts both the destination datastore cluster and the RDM datastore. That is read from
+  the **datastores' own mount tables** — two queries whatever the cluster size, rather
+  than asking each of 42 hosts what it mounts. Hosts that fail are summarised by reason;
+  if none qualifies, the reasons are in the error.
 - No two disks in the group resolve to the same device.
 - The devices to re-attach are the ones the VMs already have — same LUNs, re-presented —
   so nothing has to scan a host to find them and the operator never types an NAA.
