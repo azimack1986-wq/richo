@@ -4565,3 +4565,13 @@ of it immediately.
   controllers, with `sharingNone` disks and an explicit disk mode. The assertion is
   round-trip fidelity — every setting comes back exactly as the source had it — so a
   future change that normalises any of them fails here rather than in a guest.
+
+### [2.12.1] — 2026-09-01
+
+#### Added
+
+- **The banner names the file that ran**, with its last-write time and size, next to the
+  version. Two failures were chased through several releases before the line numbers in a
+  traceback showed the run had been a stale copy on a share, three versions behind the
+  fixes for both. A version alone did not settle it, because the version was never in the
+  pasted log; the path and timestamp now are.

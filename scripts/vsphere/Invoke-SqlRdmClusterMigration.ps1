@@ -193,7 +193,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.12.0'
+$ScriptVersion = '2.12.1'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -2622,6 +2622,14 @@ $script:RunStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 try {
     $bannerMode = if ($Execute) { 'EXECUTE' } else { 'DRY RUN - nothing will be changed' }
     Write-RichoLog "Invoke-SqlRdmClusterMigration v$ScriptVersion - $bannerMode against $VCenter" -Level INFO
+
+    # Which file actually ran, and when it was last written. These scripts are run from a
+    # versioned folder on a share, and a stale copy there reports failures that were fixed
+    # releases ago - a whole afternoon was spent on two of them.
+    if ($PSCommandPath) {
+        $scriptFile = Get-Item -LiteralPath $PSCommandPath
+        Write-RichoLog "Running $($scriptFile.FullName), last written $($scriptFile.LastWriteTime.ToString('yyyy-MM-dd HH:mm')), $([math]::Round($scriptFile.Length / 1KB)) KB." -Level INFO
+    }
 
     if ($IgnoreInvalidCertificate) {
         Set-PowerCLIConfiguration -InvalidCertificateAction Ignore -Scope Session -Confirm:$false | Out-Null
