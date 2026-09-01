@@ -83,6 +83,11 @@
     Allow a hard power-off, and only when VMware Tools is not running. Without it a
     powered-on VM whose Tools are unavailable stops the migration.
 
+.PARAMETER VerifyLunPresentation
+    Read the destination hosts' storage and confirm every LUN in the CSV is presented
+    before anything is changed. Off by default: presentation and rescanning are the
+    engineer's prerequisite, and the read costs one storage enumeration per host.
+
 .PARAMETER PowerOnAfterMigration
     Power the VMs on at the destination once every migration group has been relocated,
     re-attached and verified - a workload type at a time, groups in CSV order and VMs in
@@ -166,6 +171,9 @@ param(
     [switch]$PowerOnAfterMigration,
 
     [Parameter()]
+    [switch]$VerifyLunPresentation,
+
+    [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$OutputFolder = (Join-Path (Get-Location) 'SqlRdmClusterMigrationOutput'),
 
@@ -176,7 +184,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.8.1'
+$ScriptVersion = '2.9.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -193,7 +201,11 @@ $script:ValidWorkloadTypes = @('PROD', 'SIT', 'DEV')
 
 $script:Plan = [System.Collections.Generic.List[object]]::new()
 $script:Results = [System.Collections.Generic.List[object]]::new()
-$script:Verification = [System.Collections.Generic.List[object]]::new()
+# Named Rows, not Verification: at script scope $verification would be the same variable
+# as $script:Verification - PowerShell does not distinguish case - and a local of that
+# name in the main body replaced this list with an array, which broke every execution run
+# at the point it wrote its evidence.
+$script:VerificationRows = [System.Collections.Generic.List[object]]::new()
 
 # Highest SCSI unit number on a controller. Unit 7 is reserved for the controller itself.
 $script:MaxScsiUnitNumber = 15
@@ -614,10 +626,12 @@ function Format-Elapsed {
         [timespan]$Elapsed
     )
 
+    # [int] rounds in PowerShell - [int]1.5 is 2 - so 90 seconds came out as "2m 30s".
+    # Floor is what a clock does.
     if ($Elapsed.TotalMinutes -lt 1) { return "$([math]::Round($Elapsed.TotalSeconds, 1))s" }
-    if ($Elapsed.TotalHours -lt 1) { return "$([int]$Elapsed.TotalMinutes)m $($Elapsed.Seconds)s" }
+    if ($Elapsed.TotalHours -lt 1) { return "$([int][math]::Floor($Elapsed.TotalMinutes))m $($Elapsed.Seconds)s" }
 
-    return "$([int]$Elapsed.TotalHours)h $($Elapsed.Minutes)m"
+    return "$([int][math]::Floor($Elapsed.TotalHours))h $($Elapsed.Minutes)m"
 }
 
 function Wait-VMLongTask {
@@ -1055,6 +1069,7 @@ function Get-VMRdmLayout {
         $rdms.Add([pscustomobject]@{
             Label          = [string]$device.DeviceInfo.Label
             CanonicalName  = $canonicalName
+            DeviceName     = [string]$backing.DeviceName
             CapacityGB     = [math]::Round($capacityBytes / 1GB, 3)
             ControllerBus  = [int]$controller.BusNumber
             UnitNumber     = [int]$device.UnitNumber
@@ -1177,16 +1192,77 @@ function Resolve-DestinationLun {
     }
 }
 
+function Confirm-LunPresentation {
+    <#
+    .SYNOPSIS
+        Reads the destination hosts back and confirms every LUN is presented.
+
+    .DESCRIPTION
+        Only ever run on request. Presenting the LUNs and rescanning is the engineer's
+        prerequisite, and confirming it costs a full storage enumeration per host - the
+        slowest thing this script used to do, on every run, whether anyone doubted the
+        presentation or not.
+
+    .PARAMETER DestinationHosts
+        The eligible destination host records.
+
+    .PARAMETER Svm
+        SVM presenting the LUNs.
+
+    .PARAMETER Disks
+        The resolved destination disks, carrying the LUN IDs and the device identities
+        taken from the source RDMs.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$DestinationHosts,
+
+        [Parameter(Mandatory)]
+        [string]$Svm,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$Disks
+    )
+
+    foreach ($record in $DestinationHosts) {
+        $hostName = $record.VMHost.Name
+        Write-RichoLog "    $hostName : reading storage paths and devices..." -Level INFO
+        $hostStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $storageMap = Get-HostStorageMap -VMHost $record.VMHost
+
+        foreach ($disk in $Disks) {
+            $resolved = Resolve-DestinationLun -StorageMap $storageMap -Svm $Svm -LunId $disk.LunId
+            if ($resolved.CanonicalName -ne $disk.CanonicalName) {
+                throw "On '$hostName', SVM '$Svm' LUN $($disk.LunId) is device '$($resolved.CanonicalName)', but the RDM being moved is '$($disk.CanonicalName)'."
+            }
+            if ([math]::Abs($resolved.CapacityGB - $disk.CapacityGB) -gt $script:CapacityToleranceGB) {
+                throw "On '$hostName', LUN $($disk.LunId) is $($resolved.CapacityGB) GB but the RDM being moved is $($disk.CapacityGB) GB."
+            }
+        }
+
+        $hostStopwatch.Stop()
+        Write-RichoLog "      all $($Disks.Count) LUN(s) present and matching ($(Format-Elapsed -Elapsed $hostStopwatch.Elapsed))." -Level INFO
+    }
+}
+
 function Get-EligibleDestinationHosts {
     <#
     .SYNOPSIS
         Returns the destination hosts that can run the migrated VMs.
 
     .DESCRIPTION
-        A host qualifies only if it is connected, out of maintenance mode, mounts the
-        destination datastore cluster and the RDM pointer datastore, and resolves every
-        LUN in the group. Hosts that fail are reported with the reason - "no eligible
-        host" on its own tells the operator nothing about which prerequisite is missing.
+        A host qualifies if it is connected, powered on, out of maintenance mode, and
+        mounts both the destination datastore cluster and the RDM pointer datastore.
+        Hosts that fail are reported with the reason - "no eligible host" on its own tells
+        the operator nothing about which prerequisite is missing.
+
+        Storage presentation is NOT checked here. Presenting the LUNs to the destination
+        hosts and rescanning is the engineer's prerequisite, and reading every path on
+        every host to re-confirm it was the slowest thing this script did. What must be
+        presented is printed instead, and -VerifyLunPresentation reads it back on request.
 
     .PARAMETER Cluster
         The destination cluster.
@@ -1196,12 +1272,6 @@ function Get-EligibleDestinationHosts {
 
     .PARAMETER RdmDatastore
         Datastore that holds the RDM mapping files.
-
-    .PARAMETER Svm
-        SVM presenting the LUNs.
-
-    .PARAMETER LunIds
-        Every LUN ID in the migration group.
     #>
     [CmdletBinding()]
     param(
@@ -1212,14 +1282,7 @@ function Get-EligibleDestinationHosts {
         $DatastoreCluster,
 
         [Parameter(Mandatory)]
-        $RdmDatastore,
-
-        [Parameter(Mandatory)]
-        [string]$Svm,
-
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [int[]]$LunIds
+        $RdmDatastore
     )
 
     $datastoreClusterIds = @(Get-Datastore -Location $DatastoreCluster | ForEach-Object { [string]$_.Id })
@@ -1228,7 +1291,7 @@ function Get-EligibleDestinationHosts {
 
     $candidateHosts = @(Get-VMHost -Location $Cluster)
     $activity = "Checking hosts in '$($Cluster.Name)'"
-    Write-RichoLog "  Checking $($candidateHosts.Count) host(s) in '$($Cluster.Name)' for datastore and LUN access. This is the slow part - one storage read per host." -Level INFO
+    Write-RichoLog "  Checking $($candidateHosts.Count) host(s) in '$($Cluster.Name)' for datastore access." -Level INFO
 
     $hostIndex = 0
     $scanStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1260,32 +1323,16 @@ function Get-EligibleDestinationHosts {
             continue
         }
 
-        try {
-            # Said before the read, not after: the read is the slow bit, and a name on
-            # screen while it runs is the difference between working and hung.
-            Write-RichoLog "    [$hostIndex/$($candidateHosts.Count)] $($candidateHost.Name): reading storage paths and devices..." -Level INFO
-            $hostStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-            $storageMap = Get-HostStorageMap -VMHost $candidateHost
-            $resolvedLuns = [System.Collections.Generic.List[object]]::new()
-            foreach ($lunId in $LunIds) {
-                $resolvedLuns.Add((Resolve-DestinationLun -StorageMap $storageMap -Svm $Svm -LunId $lunId))
-            }
-            $hostStopwatch.Stop()
-            $eligible.Add([pscustomobject]@{
-                VMHost = $candidateHost
-                Luns   = $resolvedLuns.ToArray()
-            })
-            Write-RichoLog "         all $($LunIds.Count) LUN(s) resolved ($(Format-Elapsed -Elapsed $hostStopwatch.Elapsed))." -Level INFO
-        }
-        catch {
-            $exclusions.Add("$($candidateHost.Name): $($_.Exception.Message)")
-            Write-RichoLog "         excluded - $($_.Exception.Message)" -Level WARN
-        }
+        $eligible.Add([pscustomobject]@{ VMHost = $candidateHost })
+        Write-RichoLog "    [$hostIndex/$($candidateHosts.Count)] $($candidateHost.Name): eligible." -Level INFO
     }
 
     Write-Progress -Activity $activity -Completed
     $scanStopwatch.Stop()
     Write-RichoLog "  $($eligible.Count) of $($candidateHosts.Count) host(s) can take these VMs ($(Format-Elapsed -Elapsed $scanStopwatch.Elapsed))." -Level INFO
+    foreach ($exclusion in $exclusions) {
+        Write-RichoLog "    excluded - $exclusion" -Level WARN
+    }
 
     return [pscustomobject]@{
         Hosts      = $eligible.ToArray()
@@ -2010,32 +2057,15 @@ function Resolve-MigrationPlan {
             Cluster          = $cluster
             DatastoreCluster = $datastoreCluster
             RdmDatastore     = $rdmDatastore
-            Svm              = $svm
-            LunIds           = [int[]]$allLunIds.ToArray()
         }
         $eligibility = Get-EligibleDestinationHosts @eligibleHostParameters
         $eligibleHosts = $eligibility.Hosts
         if ($eligibleHosts.Count -eq 0) {
             $reasons = if ($eligibility.Exclusions.Count -gt 0) { " Hosts were excluded because - $($eligibility.Exclusions -join '; ')" } else { '' }
-            throw "No eligible destination host in '$groupName' can access all required datastores and LUNs.$reasons"
+            throw "No eligible destination host in '$groupName' can mount both the destination datastore cluster and the RDM datastore.$reasons"
         }
         if (($eligibleHosts.Count -eq 1) -and ($vmNames.Count -gt 1)) {
             Write-RichoLog "Only one eligible host in '$groupName'; every node of this cluster will land on $($eligibleHosts[0].VMHost.Name). Separate them before the guests are brought back into service." -Level WARN
-        }
-
-        foreach ($lunId in $allLunIds) {
-            $identities = @(
-                $eligibleHosts |
-                    ForEach-Object {
-                        $_.Luns |
-                            Where-Object { $_.LunId -eq $lunId } |
-                            ForEach-Object { $_.CanonicalName }
-                    } |
-                    Select-Object -Unique
-            )
-            if ($identities.Count -ne 1) {
-                throw "LUN $lunId resolves to inconsistent device identities across eligible hosts: $($identities -join ', ')."
-            }
         }
 
         Write-RichoLog "  Reading the RDM topology of $($vmNames.Count) VM(s)." -Level INFO
@@ -2151,36 +2181,49 @@ function Resolve-MigrationPlan {
                     throw "Source topology differs from CSV order at LUN $lunId : the CSV places it at SCSI $($diskGroup.ControllerBus):$unitNumber, the source has SCSI $($reference.ControllerBus):$($reference.UnitNumber)."
                 }
 
-                $destinationCandidates = @($eligibleHosts[0].Luns | Where-Object { $_.LunId -eq $lunId })
-                if ($destinationCandidates.Count -ne 1) {
-                    throw "LUN $lunId resolved to $($destinationCandidates.Count) devices on '$($eligibleHosts[0].VMHost.Name)'; expected one."
-                }
-                $destinationLun = $destinationCandidates[0]
-
-                # A mistyped LUN ID that happens to exist on the array is the failure this
-                # catches: same SVM, wrong disk, and nothing else in the run would notice
-                # until SQL failed to bring the disk online.
-                if ([math]::Abs($destinationLun.CapacityGB - $reference.CapacityGB) -gt $script:CapacityToleranceGB) {
-                    throw "LUN $lunId is $($destinationLun.CapacityGB) GB but the RDM it replaces at SCSI $($diskGroup.ControllerBus):$unitNumber is $($reference.CapacityGB) GB."
+                # The device is the one the VM already has. These are the same LUNs,
+                # re-presented to the destination cluster, so the mapping the source RDM
+                # carries is the mapping to put back - which is why nothing here has to
+                # scan a host to find it, and why the operator never types an NAA.
+                if ([string]::IsNullOrWhiteSpace($reference.DeviceName)) {
+                    throw "The RDM at SCSI $($diskGroup.ControllerBus):$unitNumber on '$($referenceItem.VM.Name)' has no device path to re-attach."
                 }
 
                 $resolvedDisks.Add([pscustomobject]@{
-                    LunId                = $lunId
-                    CanonicalName        = $destinationLun.CanonicalName
-                    ConsoleDeviceName    = $destinationLun.ConsoleDeviceName
-                    CapacityGB           = $destinationLun.CapacityGB
-                    ControllerBus        = $diskGroup.ControllerBus
-                    UnitNumber           = $unitNumber
-                    SourceCanonicalName  = $reference.CanonicalName
-                    SourceCapacityGB     = $reference.CapacityGB
-                    SameDeviceAsSource   = ($destinationLun.CanonicalName -eq $reference.CanonicalName)
-                    SourceLabel          = $reference.Label
+                    LunId             = $lunId
+                    CanonicalName     = $reference.CanonicalName
+                    ConsoleDeviceName = $reference.DeviceName
+                    CapacityGB        = $reference.CapacityGB
+                    ControllerBus     = $diskGroup.ControllerBus
+                    UnitNumber        = $unitNumber
+                    SourceLabel       = $reference.Label
                 })
                 $diskIndex++
             }
         }
 
         Write-RichoLog "  Plan resolved: $($resolvedDisks.Count) LUN(s) across $($controllers.Count) controller(s), $mappingMode mapping files." -Level INFO
+
+        # Presentation is the engineer's prerequisite, so it is stated rather than
+        # checked: these devices, on these hosts, before this group runs.
+        $destinationHostNames = @($eligibleHosts | ForEach-Object { $_.VMHost.Name })
+        $prerequisite = [System.Collections.Generic.List[string]]::new()
+        $prerequisite.Add("Present these LUNs from SVM '$svm' to $($destinationHostNames -join ', ') and rescan the HBAs before running group '$groupName':")
+        foreach ($disk in $resolvedDisks) {
+            $prerequisite.Add("  LUN $($disk.LunId)  $($disk.CanonicalName)  $($disk.CapacityGB) GB  -> SCSI $($disk.ControllerBus):$($disk.UnitNumber)")
+        }
+
+        Write-RichoLog '  ---- PREREQUISITE, not checked by this script ----' -Level INFO
+        foreach ($line in $prerequisite) { Write-RichoLog "  $line" -Level INFO }
+
+        if ($VerifyLunPresentation) {
+            Write-RichoLog '  -VerifyLunPresentation was supplied; reading the destination hosts back.' -Level INFO
+            Confirm-LunPresentation -DestinationHosts $eligibleHosts -Svm $svm -Disks $resolvedDisks.ToArray()
+        }
+        else {
+            Write-RichoLog '  Not verified. Supply -VerifyLunPresentation to have the hosts read back, at one storage enumeration each.' -Level INFO
+        }
+        Write-RichoLog '  -------------------------------------------------' -Level INFO
 
         $duplicateDevices = @(
             $resolvedDisks |
@@ -2209,6 +2252,8 @@ function Resolve-MigrationPlan {
             Controllers         = $controllers.ToArray()
             MappingMode         = $mappingMode
             MappingFiles        = @{}
+            Prerequisite        = $prerequisite.ToArray()
+            LunPresentationVerified = [bool]$VerifyLunPresentation
             HostExclusions      = $eligibility.Exclusions
         })
     }
@@ -2247,6 +2292,8 @@ function New-MigrationManifest {
         RdmDatastore                = $GroupPlan.RdmDatastore.Name
         RdmDatastoreDerived         = $GroupPlan.RdmDatastoreDerived
         RdmMappingMode              = $GroupPlan.MappingMode
+        PresentationPrerequisite    = $GroupPlan.Prerequisite
+        LunPresentationVerified     = $GroupPlan.LunPresentationVerified
         ExcludedHosts               = $GroupPlan.HostExclusions
         Controllers                 = $GroupPlan.Controllers
         VMs = @($GroupPlan.VMItems | ForEach-Object {
@@ -2536,16 +2583,16 @@ try {
             Add-Result $groupPlan.Name '' 'Verify' 'DryRun' 'Post-migration verification runs only in an execution run.'
         }
         else {
-            $verification = @(Confirm-MigrationOutcome -GroupPlan $groupPlan)
-            $script:Verification.AddRange($verification)
-            $failures = @($verification | Where-Object { $_.Status -ne 'Passed' })
+            $groupVerification = @(Confirm-MigrationOutcome -GroupPlan $groupPlan)
+            $script:VerificationRows.AddRange($groupVerification)
+            $failures = @($groupVerification | Where-Object { $_.Status -ne 'Passed' })
             foreach ($failure in $failures) {
                 Add-Result $groupPlan.Name $failure.VM 'Verify' 'Failed' "SCSI $($failure.ScsiAddress): $($failure.Detail)"
             }
             if ($failures.Count -gt 0) {
                 throw "Post-migration verification failed for $($failures.Count) disk(s) in '$($groupPlan.Name)'. See the verification CSV."
             }
-            Add-Result $groupPlan.Name '' 'Verify' 'Passed' "All $($verification.Count) disk placements match the plan."
+            Add-Result $groupPlan.Name '' 'Verify' 'Passed' "All $($groupVerification.Count) disk placements match the plan."
         }
 
         $groupStatus = if ($DryRun) { 'DryRunPassed' } else { 'Succeeded' }
@@ -2582,7 +2629,7 @@ finally {
     if (Test-Path -LiteralPath $OutputFolder) {
         Export-RunArtifact -Records $script:Plan.ToArray() -Name 'change-plan' -Folder $OutputFolder
         Export-RunArtifact -Records $script:Results.ToArray() -Name 'results' -Folder $OutputFolder
-        Export-RunArtifact -Records $script:Verification.ToArray() -Name 'verification' -Folder $OutputFolder
+        Export-RunArtifact -Records $script:VerificationRows.ToArray() -Name 'verification' -Folder $OutputFolder
     }
     if ($connection) {
         Disconnect-VIServer -Server $connection -Confirm:$false -ErrorAction SilentlyContinue

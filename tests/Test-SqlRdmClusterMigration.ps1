@@ -251,9 +251,12 @@ try {
     }
 
     Invoke-NativeTest 'Elapsed times are rendered for an operator, not a debugger' {
-        Assert-Equal (Format-Elapsed -Elapsed ([timespan]::FromSeconds(4.25))) '4.3s' 'Seconds are wrong.'
+        Assert-Equal (Format-Elapsed -Elapsed ([timespan]::FromSeconds(4.26))) '4.3s' 'Seconds are wrong.'
+        Assert-Equal (Format-Elapsed -Elapsed ([timespan]::FromSeconds(0.5))) '0.5s' 'Sub-second is wrong.'
         Assert-Equal (Format-Elapsed -Elapsed ([timespan]::FromSeconds(90))) '1m 30s' 'Minutes are wrong.'
+        Assert-Equal (Format-Elapsed -Elapsed ([timespan]::FromSeconds(150))) '2m 30s' 'Minutes are wrong just past the half.'
         Assert-Equal (Format-Elapsed -Elapsed ([timespan]::FromMinutes(75))) '1h 15m' 'Hours are wrong.'
+        Assert-Equal (Format-Elapsed -Elapsed ([timespan]::FromMinutes(90))) '1h 30m' 'Hours are wrong on the half hour.'
     }
 
     Invoke-NativeTest 'Shipped sample CSV is accepted and matches the required header' {
@@ -545,6 +548,36 @@ try {
         Assert-True ($text -match 'carries no LUN from this migration') 'The leave-it-alone rule for LUN-less controllers is missing.'
     }
 
+    Invoke-NativeTest 'No local in the main body shadows a script-scope variable' {
+        # SHIPPED. PowerShell variable names are case-insensitive, so at script scope
+        # $verification IS $script:Verification - a local of that name in the main body
+        # replaced the results list with an array, and every execution run died writing
+        # its evidence. Assignments inside functions are safe; only the main body shares
+        # the script scope.
+        $functions = @($functionAsts)
+        $scriptScoped = @(
+            $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.VariableExpressionAst] }, $true) |
+                Where-Object { $_.VariablePath.IsScript } |
+                ForEach-Object { ($_.VariablePath.UserPath -replace '^script:', '').ToLower() } |
+                Select-Object -Unique
+        )
+        $shadowed = @(
+            $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+                Where-Object { $_.Left -is [System.Management.Automation.Language.VariableExpressionAst] } |
+                Where-Object { -not $_.Left.VariablePath.IsScript } |
+                Where-Object {
+                    $node = $_
+                    $inside = @($functions | Where-Object {
+                        ($node.Extent.StartOffset -ge $_.Extent.StartOffset) -and ($node.Extent.EndOffset -le $_.Extent.EndOffset)
+                    })
+                    $inside.Count -eq 0
+                } |
+                Where-Object { $scriptScoped -contains $_.Left.VariablePath.UserPath.ToLower() } |
+                ForEach-Object { "line $($_.Extent.StartLineNumber): `$$($_.Left.VariablePath.UserPath)" }
+        )
+        Assert-Equal $shadowed.Count 0 "Locals in the main body shadow script-scope state: $($shadowed -join '; ')."
+    }
+
     Invoke-NativeTest 'A failure is reported against the line that failed' {
         # Write-RichoLog ERROR calls Write-Error, which under $ErrorActionPreference =
         # 'Stop' becomes the terminating error itself - so the rethrow never ran and the
@@ -606,7 +639,8 @@ try {
     Invoke-NativeTest 'RDM attach sets the SCSI unit in the device spec, not afterwards' {
         Assert-True ($text -match '\$disk\.UnitNumber = \$UnitNumber') 'The add spec does not set the unit number.'
         Assert-True ($text -notmatch 'function Set-HardDiskUnitNumber') 'The unsupported post-attach unit-number edit is back.'
-        Assert-True ($text -notmatch '(?m)^\s*New-HardDisk') 'RDMs are being added with New-HardDisk, which cannot pick the unit.'
+        $newHardDiskCalls = @(Get-CommandAst -Ast $ast -Name 'New-HardDisk')
+        Assert-Equal $newHardDiskCalls.Count 0 'RDMs are being added with New-HardDisk, which cannot pick the unit.'
     }
 
     Invoke-NativeTest 'Destination controller type comes from the source, not a hardcoded PVSCSI' {
@@ -615,9 +649,31 @@ try {
         Assert-True ($text -match 'ControllerType = \$controller\.GetType\(\)\.FullName') 'The source controller type is not recorded.'
     }
 
-    Invoke-NativeTest 'Destination LUN capacity is checked against the RDM it replaces' {
+    Invoke-NativeTest 'Capacity is checked everywhere it still can be' {
         Assert-True ($text -match 'CapacityToleranceGB') 'No capacity tolerance is defined.'
-        Assert-True ($text -match 'but the RDM it replaces at SCSI') 'No capacity comparison against the source RDM was found.'
+        Assert-True ($text -match 'Capacity is \$\(\$actual\[0\]\.CapacityGB\)') 'Post-migration verification does not compare capacity.'
+        Assert-True ($text -match 'but the RDM being moved is') 'The opt-in presentation check does not compare capacity.'
+    }
+
+    Invoke-NativeTest 'Host storage is read only when presentation is being verified' {
+        # Presenting the LUNs is the engineer's prerequisite. Reading every path on every
+        # host to re-confirm it was the slowest thing the script did, on every run.
+        $storageReads = @(Get-CommandAst -Ast $ast -Name 'Get-HostStorageMap')
+        Assert-True ($storageReads.Count -gt 0) 'The host storage read has gone entirely; -VerifyLunPresentation needs it.'
+
+        $verifyFunction = @($functionAsts | Where-Object { $_.Name -eq 'Confirm-LunPresentation' })
+        Assert-Equal $verifyFunction.Count 1 'Confirm-LunPresentation is missing.'
+
+        $outside = @(
+            $storageReads |
+                Where-Object {
+                    ($_.Extent.StartOffset -lt $verifyFunction[0].Extent.StartOffset) -or
+                    ($_.Extent.EndOffset -gt $verifyFunction[0].Extent.EndOffset)
+                } |
+                ForEach-Object { "line $($_.Extent.StartLineNumber)" }
+        )
+        Assert-Equal $outside.Count 0 "Host storage is read outside the opt-in verification: $($outside -join ', ')."
+        Assert-True ($text -match 'PREREQUISITE, not checked by this script') 'The prerequisite is not printed for the engineer.'
     }
 
     Invoke-NativeTest 'RDM discovery matches device types rather than duck-typing a backing' {

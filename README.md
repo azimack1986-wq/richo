@@ -160,3 +160,4 @@ They are independent, so any one can be run on its own:
 | `Test-IntersightFailureKind.ps1` | Auth failure vs. a response the client cannot parse |
 | `Test-ModuleEnumerationCache.ps1` | Module enumeration happens once, not per lookup |
 | `Test-SqlRdmClusterMigration.ps1` | The SQL RDM migration tool: CSV rules, SCSI unit allocation, the change gate, and its own safety guards |
+| `Test-SqlRdmMigrationSimulation.ps1` | The whole SQL RDM migration, dry run and live, against a simulated vCenter |

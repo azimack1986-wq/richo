@@ -4430,3 +4430,63 @@ behavioural rather than cosmetic.
   the destination (the rebuild has nowhere to put those LUNs), and a controller carrying
   this migration's LUNs alongside a disk the CSV does not describe (removing it would
   detach someone else's disk).
+
+### [2.8.2] — 2026-09-01
+
+PowerShell was installed in the development sandbox for the first time, so this revision
+is the first that has actually been run rather than only reviewed. Two defects fell out
+of it immediately.
+
+#### Fixed
+
+- **Every execution run would have died writing its evidence.** At script scope
+  `$verification` and `$script:Verification` are the same variable — PowerShell does not
+  distinguish case — so the local holding one group's verification rows replaced the list
+  that collects them all. `AddRange` then failed on an array, and because that happened
+  inside the `try`, the `finally` failed too and reported *its* error, hiding the real
+  one. The list is now `$script:VerificationRows` and the local is `$groupVerification`.
+
+- **`Format-Elapsed` rounded up.** `[int]1.5` is 2 in PowerShell, so 90 seconds printed
+  as "2m 30s". It floors now, like a clock.
+
+#### Tests
+
+- `tests/Test-SqlRdmMigrationSimulation.ps1` — the whole workflow against a simulated
+  vCenter: compiled `VMware.Vim` stand-ins so the script's type tests behave as they do
+  against the real SDK, and PowerCLI cmdlets as functions over an inventory that a
+  reconfigure really mutates. Fifteen assertions covering a dry run that changes nothing,
+  an execution run that ends with every RDM back at its own SCSI address on a
+  same-typed, physically-shared controller, SCSI 0 and a stray SCSI 2 untouched, the
+  second node attaching the first node's mapping files, nothing moving until every node
+  has given up its disks, power-on last and in CSV order, and the excluded host reported
+  with its reason. This is what caught the shadowing defect.
+
+- A static guard in the unit suite for that whole class of bug: no local in the main body
+  may share a name with script-scope state.
+
+### [2.9.0] — 2026-09-01
+
+#### Changed
+
+- **The per-host LUN scan is gone.** Presenting the LUNs to the destination hosts and
+  rescanning is the engineer's prerequisite, and confirming it cost one full storage
+  enumeration per host per run — the slowest thing the script did, and the source of the
+  long silences that looked like a hang. Host eligibility is now the cheap part alone:
+  connected, powered on, out of maintenance mode, mounting the destination datastore
+  cluster and the RDM datastore.
+
+- **The devices to re-attach come from the VMs themselves.** These are the same LUNs,
+  re-presented to the destination cluster, so the mapping each source RDM already
+  carries is the mapping to put back. Nothing has to resolve SVM plus LUN ID to a
+  canonical name, and the operator still never types an NAA.
+
+- **The prerequisite is printed instead of checked**, device by device, with the LUN ID,
+  the device identity, the size and the SCSI address it is going back to, and the hosts
+  it must be presented to. A dry run is now a work order.
+
+#### Added
+
+- **`-VerifyLunPresentation`**, off by default: reads the destination hosts back and
+  fails if a LUN is missing, or is a different device or a different size from the RDM
+  being moved. Worth it the first time through a new cluster; skippable once the
+  presentation is routine.

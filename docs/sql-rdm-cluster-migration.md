@@ -133,7 +133,7 @@ Validating WSFC and SQL inside the guests is still yours.
 
 | Prerequisite | Why |
 | --- | --- |
-| Destination LUNs presented to the destination hosts, HBAs rescanned | The script never presents or rescans storage; it fails a host that cannot see a LUN |
+| Destination LUNs presented to the destination hosts, HBAs rescanned | **Yours to do, and not checked by default.** The script prints exactly which devices must be presented, on which hosts, before it changes anything; `-VerifyLunPresentation` makes it read the hosts back |
 | Destination resource pool, datastore cluster and RDM pointer datastore exist | Each is resolved by exact, case-sensitive name |
 | `VMware.VimAutomation.Core` available on the jump host | The only dependency. Loaded once, behind a `Get-Module` guard; nothing is installed |
 | vCenter permissions for cold migration, device add/remove and power operations | Everything the run does |
@@ -209,14 +209,12 @@ still up:
 
 - Destination cluster, resource pool, datastore cluster and RDM datastore each
   resolve to exactly one object, matched case-sensitively.
-- Every eligible destination host is connected, out of maintenance mode, mounts the
-  destination datastore cluster and the RDM datastore, and resolves every LUN. Hosts
-  that fail are logged with the reason; if none qualifies, the reasons are in the
-  error.
-- Every LUN resolves to the same canonical device on every eligible host.
-- No two CSV LUN IDs resolve to the same device.
-- Each destination LUN's capacity matches the RDM it replaces, within 1 GB. This is
-  what catches a mistyped LUN ID that happens to exist on the same SVM.
+- Every eligible destination host is connected, powered on, out of maintenance mode and
+  mounts both the destination datastore cluster and the RDM datastore. Hosts that fail
+  are logged with the reason; if none qualifies, the reasons are in the error.
+- No two disks in the group resolve to the same device.
+- The devices to re-attach are the ones the VMs already have — same LUNs, re-presented —
+  so nothing has to scan a host to find them and the operator never types an NAA.
 - Every VM in the group has the same RDM topology as the first: same buses, units,
   capacities and controller type, all on physical-sharing controllers, and no
   snapshots.
@@ -238,6 +236,30 @@ Once the VMs are powered down, and before anything moves:
 - A controller carrying this migration's LUNs **alongside** a disk the CSV does not
   describe also stops the run. Move that disk to SCSI 0, or take the VM out of the
   migration.
+
+## The presentation prerequisite
+
+Presenting the LUNs to the destination hosts and rescanning the HBAs is the engineer's
+job, before the run. The script does not do it and, by default, does not check it —
+reading every path on every host to re-confirm it was the slowest thing the script did,
+on every run, whether anyone doubted the presentation or not.
+
+What it does instead is **state it**, device by device, before anything changes:
+
+```text
+  ---- PREREQUISITE, not checked by this script ----
+  Present these LUNs from SVM 'sql-svm01' to esx02, esx04 and rescan the HBAs before running group 'D24SQL01':
+    LUN 40  naa.60a98000...4d31  100 GB  -> SCSI 1:0
+    LUN 41  naa.60a98000...4d32  250 GB  -> SCSI 1:1
+    LUN 42  naa.60a98000...4d33  500 GB  -> SCSI 1:2
+  Not verified. Supply -VerifyLunPresentation to have the hosts read back, at one storage enumeration each.
+  -------------------------------------------------
+```
+
+Run a dry run first and that list is your work order. `-VerifyLunPresentation` reads the
+destination hosts back and fails if any LUN is missing or is a different device or size
+from the RDM being moved — worth it the first time through a new cluster, and skippable
+once the presentation is routine.
 
 ## What it does at the destination
 
