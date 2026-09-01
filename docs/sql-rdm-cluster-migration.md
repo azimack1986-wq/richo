@@ -7,6 +7,24 @@ cluster, and puts every shared disk back at exactly the SCSI address it came fro
 - Tests: [`tests/Test-SqlRdmClusterMigration.ps1`](../tests/Test-SqlRdmClusterMigration.ps1)
 - Sample CSV: [`scripts/vsphere/SqlRdmClusterMigration.Sample.csv`](../scripts/vsphere/SqlRdmClusterMigration.Sample.csv)
 
+## Running it from a jump host
+
+The script is self-contained: no configuration file, nothing imported from this
+repository, and PowerCLI as its only dependency. It carries its own copies of
+`Write-RichoLog` and `Get-RichoCredential` so the log format and credential handling
+match the rest of the estate without needing `Richo.Common` on the box.
+
+Copy these into one folder on the jump host and it runs there as-is:
+
+```text
+Invoke-SqlRdmClusterMigration.ps1
+Test-SqlRdmClusterMigration.ps1
+SqlRdmClusterMigration.Sample.csv   (or your completed migration CSV)
+```
+
+The test script looks for the migration script beside itself first and falls back to
+the repository layout, so the same file works in both places.
+
 ## Usage
 
 ```powershell
@@ -35,14 +53,15 @@ cluster, and puts every shared disk back at exactly the SCSI address it came fro
     -Execute -PowerAction ShutdownGuest -ForcePowerOffIfGuestShutdownUnavailable
 ```
 
-`-WhatIf` works in both parameter sets and is a genuine no-op: every change is
-announced and none is made, including the post-migration verification, which only
-runs when something actually changed.
+There are two modes and nothing in between. `-DryRun` announces every change and
+makes none; `-Execute` performs them. The plan file a dry run writes is the same list
+of operations a live run performs, so what you review is what will happen.
 
-Credentials come from `Get-RichoCredential` — SecretManagement first, then
-`RICHO_<NAME>_USER` / `RICHO_<NAME>_PASSWORD`, then a prompt. The lookup name
-defaults to the vCenter FQDN; override it with `-CredentialName`. `-Credential`
-still takes a `PSCredential` directly.
+Credentials resolve through the script's own credential helper — SecretManagement
+first, then `RICHO_<NAME>_USER` / `RICHO_<NAME>_PASSWORD`, then a prompt. The lookup
+name defaults to the vCenter FQDN; override it with `-CredentialName`. `-Credential`
+still takes a `PSCredential` directly, which is what an unattended run on a jump host
+would normally use.
 
 > `-ForcePowerOffIfGuestShutdownUnavailable` is deliberately opt-in. Without it, a
 > powered-on VM whose VMware Tools is not running stops the migration. With it, a hard
@@ -111,7 +130,7 @@ Validating WSFC and SQL inside the guests is still yours.
 | --- | --- |
 | Destination LUNs presented to the destination hosts, HBAs rescanned | The script never presents or rescans storage; it fails a host that cannot see a LUN |
 | Destination resource pool, datastore cluster and RDM pointer datastore exist | Each is resolved by exact, case-sensitive name |
-| `VMware.VimAutomation.Core` available on the jump host | Loaded once, behind a `Get-Module` guard; nothing is installed |
+| `VMware.VimAutomation.Core` available on the jump host | The only dependency. Loaded once, behind a `Get-Module` guard; nothing is installed |
 | vCenter permissions for cold migration, device add/remove and power operations | Everything the run does |
 | An approved outage window | Every VM in a group is shut down before any of them moves |
 
@@ -211,7 +230,6 @@ writes its temporary CSVs to the temporary directory and deletes them.
 ## Safety notes
 
 - `-DryRun` performs VMware reads and writes local evidence files only.
-- `-WhatIf` is a genuine no-op in either parameter set.
 - The script does not present LUNs on the array and does not rescan ESXi HBAs.
 - RDM removal always uses `-DeletePermanently:$false`.
 - A hard power-off is unavailable unless the explicit force switch is supplied, and

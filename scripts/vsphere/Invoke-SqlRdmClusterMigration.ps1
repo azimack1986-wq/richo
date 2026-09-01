@@ -28,8 +28,14 @@
     reproduced from the source rather than assumed.
 
     -DryRun performs discovery and produces local evidence files without invoking any
-    VMware modification. -Execute performs the migration. -WhatIf is honoured in both
-    parameter sets and is a genuine no-op.
+    VMware modification. -Execute performs the migration. There is no third mode: the
+    dry run is the no-op.
+
+    The script is self-contained. It reads no configuration file, imports nothing from
+    this repository, and needs only PowerCLI on the host, so it can be copied to a jump
+    host on its own and run there. Its logging and credential helpers are the
+    Richo.Common ones, carried here rather than imported, so the call sites and the log
+    format are the same as everything else in the repo.
 
     The script does not present LUNs on the array and does not rescan HBAs. Both are
     prerequisites - see docs/sql-rdm-cluster-migration.md.
@@ -47,11 +53,11 @@
     Perform the migration.
 
 .PARAMETER Credential
-    vCenter credential. When omitted it is resolved through Get-RichoCredential, which
-    tries SecretManagement, then the RICHO_* environment variables, then a prompt.
+    vCenter credential. When omitted it is resolved by the credential helper below,
+    which tries SecretManagement, then the RICHO_* environment variables, then a prompt.
 
 .PARAMETER CredentialName
-    Logical credential name for Get-RichoCredential. Defaults to the vCenter FQDN.
+    Logical credential name for the credential helper. Defaults to the vCenter FQDN.
 
 .PARAMETER PowerAction
     What to do with a VM that is still powered on. 'None' fails the run; 'ShutdownGuest'
@@ -85,7 +91,11 @@
     Migrates the groups in the CSV and powers the VMs on at the destination in CSV order.
 #>
 #Requires -Version 5.1
-[CmdletBinding(SupportsShouldProcess, DefaultParameterSetName = 'DryRun')]
+# Deliberately no SupportsShouldProcess, and so a departure from the repo convention:
+# -DryRun and -Execute are the two modes, and a single gate in Invoke-PlannedChange
+# decides between them. A second way to say "change nothing" is one too many for a tool
+# run under an outage window.
+[CmdletBinding(DefaultParameterSetName = 'DryRun')]
 param(
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
@@ -133,17 +143,12 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.2.0'
+$ScriptVersion = '2.3.0'
 $connection = $null
 
-# $PSCmdlet is captured so the change gate is callable from a function. The native test
-# suite loads these functions on their own and sets it to $null, which means "no host to
-# ask" - the gate then falls through to the -DryRun decision alone.
-$script:Cmdlet = $PSCmdlet
-# -WhatIf is honoured in both parameter sets. An Execute run with -WhatIf changes nothing,
-# so everything that asks "did this run touch anything" has to consult both.
-$script:NoOpRun = ($DryRun -or $WhatIfPreference)
-$script:RunMode = if ($DryRun) { 'DryRun' } elseif ($WhatIfPreference) { 'WhatIf' } else { 'Execute' }
+# There are exactly two modes and one gate between them: -DryRun records what would
+# happen, -Execute does it. Nothing else in the script decides whether to change a VM.
+$script:RunMode = if ($DryRun) { 'DryRun' } else { 'Execute' }
 
 $script:Plan = [System.Collections.Generic.List[object]]::new()
 $script:Results = [System.Collections.Generic.List[object]]::new()
@@ -157,32 +162,147 @@ $script:ReservedScsiUnitNumber = 7
 # rounds, and an array reports usable rather than raw capacity, so an exact match is wrong.
 $script:CapacityToleranceGB = 1
 
+function Write-RichoLog {
+    <#
+    .SYNOPSIS
+        Writes a timestamped, levelled log line to the host and optionally to a file.
+
+    .DESCRIPTION
+        The Richo.Common implementation, carried here so this script runs on a jump host
+        with nothing but PowerCLI. The format is deliberately identical:
+
+            2026-09-01 14:32:07Z [INFO ] Connecting to vcenter01.example.com
+
+        INFO and DEBUG go to the information and verbose streams, WARN to the warning
+        stream and ERROR to the error stream, so redirection and -ErrorAction behave the
+        way callers expect.
+
+    .PARAMETER Message
+        The text to log.
+
+    .PARAMETER Level
+        Severity: DEBUG, INFO, WARN or ERROR. Defaults to INFO.
+
+    .PARAMETER Path
+        Optional log file to append to. Defaults to $env:RICHO_LOG_FILE when set.
+
+    .EXAMPLE
+        Write-RichoLog 'Connected to vCenter.' -Level INFO
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0, ValueFromPipeline)]
+        [AllowEmptyString()]
+        [string]$Message,
+
+        [Parameter(Position = 1)]
+        [ValidateSet('DEBUG', 'INFO', 'WARN', 'ERROR')]
+        [string]$Level = 'INFO',
+
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$Path = $env:RICHO_LOG_FILE
+    )
+
+    process {
+        $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ')
+        $line = '{0} [{1,-5}] {2}' -f $stamp, $Level, $Message
+
+        switch ($Level) {
+            'DEBUG' { Write-Verbose $line }
+            'INFO'  { Write-Information $line -InformationAction Continue }
+            'WARN'  { Write-Warning $line }
+            'ERROR' { Write-Error $line }
+        }
+
+        if ($Path) {
+            $directory = Split-Path -Path $Path -Parent
+            if ($directory -and -not (Test-Path -LiteralPath $directory)) {
+                New-Item -Path $directory -ItemType Directory -Force | Out-Null
+            }
+            Add-Content -Path $Path -Value $line -Encoding UTF8
+        }
+    }
+}
+
+function Get-RichoCredential {
+    <#
+    .SYNOPSIS
+        Resolves a PSCredential for a named target without hardcoding a secret.
+
+    .DESCRIPTION
+        The Richo.Common implementation, carried here for the same reason as the logger.
+        Resolution order:
+
+          1. SecretManagement - Get-Secret -Name $Name, when the module is present.
+          2. Environment variables - RICHO_<NAME>_USER and RICHO_<NAME>_PASSWORD, with
+             the name upper-cased and non-alphanumerics replaced by '_'. Suits a
+             scheduled or unattended run.
+          3. An interactive prompt.
+
+        Nothing is read from a plaintext file and nothing is written back to disk.
+
+    .PARAMETER Name
+        Logical credential name, e.g. the vCenter FQDN.
+
+    .EXAMPLE
+        $credential = Get-RichoCredential -Name 'vcenter01.example.com'
+    #>
+    [CmdletBinding()]
+    [OutputType([pscredential])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name
+    )
+
+    if (Get-Command -Name 'Get-Secret' -ErrorAction SilentlyContinue) {
+        $secret = Get-Secret -Name $Name -ErrorAction SilentlyContinue
+        if ($secret -is [pscredential]) {
+            Write-RichoLog "Resolved credential '$Name' from SecretManagement." -Level DEBUG
+            return $secret
+        }
+    }
+
+    $slug = ($Name -replace '[^A-Za-z0-9]', '_').ToUpperInvariant()
+    $user = [Environment]::GetEnvironmentVariable("RICHO_${slug}_USER")
+    $password = [Environment]::GetEnvironmentVariable("RICHO_${slug}_PASSWORD")
+
+    if ($user -and $password) {
+        Write-RichoLog "Resolved credential '$Name' from environment variables." -Level DEBUG
+        return [pscredential]::new($user, (ConvertTo-SecureString $password -AsPlainText -Force))
+    }
+
+    return (Get-Credential -Message "Credentials for '$Name'")
+}
+
 function Import-RequiredModules {
     <#
     .SYNOPSIS
         Loads the modules this script needs, once, and never installs anything.
 
     .DESCRIPTION
-        Each load is behind a Get-Module check so a module already in the session - a
-        pinned vendor bundle included - is left exactly as it is. Only
-        VMware.VimAutomation.Core is needed; the VMware.PowerCLI meta-module pulls in
-        dozens of unrelated modules and costs a minute of load time to do it.
+        PowerCLI is the script's only dependency, and the load is behind a Get-Module
+        check so a module already in the session - a pinned vendor bundle included - is
+        left exactly as it is. Nothing is installed or updated.
+
+        Only VMware.VimAutomation.Core is needed; the VMware.PowerCLI meta-module pulls
+        in dozens of unrelated modules and costs a minute of load time to do it. The load
+        is explicit rather than left to auto-loading, which has been seen to fail on the
+        first use in a new session against a cold command-discovery cache.
     #>
     [CmdletBinding()]
     param()
 
-    $required = [ordered]@{
-        'Richo.Common'              = (Join-Path $PSScriptRoot '..\..\modules\Richo.Common\Richo.Common.psd1')
-        'VMware.VimAutomation.Core' = 'VMware.VimAutomation.Core'
-    }
+    $required = @('VMware.VimAutomation.Core')
 
-    foreach ($name in $required.Keys) {
+    foreach ($name in $required) {
         if (Get-Module -Name $name) { continue }
         try {
-            Import-Module -Name $required[$name] -ErrorAction Stop
+            Import-Module -Name $name -ErrorAction Stop
         }
         catch {
-            throw "Required module '$name' could not be loaded: $($_.Exception.Message)"
+            throw "PowerCLI module '$name' is not available on this host: $($_.Exception.Message)"
         }
     }
 }
@@ -267,38 +387,6 @@ function Add-Result {
     })
 }
 
-function Confirm-Change {
-    <#
-    .SYNOPSIS
-        Decides whether a mutating operation may run.
-
-    .DESCRIPTION
-        -DryRun is answered here rather than by ShouldProcess so a dry run stays a dry run
-        even when the operator also passes -Confirm. Otherwise the host decides, which is
-        what makes -WhatIf a genuine no-op.
-
-    .PARAMETER Target
-        The object being changed.
-
-    .PARAMETER Action
-        The change being made to it.
-    #>
-    [CmdletBinding()]
-    [OutputType([bool])]
-    param(
-        [Parameter(Mandatory)]
-        [string]$Target,
-
-        [Parameter(Mandatory)]
-        [string]$Action
-    )
-
-    if ($DryRun) { return $false }
-    if ($null -eq $script:Cmdlet) { return $true }
-
-    return $script:Cmdlet.ShouldProcess($Target, $Action)
-}
-
 function Invoke-PlannedChange {
     <#
     .SYNOPSIS
@@ -360,10 +448,9 @@ function Invoke-PlannedChange {
         Detail         = $Detail
     })
 
-    if (-not (Confirm-Change -Target $Target -Action $Action)) {
-        $status = if ($DryRun) { 'DryRun' } else { 'Skipped' }
-        Write-RichoLog "  $status : $Detail" -Level INFO
-        Add-Result $MigrationGroup $VM $Action $status $Detail
+    if ($DryRun) {
+        Write-RichoLog "  DRY RUN: $Detail" -Level INFO
+        Add-Result $MigrationGroup $VM $Action 'DryRun' $Detail
         return
     }
 
@@ -1254,7 +1341,7 @@ function Remove-RdmsAndControllers {
             Get-HardDisk -VM $currentVM |
                 Where-Object { $_.ExtensionData.ControllerKey -eq $controller.ExtensionData.Key }
         )
-        if ($script:NoOpRun) {
+        if ($DryRun) {
             $plannedLabels = @(
                 $VMItem.Layout.Rdms |
                     Where-Object { $_.ControllerBus -eq $bus } |
@@ -1757,8 +1844,7 @@ function Export-RunArtifact {
 Import-RequiredModules
 
 try {
-    $bannerMode = if ($Execute) { 'EXECUTE' } else { 'DRY RUN' }
-    if ($WhatIfPreference) { $bannerMode = "$bannerMode (-WhatIf: nothing will be changed)" }
+    $bannerMode = if ($Execute) { 'EXECUTE' } else { 'DRY RUN - nothing will be changed' }
     Write-RichoLog "Invoke-SqlRdmClusterMigration v$ScriptVersion - $bannerMode against $VCenter" -Level INFO
 
     if ($IgnoreInvalidCertificate) {
@@ -1788,7 +1874,7 @@ try {
         Write-RichoLog "$($groupPlan.VMItems.Count) VM(s), $($groupPlan.Disks.Count) RDM(s), $($groupPlan.MappingMode) mapping files, destination $($groupPlan.Cluster.Name)/$($groupPlan.ResourcePool.Name)." -Level INFO
 
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-        $modeLabel = if ($script:NoOpRun) { 'dryrun' } else { 'execution' }
+        $modeLabel = if ($DryRun) { 'dryrun' } else { 'execution' }
         $safeGroupName = $groupPlan.Name -replace '[^\w.-]', '_'
         $manifestPath = Join-Path $OutputFolder "$safeGroupName-$modeLabel-manifest-$stamp.json"
         New-MigrationManifest -GroupPlan $groupPlan |
@@ -1832,8 +1918,8 @@ try {
             }
         }
 
-        if ($script:NoOpRun) {
-            Add-Result $groupPlan.Name '' 'Verify' $script:RunMode 'Post-migration verification runs only in a run that changes something.'
+        if ($DryRun) {
+            Add-Result $groupPlan.Name '' 'Verify' 'DryRun' 'Post-migration verification runs only in an execution run.'
         }
         else {
             $verification = @(Confirm-MigrationOutcome -GroupPlan $groupPlan)
@@ -1848,7 +1934,7 @@ try {
             Add-Result $groupPlan.Name '' 'Verify' 'Passed' "All $($verification.Count) disk placements match the plan."
         }
 
-        $groupStatus = if ($script:NoOpRun) { 'NoChangesMade' } else { 'Succeeded' }
+        $groupStatus = if ($DryRun) { 'DryRunPassed' } else { 'Succeeded' }
         Add-Result $groupPlan.Name '' 'Group' $groupStatus 'Migration group processing completed.'
         Write-RichoLog "Migration group $($groupPlan.Name): $groupStatus." -Level INFO
     }

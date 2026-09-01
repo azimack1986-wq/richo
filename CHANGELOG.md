@@ -4219,3 +4219,34 @@ behavioural rather than cosmetic.
 - PowerShell is not installed in the Claude Code web sandbox, so this revision was
   reviewed statically and has not been executed, linted or run against vCenter.
   Run the native tests and a dry run before trusting it.
+
+### [2.3.0] — 2026-09-01
+
+#### Changed
+
+- **The script is standalone.** It no longer imports `Richo.Common` by relative path,
+  reads no configuration file, and depends on nothing in this repository. Copy it to a
+  jump host next to the CSV and it runs. `Write-RichoLog` and `Get-RichoCredential`
+  are carried in the script itself — the same implementations, so the log format and
+  the credential resolution order (SecretManagement, then `RICHO_*` environment
+  variables, then a prompt) are unchanged, and the call sites still read like the rest
+  of the repo. PowerCLI is the only dependency, loaded once behind a `Get-Module`
+  guard, and only `VMware.VimAutomation.Core`.
+
+- **`-WhatIf` is gone; there are two modes.** `-DryRun` and `-Execute`, with one gate
+  between them. `SupportsShouldProcess`, `$PSCmdlet.ShouldProcess` and the
+  `Confirm-Change` helper are removed, along with the third `Skipped` outcome they
+  produced. Everything that used to ask "did this run change anything" asks `$DryRun`
+  directly. This is a deliberate departure from the repo-wide `ShouldProcess`
+  convention: the dry run is the no-op, and having two ways to say so was one too
+  many for a tool operators run under an outage window.
+
+#### Tests
+
+- `tests/Test-SqlRdmClusterMigration.ps1` finds the script beside itself before
+  falling back to the repository layout, so the same test file works on a jump host.
+  The `ShouldProcess` case is replaced by two structural tests: that exactly the two
+  parameter sets and the single `$DryRun` gate exist, and that the script stays
+  self-contained — no shared-module import, no unguarded `Import-Module`, no
+  environment configuration file, no install or update of a module, and its own copies
+  of the logging and credential helpers present.

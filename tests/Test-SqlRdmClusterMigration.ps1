@@ -32,26 +32,41 @@
 [CmdletBinding()]
 param(
     [Parameter()]
-    [string]$ScriptPath = (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts/vsphere/Invoke-SqlRdmClusterMigration.ps1'),
+    [string]$ScriptPath,
 
     [Parameter()]
-    [string]$SampleCsvPath = (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts/vsphere/SqlRdmClusterMigration.Sample.csv')
+    [string]$SampleCsvPath
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+# The script and its sample CSV are found either beside this file - the layout when the
+# pair has been copied to a jump host - or in the repository, from tests/.
+function Resolve-PackageFile {
+    param([string]$FileName)
+    $candidates = @(
+        (Join-Path $PSScriptRoot $FileName),
+        (Join-Path (Split-Path $PSScriptRoot -Parent) "scripts/vsphere/$FileName")
+    )
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
+    return $candidates[-1]
+}
+
+if (-not $ScriptPath) { $ScriptPath = Resolve-PackageFile 'Invoke-SqlRdmClusterMigration.ps1' }
+if (-not $SampleCsvPath) { $SampleCsvPath = Resolve-PackageFile 'SqlRdmClusterMigration.Sample.csv' }
+
 $script:Passed = 0
 $script:Failed = 0
 $script:TempFiles = [System.Collections.Generic.List[string]]::new()
 
-# Scope the loaded helpers expect to find. In the script these are set from the parameters
-# and from $PSCmdlet; here they are set by each test.
+# Scope the loaded helpers expect to find. In the script these come from the parameters;
+# here each test sets them.
 $ScriptVersion = 'test'
 $DryRun = $true
-$script:Cmdlet = $null
 $script:RunMode = 'DryRun'
-$script:NoOpRun = $true
 $script:MaxScsiUnitNumber = 15
 $script:ReservedScsiUnitNumber = 7
 $script:CapacityToleranceGB = 1
@@ -59,7 +74,9 @@ $script:Plan = [System.Collections.Generic.List[object]]::new()
 $script:Results = [System.Collections.Generic.List[object]]::new()
 
 function Write-RichoLog {
-    # Stub. The real one lives in Richo.Common, which these tests deliberately do not load.
+    # Quiet stub. The script carries its own copy of this function; loading it here would
+    # scatter log lines through the test output, so its presence is asserted structurally
+    # instead.
     param([string]$Message, [string]$Level = 'INFO', [string]$Path)
     Write-Verbose "$Level $Message"
 }
@@ -138,7 +155,6 @@ try {
     $requiredFunctions = @(
         'ConvertTo-ValueList',
         'Add-Result',
-        'Confirm-Change',
         'Invoke-PlannedChange',
         'Get-ExactObject',
         'Get-ScsiUnitNumberSequence',
@@ -258,7 +274,6 @@ try {
         $script:Plan = [System.Collections.Generic.List[object]]::new()
         $script:Results = [System.Collections.Generic.List[object]]::new()
         $script:OperationRan = $false
-        $script:Cmdlet = $null
         $script:RunMode = 'DryRun'
         $DryRun = $true
         Invoke-PlannedChange 'G1' 'VM1' 'Test' 'Memory' 'dry-run test' {
@@ -273,7 +288,6 @@ try {
         $script:Plan = [System.Collections.Generic.List[object]]::new()
         $script:Results = [System.Collections.Generic.List[object]]::new()
         $script:OperationRan = $false
-        $script:Cmdlet = $null
         $script:RunMode = 'Execute'
         $DryRun = $false
         Invoke-PlannedChange 'G1' 'VM1' 'Test' 'Memory' 'execution test' {
@@ -282,26 +296,6 @@ try {
         Assert-True $script:OperationRan 'The operation block did not run.'
         Assert-Equal $script:Results[0].Status 'Succeeded' 'Unexpected execution status.'
         Assert-Equal $script:Plan[0].ScriptVersion 'test' 'The plan row is not stamped with the script version.'
-    }
-
-    Invoke-NativeTest 'A refused ShouldProcess skips the operation but keeps the plan' {
-        $script:Plan = [System.Collections.Generic.List[object]]::new()
-        $script:Results = [System.Collections.Generic.List[object]]::new()
-        $script:OperationRan = $false
-        $script:RunMode = 'WhatIf'
-        $DryRun = $false
-        $script:Cmdlet = New-Object psobject
-        Add-Member -InputObject $script:Cmdlet -MemberType ScriptMethod -Name ShouldProcess -Value {
-            param($Target, $Action)
-            return $false
-        }
-        Invoke-PlannedChange 'G1' 'VM1' 'Test' 'Memory' 'whatif test' {
-            $script:OperationRan = $true
-        }
-        $script:Cmdlet = $null
-        Assert-True (-not $script:OperationRan) 'The operation ran even though ShouldProcess said no.'
-        Assert-Equal $script:Plan.Count 1 'The plan item was not recorded.'
-        Assert-Equal $script:Results[0].Status 'Skipped' 'Unexpected skipped status.'
     }
 
     # ------------------------------------------------------- exact-name object lookup ----
@@ -370,9 +364,23 @@ try {
         Assert-Equal $unguarded.Count 0 "Unguarded mutating calls: $($unguarded -join '; ')."
     }
 
-    Invoke-NativeTest 'Script supports ShouldProcess, so -WhatIf is a real no-op' {
-        Assert-True ($text -match '(?i)\[CmdletBinding\(SupportsShouldProcess') 'SupportsShouldProcess is not declared.'
-        Assert-True ($text -match '\$script:Cmdlet\.ShouldProcess\(') 'The change gate never asks ShouldProcess.'
+    Invoke-NativeTest 'There are two modes and one gate between them' {
+        Assert-True ($text -match "ParameterSetName = 'DryRun'") 'The DryRun parameter set is missing.'
+        Assert-True ($text -match "ParameterSetName = 'Execute'") 'The Execute parameter set is missing.'
+        Assert-True ($text -notmatch '\[CmdletBinding\(SupportsShouldProcess') 'SupportsShouldProcess is back; the gate is meant to be -DryRun alone.'
+        Assert-True ($text -notmatch '\.ShouldProcess\(') 'A ShouldProcess call is back; the gate is meant to be -DryRun alone.'
+        $gates = @([regex]::Matches($text, '(?m)^\s*if \(\$DryRun\) \{\s*$'))
+        Assert-True ($gates.Count -ge 1) 'The dry-run gate was not found.'
+    }
+
+    Invoke-NativeTest 'Script is self-contained enough to run from a jump host' {
+        Assert-True ($text -notmatch 'Richo\.Common\.psd1') 'The script still imports the shared module by path.'
+        Assert-True ($text -notmatch '(?m)^\s*Import-Module(?!\s+-Name \$name)') 'An unguarded module import was found.'
+        Assert-True ($text -match 'VMware\.VimAutomation\.Core') 'PowerCLI Core is not the declared dependency.'
+        Assert-True ($text -match '(?m)^function Write-RichoLog') 'The script does not carry its own logging function.'
+        Assert-True ($text -match '(?m)^function Get-RichoCredential') 'The script does not carry its own credential helper.'
+        Assert-True ($text -notmatch '(?i)environments\.json') 'The script reads an environment configuration file.'
+        Assert-True ($text -notmatch '(?i)Install-Module|Update-Module') 'The script installs or updates a module.'
     }
 
     Invoke-NativeTest 'Output goes through Write-RichoLog, never Write-Host' {
