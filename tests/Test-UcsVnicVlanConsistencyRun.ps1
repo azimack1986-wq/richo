@@ -206,8 +206,12 @@ function Get-UcsVnicTemplate { param($Ucs, $ErrorAction) @(
     (New-Template 'eth3-tmpl' 'A' '9000' 'CDP-ON')
     # A pair with nothing wrong with it, so there is something for the clean
     # path to record. Not in the ProxySwitch map, so no vDS cross-check.
-    (New-Template 'eth4-tmpl' 'A' '9000' 'CDP-ON')
-    (New-Template 'eth5-tmpl' 'B' '9000' 'CDP-ON')
+    (New-Template 'eth4-tmpl' 'A' '1500' 'CDP-ON')
+    (New-Template 'eth5-tmpl' 'B' '1500' 'CDP-ON')
+    # Outside the configured pair groups, so nothing compares them to each
+    # other - but the per-vNIC checks still have to run on them.
+    (New-Template 'eth6-tmpl' 'A' '1500' 'CDP-ON')
+    (New-Template 'eth7-tmpl' 'B' '1500' 'CDP-ON')
 ) }
 
 function New-Vnic { param($Name, $Order, $Template)
@@ -221,6 +225,8 @@ function Get-UcsVnic { param($Ucs, $ErrorAction) @(
     (New-Vnic 'eth3' '4' 'eth3-tmpl')
     (New-Vnic 'eth4' '5' 'eth4-tmpl')
     (New-Vnic 'eth5' '6' 'eth5-tmpl')
+    (New-Vnic 'eth6' '7' 'eth6-tmpl')
+    (New-Vnic 'eth7' '8' 'eth7-tmpl')
 ) }
 
 function New-Interface { param($Parent, $Name, $Vnet, $Native = 'no')
@@ -233,24 +239,43 @@ function Get-UcsVnicInterface { param($Ucs, $ErrorAction) @(
     (New-Interface 'org-root/lan-conn-templ-eth0-tmpl' 'MGMT-10' 10 'yes')
     (New-Interface 'org-root/lan-conn-templ-eth0-tmpl' 'PROD-250' 250)
     (New-Interface 'org-root/lan-conn-templ-eth1-tmpl' 'MGMT-10' 10 'yes')
-    (New-Interface 'org-root/lan-conn-templ-eth2-tmpl' 'PROD-250' 250)
+    (New-Interface 'org-root/lan-conn-templ-eth2-tmpl' 'PROD-250' 250 'yes')
     # eth2's template has a VLAN the blade does not: an initial-template edited
     # after the profile was stamped looks right in UCS Manager and is not right
     # on the blade.
     (New-Interface 'org-root/lan-conn-templ-eth2-tmpl' 'MGMT-10' 10)
     (New-Interface 'org-root/lan-conn-templ-eth3-tmpl' 'PROD-250' 250)
-    (New-Interface 'org-root/lan-conn-templ-eth4-tmpl' 'PROD-250' 250)
-    (New-Interface 'org-root/lan-conn-templ-eth5-tmpl' 'PROD-250' 250)
+    (New-Interface 'org-root/lan-conn-templ-eth4-tmpl' 'PROD-250' 250 'yes')
+    (New-Interface 'org-root/lan-conn-templ-eth4-tmpl' 'MGMT-10' 10)
+    (New-Interface 'org-root/lan-conn-templ-eth5-tmpl' 'PROD-250' 250 'yes')
+    (New-Interface 'org-root/lan-conn-templ-eth5-tmpl' 'MGMT-10' 10)
+    (New-Interface 'org-root/lan-conn-templ-eth6-tmpl' 'PROD-250' 250 'yes')
+    (New-Interface 'org-root/lan-conn-templ-eth6-tmpl' 'MGMT-10' 10 'yes')
+    (New-Interface 'org-root/lan-conn-templ-eth7-tmpl' 'PROD-250' 250 'yes')
+    (New-Interface 'org-root/lan-conn-templ-eth7-tmpl' 'MGMT-10' 10)
 
     # --- below the service profile's vNICs ---
+    # The design: several VLANs trunked per vNIC, exactly one of them native.
     # eth0 carries MGMT and PROD; eth1, its partner, is missing PROD.
     (New-Interface 'org-root/ls-esx01/ether-eth0' 'MGMT-10' 10 'yes')
     (New-Interface 'org-root/ls-esx01/ether-eth0' 'PROD-250' 250)
     (New-Interface 'org-root/ls-esx01/ether-eth1' 'MGMT-10' 10 'yes')
-    (New-Interface 'org-root/ls-esx01/ether-eth2' 'PROD-250' 250)
+    # eth2 is the drift case: its template carries MGMT-10 and the blade does not.
+    (New-Interface 'org-root/ls-esx01/ether-eth2' 'PROD-250' 250 'yes')
+    # eth3 trunks a VLAN with none of them native - untagged frames arriving on
+    # that uplink have nowhere to land.
     (New-Interface 'org-root/ls-esx01/ether-eth3' 'PROD-250' 250)
-    (New-Interface 'org-root/ls-esx01/ether-eth4' 'PROD-250' 250)
-    (New-Interface 'org-root/ls-esx01/ether-eth5' 'PROD-250' 250)
+    # eth4/eth5 are the correct shape: several VLANs, exactly one native.
+    (New-Interface 'org-root/ls-esx01/ether-eth4' 'PROD-250' 250 'yes')
+    (New-Interface 'org-root/ls-esx01/ether-eth4' 'MGMT-10' 10)
+    (New-Interface 'org-root/ls-esx01/ether-eth5' 'PROD-250' 250 'yes')
+    (New-Interface 'org-root/ls-esx01/ether-eth5' 'MGMT-10' 10)
+    # eth6 has BOTH of its VLANs marked native. Only one can take untagged
+    # frames, so the other is not what the configuration says it is.
+    (New-Interface 'org-root/ls-esx01/ether-eth6' 'PROD-250' 250 'yes')
+    (New-Interface 'org-root/ls-esx01/ether-eth6' 'MGMT-10' 10 'yes')
+    (New-Interface 'org-root/ls-esx01/ether-eth7' 'PROD-250' 250 'yes')
+    (New-Interface 'org-root/ls-esx01/ether-eth7' 'MGMT-10' 10)
 ) }
 
 function Get-UcsNetworkControlPolicy { param($Ucs, $ErrorAction) @(
@@ -351,8 +376,8 @@ Assert-Equal 'as an error'                         'ERROR' (Get-Check 'NcpUplink
 Assert-Equal 'and categorised as best practice'    'BestPractice' (Get-Check 'NcpUplinkFailAction')[0].Category
 Assert-Equal 'MAC register mode is reported'       1 (Get-Check 'NcpMacRegisterMode').Count
 # 9000 on the vNIC, 1500 on the class its QoS policy lands in.
-Assert-Equal 'the QoS class MTU trap is reported'  4 (Get-Check 'VnicMtuExceedsQosClass').Count
-Assert-Equal 'and not for the 1500 vNICs'          $false ([bool]@((Get-Check 'VnicMtuExceedsQosClass') | Where-Object { $_.Subject -in @('eth0', 'eth1') }).Count)
+$qosMtu = @((Get-Check 'VnicMtuExceedsQosClass') | ForEach-Object { $_.Subject } | Sort-Object)
+Assert-Equal 'the QoS class MTU trap is reported'  'eth2; eth3' ($qosMtu -join '; ')
 Assert-Equal 'IP-hash teaming is reported'         1 (Get-Check 'PortGroupIpHashTeaming').Count
 Assert-Equal 'a hand-built profile is reported'    1 (Get-Check 'ProfileNotFromTemplate').Count
 # The two kinds must be separable, or the report cannot be triaged.
@@ -370,6 +395,25 @@ Assert-Equal 'and they are the right three'         'PROD_250 (250); SPARE-777 (
 # STORAGE is on no template either, but it is the FCoE collision VLAN and is
 # already reported as an error; both are true and both are reported.
 Assert-Equal 'a VLAN that IS on a template is not' $false ([bool]@((Get-Check 'VlanNotOnAnyVnicTemplate') | Where-Object { $_.Subject -match 'PROD-250' }).Count)
+
+Write-Host "`n=== The native VLAN, against the trunked design ===" -ForegroundColor Cyan
+# Many VLANs per vNIC is the design and must never be a finding in itself.
+Assert-Equal 'two natives on one vNIC is reported'  1 (Get-Check 'VnicMultipleNativeVlans').Count
+Assert-Equal 'and it names eth6'                    'eth6' (Get-Check 'VnicMultipleNativeVlans')[0].Subject
+Assert-Equal 'as an error'                          'ERROR' (Get-Check 'VnicMultipleNativeVlans')[0].Severity
+Assert-Equal 'no native at all is reported'         1 (Get-Check 'VnicNoNativeVlan').Count
+Assert-Equal 'and it names eth3'                    'eth3' (Get-Check 'VnicNoNativeVlan')[0].Subject
+# Every other vNIC trunks its VLANs with exactly one native - the correct shape -
+# so each is recorded clean rather than left out. eth6/eth7 sit outside the
+# configured pair groups, which must not stop the per-vNIC checks running.
+$nativeOk = @((Get-Check 'VnicNativeVlan') | Where-Object { $_.Severity -eq 'OK' } | ForEach-Object { $_.Subject } | Sort-Object)
+Assert-Equal 'the correctly-natived vNICs are clean' 'eth0; eth1; eth2; eth4; eth5; eth7' ($nativeOk -join '; ')
+# eth4/eth5 are built exactly the way this estate builds a vNIC: two VLANs
+# trunked, one of them native, one leg per fabric. Nothing may be said about
+# them - if trunking several VLANs were ever treated as suspect, this is where
+# it would show up.
+$referenceFaults = @($findings | Where-Object { $_.Severity -in @('ERROR', 'WARN') -and $_.Subject -in @('eth4', 'eth5', 'eth4/eth5') })
+Assert-Equal 'a correctly-built multi-VLAN trunk draws no comment' 0 $referenceFaults.Count
 
 Write-Host "`n=== Checks that ran clean are recorded, not just omitted ===" -ForegroundColor Cyan
 Assert-Equal 'the clean vNIC pair is recorded'  1     (Get-Check 'VnicPair').Count
@@ -436,6 +480,10 @@ try {
         -Credential $credential -SkipBestPractice 6>$null 3>$null)
     Assert-Equal 'the mismatches are still found' $true (@($consistencyOnly | Where-Object { $_.Category -eq 'Consistency' }).Count -gt 0)
     Assert-Equal 'and no best-practice row is emitted' 0 @($consistencyOnly | Where-Object { $_.Category -eq 'BestPractice' }).Count
+    # Two natives is wrong on any design and must survive the switch; a missing
+    # native rests on this estate's convention and must not.
+    Assert-Equal 'two natives survives -SkipBestPractice' 1 @($consistencyOnly | Where-Object { $_.Check -eq 'VnicMultipleNativeVlans' }).Count
+    Assert-Equal 'a missing native does not'              0 @($consistencyOnly | Where-Object { $_.Check -eq 'VnicNoNativeVlan' }).Count
 }
 catch {
     Write-Host "  The -SkipBestPractice run threw: $($_.Exception.Message)" -ForegroundColor Red

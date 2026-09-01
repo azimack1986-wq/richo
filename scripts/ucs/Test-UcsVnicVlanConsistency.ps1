@@ -14,6 +14,21 @@
     host with a pinned module bundle already loaded should not have this script
     fighting it.
 
+    THE DESIGN IT ASSUMES
+
+      Each vNIC trunks the VLANs its host needs, and exactly one of them is
+      native. That is what several of the checks measure against, so it is stated
+      here rather than buried: a vNIC with two VLANs marked native is a
+      misconfiguration, one with none is a deviation, and many VLANs on a vNIC is
+      normal and is never itself a finding.
+
+      It is also why MAC register mode is held to 'all-host-vlans'. With many
+      VLANs per vNIC, 'only-native-vlan' leaves every VM outside the native VLAN
+      reachable only by flooding.
+
+      -SkipBestPractice drops the parts of this that are convention - a vNIC with
+      no native VLAN - and keeps the parts that are wrong on any design.
+
     WHERE IT STARTS
 
       At UCS Manager, and at the service profiles. They are the inventory: they
@@ -71,27 +86,32 @@
          Manager marks it. Reported separately from a VLAN that reaches a blade
          through a vNIC configured off-template, which is a different problem.
 
-      3. vNIC pair symmetry. The two legs of a pair are the same connection over
+      3. The native VLAN on each vNIC. Two VLANs marked native means only one
+         of them actually takes untagged frames and the other is not what the
+         configuration says it is; none at all means untagged frames on that
+         uplink have nowhere to land.
+
+      4. vNIC pair symmetry. The two legs of a pair are the same connection over
          two fabrics, so everything about them must match except the fabric. By
          default vNICs 0/1, 2/3 and 4/5 are compared as pairs (-VnicPairGroup);
          the VLAN set, the native VLAN, the MTU, the network control, QoS and
          adapter policies and the template type must agree, and the two legs must
          sit on different fabric interconnects.
 
-      4. A vNIC that has drifted from its own template, which an initial-template
+      5. A vNIC that has drifted from its own template, which an initial-template
          edited after the profile was stamped produces silently.
 
-      5. The vSphere cross-check. For each host, the physical NICs are mapped to
+      6. The vSphere cross-check. For each host, the physical NICs are mapped to
          the distributed switch that owns them, and the VLANs the vDS port groups
          actually need are checked against the VLANs UCS trunks to those same
          vmnics. A port group VLAN that UCS does not trunk is a black hole; the
          reverse is only noise, so it is reported as INFO. The vDS MTU is checked
          against the vNIC MTU behind it.
 
-      6. Discovery protocol agreement. A vDS set to CDP in front of a network
+      7. Discovery protocol agreement. A vDS set to CDP in front of a network
          control policy with CDP disabled is why hosts report no neighbour.
 
-      7. What neither side accounts for. A service profile with no host in this
+      8. What neither side accounts for. A service profile with no host in this
          vCenter, a host that is registered but disconnected, a profile with no
          vNICs, an uplink with no vNIC behind it, and a host sharing a cluster
          with this domain's blades while cabled to a different fabric.
@@ -100,29 +120,29 @@
 
       Skipped entirely with -SkipBestPractice.
 
-      8. Network control policy. Action on Uplink Fail must be link-down: set to
+      9. Network control policy. Action on Uplink Fail must be link-down: set to
          'warning' the vNIC stays up when the fabric loses its uplinks, so ESXi
          keeps the uplink in the team and keeps sending traffic into a hole, and
          nothing fails over or alarms. MAC register mode should be all-host-vlans
          wherever a blade trunks more than its native VLAN. CDP or LLDP should be
          advertising something.
 
-      9. vNIC settings. Fabric failover should be OFF on a vNIC presented to
+     10. vNIC settings. Fabric failover should be OFF on a vNIC presented to
          ESXi - the host's teaming already handles a failed uplink, and with both
          in play the fabric moves the MAC while the host still believes its
          uplink is healthy. Templates should be updating, not initial. A vNIC's
          MTU must fit the QoS system class its policy maps to, or jumbo frames
          are dropped with no error anywhere.
 
-     10. Service profiles should come from a service profile template; one built
+     11. Service profiles should come from a service profile template; one built
          by hand has nothing holding it to its peers.
 
-     11. Port group teaming. IP hash is not supported in front of UCS - it needs
+     12. Port group teaming. IP hash is not supported in front of UCS - it needs
          a port channel to the host, and a blade's two vNICs terminate on two
          independent fabric interconnects. Beacon probing cannot attribute a
          failure across only two uplinks. Notify Switches should be on.
 
-     12. Each vDS should have two uplinks on the host, one per fabric, and should
+     13. Each vDS should have two uplinks on the host, one per fabric, and should
          be listening for CDP or LLDP.
 
 .PARAMETER UcsManager
@@ -964,6 +984,12 @@ function Get-VlanSummary {
         domain's VLAN table. Both routes are used, name first when Vnet is empty,
         so a template does not silently report an empty VLAN set.
 
+        Natives are returned as a set with a count, not as a single value. The
+        design here is many VLANs trunked per vNIC with exactly one of them
+        native, so both "none" and "more than one" are things to find - and
+        keeping only the last row marked native would report the second case as
+        if it were correct.
+
     .PARAMETER ParentDn
         Dn of the vNIC template or vNIC.
 
@@ -993,8 +1019,13 @@ function Get-VlanSummary {
     $ids = New-Object System.Collections.Generic.List[int]
     $names = New-Object System.Collections.Generic.List[string]
     $unresolved = New-Object System.Collections.Generic.List[string]
-    $nativeId = 0
-    $nativeName = ''
+    # EVERY row marked native, not the last one seen. This estate trunks many
+    # VLANs per vNIC with exactly one of them native, so "how many are native"
+    # is a thing to check rather than an assumption - and taking only the last
+    # would silently reduce two natives to one and report the misconfiguration
+    # as correct.
+    $nativeIds = New-Object System.Collections.Generic.List[int]
+    $nativeNames = New-Object System.Collections.Generic.List[string]
 
     # NOT @($InterfaceIndex[$ParentDn]). The caller indexes the interface rows
     # into Generic.List[object] as it reads them, and an array subexpression
@@ -1022,19 +1053,27 @@ function Get-VlanSummary {
         }
 
         if ([string](Get-MoProperty $row 'DefaultNet' 'no') -eq 'yes') {
-            $nativeName = $name
-            $nativeId = $id
+            if ($name -and -not $nativeNames.Contains($name)) { [void]$nativeNames.Add($name) }
+            if ($id -gt 0 -and -not $nativeIds.Contains($id)) { [void]$nativeIds.Add($id) }
         }
     }
 
+    # NativeId and NativeName are the first of them, for the comparisons that
+    # want one value; NativeCount is what says whether that is the whole truth.
+    $sortedNativeIds = @($nativeIds.ToArray() | Sort-Object)
+    $sortedNativeNames = @($nativeNames.ToArray() | Sort-Object)
+
     return [pscustomobject]@{
-        ParentDn   = $ParentDn
-        VlanIds    = @($ids.ToArray() | Sort-Object)
-        VlanNames  = @($names.ToArray() | Sort-Object)
-        Unresolved = @($unresolved.ToArray() | Sort-Object)
-        NativeId   = $nativeId
-        NativeName = $nativeName
-        Count      = $ids.Count
+        ParentDn    = $ParentDn
+        VlanIds     = @($ids.ToArray() | Sort-Object)
+        VlanNames   = @($names.ToArray() | Sort-Object)
+        Unresolved  = @($unresolved.ToArray() | Sort-Object)
+        NativeIds   = $sortedNativeIds
+        NativeNames = $sortedNativeNames
+        NativeCount = $sortedNativeNames.Count
+        NativeId    = $(if ($sortedNativeIds.Count -gt 0) { $sortedNativeIds[0] } else { 0 })
+        NativeName  = $(if ($sortedNativeNames.Count -gt 0) { $sortedNativeNames[0] } else { '' })
+        Count       = $ids.Count
     }
 }
 
@@ -1739,10 +1778,12 @@ function Test-NetworkControlPolicyBestPractice {
         is reported as an ERROR rather than a recommendation because there is no
         design in which a vSwitch-teamed blade wants it.
 
-        MAC register mode matters wherever a blade carries VLANs other than its
-        native one - which is every ESXi host with a trunked vNIC. On
-        'only-native-vlan' the fabric interconnect only installs the MAC on the
-        native VLAN, and VM traffic on the others relies on flooding.
+        MAC REGISTER MODE IS NOT A JUDGEMENT CALL HERE. This deployment trunks
+        many VLANs per vNIC with one of them native, so on 'only-native-vlan' the
+        fabric interconnect installs each MAC on the native VLAN only and every
+        VM on any other VLAN - which is most of them - relies on flooding to be
+        reached. It works, quietly and badly, until the flood domain gets large
+        enough to notice.
 
         Discovery is judged on the pair. CDP off is unremarkable where LLDP is on;
         both off means nothing downstream can identify the fabric, which is a
@@ -1782,7 +1823,7 @@ function Test-NetworkControlPolicyBestPractice {
             Subject  = $name
             Expected = 'all-host-vlans'
             Actual   = $macMode
-            Detail   = ("Network control policy '{0}' registers MACs on the native VLAN only ('{1}'). A blade trunking more than one VLAN - which is every ESXi host here - then relies on flooding for VM traffic on the rest." -f $name, $macMode)
+            Detail   = ("Network control policy '{0}' registers MACs on the native VLAN only ('{1}'). Every vNIC here trunks several VLANs with one native, so each VM outside the native VLAN is reached by flooding rather than by a learned MAC." -f $name, $macMode)
         })
     }
 
@@ -1902,6 +1943,104 @@ function Test-VnicBestPractice {
             Expected = 'no VLAN 1 on a data vNIC'
             Actual   = 'VLAN 1 trunked'
             Detail   = ("{0} trunks VLAN 1. The default VLAN carries whatever anything untagged puts on it, and is conventionally kept off data uplinks." -f $name)
+        })
+    }
+
+    return $results.ToArray()
+}
+
+function Test-VnicNativeVlan {
+    <#
+    .SYNOPSIS
+        Findings for the native VLAN on one vNIC, against a trunked design.
+
+    .DESCRIPTION
+        THE DESIGN THIS CHECKS. Each vNIC trunks the VLANs its host needs and
+        exactly one of them is native. That is what makes both of the cases here
+        findings rather than opinions.
+
+        MORE THAN ONE NATIVE is a misconfiguration, not a preference. Only one
+        VLAN can receive untagged frames on a trunk, so with two marked native
+        the fabric picks one and the other silently is not what the configuration
+        says it is. It is worth looking for even though UCS Manager will normally
+        refuse it: a profile assembled by API or copied between orgs can carry it,
+        and nothing downstream shows it.
+
+        NONE AT ALL means untagged frames arriving on that uplink have nowhere to
+        land. On a host that is exactly the traffic you cannot afford to lose -
+        it is what a port group left at VLAN 0 uses, and what some appliances and
+        PXE clients send. It is reported against the stated design rather than as
+        a universal truth, so -SkipBestPractice suppresses it while the
+        two-natives error stays.
+
+        A NATIVE OUTSIDE THE TRUNK cannot happen through the UCS model - the
+        native VLAN is one of the vNIC's own VLAN rows - but it can survive a
+        name that resolves to no id, which leaves the trunk list and the native
+        disagreeing. That is worth saying plainly rather than leaving as an
+        unresolved-name finding somewhere else in the report.
+
+        Pure. A member object in, findings out.
+
+    .PARAMETER Member
+        A resolved vNIC: VnicName, TemplateName, VlanIds, NativeIds, NativeNames,
+        NativeCount.
+
+    .PARAMETER RequireNative
+        Report a vNIC with no native VLAN. On by default; the caller turns it off
+        with -SkipBestPractice, because "every vNIC has a native" is this
+        estate's design rather than a rule of the platform.
+
+    .EXAMPLE
+        Test-VnicNativeVlan -Member $member
+
+    .EXAMPLE
+        Test-VnicNativeVlan -Member $member -RequireNative:$false
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        $Member,
+
+        [bool]$RequireNative = $true
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $name = [string]$Member.VnicName
+    $nativeIds = @(Get-MoProperty $Member 'NativeIds' @())
+    $nativeNames = @(Get-MoProperty $Member 'NativeNames' @())
+    $nativeCount = [int](Get-MoProperty $Member 'NativeCount' 0)
+    $vlanIds = @($Member.VlanIds)
+
+    if ($nativeCount -gt 1) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'ERROR'; Category = 'Consistency'; Check = 'VnicMultipleNativeVlans'
+            Subject  = $name
+            Expected = 'exactly one native VLAN'
+            Actual   = ("{0} marked native: {1}" -f $nativeCount, ($nativeNames -join ', '))
+            Detail   = ("{0} has {1} VLANs marked native ({2}). Only one VLAN can take untagged frames on a trunk, so the fabric uses one of them and the rest are not what the configuration says they are." -f $name, $nativeCount, ($nativeNames -join ', '))
+        })
+    }
+    elseif ($nativeCount -eq 0) {
+        if ($RequireNative) {
+            [void]$results.Add([pscustomobject]@{
+                Severity = 'WARN'; Category = 'BestPractice'; Check = 'VnicNoNativeVlan'
+                Subject  = $name
+                Expected = 'one native VLAN, as every other vNIC here has'
+                Actual   = ("{0} VLAN(s) trunked, none native" -f @($vlanIds).Count)
+                Detail   = ("{0} (template '{1}') trunks {2} VLAN(s) with none of them native. Untagged frames arriving on that uplink have nowhere to land - a port group left at VLAN 0, an appliance that does not tag, a PXE client." -f $name, $Member.TemplateName, @($vlanIds).Count)
+            })
+        }
+    }
+    elseif (@($vlanIds).Count -gt 0 -and $nativeIds.Count -gt 0 -and $vlanIds -notcontains $nativeIds[0]) {
+        # Only reachable when the native row's VLAN name resolved to no id, which
+        # leaves the trunk list and the native disagreeing about what is on it.
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'ERROR'; Category = 'Consistency'; Check = 'VnicNativeVlanNotTrunked'
+            Subject  = $name
+            Expected = ('the native VLAN among the trunked VLANs {0}' -f (Format-IdList -Id $vlanIds))
+            Actual   = ("native {0} ({1})" -f $nativeIds[0], ($nativeNames -join ', '))
+            Detail   = ("{0} is marked native on VLAN {1} but that VLAN is not among the ones it trunks ({2}). Untagged frames are placed on a VLAN the vNIC does not carry." -f $name, $nativeIds[0], (Format-IdList -Id $vlanIds))
         })
     }
 
@@ -2726,6 +2865,9 @@ function Get-VnicMemberDetail {
         Unresolved           = @($effective.Unresolved)
         NativeId             = [int]$effective.NativeId
         NativeName           = [string]$effective.NativeName
+        NativeIds            = @($effective.NativeIds)
+        NativeNames          = @($effective.NativeNames)
+        NativeCount          = [int]$effective.NativeCount
         NetworkControlPolicy = $controlPolicy
         QosPolicy            = $qosPolicy
         AdapterPolicy        = $adapterPolicy
@@ -3043,6 +3185,13 @@ try {
                     -Actual (Format-IdList -Id @($member.VlanIds)) `
                     -Detail "$($member.VnicName) does not carry the same VLANs as its template '$($member.TemplateName)' - they differ by $(Format-IdList -Id @($member.TemplateDriftIds)). An initial-template edited after the profile was stamped shows the change in UCS Manager without applying it to the blade."
             }
+            # Always run, best practice or not: two natives is a misconfiguration
+            # whatever the design, and only the missing-native finding is the
+            # part that rests on this estate's own convention.
+            Add-CheckResult -Finding @(Test-VnicNativeVlan -Member $member -RequireNative (-not $SkipBestPractice)) `
+                -Scope 'UCS' -Domain $target -HostName $hostName -Check 'VnicNativeVlan' -Subject $member.VnicName `
+                -Detail ("{0} trunks {1} VLAN(s) ({2}) with exactly one of them native - {3}." -f $member.VnicName, @($member.VlanIds).Count, (Format-IdList -Id @($member.VlanIds)), $(if ($member.NativeName) { "$($member.NativeName) ($($member.NativeId))" } else { 'none set' }))
+
             if (-not $SkipBestPractice) {
                 Add-CheckResult -Finding @(Test-VnicBestPractice -Member $member -QosClassMtu $qosClassMtu) `
                     -Scope 'UCS' -Domain $target -HostName $hostName -Category 'BestPractice' -Check 'VnicSettings' -Subject $member.VnicName `

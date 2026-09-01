@@ -37,7 +37,8 @@ $underTest = @(
     'Remove-UcsTargetDecoration', 'Convert-FiSystemNameToUcsCandidate', 'Get-ParentDn',
     'ConvertTo-PolicyName', 'Get-VnicMemberDetail', 'Get-QosClassMtu',
     'Test-NetworkControlPolicyBestPractice', 'Test-VnicBestPractice',
-    'Test-PortGroupBestPractice', 'Test-VdsBestPractice', 'Test-ServiceProfileBestPractice'
+    'Test-PortGroupBestPractice', 'Test-VdsBestPractice', 'Test-ServiceProfileBestPractice',
+    'Test-VnicNativeVlan'
 )
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
@@ -67,11 +68,16 @@ function New-Vsan { param($Name, $FcoeVlan)
 function New-Member {
     param($Ordinal, $VnicName, $VlanIds, $SwitchId = 'A', $Mtu = 9000, $NativeId = 0,
           $TemplateName = 'tmpl', $TemplateType = 'updating-template',
-          $Ncp = 'CDP-ON', $Qos = 'best-effort', $Adapter = 'VMWare')
+          $Ncp = 'CDP-ON', $Qos = 'best-effort', $Adapter = 'VMWare', $NativeIds = $null)
+    # NativeIds defaults to whatever NativeId says, so the existing pair tests
+    # keep meaning what they meant; the native-VLAN tests set it explicitly.
+    if ($null -eq $NativeIds) { $NativeIds = @(if ($NativeId -gt 0) { $NativeId } else { }) }
     [pscustomobject]@{
         Ordinal = $Ordinal; VnicName = $VnicName; TemplateName = $TemplateName
         TemplateType = $TemplateType; SwitchId = $SwitchId; Mtu = $Mtu
         VlanIds = @($VlanIds); NativeId = $NativeId; NativeName = ''
+        NativeIds = @($NativeIds); NativeNames = @(@($NativeIds) | ForEach-Object { "VL$_" })
+        NativeCount = @($NativeIds).Count
         NetworkControlPolicy = $Ncp; QosPolicy = $Qos; AdapterPolicy = $Adapter
     } }
 function New-PortGroup { param($Name, $Kind, $VlanIds)
@@ -184,6 +190,20 @@ $summary = Get-VlanSummary -ParentDn 'org-root/lan-conn-templ-eth0' -InterfaceIn
 Assert-Equal 'ids are read from Vnet'      '10, 250' (($summary.VlanIds | Sort-Object) -join ', ')
 Assert-Equal 'the native VLAN is found'    10        $summary.NativeId
 Assert-Equal 'the native name is found'    'MGMT-10' $summary.NativeName
+Assert-Equal 'and exactly one is native'   1         $summary.NativeCount
+
+# Keeping only the last row marked native would reduce two natives to one and
+# report the misconfiguration as correct.
+$twoNative = @{ 'p' = @(
+    [pscustomobject]@{ Name = 'MGMT-10'; Vnet = 10; DefaultNet = 'yes' }
+    [pscustomobject]@{ Name = 'PROD-250'; Vnet = 250; DefaultNet = 'yes' }
+) }
+$summary = Get-VlanSummary -ParentDn 'p' -InterfaceIndex $twoNative -VlanIdByName @{}
+Assert-Equal 'both natives are kept'       2 $summary.NativeCount
+Assert-Equal 'and both ids are returned'   '10, 250' ($summary.NativeIds -join ', ')
+
+$noNative = @{ 'p' = @([pscustomobject]@{ Name = 'PROD-250'; Vnet = 250; DefaultNet = 'no' }) }
+Assert-Equal 'no native is a count of zero' 0 (Get-VlanSummary -ParentDn 'p' -InterfaceIndex $noNative -VlanIdByName @{}).NativeCount
 
 $summary = Get-VlanSummary -ParentDn 'org-root/lan-conn-templ-eth1' -InterfaceIndex $index -VlanIdByName $byName
 Assert-Equal 'a missing Vnet is resolved by name' '250' ($summary.VlanIds -join ', ')
@@ -451,6 +471,38 @@ $operOnly = [pscustomobject]@{
     OperNwTemplName = 'org-root/lan-conn-templ-eth0-tmpl'; Mtu = '0'; SwitchId = ''
 }
 Assert-Equal 'a template Dn resolves to its name' 'eth0-tmpl' (Get-VnicMemberDetail -Ordinal 0 -Vnic $operOnly -TemplateByName $templates -InterfaceIndex $interfaces -VlanIdByName @{}).TemplateName
+
+Write-Host "`n=== The native VLAN: many trunked, exactly one native ===" -ForegroundColor Cyan
+# The design here is a trunk of several VLANs per vNIC with one of them native.
+# Many VLANs on a vNIC is normal and must never be a finding in itself.
+$normal = New-Member 0 'eth0' @(10, 250, 300, 400) 'A' 9000 10
+Assert-Equal 'a trunk with one native is clean' 0 @(Test-VnicNativeVlan -Member $normal).Count
+
+# Only one VLAN can take untagged frames on a trunk. With two marked native the
+# fabric uses one and the other is not what the configuration says it is.
+$twoNatives = New-Member 0 'eth0' @(10, 250) 'A' 9000 10 'tmpl' 'updating-template' 'CDP-ON' 'best-effort' 'VMWare' @(10, 250)
+$findings = @(Test-VnicNativeVlan -Member $twoNatives)
+Assert-Equal 'two natives is reported'          1 (Get-Check $findings 'VnicMultipleNativeVlans').Count
+Assert-Equal 'as an error'                      'ERROR' (Get-Check $findings 'VnicMultipleNativeVlans')[0].Severity
+# Wrong on any design, so it is a mismatch rather than a recommendation - and it
+# must survive -SkipBestPractice.
+Assert-Equal 'and as a consistency finding'     'Consistency' (Get-Check $findings 'VnicMultipleNativeVlans')[0].Category
+Assert-Equal 'and is not suppressed by -RequireNative:$false' 1 (Get-Check (Test-VnicNativeVlan -Member $twoNatives -RequireNative $false) 'VnicMultipleNativeVlans').Count
+
+# None at all: untagged frames on that uplink have nowhere to land.
+$noNative = New-Member 0 'eth0' @(10, 250) 'A' 9000 0
+$findings = @(Test-VnicNativeVlan -Member $noNative)
+Assert-Equal 'no native VLAN is reported'       1 (Get-Check $findings 'VnicNoNativeVlan').Count
+# This one rests on the estate's own convention, so it is the part that
+# -SkipBestPractice drops.
+Assert-Equal 'as a best-practice finding'       'BestPractice' (Get-Check $findings 'VnicNoNativeVlan')[0].Category
+Assert-Equal 'and it IS suppressible'           0 (Get-Check (Test-VnicNativeVlan -Member $noNative -RequireNative $false) 'VnicNoNativeVlan').Count
+
+# A native that resolved to an id the trunk list does not carry.
+$orphanNative = New-Member 0 'eth0' @(10, 250) 'A' 9000 999 'tmpl' 'updating-template' 'CDP-ON' 'best-effort' 'VMWare' @(999)
+Assert-Equal 'a native outside the trunk is reported' 1 (Get-Check (Test-VnicNativeVlan -Member $orphanNative) 'VnicNativeVlanNotTrunked').Count
+# A vNIC with no VLANs at all is a different finding elsewhere; not this one.
+Assert-Equal 'an empty vNIC is not reported here'     0 (Get-Check (Test-VnicNativeVlan -Member (New-Member 0 'eth0' @() 'A' 9000 10) -RequireNative $false) 'VnicNativeVlanNotTrunked').Count
 
 Write-Host "`n=== Best practice: the QoS class a vNIC's MTU actually has to fit ===" -ForegroundColor Cyan
 # A vNIC at 9000 whose priority lands in a class still at 1500 drops jumbo

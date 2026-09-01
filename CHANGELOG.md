@@ -12,6 +12,47 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Test-UcsVnicVlanConsistency.ps1
 
+### [2.1.0] — 2026-09-01
+
+#### Changed
+
+- **The checks now state the design they measure against**, rather than leaving
+  it implied: each vNIC trunks the VLANs its host needs, and exactly one of them
+  is native. Many VLANs on a vNIC is normal and is never itself a finding.
+
+- **Every native VLAN is now read, not just the last one seen.** `Get-VlanSummary`
+  kept only the final row marked `DefaultNet`, which silently reduced two natives
+  to one and reported the misconfiguration as correct. It returns `NativeIds`,
+  `NativeNames` and `NativeCount` alongside the single-value `NativeId` the pair
+  comparison uses.
+
+- **MAC register mode is no longer a judgement call.** With many VLANs per vNIC,
+  `only-native-vlan` leaves every VM outside the native VLAN reachable only by
+  flooding, so the finding now says that rather than hedging.
+
+#### Added
+
+- **`VnicMultipleNativeVlans` (ERROR, Consistency).** Only one VLAN can take
+  untagged frames on a trunk, so with two marked native the fabric uses one and
+  the other is not what the configuration says it is. Wrong on any design, so it
+  survives `-SkipBestPractice`.
+
+- **`VnicNoNativeVlan` (WARN, BestPractice).** Untagged frames arriving on that
+  uplink have nowhere to land — a port group left at VLAN 0, an appliance that
+  does not tag, a PXE client. This one rests on the estate's own convention, so
+  `-SkipBestPractice` drops it.
+
+- **`VnicNativeVlanNotTrunked` (ERROR, Consistency)** for the case where the
+  native VLAN's name resolved to an id the trunk list does not carry, leaving the
+  two disagreeing about what is on the vNIC.
+
+  Each vNIC also gets an OK row naming what it trunks and which VLAN is native,
+  so the report shows the design holding rather than merely not complaining.
+
+---
+
+## Test-UcsVnicVlanConsistency.ps1
+
 ### [2.0.0] — 2026-09-01
 
 #### Changed
