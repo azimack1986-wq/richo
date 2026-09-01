@@ -12,6 +12,67 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Test-UcsVnicVlanConsistency.ps1
 
+### [2.0.0] — 2026-09-01
+
+#### Changed
+
+- **It starts at UCS Manager now, not at vCenter.** You name the domain and its
+  vCenter; the service profiles are the inventory. They name the blades that
+  exist, and each carries the vNICs to be checked.
+
+  Starting at vCenter answered a different question — it checked whatever
+  happened to be registered there and said nothing at all about a blade whose
+  host is disconnected, was never added, or lives in another vCenter. Those are
+  exactly the blades worth knowing about, so they are findings now rather than
+  silence: `ProfileHasNoHost`, `HostNotConnected`, `ProfileUnassociated`.
+
+  Profiles match hosts by **hardware UUID** first — UCS writes the profile's UUID
+  into the blade's SMBIOS and ESXi reports it back, so a hit is proof rather than
+  a naming convention. Where only the name matches, CDP and LLDP are asked which
+  fabric the host is really cabled to before its vNICs are compared against this
+  domain; two domains holding a profile and a host of the same name was otherwise
+  a silent way to report against the wrong fabric (`HostInDifferentDomain`).
+
+  A host sharing a cluster with this domain's blades while cabled to a different
+  fabric is also reported (`HostInAnotherDomain`) — a cluster split across two UCS
+  domains has two sets of VLANs and two sets of templates to keep in step, and
+  neither domain shows the other half. The scan is bounded to those clusters
+  deliberately, rather than asking CDP of every host in the vCenter.
+
+- **One credential, typed once, used for both.** `-UcsCredential` and
+  `-VICredential` override it per side where they differ. With one domain per run
+  the cross-domain replay guard is gone; the attempt cap that stops a wrong
+  password being sent until the account locks remains.
+
+- **`-Cluster` and `-VMHostName` are replaced by `-ServiceProfile`**, since the
+  profiles are now what the run iterates.
+
+#### Added
+
+- **Best-practice checks**, separated from the mismatches by a new `Category`
+  column so the two can be triaged apart — one is an outage waiting for a fabric
+  failover, the other is a conversation. `-SkipBestPractice` turns them off.
+
+  - `NcpUplinkFailAction` (ERROR) — Action on Uplink Fail must be `link-down`.
+    Set to `warning`, the vNIC stays up when the fabric interconnect loses its
+    northbound uplinks; ESXi keeps the uplink in the team and keeps sending
+    traffic into a hole. Nothing fails over and nothing alarms.
+  - `VnicMtuExceedsQosClass` (ERROR) — a vNIC at 9000 whose QoS policy maps to a
+    system class still at 1500. Jumbo frames are dropped with no error anywhere;
+    the symptom is vMotion stalling or NFS timing out on large reads.
+  - `PortGroupIpHashTeaming` (ERROR) — IP hash needs a port channel to the host,
+    and a blade's two vNICs terminate on two independent fabric interconnects.
+  - `VnicFabricFailoverEnabled` — with ESXi teaming as well, the fabric moves the
+    MAC while the host still believes its uplink is healthy.
+  - `NcpMacRegisterMode`, `NcpNoDiscoveryProtocol`, `VnicTemplateNotUpdating`,
+    `ProfileNotFromTemplate`, `PortGroupBeaconProbing`,
+    `PortGroupNotifySwitchesOff`, `VdsSingleUplink`, `VdsDiscoveryDisabled`,
+    `VnicCarriesDefaultVlan`.
+
+---
+
+## Test-UcsVnicVlanConsistency.ps1
+
 ### [1.1.0] — 2026-09-01
 
 #### Changed

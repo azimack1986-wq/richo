@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    Finds VLAN, MTU and discovery-protocol mismatches between UCS Manager vNIC
-    templates and the vSphere Distributed Switches carrying the same blades.
+    Checks one UCS Manager domain and its vCenter against each other and against
+    the recommended configuration, and reports every difference.
 
 .DESCRIPTION
     READ ONLY. Nothing here writes to UCS Manager or to vCenter. The output is a
@@ -14,22 +14,56 @@
     host with a pinned module bundle already loaded should not have this script
     fighting it.
 
+    WHERE IT STARTS
+
+      At UCS Manager, and at the service profiles. They are the inventory: they
+      name the blades that exist, and each one carries the vNICs to be checked.
+      Each profile is then matched to its host in the vCenter you name.
+
+      Starting at vCenter instead answers a different question - it checks
+      whatever happens to be registered there, and says nothing at all about a
+      blade whose host is disconnected, was never added, or is in some other
+      vCenter. Those are exactly the blades worth knowing about, so they are
+      findings here rather than silence.
+
+      Matching is by hardware UUID first: UCS writes the service profile's UUID
+      into the blade's SMBIOS and ESXi reports it back, so a hit there is proof
+      rather than a naming convention. Where only the name matches, CDP and LLDP
+      are asked which fabric the host is really cabled to before its vNICs are
+      compared against this domain - two domains with a profile and a host of the
+      same name is otherwise a silent way to report against the wrong fabric.
+
+    HOW IT SIGNS IN
+
+      One credential, typed once, used for both. In these estates it is the same
+      domain account, and a question whose answer is always the same is just a
+      keystroke between the operator and the answer. -UcsCredential and
+      -VICredential override it for one side where they differ.
+
+      Nothing is stored and nothing outlives the run. A rejected credential is
+      discarded rather than sent again, attempts are counted, and after
+      -MaxCredentialAttempt failures no further sign-in is attempted at all.
+
     WHAT IT REPORTS
 
       Every check that runs writes a row, whether or not it found anything: ERROR
       and WARN for a discrepancy, OK for a check that ran clean. That is the
       difference between a report you can review and one you can only scan - a
       list of faults alone cannot be told apart from a run where the check never
-      happened, and on this script a domain that could not be signed in to, a
-      host with no CDP neighbour and a perfectly configured host all produce no
-      fault lines.
+      happened, and here a domain that could not be signed in to, a profile with
+      no host and a perfectly configured blade all produce no fault lines.
 
-    WHAT IT CHECKS
+      Findings carry a Category. CONSISTENCY is something that does not match
+      something else it has to match. BEST PRACTICE is something that works but
+      is not how it should be built. They are kept apart because they are read by
+      different people at different times: one is an outage waiting for a fabric
+      failover, the other is a conversation.
 
-      1. VLAN definitions in each UCS domain. The same VLAN id defined under two
+    CONSISTENCY - THINGS THAT DO NOT MATCH
+
+      1. VLAN definitions in the domain. The same VLAN id defined under two
          names, the same name carrying two ids, ids in the UCS Manager reserved
-         range, and an Ethernet VLAN colliding with a VSAN's FCoE VLAN. Each of
-         those is a silent config error until traffic is placed on it.
+         range, and an Ethernet VLAN colliding with a VSAN's FCoE VLAN.
 
       2. VLANs on the fabric that no vNIC template uses. A VLAN created in the
          domain and never added to a template is a half-finished change: the
@@ -44,56 +78,80 @@
          adapter policies and the template type must agree, and the two legs must
          sit on different fabric interconnects.
 
-      4. Per-vNIC settings. MTU against -ExpectedMtu when given, and CDP/LLDP as
-         set by the network control policy bound to each vNIC.
+      4. A vNIC that has drifted from its own template, which an initial-template
+         edited after the profile was stamped produces silently.
 
       5. The vSphere cross-check. For each host, the physical NICs are mapped to
          the distributed switch that owns them, and the VLANs the vDS port groups
          actually need are checked against the VLANs UCS trunks to those same
          vmnics. A port group VLAN that UCS does not trunk is a black hole; the
-         reverse is only noise, so it is reported as INFO.
+         reverse is only noise, so it is reported as INFO. The vDS MTU is checked
+         against the vNIC MTU behind it.
 
       6. Discovery protocol agreement. A vDS set to CDP in front of a network
-         control policy with CDP disabled is why hosts report no neighbour - and
-         is what breaks the UCS discovery this very script depends on.
+         control policy with CDP disabled is why hosts report no neighbour.
 
-    HOW IT FINDS THE UCS DOMAIN
+      7. What neither side accounts for. A service profile with no host in this
+         vCenter, a host that is registered but disconnected, a profile with no
+         vNICs, an uplink with no vNIC behind it, and a host sharing a cluster
+         with this domain's blades while cabled to a different fabric.
 
-      From CDP and LLDP, the same way the firmware scripts do. Every physical NIC
-      is asked for its neighbour, both protocols are read, and the fabric
-      interconnect system name is reduced to the UCS Manager cluster name
-      (PD24000001SS101-A.example.com becomes PD24000001SS101.example.com). Pass
-      -UcsManager to skip discovery and target named domains instead.
+    BEST PRACTICE - THINGS THAT WORK BUT SHOULD NOT BE BUILT THAT WAY
 
-    HOW IT SIGNS IN
+      Skipped entirely with -SkipBestPractice.
 
-      vCenter first, once. That credential is then offered to UCS Manager without
-      asking again, because by then it is the only credential in the run known to
-      work and in these estates it is the same domain account. It is named in the
-      log every time it is replayed. A UCS domain that rejects it is not offered
-      it again, attempts are counted, and after -MaxCredentialAttempt failures no
-      further UCS sign-in is attempted at all - replaying a wrong password at each
-      domain in turn is how an account gets locked out.
+      8. Network control policy. Action on Uplink Fail must be link-down: set to
+         'warning' the vNIC stays up when the fabric loses its uplinks, so ESXi
+         keeps the uplink in the team and keeps sending traffic into a hole, and
+         nothing fails over or alarms. MAC register mode should be all-host-vlans
+         wherever a blade trunks more than its native VLAN. CDP or LLDP should be
+         advertising something.
 
-.PARAMETER VIServer
-    vCenter to connect to. Prompted for when omitted.
+      9. vNIC settings. Fabric failover should be OFF on a vNIC presented to
+         ESXi - the host's teaming already handles a failed uplink, and with both
+         in play the fabric moves the MAC while the host still believes its
+         uplink is healthy. Templates should be updating, not initial. A vNIC's
+         MTU must fit the QoS system class its policy maps to, or jumbo frames
+         are dropped with no error anywhere.
 
-.PARAMETER Credential
-    vCenter credential. Prompted for when omitted, and then passed through to UCS
-    Manager unless -UcsCredential is given.
+     10. Service profiles should come from a service profile template; one built
+         by hand has nothing holding it to its peers.
 
-.PARAMETER UcsCredential
-    UCS Manager credential. When omitted the proven vCenter credential is used.
+     11. Port group teaming. IP hash is not supported in front of UCS - it needs
+         a port channel to the host, and a blade's two vNICs terminate on two
+         independent fabric interconnects. Beacon probing cannot attribute a
+         failure across only two uplinks. Notify Switches should be on.
 
-.PARAMETER Cluster
-    Limit the run to these clusters. Accepts wildcards.
-
-.PARAMETER VMHostName
-    Limit the run to these hosts. Accepts wildcards.
+     12. Each vDS should have two uplinks on the host, one per fabric, and should
+         be listening for CDP or LLDP.
 
 .PARAMETER UcsManager
-    Skip CDP/LLDP discovery and use these UCS Manager addresses instead. Hosts are
-    still matched to a domain by service profile name.
+    UCS Manager to check - the cluster name, not an individual fabric
+    interconnect. Prompted for when omitted.
+
+.PARAMETER VIServer
+    The vCenter that manages the blades in that domain. Prompted for when
+    omitted.
+
+.PARAMETER Credential
+    The credential for both. Prompted for once when omitted.
+
+.PARAMETER UcsCredential
+    Use this for UCS Manager instead of -Credential.
+
+.PARAMETER VICredential
+    Use this for vCenter instead of -Credential.
+
+.PARAMETER HostDomainSuffix
+    DNS suffix to append to a service profile name when matching it to a host by
+    name, e.g. '.example.com'. Only used where the hardware UUID did not match.
+
+.PARAMETER ServiceProfile
+    Limit the run to these service profiles. Accepts wildcards.
+
+.PARAMETER SkipBestPractice
+    Report only the things that do not match each other, and skip the
+    recommended-configuration checks entirely.
 
 .PARAMETER VnicPairGroup
     Groups of vNIC ordinals that must be identical to each other. Defaults to
@@ -119,9 +177,9 @@
 
 .PARAMETER CsvPath
     Write the findings to this CSV as well as returning them. One row per check,
-    faults first and the clean rows after, with a Status column of REVIEW, NOTE
-    or PASS so a reviewer can filter or colour it in a spreadsheet without
-    reading every line.
+    faults first and the clean rows after, with Status (REVIEW, NOTE, PASS) and
+    Category (Consistency, BestPractice) columns so a reviewer can filter or
+    colour it in a spreadsheet without reading every line.
 
 .PARAMETER IncludeInformational
     Return INFO findings too. By default the report carries the faults (ERROR and
@@ -132,26 +190,26 @@
     evidence.
 
 .EXAMPLE
-    .\Test-UcsVnicVlanConsistency.ps1 -VIServer vcenter01.example.com
+    .\Test-UcsVnicVlanConsistency.ps1
 
-    Prompts for the credential, checks every host it can reach, prints a summary
-    and returns the findings.
-
-.EXAMPLE
-    .\Test-UcsVnicVlanConsistency.ps1 -VIServer vcenter01.example.com -Cluster 'PRD-*' | Format-Table -AutoSize
-
-    Check every host in the matching clusters and show the findings as a table.
+    Prompts for the UCS Manager, the vCenter and one credential, then checks
+    every associated service profile in that domain.
 
 .EXAMPLE
-    .\Test-UcsVnicVlanConsistency.ps1 -VIServer vcenter01.example.com -Cluster PRD-CL01 -CsvPath .\vlan-drift.csv -Transcript
+    .\Test-UcsVnicVlanConsistency.ps1 -UcsManager ucs01.example.com -VIServer vcenter01.example.com -CsvPath .\vlan-review.csv
 
-    The same, with the full finding list written to CSV and the run recorded, for
-    a change request.
+    The same, with the full report written to CSV for review.
 
 .EXAMPLE
-    .\Test-UcsVnicVlanConsistency.ps1 -VIServer vcenter01.example.com -UcsManager ucsm01.example.com -ExpectedMtu 9000 -IncludeInformational
+    .\Test-UcsVnicVlanConsistency.ps1 -UcsManager ucs01.example.com -VIServer vcenter01.example.com -ServiceProfile 'PRD-*' -ExpectedMtu 9000 -Transcript
 
-    Skip discovery, target one domain, and require 9000 everywhere.
+    Only the production profiles, requiring 9000 everywhere, with the run
+    recorded.
+
+.EXAMPLE
+    .\Test-UcsVnicVlanConsistency.ps1 -UcsManager ucs01.example.com -VIServer vcenter01.example.com -SkipBestPractice | Where-Object Severity -eq 'ERROR'
+
+    Only the things that do not match, and only the ones that break traffic.
 
 .NOTES
     Read-only, so there is no -WhatIf: there is nothing to suppress.
@@ -160,12 +218,20 @@
     no credential is stored, cached beyond the run, or logged. Passwords are held
     as the SecureString inside a PSCredential and dropped when the script ends,
     however it ends.
+
+    One domain per run, deliberately. Checking several means several vCenters,
+    several credentials and a report in which "this VLAN is missing" no longer
+    says where - run it once per domain and keep the CSVs apart.
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
 [OutputType([pscustomobject])]
 param(
-    [Parameter(Mandatory)]
+    [Parameter(Mandatory, Position = 0)]
+    [ValidateNotNullOrEmpty()]
+    [string]$UcsManager,
+
+    [Parameter(Mandatory, Position = 1)]
     [ValidateNotNullOrEmpty()]
     [string]$VIServer,
 
@@ -173,11 +239,13 @@ param(
 
     [pscredential]$UcsCredential,
 
-    [string[]]$Cluster,
+    [pscredential]$VICredential,
 
-    [string[]]$VMHostName,
+    [string]$HostDomainSuffix,
 
-    [string[]]$UcsManager,
+    [string[]]$ServiceProfile,
+
+    [switch]$SkipBestPractice,
 
     [ValidateNotNullOrEmpty()]
     [string[]]$VnicPairGroup = @('0,1', '2,3', '4,5'),
@@ -262,9 +330,6 @@ function Write-Log {
 # variable throws, and these are read from helpers before they are ever written.
 $script:Findings                 = New-Object System.Collections.Generic.List[object]
 $script:FindingIndex             = @{}
-$script:SharedCredential         = $null
-$script:SharedCredentialSource   = ''
-$script:SharedCredentialRejected = $false
 $script:UcsCredentialCache       = $null
 $script:UcsCredentialAttempt     = 0
 $script:UcsCredentialBlocked     = $false
@@ -413,6 +478,13 @@ function Add-Finding {
     .PARAMETER Scope
         Where it was found: UCS, vCenter, or CrossCheck.
 
+    .PARAMETER Category
+        Consistency for something that does not match something else it must
+        match; BestPractice for something that works but deviates from the
+        recommended configuration. Kept apart because they are read by different
+        people at different times - one is an outage waiting to happen, the other
+        is a conversation.
+
     .PARAMETER Check
         Short stable code for the rule, e.g. VnicPairVlanMismatch.
 
@@ -456,6 +528,9 @@ function Add-Finding {
         [ValidateNotNullOrEmpty()]
         [string]$Detail,
 
+        [ValidateSet('Consistency', 'BestPractice')]
+        [string]$Category = 'Consistency',
+
         [string]$Domain = '',
         [string]$Subject = '',
         [string]$Expected = '',
@@ -476,6 +551,7 @@ function Add-Finding {
 
     $finding = [pscustomobject]@{
         Severity = $Severity
+        Category = $Category
         Scope    = $Scope
         Domain   = $Domain
         Check    = $Check
@@ -554,20 +630,27 @@ function Add-CheckResult {
         [ValidateNotNullOrEmpty()]
         [string]$Detail,
 
+        [ValidateSet('Consistency', 'BestPractice')]
+        [string]$Category = 'Consistency',
+
         [string]$Subject = '',
         [string]$Domain = '',
         [string]$HostName = ''
     )
 
     foreach ($entry in $Finding) {
+        # A check may return both kinds - a vNIC pair that does not match AND a
+        # pair that matches but sits on an initial-template - so the entry's own
+        # category wins where it has one.
         Add-Finding -Severity $entry.Severity -Scope $Scope -Check $entry.Check -Domain $Domain -HostName $HostName `
+            -Category ([string](Get-MoProperty $entry 'Category' $Category)) `
             -Subject $entry.Subject -Expected $entry.Expected -Actual $entry.Actual -Detail $entry.Detail
     }
 
     $faults = @($Finding | Where-Object { ($_.Severity -eq 'ERROR') -or ($_.Severity -eq 'WARN') })
     if ($faults.Count -gt 0) { return }
 
-    Add-Finding -Severity 'OK' -Scope $Scope -Check $Check -Domain $Domain -HostName $HostName `
+    Add-Finding -Severity 'OK' -Scope $Scope -Check $Check -Domain $Domain -HostName $HostName -Category $Category `
         -Subject $Subject -Expected '' -Actual 'checked, no discrepancy' -Detail $Detail
 }
 
@@ -1557,6 +1640,452 @@ function Compare-VdsVlanCoverage {
 }
 
 # ============================================================================
+# Best practice - the recommended configuration, as opposed to a mismatch
+# ============================================================================
+#
+# Everything in this region answers "is this how it should be built", not "does
+# this match the thing next to it". They are kept apart in the report because
+# they are read by different people at different times: a mismatch is an outage
+# waiting for a fabric failover, a best-practice deviation is a conversation.
+
+function Get-QosClassMtu {
+    <#
+    .SYNOPSIS
+        The MTU each QoS policy actually gets, by policy name.
+
+    .DESCRIPTION
+        A vNIC's MTU is not the whole story. The frame also has to fit the QoS
+        system class its priority maps to, and UCS lets you set a vNIC to 9000
+        while the class it lands in is still at 1500. Nothing warns; jumbo frames
+        are simply dropped, and the symptom - vMotion stalling, NFS timing out on
+        large reads - looks nothing like an MTU problem.
+
+        Three objects to walk: the QoS policy (epqosDefinition) names a priority
+        through its egress child (epqosEgress.Prio), and the system class
+        (fabricQosClass) holds the MTU for that priority. Class MTU is a string
+        that may be a number or a keyword.
+
+    .PARAMETER Policy
+        epqosDefinition objects: Name, Dn.
+
+    .PARAMETER Egress
+        epqosEgress objects: Dn (below the policy), Prio.
+
+    .PARAMETER QosClass
+        fabricQosClass objects: Priority, Mtu, AdminState.
+
+    .EXAMPLE
+        $mtuByPolicy = Get-QosClassMtu -Policy $p -Egress $e -QosClass $c
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Position = 0)]
+        [AllowEmptyCollection()]
+        [array]$Policy = @(),
+
+        [Parameter(Position = 1)]
+        [AllowEmptyCollection()]
+        [array]$Egress = @(),
+
+        [Parameter(Position = 2)]
+        [AllowEmptyCollection()]
+        [array]$QosClass = @()
+    )
+
+    $mtuByPriority = @{}
+    foreach ($class in $QosClass) {
+        $priority = [string](Get-MoProperty $class 'Priority' '')
+        if (-not $priority) { continue }
+        # 'normal' is the keyword for 1500 and 'fc' for the 2240-byte FCoE class.
+        # Anything else that is not a number is not something to guess at.
+        $raw = [string](Get-MoProperty $class 'Mtu' '')
+        $mtu = 0
+        if ($raw -match '^\d+$') { $mtu = [int]$raw }
+        elseif ($raw -eq 'normal') { $mtu = 1500 }
+        elseif ($raw -eq 'fc') { $mtu = 2240 }
+        if ($mtu -gt 0) { $mtuByPriority[$priority] = $mtu }
+    }
+
+    $priorityByPolicyDn = @{}
+    foreach ($row in $Egress) {
+        $parent = Get-ParentDn -Dn ([string](Get-MoProperty $row 'Dn' ''))
+        $priority = [string](Get-MoProperty $row 'Prio' '')
+        if ($parent -and $priority) { $priorityByPolicyDn[$parent] = $priority }
+    }
+
+    $result = @{}
+    foreach ($definition in $Policy) {
+        $name = [string](Get-MoProperty $definition 'Name' '')
+        $dn = [string](Get-MoProperty $definition 'Dn' '')
+        if (-not $name -or -not $priorityByPolicyDn.ContainsKey($dn)) { continue }
+        $priority = $priorityByPolicyDn[$dn]
+        if ($mtuByPriority.ContainsKey($priority)) { $result[$name] = $mtuByPriority[$priority] }
+    }
+    return $result
+}
+
+function Test-NetworkControlPolicyBestPractice {
+    <#
+    .SYNOPSIS
+        Best-practice findings for one network control policy.
+
+    .DESCRIPTION
+        THE UPLINK FAIL ACTION IS THE ONE THAT MATTERS. Set to 'warning' instead
+        of 'link-down', a vNIC stays up when its fabric interconnect loses every
+        northbound uplink. ESXi sees a healthy link, keeps the uplink in the team,
+        and keeps handing it traffic that goes nowhere. Nothing fails over,
+        nothing alarms in vCenter, and the outage is invisible from the host. This
+        is reported as an ERROR rather than a recommendation because there is no
+        design in which a vSwitch-teamed blade wants it.
+
+        MAC register mode matters wherever a blade carries VLANs other than its
+        native one - which is every ESXi host with a trunked vNIC. On
+        'only-native-vlan' the fabric interconnect only installs the MAC on the
+        native VLAN, and VM traffic on the others relies on flooding.
+
+        Discovery is judged on the pair. CDP off is unremarkable where LLDP is on;
+        both off means nothing downstream can identify the fabric, which is a
+        troubleshooting dead end and breaks discovery-based tooling.
+
+    .PARAMETER Policy
+        An nwctrlDefinition object.
+
+    .EXAMPLE
+        Test-NetworkControlPolicyBestPractice -Policy $ncp
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        $Policy
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $name = [string](Get-MoProperty $Policy 'Name' '')
+
+    $uplinkFail = [string](Get-MoProperty $Policy 'UplinkFailAction' '')
+    if ($uplinkFail -and $uplinkFail -ne 'link-down') {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'ERROR'; Category = 'BestPractice'; Check = 'NcpUplinkFailAction'
+            Subject  = $name
+            Expected = 'link-down'
+            Actual   = $uplinkFail
+            Detail   = ("Network control policy '{0}' has Action on Uplink Fail set to '{1}'. The vNIC stays up when the fabric interconnect loses its northbound uplinks, so ESXi keeps the uplink in the team and keeps sending traffic into a hole. Nothing fails over and nothing alarms." -f $name, $uplinkFail)
+        })
+    }
+
+    $macMode = [string](Get-MoProperty $Policy 'MacRegisterMode' '')
+    if ($macMode -and $macMode -ne 'all-host-vlans') {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'BestPractice'; Check = 'NcpMacRegisterMode'
+            Subject  = $name
+            Expected = 'all-host-vlans'
+            Actual   = $macMode
+            Detail   = ("Network control policy '{0}' registers MACs on the native VLAN only ('{1}'). A blade trunking more than one VLAN - which is every ESXi host here - then relies on flooding for VM traffic on the rest." -f $name, $macMode)
+        })
+    }
+
+    $cdp = [string](Get-MoProperty $Policy 'Cdp' 'disabled')
+    $lldpTransmit = [string](Get-MoProperty $Policy 'LldpTransmit' 'unknown')
+    if ($cdp -ne 'enabled') {
+        if ($lldpTransmit -eq 'enabled') {
+            [void]$results.Add([pscustomobject]@{
+                Severity = 'INFO'; Category = 'BestPractice'; Check = 'NcpCdpDisabled'
+                Subject  = $name
+                Expected = 'CDP enabled'
+                Actual   = "CDP $cdp, LLDP transmit enabled"
+                Detail   = ("Network control policy '{0}' has CDP disabled, but LLDP is transmitting, so the fabric is still identifiable from the host." -f $name)
+            })
+        }
+        else {
+            [void]$results.Add([pscustomobject]@{
+                Severity = 'WARN'; Category = 'BestPractice'; Check = 'NcpNoDiscoveryProtocol'
+                Subject  = $name
+                Expected = 'CDP or LLDP enabled'
+                Actual   = "CDP $cdp, LLDP transmit $lldpTransmit"
+                Detail   = ("Network control policy '{0}' has neither CDP nor LLDP transmitting. Nothing downstream can identify which fabric interconnect a blade is cabled to - which is a dead end when troubleshooting, and breaks any tooling that maps hosts to their domain." -f $name)
+            })
+        }
+    }
+
+    return $results.ToArray()
+}
+
+function Test-VnicBestPractice {
+    <#
+    .SYNOPSIS
+        Best-practice findings for one resolved vNIC.
+
+    .DESCRIPTION
+        FABRIC FAILOVER IS THE ONE PEOPLE ARGUE ABOUT. On a vNIC presented to
+        ESXi it should be off: the host's own teaming already handles a failed
+        uplink, and hardware failover on top of it means the fabric moves the MAC
+        while the host still believes the original uplink is fine. The failure
+        then looks like intermittent loss rather than a failed link, and the host
+        never reports the event. Fabric failover is for operating systems with no
+        teaming of their own, which ESXi is not.
+
+        An initial-template is a template that stops being one the moment the
+        profile is stamped. Edits to it never reach the blades already built from
+        it, which is exactly the drift this script exists to find, so a vNIC that
+        comes from one is flagged whether or not it has drifted yet.
+
+        The QoS class MTU is the silent one. A vNIC at 9000 whose priority lands
+        in a class still at 1500 drops jumbo frames with no error anywhere.
+
+    .PARAMETER Member
+        A resolved vNIC: VnicName, TemplateName, TemplateType, SwitchId, Mtu,
+        VlanIds, QosPolicy.
+
+    .PARAMETER QosClassMtu
+        Hashtable of QoS policy name to the MTU of the class it maps to. An
+        absent entry means the class could not be resolved and is not guessed at.
+
+    .EXAMPLE
+        Test-VnicBestPractice -Member $member -QosClassMtu $mtuByPolicy
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        $Member,
+
+        [Parameter(Position = 1)]
+        [hashtable]$QosClassMtu = @{}
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $name = [string]$Member.VnicName
+
+    # 'A-B' or 'B-A' is UCS fabric failover; a bare 'A' or 'B' is not.
+    $switchId = [string]$Member.SwitchId
+    if ($switchId -match '-') {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'BestPractice'; Check = 'VnicFabricFailoverEnabled'
+            Subject  = $name
+            Expected = 'fabric failover disabled, teaming left to ESXi'
+            Actual   = $switchId
+            Detail   = ("{0} has UCS fabric failover enabled ('{1}'). ESXi already handles a failed uplink through its own teaming; with both in play the fabric moves the MAC while the host still believes its uplink is healthy, so a failure reads as intermittent loss and the host never reports it." -f $name, $switchId)
+        })
+    }
+
+    if ([string]$Member.TemplateType -eq 'initial-template') {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'BestPractice'; Check = 'VnicTemplateNotUpdating'
+            Subject  = $name
+            Expected = 'updating-template'
+            Actual   = 'initial-template'
+            Detail   = ("{0} comes from vNIC template '{1}', which is an initial-template. Edits to it never reach a blade already built from it, so the template and the blade drift apart silently from the moment the profile is stamped." -f $name, $Member.TemplateName)
+        })
+    }
+
+    $qosPolicy = [string]$Member.QosPolicy
+    $mtu = [int]$Member.Mtu
+    if ($qosPolicy -and $mtu -gt 0 -and $QosClassMtu.ContainsKey($qosPolicy)) {
+        $classMtu = [int]$QosClassMtu[$qosPolicy]
+        if ($mtu -gt $classMtu) {
+            [void]$results.Add([pscustomobject]@{
+                Severity = 'ERROR'; Category = 'BestPractice'; Check = 'VnicMtuExceedsQosClass'
+                Subject  = $name
+                Expected = "a QoS class MTU of at least $mtu"
+                Actual   = "QoS policy '$qosPolicy' lands in a class with MTU $classMtu"
+                Detail   = ("{0} is set to MTU {1} but its QoS policy '{2}' maps to a system class with MTU {3}. Frames above {3} are dropped with no error anywhere - the symptom is vMotion stalling or NFS timing out on large reads, which looks nothing like an MTU problem." -f $name, $mtu, $qosPolicy, $classMtu)
+            })
+        }
+    }
+
+    if (@($Member.VlanIds) -contains 1) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'INFO'; Category = 'BestPractice'; Check = 'VnicCarriesDefaultVlan'
+            Subject  = $name
+            Expected = 'no VLAN 1 on a data vNIC'
+            Actual   = 'VLAN 1 trunked'
+            Detail   = ("{0} trunks VLAN 1. The default VLAN carries whatever anything untagged puts on it, and is conventionally kept off data uplinks." -f $name)
+        })
+    }
+
+    return $results.ToArray()
+}
+
+function Test-PortGroupBestPractice {
+    <#
+    .SYNOPSIS
+        Best-practice findings for one distributed port group's teaming.
+
+    .DESCRIPTION
+        IP HASH IS NOT SUPPORTED IN FRONT OF UCS. It requires a port channel to
+        the host, and a blade's two vNICs terminate on two independent fabric
+        interconnects that are not a port-channel pair. The result is not a
+        performance question - MACs flap between fabrics and traffic is lost.
+
+        Beacon probing needs three or more uplinks to tell which one is at fault.
+        With the two a blade has, a beacon failure cannot be attributed, so the
+        host guesses; on top of UCS's own link-down behaviour it is redundant as
+        well as wrong.
+
+        Notify Switches is what makes a failover fast. With it off, the fabric
+        keeps sending to the failed uplink until its MAC table ages out.
+
+    .PARAMETER PortGroup
+        A port group row: Name, Teaming, BeaconProbing, NotifySwitches.
+
+    .PARAMETER VdsName
+        The switch it belongs to, for the finding text.
+
+    .EXAMPLE
+        Test-PortGroupBestPractice -PortGroup $row -VdsName 'dvs-prod'
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        $PortGroup,
+
+        [Parameter(Mandatory, Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [string]$VdsName
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $name = [string](Get-MoProperty $PortGroup 'Name' '')
+    $subject = "$VdsName / $name"
+
+    $teaming = [string](Get-MoProperty $PortGroup 'Teaming' '')
+    if ($teaming -eq 'loadbalance_ip') {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'ERROR'; Category = 'BestPractice'; Check = 'PortGroupIpHashTeaming'
+            Subject  = $subject
+            Expected = 'originating virtual port, or explicit failover'
+            Actual   = 'route based on IP hash'
+            Detail   = ("Port group '{0}' on '{1}' uses IP-hash teaming. That needs a port channel to the host, and a blade's two vNICs terminate on two independent fabric interconnects which are not one. MACs flap between fabrics and traffic is lost." -f $name, $VdsName)
+        })
+    }
+
+    if ([bool](Get-MoProperty $PortGroup 'BeaconProbing' $false)) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'BestPractice'; Check = 'PortGroupBeaconProbing'
+            Subject  = $subject
+            Expected = 'link status only'
+            Actual   = 'beacon probing enabled'
+            Detail   = ("Port group '{0}' on '{1}' has beacon probing enabled. It needs three or more uplinks to attribute a failure; with the two a blade has, the host cannot tell which uplink is at fault and guesses." -f $name, $VdsName)
+        })
+    }
+
+    $notify = Get-MoProperty $PortGroup 'NotifySwitches' $null
+    if ($null -ne $notify -and -not [bool]$notify) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'BestPractice'; Check = 'PortGroupNotifySwitchesOff'
+            Subject  = $subject
+            Expected = 'notify switches enabled'
+            Actual   = 'disabled'
+            Detail   = ("Port group '{0}' on '{1}' has Notify Switches off. After a failover the fabric keeps sending to the failed uplink until its MAC table ages out, so the outage lasts seconds longer than it needs to." -f $name, $VdsName)
+        })
+    }
+
+    return $results.ToArray()
+}
+
+function Test-VdsBestPractice {
+    <#
+    .SYNOPSIS
+        Best-practice findings for one distributed switch as a host sees it.
+
+    .PARAMETER VdsName
+        The switch.
+
+    .PARAMETER UplinkCount
+        How many of this host's physical NICs are assigned to it.
+
+    .PARAMETER DiscoveryOperation
+        The switch's link discovery operation - listen, advertise, both or none.
+
+    .EXAMPLE
+        Test-VdsBestPractice -VdsName dvs-prod -UplinkCount 2 -DiscoveryOperation both
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$VdsName,
+
+        [Parameter(Mandatory, Position = 1)]
+        [int]$UplinkCount,
+
+        [Parameter(Position = 2)]
+        [AllowEmptyString()]
+        [string]$DiscoveryOperation = ''
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+
+    if ($UplinkCount -lt 2) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'BestPractice'; Check = 'VdsSingleUplink'
+            Subject  = $VdsName
+            Expected = 'two uplinks, one per fabric'
+            Actual   = "$UplinkCount uplink(s) on this host"
+            Detail   = ("'{0}' has {1} uplink(s) on this host. Everything on it is lost with a single fabric interconnect, a single vNIC or a single cable." -f $VdsName, $UplinkCount)
+        })
+    }
+
+    if ($DiscoveryOperation -eq 'none' -or $DiscoveryOperation -eq '') {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'BestPractice'; Check = 'VdsDiscoveryDisabled'
+            Subject  = $VdsName
+            Expected = 'CDP or LLDP, listening at least'
+            Actual   = $(if ($DiscoveryOperation) { $DiscoveryOperation } else { 'not configured' })
+            Detail   = ("'{0}' has link discovery off, so no host on it can report which fabric interconnect and which port an uplink is cabled to. That is the first question asked in every network fault, and the answer is not available." -f $VdsName)
+        })
+    }
+
+    return $results.ToArray()
+}
+
+function Test-ServiceProfileBestPractice {
+    <#
+    .SYNOPSIS
+        Best-practice findings for one service profile.
+
+    .DESCRIPTION
+        A profile built by hand rather than from a service profile template has
+        nothing holding it to its peers. Every check in this script that compares
+        one blade to another is looking for the drift that this permits, so it is
+        worth knowing which blades are exposed to it before reading the rest.
+
+    .PARAMETER ServiceProfile
+        An lsServer object.
+
+    .EXAMPLE
+        Test-ServiceProfileBestPractice -ServiceProfile $sp
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        $ServiceProfile
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    $name = [string](Get-MoProperty $ServiceProfile 'Name' '')
+
+    $source = [string](Get-MoProperty $ServiceProfile 'OperSrcTemplName' '')
+    if (-not $source) { $source = [string](Get-MoProperty $ServiceProfile 'SrcTemplName' '') }
+    if (-not $source) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Category = 'BestPractice'; Check = 'ProfileNotFromTemplate'
+            Subject  = $name
+            Expected = 'a service profile template'
+            Actual   = 'built directly'
+            Detail   = ("Service profile '{0}' was not created from a service profile template, so nothing holds its vNICs, policies and VLANs to those of its peers. Every drift this report looks for is permitted here by design." -f $name)
+        })
+    }
+
+    return $results.ToArray()
+}
+
+# ============================================================================
 # CDP/LLDP discovery of the UCS domain in front of a host
 # ============================================================================
 
@@ -1799,19 +2328,19 @@ function Get-UcsTargetForHost {
 function Get-UcsRunCredential {
     <#
     .SYNOPSIS
-        The credential to send to UCS Manager, held or passed through from vCenter.
+        The credential to send to UCS Manager.
 
     .DESCRIPTION
-        Order: a credential given explicitly on the command line, then one typed
-        for UCS earlier in this run, then the vCenter credential - which by this
-        point is the only one in the run known to work, and in these estates is
-        the same domain account.
+        The run's credential, typed once and used for UCS Manager and vCenter
+        both, unless -UcsCredential named a different one. Asked for again only
+        if there is none held - which happens when a first attempt was rejected
+        and discarded.
 
-        It is used without asking, but never silently: the account name and where
-        it came from are logged every time, so a replay is visible when something
-        401s. The safety is not a prompt, it is what happens on failure -
-        Register-UcsCredentialResult drops it, counts the attempt, stops offering
-        the vCenter one, and blocks UCS entirely at the limit.
+        The account name is logged every time it is used, so which account was
+        sent where is visible when something 401s. The safety is not a prompt,
+        it is what happens on failure: Register-UcsCredentialResult discards it,
+        counts the attempt, and stops trying at -MaxCredentialAttempt rather than
+        sending the same wrong password until the account locks.
 
     .EXAMPLE
         $cred = Get-UcsRunCredential
@@ -1823,16 +2352,11 @@ function Get-UcsRunCredential {
     if ($script:UcsCredentialBlocked) { return $null }
 
     if ($null -ne $script:UcsCredentialCache) {
-        Write-Log "UCS Manager: using '$($script:UcsCredentialCache.UserName)', held from earlier in this run." -Level DEBUG
+        Write-Log "UCS Manager: using '$($script:UcsCredentialCache.UserName)'." -Level DEBUG
         return $script:UcsCredentialCache
     }
 
-    if ($null -ne $script:SharedCredential -and -not $script:SharedCredentialRejected) {
-        Write-Log "UCS Manager: using '$($script:SharedCredential.UserName)', already accepted by $($script:SharedCredentialSource)." -Level INFO
-        return $script:SharedCredential
-    }
-
-    Write-Log 'UCS Manager: no usable credential to pass through; asking for one.' -Level INFO
+    Write-Log 'UCS Manager: no usable credential held; asking for one.' -Level INFO
     $resolved = $null
     try { $resolved = Get-Credential -Message 'Credentials for UCS Manager' } catch { $resolved = $null }
     if ($null -eq $resolved -or [string]::IsNullOrWhiteSpace($resolved.GetNetworkCredential().Password)) { return $null }
@@ -1881,11 +2405,6 @@ function Register-UcsCredentialResult {
     # A name that does not resolve or a blocked port says nothing about the
     # password, and counting it would block UCS over a firewall rule.
     if ($Message -notmatch '(?i)auth|credential|password|denied|unauthori[sz]ed|login|401') { return }
-
-    if ($null -ne $script:SharedCredential -and $null -eq $script:UcsCredentialCache) {
-        $script:SharedCredentialRejected = $true
-        Write-Log "UCS Manager rejected the $($script:SharedCredentialSource) credential; it will not be offered to UCS again." -Level WARN
-    }
 
     $script:UcsCredentialCache = $null
     $script:UcsCredentialAttempt++
@@ -2215,66 +2734,6 @@ function Get-VnicMemberDetail {
     }
 }
 
-function Resolve-UcsServiceProfile {
-    <#
-    .SYNOPSIS
-        The service profile a host is running on.
-
-    .DESCRIPTION
-        By hardware UUID first. UCS writes the service profile's UUID into the
-        blade's SMBIOS and ESXi reports it back, so it is an identity rather than
-        a convention, and it holds when the service profile is named nothing like
-        the host.
-
-        By short host name second, which is what these estates name profiles
-        after, then a scan of the profile Dns for the same name. The scan reuses
-        an enumeration done once per domain rather than querying per host.
-
-    .PARAMETER HostName
-        The ESXi host name.
-
-    .PARAMETER HostUuid
-        The host's hardware UUID, or '' when it could not be read.
-
-    .PARAMETER Profile
-        Every service profile in the domain.
-
-    .EXAMPLE
-        Resolve-UcsServiceProfile -HostName $esx.Name -HostUuid $uuid -Profile $profiles
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory, Position = 0)]
-        [ValidateNotNullOrEmpty()]
-        [string]$HostName,
-
-        [Parameter(Position = 1)]
-        [AllowEmptyString()]
-        [string]$HostUuid = '',
-
-        [Parameter(Position = 2)]
-        [AllowEmptyCollection()]
-        [array]$Profile = @()
-    )
-
-    if ($HostUuid) {
-        $byUuid = @($Profile | Where-Object { [string](Get-MoProperty $_ 'Uuid' '') -eq $HostUuid })
-        if ($byUuid.Count -eq 1) { return $byUuid[0] }
-    }
-
-    $short = $HostName.Trim().Split('.')[0]
-    $byName = @($Profile | Where-Object { [string](Get-MoProperty $_ 'Name' '') -eq $short })
-    if ($byName.Count -ge 1) { return $byName[0] }
-
-    $byDn = @($Profile | Where-Object {
-        $dn = [string](Get-MoProperty $_ 'Dn' '')
-        $dn -like "*/ls-$short" -or $dn -like "*/$short"
-    })
-    if ($byDn.Count -ge 1) { return $byDn[0] }
-
-    return $null
-}
-
 # ============================================================================
 # Main
 # ============================================================================
@@ -2309,360 +2768,459 @@ try {
         throw ("This script needs cmdlets that are not available in this session:`n  " + ($missing.ToArray() -join "`n  "))
     }
 
-    # ---- Where to connect --------------------------------------------------
-    $viTarget = $VIServer
-    $viCredential = $Credential
-    if ($null -eq $viCredential) {
-        $viCredential = Get-Credential -Message "Credentials for vCenter '$viTarget'"
+    # ---- One credential, asked for once ------------------------------------
+    # In these estates the same domain account signs in to both, so it is typed
+    # once and used for both. -UcsCredential or -VICredential override it for
+    # one side where they differ. Nothing is stored and nothing outlives the run.
+    $runCredential = $Credential
+    if ($null -eq $runCredential -and ($null -eq $UcsCredential -or $null -eq $VICredential)) {
+        $runCredential = Get-Credential -Message "Credentials for UCS Manager '$UcsManager' and vCenter '$VIServer'"
     }
-    if ($null -eq $viCredential) { throw "No credential supplied for vCenter '$viTarget'." }
+    if ($null -ne $UcsCredential) { $script:UcsCredentialCache = $UcsCredential }
+    elseif ($null -ne $runCredential) { $script:UcsCredentialCache = $runCredential }
 
-    if ($PSBoundParameters.ContainsKey('UcsCredential')) { $script:UcsCredentialCache = $UcsCredential }
+    $viCredential = $VICredential
+    if ($null -eq $viCredential) { $viCredential = $runCredential }
+    if ($null -eq $viCredential) { throw "No credential available for vCenter '$VIServer'." }
+    if ($null -eq $script:UcsCredentialCache) { throw "No credential available for UCS Manager '$UcsManager'." }
 
-    # ---- vCenter -----------------------------------------------------------
-    Write-Log "Connecting to vCenter '$viTarget' as '$($viCredential.UserName)'." -Level INFO
-    $viConnection = Connect-VIServer -Server $viTarget -Credential $viCredential -ErrorAction Stop
-    Write-Log "Connected to vCenter '$($viConnection.Name)'." -Level INFO
+    # ---- UCS Manager first -------------------------------------------------
+    # THIS IS THE PIVOT. The service profiles are the inventory: they name the
+    # blades that exist, and each one carries the vNICs to be checked. Starting
+    # at vCenter instead means starting from whatever happens to be registered
+    # there, which answers a different question - and quietly skips a blade whose
+    # host is disconnected or was never added.
+    $target = Remove-UcsTargetDecoration -Value $UcsManager
+    $session = Connect-UcsForTarget -Target $target
+    if ($null -eq $session) { throw "Could not sign in to UCS Manager '$target'. Nothing was checked." }
 
-    # Proven, and only now. The point of replaying a credential is that it is
-    # known good; replaying an unproven one at each UCS domain in turn is how an
-    # account gets locked.
-    $script:SharedCredential = $viCredential
-    $script:SharedCredentialSource = "vCenter '$($viConnection.Name)'"
+    Write-Log "Reading the VLAN and vNIC configuration of '$target'." -Level INFO
+    $vlans = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVlan' -ClassId 'fabricVlan')
+    $vsans = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVsan' -ClassId 'fabricVsan')
+    $templates = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVnicTemplate' -ClassId 'vnicLanConnTempl')
+    $vnics = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVnic' -ClassId 'vnicEther')
+    $interfaces = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVnicInterface' -ClassId 'vnicEtherIf')
+    $controlPolicies = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsNetworkControlPolicy' -ClassId 'nwctrlDefinition')
+    $profiles = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsServiceProfile' -ClassId 'lsServer')
+    $qosPolicies = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsQosPolicy' -ClassId 'epqosDefinition')
+    $qosEgress = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVnicEgressPolicy' -ClassId 'epqosEgress')
+    $qosClasses = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsQosClass' -ClassId 'fabricQosClass')
 
-    # ---- Hosts in scope ----------------------------------------------------
-    $targetHosts = @()
-    if ($Cluster) {
-        foreach ($clusterName in $Cluster) {
-            $targetHosts += @(Get-Cluster -Name $clusterName -ErrorAction Stop | Get-VMHost)
+    # ---- Indexes -----------------------------------------------------------
+    $vlanIdByName = @{}
+    foreach ($vlan in $vlans) {
+        $name = [string](Get-MoProperty $vlan 'Name' '')
+        $id = [int](Get-MoProperty $vlan 'Id' 0)
+        if ($name -and $id -gt 0 -and -not $vlanIdByName.ContainsKey($name)) { $vlanIdByName[$name] = $id }
+    }
+
+    $interfaceIndex = @{}
+    foreach ($interface in $interfaces) {
+        $parent = Get-ParentDn -Dn ([string](Get-MoProperty $interface 'Dn' ''))
+        if (-not $parent) { continue }
+        if (-not $interfaceIndex.ContainsKey($parent)) { $interfaceIndex[$parent] = New-Object System.Collections.Generic.List[object] }
+        [void]$interfaceIndex[$parent].Add($interface)
+    }
+
+    $templateByName = @{}
+    $templateDn = @{}
+    foreach ($template in $templates) {
+        $name = [string](Get-MoProperty $template 'Name' '')
+        if ($name -and -not $templateByName.ContainsKey($name)) { $templateByName[$name] = $template }
+        $dn = [string](Get-MoProperty $template 'Dn' '')
+        if ($dn) { $templateDn[$dn] = $true }
+    }
+
+    # Every VLAN name reached from a template, and every one reached only from a
+    # service profile's own vNIC. The parent Dn of an interface row separates
+    # them - templates and vNICs hold their VLANs the same way.
+    $vlanOnTemplate = New-Object System.Collections.Generic.List[string]
+    $vlanOnVnic = New-Object System.Collections.Generic.List[string]
+    foreach ($interface in $interfaces) {
+        $name = [string](Get-MoProperty $interface 'Name' '')
+        if (-not $name) { continue }
+        $parent = Get-ParentDn -Dn ([string](Get-MoProperty $interface 'Dn' ''))
+        if ($templateDn.ContainsKey($parent)) {
+            if (-not $vlanOnTemplate.Contains($name)) { [void]$vlanOnTemplate.Add($name) }
+        }
+        elseif (-not $vlanOnVnic.Contains($name)) { [void]$vlanOnVnic.Add($name) }
+    }
+
+    $controlPolicyByName = @{}
+    foreach ($policy in $controlPolicies) {
+        $name = [string](Get-MoProperty $policy 'Name' '')
+        if ($name -and -not $controlPolicyByName.ContainsKey($name)) { $controlPolicyByName[$name] = $policy }
+    }
+
+    $vnicsByProfile = @{}
+    foreach ($vnic in $vnics) {
+        $parent = Get-ParentDn -Dn ([string](Get-MoProperty $vnic 'Dn' ''))
+        if (-not $parent) { continue }
+        if (-not $vnicsByProfile.ContainsKey($parent)) { $vnicsByProfile[$parent] = New-Object System.Collections.Generic.List[object] }
+        [void]$vnicsByProfile[$parent].Add($vnic)
+    }
+
+    $qosClassMtu = Get-QosClassMtu -Policy $qosPolicies -Egress $qosEgress -QosClass $qosClasses
+
+    Write-Log ("'{0}': {1} VLAN(s), {2} vNIC template(s), {3} service profile(s)." -f $target, $vlans.Count, $templates.Count, $profiles.Count) -Level INFO
+
+    # ---- Domain-wide checks ------------------------------------------------
+    Add-CheckResult -Finding @(Test-UcsVlanInventory -Vlan $vlans -Vsan $vsans) `
+        -Scope 'UCS' -Domain $target -Check 'VlanDefinitions' -Subject "$target VLAN table" `
+        -Detail ("All {0} VLAN definitions in this domain are unique by id and by name, inside the usable range, and none collide with a VSAN's FCoE VLAN." -f $vlans.Count)
+
+    Add-CheckResult -Finding @(Test-UcsVlanAssignment -Vlan $vlans -TemplateVlanName $vlanOnTemplate.ToArray() `
+                -ProfileVlanName $vlanOnVnic.ToArray() -MaxIndividual $MaxUnassignedVlanDetail) `
+        -Scope 'UCS' -Domain $target -Check 'VlanAssignment' -Subject "$target vNIC templates" `
+        -Detail ("Every VLAN defined on this fabric is carried by at least one vNIC template - {0} VLAN(s) across {1} template(s)." -f $vlanOnTemplate.Count, $templates.Count)
+
+    if (-not $SkipBestPractice) {
+        foreach ($policy in $controlPolicies) {
+            Add-CheckResult -Finding @(Test-NetworkControlPolicyBestPractice -Policy $policy) `
+                -Scope 'UCS' -Domain $target -Category 'BestPractice' -Check 'NetworkControlPolicy' `
+                -Subject ([string](Get-MoProperty $policy 'Name' '')) `
+                -Detail ("Network control policy '{0}' drops the link on uplink failure, registers MACs on all host VLANs, and advertises a discovery protocol." -f (Get-MoProperty $policy 'Name' ''))
         }
     }
-    else {
-        $targetHosts = @(Get-VMHost)
-    }
 
-    if ($VMHostName) {
-        $targetHosts = @($targetHosts | Where-Object {
-            $candidate = $_.Name
-            [bool](@($VMHostName | Where-Object { $candidate -like $_ }).Count)
+    # ---- The blades, from the service profiles ------------------------------
+    $associated = @($profiles | Where-Object { [string](Get-MoProperty $_ 'AssocState' '') -ne 'unassociated' })
+    if ($ServiceProfile) {
+        $associated = @($associated | Where-Object {
+            $candidate = [string](Get-MoProperty $_ 'Name' '')
+            [bool](@($ServiceProfile | Where-Object { $candidate -like $_ }).Count)
         })
     }
 
-    $targetHosts = @($targetHosts | Where-Object { $_.ConnectionState -eq 'Connected' -or $_.ConnectionState -eq 'Maintenance' } | Sort-Object Name)
-    if ($targetHosts.Count -eq 0) { throw 'No connected hosts matched the given -Cluster/-VMHostName filters.' }
-    Write-Log "$($targetHosts.Count) host(s) in scope." -Level INFO
+    foreach ($idle in @($profiles | Where-Object { [string](Get-MoProperty $_ 'AssocState' '') -eq 'unassociated' })) {
+        Add-Finding -Severity 'INFO' -Scope 'UCS' -Check 'ProfileUnassociated' -Domain $target `
+            -Subject ([string](Get-MoProperty $idle 'Name' '')) -Expected '' -Actual 'not associated with a blade' `
+            -Detail ("Service profile '{0}' is not associated with a blade, so there is no host to check it against. Its vNICs were not compared." -f (Get-MoProperty $idle 'Name' ''))
+    }
 
-    # ---- vDS inventory, read once -----------------------------------------
+    if ($associated.Count -eq 0) { throw "No associated service profiles in '$target' matched the filter. Nothing to check." }
+    Write-Log "$($associated.Count) associated service profile(s) to check." -Level INFO
+
+    # ---- vCenter ------------------------------------------------------------
+    Write-Log "Connecting to vCenter '$VIServer' as '$($viCredential.UserName)'." -Level INFO
+    $viConnection = Connect-VIServer -Server $VIServer -Credential $viCredential -ErrorAction Stop
+    Write-Log "Connected to vCenter '$($viConnection.Name)'." -Level INFO
+
     $vdsByName = @{}
     $portGroupsByVds = @{}
     foreach ($vds in @(Get-VDSwitch -ErrorAction SilentlyContinue)) { $vdsByName[[string]$vds.Name] = $vds }
     Write-Log "$($vdsByName.Count) distributed switch(es) visible in this vCenter." -Level DEBUG
 
-    # ---- Map each host to a UCS domain -------------------------------------
-    $hostsByTarget = @{}
-    foreach ($esx in $targetHosts) {
-        $targets = if ($UcsManager) { @($UcsManager) } else { @(Get-UcsTargetForHost -VMHostObject $esx) }
-
-        if ($targets.Count -eq 0) {
-            Write-Log "$($esx.Name) reports no CDP or LLDP neighbour, so its UCS domain is unknown. Skipping it." -Level WARN
-            Add-Finding -Severity 'WARN' -Scope 'vCenter' -Check 'NoDiscoveryNeighbour' -HostName $esx.Name `
-                -Subject $esx.Name -Expected 'a CDP or LLDP neighbour on at least one vmnic' -Actual 'none reported' `
-                -Detail "$($esx.Name) reports no CDP or LLDP neighbour on any physical NIC, so the UCS domain in front of it could not be identified. Either discovery is disabled on the vNIC's network control policy, or the vDS is set to a protocol the fabric does not send."
-            continue
+    # Every host in the vCenter, indexed the two ways a service profile can be
+    # matched to one. The UUID index is the authoritative one: UCS writes the
+    # profile's UUID into the blade's SMBIOS and ESXi reports it back, so a hit
+    # there is proof rather than a naming convention.
+    $allHosts = @(Get-VMHost)
+    $hostByUuid = @{}
+    $hostByShortName = @{}
+    $hostViewByName = @{}
+    foreach ($esx in $allHosts) {
+        $shortName = ([string]$esx.Name).Split('.')[0].ToLowerInvariant()
+        if (-not $hostByShortName.ContainsKey($shortName)) { $hostByShortName[$shortName] = $esx }
+        try {
+            $view = Get-View -Id $esx.Id -ErrorAction Stop
+            $hostViewByName[[string]$esx.Name] = $view
+            $uuid = [string](Get-MoProperty (Get-MoProperty (Get-MoProperty $view 'Hardware' $null) 'SystemInfo' $null) 'Uuid' '')
+            if ($uuid -and -not $hostByUuid.ContainsKey($uuid)) { $hostByUuid[$uuid] = $esx }
         }
-
-        $target = $targets[0]
-        if ($targets.Count -gt 1) {
-            Write-Log "$($esx.Name) reports several neighbour names ($($targets -join ', ')); using '$target'." -Level DEBUG
+        catch {
+            Write-Log "Could not read the host view for $($esx.Name): $($_.Exception.Message)" -Level WARN
         }
-        if (-not $hostsByTarget.ContainsKey($target)) { $hostsByTarget[$target] = New-Object System.Collections.Generic.List[object] }
-        [void]$hostsByTarget[$target].Add($esx)
     }
+    Write-Log "$($allHosts.Count) host(s) registered in this vCenter." -Level DEBUG
 
-    Write-Log "$($hostsByTarget.Count) UCS domain(s) to check: $((@($hostsByTarget.Keys) | Sort-Object) -join ', ')." -Level INFO
+    $matchedHostName = @{}
 
-    # ---- Per UCS domain ----------------------------------------------------
-    foreach ($target in @($hostsByTarget.Keys | Sort-Object)) {
-        $domainHosts = @($hostsByTarget[$target].ToArray())
-        $session = Connect-UcsForTarget -Target $target
-        if ($null -eq $session) {
-            Add-Finding -Severity 'WARN' -Scope 'UCS' -Check 'DomainUnreachable' -Domain $target `
-                -Subject $target -Expected 'a UCS Manager session' -Actual 'sign-in failed or was skipped' `
-                -Detail "Could not sign in to UCS Manager '$target', so the $($domainHosts.Count) host(s) behind it were not checked."
+    # ---- Per service profile ------------------------------------------------
+    foreach ($profileMo in @($associated | Sort-Object { [string](Get-MoProperty $_ 'Name' '') })) {
+        $profileName = [string](Get-MoProperty $profileMo 'Name' '')
+        $profileDn = [string](Get-MoProperty $profileMo 'Dn' '')
+        $profileUuid = [string](Get-MoProperty $profileMo 'Uuid' '')
+
+        if (-not $SkipBestPractice) {
+            Add-CheckResult -Finding @(Test-ServiceProfileBestPractice -ServiceProfile $profileMo) `
+                -Scope 'UCS' -Domain $target -Category 'BestPractice' -Check 'ServiceProfileSource' -Subject $profileName `
+                -Detail ("Service profile '{0}' comes from a service profile template, so its vNICs and policies are held to its peers'." -f $profileName)
+        }
+
+        # --- which host is this blade? ---------------------------------------
+        $esx = $null
+        $matchedBy = ''
+        if ($profileUuid -and $hostByUuid.ContainsKey($profileUuid)) {
+            $esx = $hostByUuid[$profileUuid]
+            $matchedBy = 'hardware UUID'
+        }
+        else {
+            foreach ($candidate in @($profileName, ($profileName + $HostDomainSuffix))) {
+                $shortName = ([string]$candidate).Split('.')[0].ToLowerInvariant()
+                if ($shortName -and $hostByShortName.ContainsKey($shortName)) {
+                    $esx = $hostByShortName[$shortName]
+                    $matchedBy = 'name'
+                    break
+                }
+            }
+        }
+
+        if ($null -eq $esx) {
+            Add-Finding -Severity 'WARN' -Scope 'CrossCheck' -Check 'ProfileHasNoHost' -Domain $target `
+                -Subject $profileName -Expected "a host in '$($viConnection.Name)'" -Actual 'no match by UUID or name' `
+                -Detail ("Service profile '{0}' is associated with a blade, but no host in '{1}' matches it by hardware UUID or by name. Either the blade runs something other than ESXi, its host is registered in a different vCenter, or it was never added." -f $profileName, $viConnection.Name)
             continue
         }
 
-        Write-Log "Reading the VLAN and vNIC configuration of '$target'." -Level INFO
-        $vlans = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVlan' -ClassId 'fabricVlan')
-        $vsans = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVsan' -ClassId 'fabricVsan')
-        $templates = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVnicTemplate' -ClassId 'vnicLanConnTempl')
-        $vnics = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVnic' -ClassId 'vnicEther')
-        $interfaces = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVnicInterface' -ClassId 'vnicEtherIf')
-        $controlPolicies = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsNetworkControlPolicy' -ClassId 'nwctrlDefinition')
-        $profiles = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsServiceProfile' -ClassId 'lsServer')
+        $hostName = [string]$esx.Name
+        $matchedHostName[$hostName] = $true
+        Write-Log ("{0} -> {1}, matched by {2}." -f $profileName, $hostName, $matchedBy) -Level DEBUG
 
-        # --- indexes ---------------------------------------------------------
-        $vlanIdByName = @{}
-        foreach ($vlan in $vlans) {
-            $name = [string](Get-MoProperty $vlan 'Name' '')
-            $id = [int](Get-MoProperty $vlan 'Id' 0)
-            if ($name -and $id -gt 0 -and -not $vlanIdByName.ContainsKey($name)) { $vlanIdByName[$name] = $id }
+        if ([string]$esx.ConnectionState -notin @('Connected', 'Maintenance')) {
+            Add-Finding -Severity 'WARN' -Scope 'vCenter' -Check 'HostNotConnected' -Domain $target -HostName $hostName `
+                -Subject $hostName -Expected 'a connected host' -Actual ([string]$esx.ConnectionState) `
+                -Detail ("{0} is {1} in vCenter, so its vDS and port group configuration could not be read. The UCS side was still checked." -f $hostName, $esx.ConnectionState)
         }
 
-        $interfaceIndex = @{}
-        foreach ($interface in $interfaces) {
-            $parent = Get-ParentDn -Dn ([string](Get-MoProperty $interface 'Dn' ''))
-            if (-not $parent) { continue }
-            if (-not $interfaceIndex.ContainsKey($parent)) { $interfaceIndex[$parent] = New-Object System.Collections.Generic.List[object] }
-            [void]$interfaceIndex[$parent].Add($interface)
-        }
+        $hostView = $null
+        if ($hostViewByName.ContainsKey($hostName)) { $hostView = $hostViewByName[$hostName] }
 
-        $templateByName = @{}
-        $templateDn = @{}
-        foreach ($template in $templates) {
-            $name = [string](Get-MoProperty $template 'Name' '')
-            if ($name -and -not $templateByName.ContainsKey($name)) { $templateByName[$name] = $template }
-            $dn = [string](Get-MoProperty $template 'Dn' '')
-            if ($dn) { $templateDn[$dn] = $true }
-        }
-
-        # Every VLAN name reached from a template, and every one reached only
-        # from a service profile's own vNIC. The parent Dn of an interface row is
-        # what separates them - templates and vNICs hold their VLANs the same way.
-        $vlanOnTemplate = New-Object System.Collections.Generic.List[string]
-        $vlanOnVnic = New-Object System.Collections.Generic.List[string]
-        foreach ($interface in $interfaces) {
-            $name = [string](Get-MoProperty $interface 'Name' '')
-            if (-not $name) { continue }
-            $parent = Get-ParentDn -Dn ([string](Get-MoProperty $interface 'Dn' ''))
-            if ($templateDn.ContainsKey($parent)) {
-                if (-not $vlanOnTemplate.Contains($name)) { [void]$vlanOnTemplate.Add($name) }
+        # A name match is a convention, not proof. CDP and LLDP say which fabric
+        # the blade is actually cabled to, so a name-matched host is verified
+        # against the domain being checked before its vNICs are compared to it.
+        # A UUID match needs no such confirmation - it already is the proof.
+        if ($matchedBy -eq 'name') {
+            $neighbours = @(Get-UcsTargetForHost -VMHostObject $esx)
+            if ($neighbours.Count -eq 0) {
+                Add-Finding -Severity 'INFO' -Scope 'CrossCheck' -Check 'HostDomainUnverified' -Domain $target -HostName $hostName `
+                    -Subject $hostName -Expected "confirmation that $hostName is behind '$target'" -Actual 'no CDP or LLDP neighbour' `
+                    -Detail ("{0} was matched to service profile '{1}' by name alone and reports no CDP or LLDP neighbour, so it could not be confirmed as a blade of '{2}'." -f $hostName, $profileName, $target)
             }
-            elseif (-not $vlanOnVnic.Contains($name)) { [void]$vlanOnVnic.Add($name) }
-        }
-
-        $controlPolicyByName = @{}
-        foreach ($policy in $controlPolicies) {
-            $name = [string](Get-MoProperty $policy 'Name' '')
-            if ($name -and -not $controlPolicyByName.ContainsKey($name)) { $controlPolicyByName[$name] = $policy }
-        }
-
-        $vnicsByProfile = @{}
-        foreach ($vnic in $vnics) {
-            $parent = Get-ParentDn -Dn ([string](Get-MoProperty $vnic 'Dn' ''))
-            if (-not $parent) { continue }
-            if (-not $vnicsByProfile.ContainsKey($parent)) { $vnicsByProfile[$parent] = New-Object System.Collections.Generic.List[object] }
-            [void]$vnicsByProfile[$parent].Add($vnic)
-        }
-
-        Write-Log ("'{0}': {1} VLAN(s), {2} vNIC template(s), {3} service profile(s)." -f $target, $vlans.Count, $templates.Count, $profiles.Count) -Level INFO
-
-        # --- domain-wide VLAN definitions ------------------------------------
-        Add-CheckResult -Finding @(Test-UcsVlanInventory -Vlan $vlans -Vsan $vsans) `
-            -Scope 'UCS' -Domain $target -Check 'VlanDefinitions' -Subject "$target VLAN table" `
-            -Detail ("All {0} VLAN definitions in this domain are unique by id and by name, inside the usable range, and none collide with a VSAN's FCoE VLAN." -f $vlans.Count)
-
-        # --- VLANs the fabric carries that no vNIC template uses --------------
-        Add-CheckResult -Finding @(Test-UcsVlanAssignment -Vlan $vlans -TemplateVlanName $vlanOnTemplate.ToArray() `
-                    -ProfileVlanName $vlanOnVnic.ToArray() -MaxIndividual $MaxUnassignedVlanDetail) `
-            -Scope 'UCS' -Domain $target -Check 'VlanAssignment' -Subject "$target vNIC templates" `
-            -Detail ("Every VLAN defined on this fabric is carried by at least one vNIC template - {0} VLAN(s) across {1} template(s)." -f $vlanOnTemplate.Count, $templates.Count)
-
-        # --- per host --------------------------------------------------------
-        foreach ($esx in $domainHosts) {
-            $hostView = $null
-            $hostUuid = ''
-            try {
-                $hostView = Get-View -Id $esx.Id -ErrorAction Stop
-                $hostUuid = [string](Get-MoProperty (Get-MoProperty (Get-MoProperty $hostView 'Hardware' $null) 'SystemInfo' $null) 'Uuid' '')
-            }
-            catch {
-                Write-Log "Could not read the host view for $($esx.Name): $($_.Exception.Message)" -Level WARN
-            }
-
-            $serviceProfile = Resolve-UcsServiceProfile -HostName $esx.Name -HostUuid $hostUuid -Profile $profiles
-            if ($null -eq $serviceProfile) {
-                Add-Finding -Severity 'WARN' -Scope 'UCS' -Check 'NoServiceProfile' -Domain $target -HostName $esx.Name `
-                    -Subject $esx.Name -Expected 'a service profile in this domain' -Actual 'no match by UUID or name' `
-                    -Detail "No service profile in '$target' matches $($esx.Name) by hardware UUID or by name, so its vNICs could not be checked."
+            elseif ($neighbours -notcontains $target) {
+                Add-Finding -Severity 'ERROR' -Scope 'CrossCheck' -Check 'HostInDifferentDomain' -Domain $target -HostName $hostName `
+                    -Subject $hostName -Expected $target -Actual ($neighbours -join ', ') `
+                    -Detail ("{0} was matched to service profile '{1}' by name, but its CDP/LLDP neighbour is {2}, not '{3}'. Two domains have a profile and a host of the same name, and the findings for this host would be against the wrong fabric - so it was skipped." -f $hostName, $profileName, ($neighbours -join ', '), $target)
                 continue
             }
+        }
 
-            $profileDn = [string](Get-MoProperty $serviceProfile 'Dn' '')
-            $profileVnics = @()
-            if ($vnicsByProfile.ContainsKey($profileDn)) { $profileVnics = @($vnicsByProfile[$profileDn].ToArray()) }
+        # --- the vNICs --------------------------------------------------------
+        $profileVnics = @()
+        if ($vnicsByProfile.ContainsKey($profileDn)) { $profileVnics = @($vnicsByProfile[$profileDn].ToArray()) }
 
-            if ($profileVnics.Count -eq 0) {
-                Add-Finding -Severity 'WARN' -Scope 'UCS' -Check 'NoVnics' -Domain $target -HostName $esx.Name `
-                    -Subject ([string](Get-MoProperty $serviceProfile 'Name' '')) -Expected 'vNICs on the service profile' -Actual 'none' `
-                    -Detail "Service profile '$(Get-MoProperty $serviceProfile 'Name' '')' in '$target' has no vNICs."
-                continue
-            }
+        if ($profileVnics.Count -eq 0) {
+            Add-Finding -Severity 'WARN' -Scope 'UCS' -Check 'NoVnics' -Domain $target -HostName $hostName `
+                -Subject $profileName -Expected 'vNICs on the service profile' -Actual 'none' `
+                -Detail "Service profile '$profileName' in '$target' has no vNICs."
+            continue
+        }
 
-            $ordinalMap = Get-VnicOrdinalMap -Vnic $profileVnics
-            Write-Log ("{0}: service profile '{1}', {2} vNIC(s), ordinals derived from {3}." -f $esx.Name, (Get-MoProperty $serviceProfile 'Name' ''), $profileVnics.Count, $ordinalMap.Source) -Level DEBUG
+        $ordinalMap = Get-VnicOrdinalMap -Vnic $profileVnics
+        Write-Log ("{0}: {1} vNIC(s), ordinals derived from {2}." -f $profileName, $profileVnics.Count, $ordinalMap.Source) -Level DEBUG
 
-            if ($ordinalMap.Source -eq 'order') {
-                Add-Finding -Severity 'INFO' -Scope 'UCS' -Check 'VnicOrdinalDerived' -Domain $target -HostName $esx.Name `
-                    -Subject ([string](Get-MoProperty $serviceProfile 'Name' '')) -Expected 'vNIC names ending in their ordinal' -Actual 'ordinals taken from the UCS order field' `
-                    -Detail "The vNICs on '$(Get-MoProperty $serviceProfile 'Name' '')' are not named with distinct trailing numbers, so their ordinals were derived from the UCS order field. Confirm the pairing before acting on the findings for this profile."
-            }
+        if ($ordinalMap.Source -eq 'order') {
+            Add-Finding -Severity 'INFO' -Scope 'UCS' -Check 'VnicOrdinalDerived' -Domain $target -HostName $hostName `
+                -Subject $profileName -Expected 'vNIC names ending in their ordinal' -Actual 'ordinals taken from the UCS order field' `
+                -Detail "The vNICs on '$profileName' are not named with distinct trailing numbers, so their ordinals were derived from the UCS order field. Confirm the pairing before acting on the findings for this profile."
+        }
 
-            # Every member, indexed by ordinal, so both the pair checks and the
-            # vDS cross-check read the same resolved view of the vNIC.
-            $memberByOrdinal = @{}
-            foreach ($ordinal in @($ordinalMap.Map.Keys)) {
-                $memberByOrdinal[$ordinal] = Get-VnicMemberDetail -Ordinal $ordinal -Vnic $ordinalMap.Map[$ordinal] `
-                    -TemplateByName $templateByName -InterfaceIndex $interfaceIndex -VlanIdByName $vlanIdByName
-            }
+        $memberByOrdinal = @{}
+        foreach ($ordinal in @($ordinalMap.Map.Keys)) {
+            $memberByOrdinal[$ordinal] = Get-VnicMemberDetail -Ordinal $ordinal -Vnic $ordinalMap.Map[$ordinal] `
+                -TemplateByName $templateByName -InterfaceIndex $interfaceIndex -VlanIdByName $vlanIdByName
+        }
 
-            # --- VLANs referenced by name that this domain does not define ----
-            foreach ($member in @($memberByOrdinal.Values | Sort-Object Ordinal)) {
-                if (@($member.Unresolved).Count -eq 0) { continue }
-                Add-Finding -Severity 'ERROR' -Scope 'UCS' -Check 'VlanNotDefined' -Domain $target -HostName $esx.Name `
+        foreach ($member in @($memberByOrdinal.Values | Sort-Object Ordinal)) {
+            if (@($member.Unresolved).Count -gt 0) {
+                Add-Finding -Severity 'ERROR' -Scope 'UCS' -Check 'VlanNotDefined' -Domain $target -HostName $hostName `
                     -Subject $member.VnicName -Expected 'every VLAN on the vNIC defined in this domain' -Actual (@($member.Unresolved) -join ', ') `
                     -Detail "$($member.VnicName) references VLAN(s) $((@($member.Unresolved)) -join ', ') that resolve to no id in '$target'."
             }
-
-            # --- a vNIC that has drifted from its own template ----------------
-            # An initial-template edited after the profile was stamped looks
-            # correct in UCS Manager and is not correct on the blade.
-            foreach ($member in @($memberByOrdinal.Values | Sort-Object Ordinal)) {
-                if (@($member.TemplateDriftIds).Count -eq 0) { continue }
-                Add-Finding -Severity 'WARN' -Scope 'UCS' -Check 'VnicDivergedFromTemplate' -Domain $target -HostName $esx.Name `
+            if (@($member.TemplateDriftIds).Count -gt 0) {
+                Add-Finding -Severity 'WARN' -Scope 'UCS' -Check 'VnicDivergedFromTemplate' -Domain $target -HostName $hostName `
                     -Subject $member.VnicName -Expected ('the VLANs of template ''{0}'': {1}' -f $member.TemplateName, (Format-IdList -Id @($member.TemplateVlanIds))) `
                     -Actual (Format-IdList -Id @($member.VlanIds)) `
                     -Detail "$($member.VnicName) does not carry the same VLANs as its template '$($member.TemplateName)' - they differ by $(Format-IdList -Id @($member.TemplateDriftIds)). An initial-template edited after the profile was stamped shows the change in UCS Manager without applying it to the blade."
             }
-
-            # --- pair groups ---------------------------------------------------
-            foreach ($group in $pairGroups) {
-                $members = @($group | Where-Object { $memberByOrdinal.ContainsKey($_) } | ForEach-Object { $memberByOrdinal[$_] })
-                if ($members.Count -eq 0) { continue }
-                $label = (@($members | ForEach-Object { $_.VnicName }) -join '/')
-                Add-CheckResult -Finding @(Compare-VnicGroup -Member $members -ExpectedMtu $ExpectedMtu) `
-                    -Scope 'UCS' -Domain $target -HostName $esx.Name -Check 'VnicPair' -Subject $label `
-                    -Detail ("{0} match on VLANs ({1}), native VLAN, MTU {2} and their network control, QoS and adapter policies, and sit on separate fabric interconnects." -f $label, (Format-IdList -Id @($members[0].VlanIds)), $members[0].Mtu)
+            if (-not $SkipBestPractice) {
+                Add-CheckResult -Finding @(Test-VnicBestPractice -Member $member -QosClassMtu $qosClassMtu) `
+                    -Scope 'UCS' -Domain $target -HostName $hostName -Category 'BestPractice' -Check 'VnicSettings' -Subject $member.VnicName `
+                    -Detail ("{0} has fabric failover off, comes from an updating template, and its MTU {1} fits the QoS class it maps to." -f $member.VnicName, $member.Mtu)
             }
+        }
 
-            # --- the vSphere cross-check --------------------------------------
-            $uplinkMap = Get-HostUplinkMap -HostView $hostView
-            if ($uplinkMap.Count -eq 0) {
-                Write-Log "$($esx.Name) has no distributed switch uplinks; nothing to cross-check." -Level DEBUG
+        foreach ($group in $pairGroups) {
+            $members = @($group | Where-Object { $memberByOrdinal.ContainsKey($_) } | ForEach-Object { $memberByOrdinal[$_] })
+            if ($members.Count -eq 0) { continue }
+            $label = (@($members | ForEach-Object { $_.VnicName }) -join '/')
+            Add-CheckResult -Finding @(Compare-VnicGroup -Member $members -ExpectedMtu $ExpectedMtu) `
+                -Scope 'UCS' -Domain $target -HostName $hostName -Check 'VnicPair' -Subject $label `
+                -Detail ("{0} match on VLANs ({1}), native VLAN, MTU {2} and their network control, QoS and adapter policies, and sit on separate fabric interconnects." -f $label, (Format-IdList -Id @($members[0].VlanIds)), $members[0].Mtu)
+        }
+
+        # --- the vSphere cross-check ------------------------------------------
+        $uplinkMap = Get-HostUplinkMap -HostView $hostView
+        if ($uplinkMap.Count -eq 0) {
+            Add-Finding -Severity 'INFO' -Scope 'CrossCheck' -Check 'NoDistributedSwitch' -Domain $target -HostName $hostName `
+                -Subject $hostName -Expected '' -Actual 'no distributed switch uplinks' `
+                -Detail ("{0} has no distributed switch uplinks, so its UCS VLANs could not be cross-checked against vCenter. Standard switches are not read by this script." -f $hostName)
+            continue
+        }
+
+        foreach ($vdsName in @($uplinkMap.Values | Sort-Object -Unique)) {
+            $vmnics = @($uplinkMap.Keys | Where-Object { $uplinkMap[$_] -eq $vdsName } | Sort-Object)
+            $ordinals = @($vmnics | ForEach-Object { Get-VnicOrdinal -Name $_ } | Where-Object { $_ -ge 0 })
+            $backing = @($ordinals | Where-Object { $memberByOrdinal.ContainsKey($_) } | ForEach-Object { $memberByOrdinal[$_] })
+
+            if ($backing.Count -eq 0) {
+                Add-Finding -Severity 'WARN' -Scope 'CrossCheck' -Check 'UplinkNotMappedToVnic' -Domain $target -HostName $hostName `
+                    -Subject $vdsName -Expected 'a UCS vNIC behind each vDS uplink' -Actual ($vmnics -join ', ') `
+                    -Detail "The uplinks $($vmnics -join ', ') on '$vdsName' could not be matched to a vNIC on service profile '$profileName', so their VLANs were not cross-checked."
                 continue
             }
 
-            foreach ($vdsName in @($uplinkMap.Values | Sort-Object -Unique)) {
-                $vmnics = @($uplinkMap.Keys | Where-Object { $uplinkMap[$_] -eq $vdsName } | Sort-Object)
-                $ordinals = @($vmnics | ForEach-Object { Get-VnicOrdinal -Name $_ } | Where-Object { $_ -ge 0 })
-                $backing = @($ordinals | Where-Object { $memberByOrdinal.ContainsKey($_) } | ForEach-Object { $memberByOrdinal[$_] })
+            if ($backing.Count -lt $vmnics.Count) {
+                Add-Finding -Severity 'WARN' -Scope 'CrossCheck' -Check 'UplinkPartiallyMapped' -Domain $target -HostName $hostName `
+                    -Subject $vdsName -Expected "a vNIC for each of $($vmnics -join ', ')" -Actual "$($backing.Count) matched" `
+                    -Detail "Only $($backing.Count) of the $($vmnics.Count) uplinks on '$vdsName' matched a UCS vNIC. The cross-check below covers the matched ones only."
+            }
 
-                if ($backing.Count -eq 0) {
-                    Add-Finding -Severity 'WARN' -Scope 'CrossCheck' -Check 'UplinkNotMappedToVnic' -Domain $target -HostName $esx.Name `
-                        -Subject $vdsName -Expected 'a UCS vNIC behind each vDS uplink' -Actual ($vmnics -join ', ') `
-                        -Detail "The uplinks $($vmnics -join ', ') on '$vdsName' could not be matched to a vNIC on the service profile, so their VLANs were not cross-checked."
-                    continue
+            $trunked = @(@($backing | ForEach-Object { $_.VlanIds }) | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+            $natives = @($backing | ForEach-Object { [int]$_.NativeId } | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+            $nativeId = if ($natives.Count -ge 1) { $natives[0] } else { 0 }
+
+            if (-not $vdsByName.ContainsKey($vdsName)) {
+                Write-Log "vDS '$vdsName' is on $hostName but was not returned by Get-VDSwitch; skipping its port groups." -Level WARN
+                continue
+            }
+            $vds = $vdsByName[$vdsName]
+            $discovery = Get-VdsDiscoveryProtocol -VdsView $vds.ExtensionData
+
+            if (-not $portGroupsByVds.ContainsKey($vdsName)) {
+                $rows = New-Object System.Collections.Generic.List[object]
+                foreach ($portGroup in @(Get-VDPortgroup -VDSwitch $vds -ErrorAction SilentlyContinue)) {
+                    $view = $portGroup.ExtensionData
+                    if (Test-UplinkPortGroup -PortGroupView $view) { continue }
+                    $defaultConfig = Get-MoProperty (Get-MoProperty $view 'Config' $null) 'DefaultPortConfig' $null
+                    $parsed = ConvertTo-VlanIdList -VlanSpec (Get-MoProperty $defaultConfig 'Vlan' $null)
+                    $teamingPolicy = Get-MoProperty $defaultConfig 'UplinkTeamingPolicy' $null
+                    [void]$rows.Add([pscustomobject]@{
+                        Name           = [string]$portGroup.Name
+                        Kind           = $parsed.Kind
+                        VlanIds        = $parsed.VlanIds
+                        Count          = $parsed.Count
+                        Teaming        = [string](Get-MoProperty (Get-MoProperty $teamingPolicy 'Policy' $null) 'Value' '')
+                        BeaconProbing  = [bool](Get-MoProperty (Get-MoProperty (Get-MoProperty $teamingPolicy 'FailureCriteria' $null) 'CheckBeacon' $null) 'Value' $false)
+                        NotifySwitches = Get-MoProperty (Get-MoProperty $teamingPolicy 'NotifySwitches' $null) 'Value' $null
+                    })
                 }
+                $portGroupsByVds[$vdsName] = $rows.ToArray()
+            }
 
-                if ($backing.Count -lt $vmnics.Count) {
-                    Add-Finding -Severity 'WARN' -Scope 'CrossCheck' -Check 'UplinkPartiallyMapped' -Domain $target -HostName $esx.Name `
-                        -Subject $vdsName -Expected "a vNIC for each of $($vmnics -join ', ')" -Actual "$($backing.Count) matched" `
-                        -Detail "Only $($backing.Count) of the $($vmnics.Count) uplinks on '$vdsName' matched a UCS vNIC. The cross-check below covers the matched ones only."
+            Add-CheckResult -Finding @(Compare-VdsVlanCoverage -VdsName $vdsName -PortGroup $portGroupsByVds[$vdsName] `
+                    -TrunkedVlanId $trunked -NativeVlanId $nativeId -LargeTrunkThreshold $LargeTrunkThreshold) `
+                -Scope 'CrossCheck' -Domain $target -HostName $hostName -Check 'VdsVlanCoverage' -Subject $vdsName `
+                -Detail ("Every VLAN the {0} port group(s) on '{1}' need is trunked to the vmnics behind it ({2})." -f @($portGroupsByVds[$vdsName]).Count, $vdsName, (Format-IdList -Id $trunked))
+
+            if (-not $SkipBestPractice) {
+                Add-CheckResult -Finding @(Test-VdsBestPractice -VdsName $vdsName -UplinkCount $vmnics.Count -DiscoveryOperation $discovery.Operation) `
+                    -Scope 'vCenter' -Domain $target -HostName $hostName -Category 'BestPractice' -Check 'VdsSettings' -Subject $vdsName `
+                    -Detail ("'{0}' has {1} uplinks on this host and link discovery is {2}." -f $vdsName, $vmnics.Count, $discovery.Operation)
+
+                $teamingFindings = New-Object System.Collections.Generic.List[object]
+                foreach ($row in @($portGroupsByVds[$vdsName])) {
+                    foreach ($entry in @(Test-PortGroupBestPractice -PortGroup $row -VdsName $vdsName)) { [void]$teamingFindings.Add($entry) }
                 }
+                Add-CheckResult -Finding $teamingFindings.ToArray() `
+                    -Scope 'vCenter' -Domain $target -HostName $hostName -Category 'BestPractice' -Check 'PortGroupTeaming' -Subject $vdsName `
+                    -Detail ("All {0} port group(s) on '{1}' use a teaming mode that works in front of UCS, with beacon probing off and notify switches on." -f @($portGroupsByVds[$vdsName]).Count, $vdsName)
+            }
 
-                $trunked = @(@($backing | ForEach-Object { $_.VlanIds }) | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
-                $natives = @($backing | ForEach-Object { [int]$_.NativeId } | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
-                $nativeId = if ($natives.Count -ge 1) { $natives[0] } else { 0 }
-
-                if (-not $vdsByName.ContainsKey($vdsName)) {
-                    Write-Log "vDS '$vdsName' is on $($esx.Name) but was not returned by Get-VDSwitch; skipping its port groups." -Level WARN
-                    continue
+            # --- MTU: the vDS cannot carry more than the vNIC does -------------
+            $vdsMtu = [int](Get-MoProperty (Get-MoProperty $vds.ExtensionData 'Config' $null) 'MaxMtu' 0)
+            if ($vdsMtu -gt 0) {
+                $mtuFindings = New-Object System.Collections.Generic.List[object]
+                foreach ($member in @($backing | Where-Object { [int]$_.Mtu -gt 0 -and [int]$_.Mtu -lt $vdsMtu })) {
+                    [void]$mtuFindings.Add([pscustomobject]@{
+                        Severity = 'ERROR'; Check = 'VdsMtuExceedsVnicMtu'
+                        Subject  = "$vdsName / $($member.VnicName)"
+                        Expected = "a vNIC MTU of at least $vdsMtu"
+                        Actual   = "$($member.Mtu)"
+                        Detail   = "'$vdsName' is set to MTU $vdsMtu but $($member.VnicName) (template '$($member.TemplateName)') is MTU $($member.Mtu). Frames above $($member.Mtu) are dropped at the fabric interconnect."
+                    })
                 }
-                $vds = $vdsByName[$vdsName]
+                Add-CheckResult -Finding $mtuFindings.ToArray() `
+                    -Scope 'CrossCheck' -Domain $target -HostName $hostName -Check 'VdsMtu' -Subject $vdsName `
+                    -Detail ("'{0}' is set to MTU {1} and every UCS vNIC behind it carries at least that." -f $vdsName, $vdsMtu)
+            }
 
-                if (-not $portGroupsByVds.ContainsKey($vdsName)) {
-                    $rows = New-Object System.Collections.Generic.List[object]
-                    foreach ($portGroup in @(Get-VDPortgroup -VDSwitch $vds -ErrorAction SilentlyContinue)) {
-                        $view = $portGroup.ExtensionData
-                        if (Test-UplinkPortGroup -PortGroupView $view) { continue }
-                        $vlanSpec = Get-MoProperty (Get-MoProperty (Get-MoProperty $view 'Config' $null) 'DefaultPortConfig' $null) 'Vlan' $null
-                        $parsed = ConvertTo-VlanIdList -VlanSpec $vlanSpec
-                        [void]$rows.Add([pscustomobject]@{
-                            Name = [string]$portGroup.Name; Kind = $parsed.Kind
-                            VlanIds = $parsed.VlanIds; Count = $parsed.Count
-                        })
+            # --- discovery protocol -------------------------------------------
+            # The fault that hides every other fault: with CDP off in UCS and the
+            # vDS listening for CDP, the host reports no neighbour at all.
+            if ($discovery.Protocol -and $discovery.Operation -notmatch '^(none|)$') {
+                $discoveryFindings = New-Object System.Collections.Generic.List[object]
+                foreach ($member in $backing) {
+                    $policy = $null
+                    if ($member.NetworkControlPolicy -and $controlPolicyByName.ContainsKey($member.NetworkControlPolicy)) {
+                        $policy = $controlPolicyByName[$member.NetworkControlPolicy]
                     }
-                    $portGroupsByVds[$vdsName] = $rows.ToArray()
-                }
+                    if ($null -eq $policy) { continue }
 
-                Add-CheckResult -Finding @(Compare-VdsVlanCoverage -VdsName $vdsName -PortGroup $portGroupsByVds[$vdsName] `
-                        -TrunkedVlanId $trunked -NativeVlanId $nativeId -LargeTrunkThreshold $LargeTrunkThreshold) `
-                    -Scope 'CrossCheck' -Domain $target -HostName $esx.Name -Check 'VdsVlanCoverage' -Subject $vdsName `
-                    -Detail ("Every VLAN the {0} port group(s) on '{1}' need is trunked to the vmnics behind it ({2})." -f @($portGroupsByVds[$vdsName]).Count, $vdsName, (Format-IdList -Id $trunked))
-
-                # --- MTU: the vDS cannot carry more than the vNIC does ---------
-                $vdsMtu = [int](Get-MoProperty (Get-MoProperty $vds.ExtensionData 'Config' $null) 'MaxMtu' 0)
-                if ($vdsMtu -gt 0) {
-                    $mtuFindings = New-Object System.Collections.Generic.List[object]
-                    foreach ($member in @($backing | Where-Object { [int]$_.Mtu -gt 0 -and [int]$_.Mtu -lt $vdsMtu })) {
-                        [void]$mtuFindings.Add([pscustomobject]@{
-                            Severity = 'ERROR'; Check = 'VdsMtuExceedsVnicMtu'
-                            Subject  = "$vdsName / $($member.VnicName)"
-                            Expected = "a vNIC MTU of at least $vdsMtu"
-                            Actual   = "$($member.Mtu)"
-                            Detail   = "'$vdsName' is set to MTU $vdsMtu but $($member.VnicName) (template '$($member.TemplateName)') is MTU $($member.Mtu). Frames above $($member.Mtu) are dropped at the fabric interconnect."
-                        })
-                    }
-                    Add-CheckResult -Finding $mtuFindings.ToArray() `
-                        -Scope 'CrossCheck' -Domain $target -HostName $esx.Name -Check 'VdsMtu' -Subject $vdsName `
-                        -Detail ("'{0}' is set to MTU {1} and every UCS vNIC behind it carries at least that." -f $vdsName, $vdsMtu)
-                }
-
-                # --- discovery protocol ---------------------------------------
-                # This is the fault that hides every other fault: with CDP off in
-                # UCS and the vDS listening for CDP, the host reports no
-                # neighbour and the domain in front of it cannot be identified.
-                $discovery = Get-VdsDiscoveryProtocol -VdsView $vds.ExtensionData
-                if ($discovery.Protocol -and $discovery.Operation -notmatch '^(none|)$') {
-                    $discoveryFindings = New-Object System.Collections.Generic.List[object]
-                    foreach ($member in $backing) {
-                        $policy = $null
-                        if ($member.NetworkControlPolicy -and $controlPolicyByName.ContainsKey($member.NetworkControlPolicy)) {
-                            $policy = $controlPolicyByName[$member.NetworkControlPolicy]
-                        }
-                        if ($null -eq $policy) { continue }
-
-                        if ($discovery.Protocol -eq 'cdp') {
-                            $cdp = [string](Get-MoProperty $policy 'Cdp' 'disabled')
-                            if ($cdp -ne 'enabled') {
-                                [void]$discoveryFindings.Add([pscustomobject]@{
-                                    Severity = 'WARN'; Check = 'CdpDisabledOnUcs'
-                                    Subject  = "$vdsName / $($member.VnicName)"
-                                    Expected = 'CDP enabled on the network control policy'
-                                    Actual   = $cdp
-                                    Detail   = "'$vdsName' is set to CDP ($($discovery.Operation)) but network control policy '$($member.NetworkControlPolicy)' behind $($member.VnicName) has CDP $cdp. The host will report no neighbour on that uplink."
-                                })
-                            }
-                        }
-                        elseif ($discovery.Protocol -eq 'lldp') {
-                            $transmit = [string](Get-MoProperty $policy 'LldpTransmit' 'unknown')
-                            if ($transmit -eq 'disabled') {
-                                [void]$discoveryFindings.Add([pscustomobject]@{
-                                    Severity = 'WARN'; Check = 'LldpDisabledOnUcs'
-                                    Subject  = "$vdsName / $($member.VnicName)"
-                                    Expected = 'LLDP transmit enabled on the network control policy'
-                                    Actual   = $transmit
-                                    Detail   = "'$vdsName' is set to LLDP ($($discovery.Operation)) but network control policy '$($member.NetworkControlPolicy)' behind $($member.VnicName) has LLDP transmit disabled. The host will report no neighbour on that uplink."
-                                })
-                            }
+                    if ($discovery.Protocol -eq 'cdp') {
+                        $cdp = [string](Get-MoProperty $policy 'Cdp' 'disabled')
+                        if ($cdp -ne 'enabled') {
+                            [void]$discoveryFindings.Add([pscustomobject]@{
+                                Severity = 'WARN'; Check = 'CdpDisabledOnUcs'
+                                Subject  = "$vdsName / $($member.VnicName)"
+                                Expected = 'CDP enabled on the network control policy'
+                                Actual   = $cdp
+                                Detail   = "'$vdsName' is set to CDP ($($discovery.Operation)) but network control policy '$($member.NetworkControlPolicy)' behind $($member.VnicName) has CDP $cdp. The host will report no neighbour on that uplink."
+                            })
                         }
                     }
-                    Add-CheckResult -Finding $discoveryFindings.ToArray() `
-                        -Scope 'CrossCheck' -Domain $target -HostName $esx.Name -Check 'DiscoveryProtocol' -Subject $vdsName `
-                        -Detail ("'{0}' is set to {1} ({2}) and the UCS network control policies behind it have {1} enabled, so the blades report their neighbour." -f $vdsName, $discovery.Protocol.ToUpperInvariant(), $discovery.Operation)
+                    elseif ($discovery.Protocol -eq 'lldp') {
+                        $transmit = [string](Get-MoProperty $policy 'LldpTransmit' 'unknown')
+                        if ($transmit -eq 'disabled') {
+                            [void]$discoveryFindings.Add([pscustomobject]@{
+                                Severity = 'WARN'; Check = 'LldpDisabledOnUcs'
+                                Subject  = "$vdsName / $($member.VnicName)"
+                                Expected = 'LLDP transmit enabled on the network control policy'
+                                Actual   = $transmit
+                                Detail   = "'$vdsName' is set to LLDP ($($discovery.Operation)) but network control policy '$($member.NetworkControlPolicy)' behind $($member.VnicName) has LLDP transmit disabled. The host will report no neighbour on that uplink."
+                            })
+                        }
+                    }
                 }
+                Add-CheckResult -Finding $discoveryFindings.ToArray() `
+                    -Scope 'CrossCheck' -Domain $target -HostName $hostName -Check 'DiscoveryProtocol' -Subject $vdsName `
+                    -Detail ("'{0}' is set to {1} ({2}) and the UCS network control policies behind it have {1} enabled, so the blades report their neighbour." -f $vdsName, $discovery.Protocol.ToUpperInvariant(), $discovery.Operation)
             }
         }
+    }
+
+    # ---- Hosts in the same clusters that this domain does not account for ----
+    # Bounded to the clusters the matched blades are in, deliberately. Scanning
+    # every host in the vCenter would ask CDP of hundreds of hosts that have
+    # nothing to do with this domain; a host sitting in the same cluster as this
+    # domain's blades and claiming a different fabric is the case worth catching,
+    # because a cluster split across two UCS domains is invisible from either.
+    $matchedClusters = @($allHosts | Where-Object { $matchedHostName.ContainsKey([string]$_.Name) } |
+        ForEach-Object { [string](Get-MoProperty $_ 'Parent' '') } | Where-Object { $_ } | Sort-Object -Unique)
+
+    foreach ($esx in @($allHosts | Where-Object { -not $matchedHostName.ContainsKey([string]$_.Name) })) {
+        $parent = [string](Get-MoProperty $esx 'Parent' '')
+        if (-not $parent -or $matchedClusters -notcontains $parent) { continue }
+        $neighbours = @(Get-UcsTargetForHost -VMHostObject $esx)
+        if ($neighbours.Count -eq 0) {
+            Add-Finding -Severity 'INFO' -Scope 'CrossCheck' -Check 'HostNotInDomain' -Domain $target -HostName ([string]$esx.Name) `
+                -Subject ([string]$esx.Name) -Expected '' -Actual 'no CDP or LLDP neighbour' `
+                -Detail ("{0} sits in cluster '{1}' alongside blades of '{2}' but has no service profile there and reports no neighbour, so which fabric it belongs to is unknown." -f $esx.Name, $parent, $target)
+            continue
+        }
+        Add-Finding -Severity 'WARN' -Scope 'CrossCheck' -Check 'HostInAnotherDomain' -Domain $target -HostName ([string]$esx.Name) `
+            -Subject ([string]$esx.Name) -Expected "a blade of '$target', like the rest of its cluster" -Actual ($neighbours -join ', ') `
+            -Detail ("{0} shares cluster '{1}' with blades of '{2}' but is cabled to {3}. A cluster split across two UCS domains has two sets of VLANs and two sets of vNIC templates to keep in step, and neither domain shows the other half." -f $esx.Name, $parent, $target, ($neighbours -join ', '))
     }
 
     # ---- Report ------------------------------------------------------------
@@ -2682,11 +3240,12 @@ try {
     # was checked on, then what should have been true and what is.
     $order = @{ 'ERROR' = 0; 'WARN' = 1; 'INFO' = 2; 'OK' = 3 }
     $output = @($selected |
-        Sort-Object -Property @{ Expression = { $order[$_.Severity] } }, Domain, Scope, Check, Subject |
+        Sort-Object -Property @{ Expression = { $order[$_.Severity] } }, Category, Scope, Check, Subject |
         ForEach-Object {
             [pscustomobject]@{
                 Severity  = $_.Severity
                 Status    = $(if ($_.Severity -eq 'OK') { 'PASS' } elseif ($_.Severity -eq 'INFO') { 'NOTE' } else { 'REVIEW' })
+                Category  = $_.Category
                 Scope     = $_.Scope
                 Check     = $_.Check
                 Subject   = $_.Subject
@@ -2763,7 +3322,6 @@ finally {
 
     # Nothing survives the run. A credential left held is one the next thing in
     # this session can replay.
-    $script:SharedCredential = $null
     $script:UcsCredentialCache = $null
 
     try { Disconnect-VIServer -Server * -Confirm:$false -ErrorAction SilentlyContinue } catch { }

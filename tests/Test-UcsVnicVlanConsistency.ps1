@@ -35,7 +35,9 @@ $underTest = @(
     'Compare-VnicGroup', 'ConvertTo-VlanIdList', 'Test-UplinkPortGroup', 'Get-HostUplinkMap',
     'Get-VdsDiscoveryProtocol', 'Compare-VdsVlanCoverage', 'Get-LldpSystemName',
     'Remove-UcsTargetDecoration', 'Convert-FiSystemNameToUcsCandidate', 'Get-ParentDn',
-    'ConvertTo-PolicyName', 'Get-VnicMemberDetail', 'Resolve-UcsServiceProfile'
+    'ConvertTo-PolicyName', 'Get-VnicMemberDetail', 'Get-QosClassMtu',
+    'Test-NetworkControlPolicyBestPractice', 'Test-VnicBestPractice',
+    'Test-PortGroupBestPractice', 'Test-VdsBestPractice', 'Test-ServiceProfileBestPractice'
 )
 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
@@ -450,17 +452,101 @@ $operOnly = [pscustomobject]@{
 }
 Assert-Equal 'a template Dn resolves to its name' 'eth0-tmpl' (Get-VnicMemberDetail -Ordinal 0 -Vnic $operOnly -TemplateByName $templates -InterfaceIndex $interfaces -VlanIdByName @{}).TemplateName
 
-Write-Host "`n=== Matching a host to its service profile ===" -ForegroundColor Cyan
-# UUID first: UCS writes the profile's UUID into the blade's SMBIOS, so it is an
-# identity rather than a naming convention, and it holds when the profile is
-# named nothing like the host.
-$profiles = @(
-    [pscustomobject]@{ Name = 'sp-blade-7'; Dn = 'org-root/ls-sp-blade-7'; Uuid = '1b4e28ba-2fa1-11d2-883f-0016d3cca427' }
-    [pscustomobject]@{ Name = 'esx02';      Dn = 'org-root/ls-esx02';      Uuid = '00000000-0000-0000-0000-000000000000' }
+Write-Host "`n=== Best practice: the QoS class a vNIC's MTU actually has to fit ===" -ForegroundColor Cyan
+# A vNIC at 9000 whose priority lands in a class still at 1500 drops jumbo
+# frames with no error anywhere. Three objects have to line up to see it.
+$policies = @(
+    [pscustomobject]@{ Name = 'Platinum'; Dn = 'org-root/ep-qos-Platinum' }
+    [pscustomobject]@{ Name = 'BestEffort'; Dn = 'org-root/ep-qos-BestEffort' }
 )
-Assert-Equal 'matched by hardware UUID' 'sp-blade-7' (Resolve-UcsServiceProfile -HostName 'esx01.example.com' -HostUuid '1b4e28ba-2fa1-11d2-883f-0016d3cca427' -Profile $profiles).Name
-Assert-Equal 'matched by short name'    'esx02'      (Resolve-UcsServiceProfile -HostName 'esx02.example.com' -HostUuid '' -Profile $profiles).Name
-Assert-Equal 'no match is $null, not a guess' $true ($null -eq (Resolve-UcsServiceProfile -HostName 'esx99.example.com' -HostUuid '' -Profile $profiles))
+$egress = @(
+    [pscustomobject]@{ Dn = 'org-root/ep-qos-Platinum/egress'; Prio = 'platinum' }
+    [pscustomobject]@{ Dn = 'org-root/ep-qos-BestEffort/egress'; Prio = 'best-effort' }
+)
+$classes = @(
+    [pscustomobject]@{ Priority = 'platinum'; Mtu = '9216'; AdminState = 'enabled' }
+    [pscustomobject]@{ Priority = 'best-effort'; Mtu = 'normal'; AdminState = 'enabled' }
+    [pscustomobject]@{ Priority = 'fc'; Mtu = 'fc'; AdminState = 'enabled' }
+)
+$mtuByPolicy = Get-QosClassMtu -Policy $policies -Egress $egress -QosClass $classes
+Assert-Equal 'a numeric class MTU is read'   9216 $mtuByPolicy['Platinum']
+Assert-Equal "'normal' means 1500"           1500 $mtuByPolicy['BestEffort']
+Assert-Equal 'a policy with no class is absent, not guessed' $false $mtuByPolicy.ContainsKey('Gold')
+
+Write-Host "`n=== Best practice: network control policy ===" -ForegroundColor Cyan
+function New-Ncp { param($Name = 'NCP', $Cdp = 'enabled', $Uplink = 'link-down', $Mac = 'all-host-vlans', $Lldp = 'enabled')
+    [pscustomobject]@{ Name = $Name; Cdp = $Cdp; UplinkFailAction = $Uplink; MacRegisterMode = $Mac
+        LldpTransmit = $Lldp; LldpReceive = $Lldp } }
+
+Assert-Equal 'a correct policy is clean' 0 @(Test-NetworkControlPolicyBestPractice -Policy (New-Ncp)).Count
+
+# THE ONE THAT MATTERS. On 'warning' the vNIC stays up when the fabric loses its
+# uplinks, ESXi keeps the uplink in the team, and nothing fails over or alarms.
+$findings = @(Test-NetworkControlPolicyBestPractice -Policy (New-Ncp -Uplink 'warning'))
+Assert-Equal 'uplink-fail warning is reported' 1 (Get-Check $findings 'NcpUplinkFailAction').Count
+Assert-Equal 'and as an error, not advice'     'ERROR' (Get-Check $findings 'NcpUplinkFailAction')[0].Severity
+Assert-Equal 'and it is a best-practice finding' 'BestPractice' (Get-Check $findings 'NcpUplinkFailAction')[0].Category
+
+$findings = @(Test-NetworkControlPolicyBestPractice -Policy (New-Ncp -Mac 'only-native-vlan'))
+Assert-Equal 'native-only MAC registration is reported' 1 (Get-Check $findings 'NcpMacRegisterMode').Count
+
+# CDP off with LLDP on is unremarkable; both off is a troubleshooting dead end.
+$findings = @(Test-NetworkControlPolicyBestPractice -Policy (New-Ncp -Cdp 'disabled'))
+Assert-Equal 'CDP off with LLDP on is only INFO' 'INFO' (Get-Check $findings 'NcpCdpDisabled')[0].Severity
+Assert-Equal 'and is not escalated'              0 (Get-Check $findings 'NcpNoDiscoveryProtocol').Count
+
+$findings = @(Test-NetworkControlPolicyBestPractice -Policy (New-Ncp -Cdp 'disabled' -Lldp 'disabled'))
+Assert-Equal 'both off is a warning'  1 (Get-Check $findings 'NcpNoDiscoveryProtocol').Count
+Assert-Equal 'and not double-reported' 0 (Get-Check $findings 'NcpCdpDisabled').Count
+
+Write-Host "`n=== Best practice: vNIC settings ===" -ForegroundColor Cyan
+Assert-Equal 'a correct vNIC is clean' 0 @(Test-VnicBestPractice -Member (New-Member 0 'eth0' @(10, 250) 'A') -QosClassMtu @{}).Count
+
+# Fabric failover on a vNIC presented to ESXi: the fabric moves the MAC while
+# the host still believes its uplink is healthy.
+$findings = @(Test-VnicBestPractice -Member (New-Member 0 'eth0' @(10) 'A-B') -QosClassMtu @{})
+Assert-Equal 'fabric failover is reported'      1 (Get-Check $findings 'VnicFabricFailoverEnabled').Count
+Assert-Equal 'a plain fabric id is not'         0 (Get-Check (Test-VnicBestPractice -Member (New-Member 0 'eth0' @(10) 'B') -QosClassMtu @{}) 'VnicFabricFailoverEnabled').Count
+
+$initial = New-Member 0 'eth0' @(10) 'A' 9000 0 'tmpl' 'initial-template'
+Assert-Equal 'an initial-template is reported' 1 (Get-Check (Test-VnicBestPractice -Member $initial -QosClassMtu @{}) 'VnicTemplateNotUpdating').Count
+
+# MTU 9000 into a 1500 class.
+$jumbo = New-Member 0 'eth0' @(10) 'A' 9000
+$findings = @(Test-VnicBestPractice -Member $jumbo -QosClassMtu @{ 'best-effort' = 1500 })
+Assert-Equal 'an MTU above its QoS class is reported' 1 (Get-Check $findings 'VnicMtuExceedsQosClass').Count
+Assert-Equal 'and as an error'                        'ERROR' (Get-Check $findings 'VnicMtuExceedsQosClass')[0].Severity
+Assert-Equal 'a class that fits is clean'             0 (Get-Check (Test-VnicBestPractice -Member $jumbo -QosClassMtu @{ 'best-effort' = 9216 }) 'VnicMtuExceedsQosClass').Count
+# An unresolvable class must not be guessed at in either direction.
+Assert-Equal 'an unknown QoS class is not reported'   0 (Get-Check (Test-VnicBestPractice -Member $jumbo -QosClassMtu @{}) 'VnicMtuExceedsQosClass').Count
+
+Assert-Equal 'VLAN 1 on a data vNIC is noted' 1 (Get-Check (Test-VnicBestPractice -Member (New-Member 0 'eth0' @(1, 250) 'A') -QosClassMtu @{}) 'VnicCarriesDefaultVlan').Count
+
+Write-Host "`n=== Best practice: port group teaming ===" -ForegroundColor Cyan
+function New-Teaming { param($Name = 'PG', $Teaming = 'loadbalance_srcid', $Beacon = $false, $Notify = $true)
+    [pscustomobject]@{ Name = $Name; Teaming = $Teaming; BeaconProbing = $Beacon; NotifySwitches = $Notify } }
+
+Assert-Equal 'a correct port group is clean' 0 @(Test-PortGroupBestPractice -PortGroup (New-Teaming) -VdsName 'dvs').Count
+
+# IP hash needs a port channel to the host; a blade's two vNICs land on two
+# independent fabric interconnects, which are not one.
+$findings = @(Test-PortGroupBestPractice -PortGroup (New-Teaming -Teaming 'loadbalance_ip') -VdsName 'dvs')
+Assert-Equal 'IP-hash teaming is reported' 1 (Get-Check $findings 'PortGroupIpHashTeaming').Count
+Assert-Equal 'and as an error'             'ERROR' (Get-Check $findings 'PortGroupIpHashTeaming')[0].Severity
+
+Assert-Equal 'beacon probing is reported'  1 (Get-Check (Test-PortGroupBestPractice -PortGroup (New-Teaming -Beacon $true) -VdsName 'dvs') 'PortGroupBeaconProbing').Count
+Assert-Equal 'notify switches off is reported' 1 (Get-Check (Test-PortGroupBestPractice -PortGroup (New-Teaming -Notify $false) -VdsName 'dvs') 'PortGroupNotifySwitchesOff').Count
+# An absent property is not a disabled one.
+Assert-Equal 'an unreadable notify setting is not reported' 0 (Get-Check (Test-PortGroupBestPractice -PortGroup ([pscustomobject]@{ Name = 'PG'; Teaming = 'loadbalance_srcid' }) -VdsName 'dvs') 'PortGroupNotifySwitchesOff').Count
+
+Write-Host "`n=== Best practice: the vDS and the service profile ===" -ForegroundColor Cyan
+Assert-Equal 'two uplinks and CDP is clean' 0 @(Test-VdsBestPractice -VdsName 'dvs' -UplinkCount 2 -DiscoveryOperation 'both').Count
+Assert-Equal 'a single uplink is reported'  1 (Get-Check (Test-VdsBestPractice -VdsName 'dvs' -UplinkCount 1 -DiscoveryOperation 'both') 'VdsSingleUplink').Count
+Assert-Equal 'discovery off is reported'    1 (Get-Check (Test-VdsBestPractice -VdsName 'dvs' -UplinkCount 2 -DiscoveryOperation 'none') 'VdsDiscoveryDisabled').Count
+Assert-Equal 'and so is discovery unset'    1 (Get-Check (Test-VdsBestPractice -VdsName 'dvs' -UplinkCount 2 -DiscoveryOperation '') 'VdsDiscoveryDisabled').Count
+
+Assert-Equal 'a templated profile is clean' 0 @(Test-ServiceProfileBestPractice -ServiceProfile ([pscustomobject]@{ Name = 'esx01'; OperSrcTemplName = 'org-root/ls-PRD-TMPL' })).Count
+Assert-Equal 'a hand-built profile is reported' 1 (Get-Check (Test-ServiceProfileBestPractice -ServiceProfile ([pscustomobject]@{ Name = 'esx01' })) 'ProfileNotFromTemplate').Count
 
 Write-Host "`n=== vDS discovery protocol ===" -ForegroundColor Cyan
 $vdsView = [pscustomobject]@{ Config = [pscustomobject]@{ LinkDiscoveryProtocolConfig = [pscustomobject]@{ Protocol = 'CDP'; Operation = 'Both' } } }

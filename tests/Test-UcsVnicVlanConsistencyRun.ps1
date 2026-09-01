@@ -77,9 +77,15 @@ $global:PortGroups = @{
                 DefaultPortConfig = [pscustomobject]@{ Vlan = (New-VlanSpec 0) } } } }
     )
     'dvs-prod' = @(
+        # IP-hash teaming in front of UCS: it needs a port channel to the host,
+        # and a blade's two vNICs land on two independent fabric interconnects.
         [pscustomobject]@{ Name = 'PG-PROD'; ExtensionData = [pscustomobject]@{
             Tag = @(); Config = [pscustomobject]@{ Type = 'earlyBinding'
-                DefaultPortConfig = [pscustomobject]@{ Vlan = (New-VlanSpec 250) } } } }
+                DefaultPortConfig = [pscustomobject]@{ Vlan = (New-VlanSpec 250)
+                    UplinkTeamingPolicy = [pscustomobject]@{
+                        Policy = [pscustomobject]@{ Value = 'loadbalance_ip' }
+                        NotifySwitches = [pscustomobject]@{ Value = $true }
+                        FailureCriteria = [pscustomobject]@{ CheckBeacon = [pscustomobject]@{ Value = $false } } } } } } }
         # VLAN 999 exists in vCenter and is trunked nowhere in UCS.
         [pscustomobject]@{ Name = 'PG-ORPHAN'; ExtensionData = [pscustomobject]@{
             Tag = @(); Config = [pscustomobject]@{ Type = 'earlyBinding'
@@ -100,12 +106,14 @@ function Connect-VIServer { param($Server, $Credential, $ErrorAction) [pscustomo
 function Disconnect-VIServer { param($Server, $Confirm, $ErrorAction) }
 function Get-VDSwitch { param($ErrorAction) return $global:Switches }
 function Get-VDPortgroup { param($VDSwitch, $ErrorAction) return $global:PortGroups[$VDSwitch.Name] }
-function Get-Cluster { param($Name, $ErrorAction) [pscustomobject]@{ Name = 'PRD-CL01' } }
-# Takes pipeline input because the -Cluster path is 'Get-Cluster | Get-VMHost'.
 function Get-VMHost {
-    [CmdletBinding()]
-    param([Parameter(ValueFromPipeline)]$Cluster)
-    process { [pscustomobject]@{ Name = 'esx01.example.com'; Id = 'HostSystem-host-1'; ConnectionState = 'Connected' } }
+    @(
+        [pscustomobject]@{ Name = 'esx01.example.com'; Id = 'HostSystem-host-1'; ConnectionState = 'Connected'; Parent = 'PRD-CL01' }
+        # Same cluster as this domain's blade, no service profile here, and its
+        # CDP names a different fabric. A cluster split across two UCS domains
+        # is invisible from either one.
+        [pscustomobject]@{ Name = 'esx50.example.com'; Id = 'HostSystem-host-50'; ConnectionState = 'Connected'; Parent = 'PRD-CL01' }
+    )
 }
 
 # CDP on vmnic0 only, reporting fabric A. The script must reduce that to the
@@ -119,12 +127,28 @@ $global:Hints = @{
 
 function Get-View {
     param($Id, $ErrorAction)
+    if ("$Id" -eq 'network-50') {
+        return ([pscustomobject]@{ } | Add-Member -MemberType ScriptMethod -Name QueryNetworkHint -Value {
+            param($device)
+            return @([pscustomobject]@{
+                ConnectedSwitchPort = [pscustomobject]@{ SystemName = 'ucs02-A.example.com'; DevId = 'ucs02-A'; PortId = 'Eth1/1' }
+                LldpInfo = $null })
+        } -PassThru)
+    }
     if ("$Id" -like 'network-*') {
         return ([pscustomobject]@{ } | Add-Member -MemberType ScriptMethod -Name QueryNetworkHint -Value {
             param($device)
             if (-not $global:Hints.ContainsKey($device)) { return @() }
             return @($global:Hints[$device])
         } -PassThru)
+    }
+    if ("$Id" -eq 'HostSystem-host-50') {
+        return [pscustomobject]@{
+            ConfigManager = [pscustomobject]@{ NetworkSystem = 'network-50' }
+            Hardware = [pscustomobject]@{ SystemInfo = [pscustomobject]@{ Uuid = 'bbbbbbbb-0000-0000-0000-000000000050' } }
+            Config = [pscustomobject]@{ Network = [pscustomobject]@{
+                Pnic = @([pscustomobject]@{ Device = 'vmnic0' }); ProxySwitch = @() } }
+        }
     }
     return [pscustomobject]@{
         ConfigManager = [pscustomobject]@{ NetworkSystem = 'network-1' }
@@ -157,10 +181,22 @@ function Get-UcsVlan { param($Ucs, $ErrorAction) @(
 ) }
 function Get-UcsVsan { param($Ucs, $ErrorAction) @([pscustomobject]@{ Name = 'VSAN-A'; Id = 100; FcoeVlan = 4048 }) }
 
-function New-Template { param($Name, $SwitchId, $Mtu, $Ncp)
+function New-Template { param($Name, $SwitchId, $Mtu, $Ncp, $TemplType = 'updating-template', $Qos = 'BestEffort')
     [pscustomobject]@{ Dn = "org-root/lan-conn-templ-$Name"; Name = $Name; SwitchId = $SwitchId
-        Mtu = $Mtu; TemplType = 'updating-template'; NwCtrlPolicyName = $Ncp
-        QosPolicyName = 'best-effort'; AdaptorProfileName = 'VMWare' } }
+        Mtu = $Mtu; TemplType = $TemplType; NwCtrlPolicyName = $Ncp
+        QosPolicyName = $Qos; AdaptorProfileName = 'VMWare' } }
+
+# The QoS side of the MTU question: eth2/eth3 are 9000 but BestEffort lands in a
+# system class still at 1500, so their jumbo frames are dropped silently.
+function Get-UcsQosPolicy { param($Ucs, $ErrorAction) @(
+    [pscustomobject]@{ Name = 'BestEffort'; Dn = 'org-root/ep-qos-BestEffort' }
+) }
+function Get-UcsVnicEgressPolicy { param($Ucs, $ErrorAction) @(
+    [pscustomobject]@{ Dn = 'org-root/ep-qos-BestEffort/egress'; Prio = 'best-effort' }
+) }
+function Get-UcsQosClass { param($Ucs, $ErrorAction) @(
+    [pscustomobject]@{ Priority = 'best-effort'; Mtu = 'normal'; AdminState = 'enabled' }
+) }
 
 function Get-UcsVnicTemplate { param($Ucs, $ErrorAction) @(
     (New-Template 'eth0-tmpl' 'A' '1500' 'CDP-OFF')
@@ -219,12 +255,23 @@ function Get-UcsVnicInterface { param($Ucs, $ErrorAction) @(
 
 function Get-UcsNetworkControlPolicy { param($Ucs, $ErrorAction) @(
     # dvs-mgmt is set to CDP and this is what sits behind it.
-    [pscustomobject]@{ Name = 'CDP-OFF'; Cdp = 'disabled'; LldpTransmit = 'disabled'; LldpReceive = 'disabled' }
-    [pscustomobject]@{ Name = 'CDP-ON';  Cdp = 'enabled';  LldpTransmit = 'enabled';  LldpReceive = 'enabled' }
+    # Uplink fail set to 'warning': the vNIC stays up when the fabric loses its
+    # uplinks and ESXi never fails over. The worst thing in this estate.
+    [pscustomobject]@{ Name = 'CDP-OFF'; Cdp = 'disabled'; LldpTransmit = 'disabled'; LldpReceive = 'disabled'
+        UplinkFailAction = 'warning'; MacRegisterMode = 'only-native-vlan' }
+    [pscustomobject]@{ Name = 'CDP-ON';  Cdp = 'enabled';  LldpTransmit = 'enabled';  LldpReceive = 'enabled'
+        UplinkFailAction = 'link-down'; MacRegisterMode = 'all-host-vlans' }
 ) }
 
 function Get-UcsServiceProfile { param($Ucs, $ErrorAction) @(
-    [pscustomobject]@{ Name = 'esx01'; Dn = 'org-root/ls-esx01'; Uuid = 'aaaaaaaa-0000-0000-0000-000000000001' }
+    [pscustomobject]@{ Name = 'esx01'; Dn = 'org-root/ls-esx01'; Uuid = 'aaaaaaaa-0000-0000-0000-000000000001'
+        AssocState = 'associated'; OperSrcTemplName = 'org-root/ls-PRD-TMPL' }
+    # Associated, so it is a real blade - but nothing in this vCenter runs it.
+    # Starting from vCenter, this profile would simply never be looked at.
+    [pscustomobject]@{ Name = 'esx99'; Dn = 'org-root/ls-esx99'; Uuid = 'aaaaaaaa-0000-0000-0000-000000000099'
+        AssocState = 'associated'; OperSrcTemplName = '' }
+    [pscustomobject]@{ Name = 'spare01'; Dn = 'org-root/ls-spare01'; Uuid = ''
+        AssocState = 'unassociated'; OperSrcTemplName = 'org-root/ls-PRD-TMPL' }
 ) }
 
 # ============================================================================
@@ -236,7 +283,8 @@ $credential = [pscredential]::new('EXAMPLE\svc-automation', (ConvertTo-SecureStr
 Write-Host "`n=== Running the script against the fake estate ===" -ForegroundColor Cyan
 $findings = @()
 try {
-    $findings = @(& $scriptPath -VIServer 'vcenter01.example.com' -Credential $credential -IncludeInformational 6>$null 3>$null)
+    $findings = @(& $scriptPath -UcsManager 'ucs01.example.com' -VIServer 'vcenter01.example.com' `
+        -Credential $credential -IncludeInformational 6>$null 3>$null)
 }
 catch {
     Write-Host "  The script threw: $($_.Exception.Message)" -ForegroundColor Red
@@ -282,6 +330,35 @@ Assert-Equal 'no false MTU finding'             0 (Get-Check 'VdsMtuExceedsVnicM
 # The uplink port group trunks nothing in particular and must not be measured.
 Assert-Equal 'the uplink port group was skipped' $false ([bool]@($findings | Where-Object { $_.Subject -match 'uplinks' }).Count)
 
+Write-Host "`n=== The UCS-first pivot: the profiles are the inventory ===" -ForegroundColor Cyan
+# esx99 is an associated blade whose host is in no vCenter this run can see.
+# Starting from vCenter, it would simply never have been looked at.
+Assert-Equal 'a profile with no host is reported'   1 (Get-Check 'ProfileHasNoHost').Count
+Assert-Equal 'and it names the profile'             'esx99' (Get-Check 'ProfileHasNoHost')[0].Subject
+# An unassociated profile has no blade to check, which is context, not a fault.
+Assert-Equal 'an unassociated profile is only INFO' 'INFO' (Get-Check 'ProfileUnassociated')[0].Severity
+Assert-Equal 'and it names that profile'            'spare01' (Get-Check 'ProfileUnassociated')[0].Subject
+# esx50 shares a cluster with this domain's blade but is cabled to another
+# fabric. Neither domain shows the other half of a cluster split this way.
+Assert-Equal 'a host of another domain in the same cluster' 1 (Get-Check 'HostInAnotherDomain').Count
+Assert-Equal 'and it names the other fabric'        $true ((Get-Check 'HostInAnotherDomain')[0].Actual -match 'ucs02')
+
+Write-Host "`n=== Best practice, and kept apart from the mismatches ===" -ForegroundColor Cyan
+# The worst thing in the estate: the vNIC stays up when the fabric loses its
+# uplinks, so ESXi never fails over and nothing alarms.
+Assert-Equal 'the uplink fail action is reported'  1 (Get-Check 'NcpUplinkFailAction').Count
+Assert-Equal 'as an error'                         'ERROR' (Get-Check 'NcpUplinkFailAction')[0].Severity
+Assert-Equal 'and categorised as best practice'    'BestPractice' (Get-Check 'NcpUplinkFailAction')[0].Category
+Assert-Equal 'MAC register mode is reported'       1 (Get-Check 'NcpMacRegisterMode').Count
+# 9000 on the vNIC, 1500 on the class its QoS policy lands in.
+Assert-Equal 'the QoS class MTU trap is reported'  4 (Get-Check 'VnicMtuExceedsQosClass').Count
+Assert-Equal 'and not for the 1500 vNICs'          $false ([bool]@((Get-Check 'VnicMtuExceedsQosClass') | Where-Object { $_.Subject -in @('eth0', 'eth1') }).Count)
+Assert-Equal 'IP-hash teaming is reported'         1 (Get-Check 'PortGroupIpHashTeaming').Count
+Assert-Equal 'a hand-built profile is reported'    1 (Get-Check 'ProfileNotFromTemplate').Count
+# The two kinds must be separable, or the report cannot be triaged.
+Assert-Equal 'mismatches are categorised apart'    $true (@($findings | Where-Object { $_.Category -eq 'Consistency' }).Count -gt 0)
+Assert-Equal 'and so are the recommendations'      $true (@($findings | Where-Object { $_.Category -eq 'BestPractice' }).Count -gt 0)
+
 Write-Host "`n=== VLANs the fabric carries that no vNIC template uses ===" -ForegroundColor Cyan
 # Three VLANs exist on this fabric that no template carries: the deliberate
 # SPARE-777, the STORAGE VLAN that also collides with FCoE, and PROD_250 - the
@@ -316,19 +393,22 @@ Assert-Equal 'CDP disabled under a CDP vDS is found' 2 (Get-Check 'CdpDisabledOn
 Assert-Equal 'and not for the vDS whose policy has CDP on' $false ([bool]@((Get-Check 'CdpDisabledOnUcs') | Where-Object { $_.Subject -match 'dvs-prod' }).Count)
 
 Write-Host "`n=== The report itself ===" -ForegroundColor Cyan
-Assert-Equal 'every cross-check row names the host' $true (-not [bool]@($findings | Where-Object { $_.Scope -eq 'CrossCheck' -and $_.HostCount -eq 0 }).Count)
+# A cross-check row is about a host and must name it - except the one that
+# exists precisely because there is no host to name.
+Assert-Equal 'every cross-check row names its host' $true (-not [bool]@($findings | Where-Object { $_.Scope -eq 'CrossCheck' -and $_.Check -ne 'ProfileHasNoHost' -and $_.HostCount -eq 0 }).Count)
 Assert-Equal 'every row carries a PASS/REVIEW status'  $true (-not [bool]@($findings | Where-Object { $_.Status -notin @('PASS', 'REVIEW', 'NOTE') }).Count)
 Assert-Equal 'severities are the expected set' $true (-not [bool]@($findings | Where-Object { $_.Severity -notin @('ERROR', 'WARN', 'INFO', 'OK') }).Count)
 
-Write-Host "`n=== The -Cluster and -CsvPath paths ===" -ForegroundColor Cyan
+Write-Host "`n=== The -ServiceProfile and -CsvPath paths ===" -ForegroundColor Cyan
 # Neither is exercised by the run above, and both are the sort of thing that only
-# fails once someone is actually using it: the cluster filter pipes Get-Cluster
-# into Get-VMHost, and the CSV export has to flatten the per-finding host list.
+# fails once someone is actually using it: the profile filter has to survive
+# wildcards, and the CSV export has to flatten the per-finding host list.
 $csvPath = Join-Path ([System.IO.Path]::GetTempPath()) ('richo-vlan-' + [guid]::NewGuid().ToString('N') + '.csv')
 $filtered = @()
 try {
-    $filtered = @(& $scriptPath -VIServer 'vcenter01.example.com' -Credential $credential -Cluster 'PRD-CL01' -CsvPath $csvPath 6>$null 3>$null)
-    Assert-Equal 'the cluster filter still finds the faults' $true ($filtered.Count -gt 0)
+    $filtered = @(& $scriptPath -UcsManager 'ucs01.example.com' -VIServer 'vcenter01.example.com' `
+        -Credential $credential -ServiceProfile 'esx*' -CsvPath $csvPath 6>$null 3>$null)
+    Assert-Equal 'the profile filter still finds the faults' $true ($filtered.Count -gt 0)
     # -IncludeInformational was not passed this time.
     Assert-Equal 'INFO findings are withheld by default'     0 @($filtered | Where-Object { $_.Severity -eq 'INFO' }).Count
     # The clean rows are the point of the CSV: a fault list alone cannot be told
@@ -337,7 +417,10 @@ try {
     Assert-Equal 'the CSV was written'                       $true (Test-Path $csvPath)
     $fromCsv = @(Import-Csv -Path $csvPath)
     Assert-Equal 'and holds every returned finding'          $filtered.Count $fromCsv.Count
-    Assert-Equal 'with the host list flattened to text'      'esx01.example.com' $fromCsv[0].Hosts
+    $withHosts = @($fromCsv | Where-Object { [int]$_.HostCount -gt 0 })
+    Assert-Equal 'per-host rows survive the round trip'      $true ($withHosts.Count -gt 0)
+    Assert-Equal 'with the host list flattened to text'      'esx01.example.com' $withHosts[0].Hosts
+    Assert-Equal 'and the category column is populated'      $true (-not [bool]@($fromCsv | Where-Object { $_.Category -notin @('Consistency', 'BestPractice') }).Count)
 }
 catch {
     Write-Host "  The -Cluster/-CsvPath run threw: $($_.Exception.Message)" -ForegroundColor Red
@@ -345,6 +428,18 @@ catch {
 }
 finally {
     Remove-Item -Path $csvPath -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host "`n=== -SkipBestPractice ===" -ForegroundColor Cyan
+try {
+    $consistencyOnly = @(& $scriptPath -UcsManager 'ucs01.example.com' -VIServer 'vcenter01.example.com' `
+        -Credential $credential -SkipBestPractice 6>$null 3>$null)
+    Assert-Equal 'the mismatches are still found' $true (@($consistencyOnly | Where-Object { $_.Category -eq 'Consistency' }).Count -gt 0)
+    Assert-Equal 'and no best-practice row is emitted' 0 @($consistencyOnly | Where-Object { $_.Category -eq 'BestPractice' }).Count
+}
+catch {
+    Write-Host "  The -SkipBestPractice run threw: $($_.Exception.Message)" -ForegroundColor Red
+    $script:fail++
 }
 
 Remove-Item -Path $stubRoot -Recurse -Force -ErrorAction SilentlyContinue
