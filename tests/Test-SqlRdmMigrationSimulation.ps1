@@ -370,6 +370,12 @@ function Invoke-SimReconfigure {
                     # from the LUN. The simulation has to do the same or the script's own
                     # verification has nothing to check against.
                     if ($device.Backing -is [VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo]) {
+                        # vCenter refused a physical-mode RDM with no disk mode:
+                        # "Incompatible device backing specified for device '0'".
+                        if ([string]::IsNullOrWhiteSpace($device.Backing.DiskMode)) {
+                            throw "Incompatible device backing specified for device '0'."
+                        }
+
                         $canonical = ([string]$device.Backing.DeviceName) -replace '^.*/', ''
                         $lun = @($global:Sim.HostLuns['sim-esx02'] | Where-Object { $_.CanonicalName -eq $canonical })
                         if ($lun.Count -ne 1) { throw "Simulated attach of unknown device '$canonical'." }
@@ -918,6 +924,26 @@ try {
         Assert-True ($log -match 'all 3 LUN\(s\) present and matching') 'Verification did not confirm the LUNs.'
         $manifest = Get-Content -LiteralPath (Get-ChildItem -Path $verifyFolder -Filter '*-dryrun-manifest-*.json' | Select-Object -First 1).FullName -Raw | ConvertFrom-Json
         Assert-True ([bool]$manifest.LunPresentationVerified) 'The manifest does not record that presentation was verified.'
+    }
+
+    # ------------------------------------------- an unpresented device, caught early ----
+    Reset-SimInventory
+    $global:Sim.HostLuns['sim-esx02'] = @($global:Sim.HostLuns['sim-esx02'] | Where-Object { $_.CanonicalName -ne 'naa.6000000000000041' })
+    $missingFolder = Join-Path $script:WorkFolder 'missing'
+    $missingLog = Join-Path $script:WorkFolder 'missing.log'
+    $missingError = ''
+    try {
+        & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
+            -PowerAction ShutdownGuest -OutputFolder $missingFolder *> $missingLog
+    }
+    catch {
+        $missingError = $_.Exception.Message
+    }
+
+    Invoke-SimTest 'A device the destination host cannot see stops the run before anything changes' {
+        Assert-True ($missingError -like '*cannot see*naa.6000000000000041*') "The run did not name the missing device. It said: $missingError"
+        Assert-Equal $global:Sim.Events.Count 0 "The run changed $($global:Sim.Events.Count) thing(s) before finding the missing device: $($global:Sim.Events -join '; ')"
+        Assert-Equal $global:Sim.VMs['SIMSQLA'].PowerState 'PoweredOn' 'A VM was powered off before the device check failed.'
     }
 
     Write-Host ''

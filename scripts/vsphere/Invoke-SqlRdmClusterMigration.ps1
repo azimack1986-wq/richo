@@ -88,6 +88,12 @@
     before anything is changed. Off by default: presentation and rescanning are the
     engineer's prerequisite, and the read costs one storage enumeration per host.
 
+.PARAMETER SkipDeviceCheck
+    Skip even the quick "can the destination host see this device" check. That check is
+    one storage read per destination host and it runs before anything is powered off;
+    skipping it means a device that is not presented is found at the attach instead,
+    with the VMs already down and moved.
+
 .PARAMETER PowerOnAfterMigration
     Power the VMs on at the destination once every migration group has been relocated,
     re-attached and verified - a workload type at a time, groups in CSV order and VMs in
@@ -174,6 +180,9 @@ param(
     [switch]$VerifyLunPresentation,
 
     [Parameter()]
+    [switch]$SkipDeviceCheck,
+
+    [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$OutputFolder = (Join-Path (Get-Location) 'SqlRdmClusterMigrationOutput'),
 
@@ -184,7 +193,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.10.0'
+$ScriptVersion = '2.11.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -1192,6 +1201,54 @@ function Resolve-DestinationLun {
     }
 }
 
+function Assert-DeviceVisible {
+    <#
+    .SYNOPSIS
+        Confirms the destination hosts can see the devices the RDMs will be re-attached to.
+
+    .DESCRIPTION
+        One Get-ScsiLun per destination host - the hosts actually chosen, not every host
+        in the cluster, and no per-LUN path enumeration. It exists because the alternative
+        is finding out at the attach, which happens after the VMs are powered off, their
+        RDMs detached and the machines relocated: the worst possible moment and the
+        hardest state to unpick.
+
+        This is not the presentation check; -VerifyLunPresentation is. This only asks
+        whether the device the VM already has is visible where the VM is going.
+
+    .PARAMETER DestinationHosts
+        The hosts the VMs will be placed on.
+
+    .PARAMETER Disks
+        The resolved destination disks.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$DestinationHosts,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$Disks
+    )
+
+    foreach ($destinationHost in $DestinationHosts) {
+        $visible = @{}
+        foreach ($scsiLun in @(Get-ScsiLun -VMHost $destinationHost -LunType Disk)) {
+            $visible[([string]$scsiLun.CanonicalName).ToLowerInvariant()] = $true
+        }
+
+        $missing = @($Disks | Where-Object { -not $visible.ContainsKey($_.CanonicalName) })
+        if ($missing.Count -gt 0) {
+            $names = @($missing | ForEach-Object { "LUN $($_.LunId) ($($_.CanonicalName))" }) -join ', '
+            throw "Host '$($destinationHost.Name)' cannot see $names. Present the LUNs to it and rescan the HBAs, then run again."
+        }
+
+        Write-RichoLog "    $($destinationHost.Name): all $($Disks.Count) device(s) visible." -Level INFO
+    }
+}
+
 function Confirm-LunPresentation {
     <#
     .SYNOPSIS
@@ -1627,8 +1684,12 @@ function Add-RdmDevice {
     $backing = New-Object VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo
     $backing.CompatibilityMode = 'physicalMode'
     $backing.DeviceName = $ConsoleDeviceName
-    # DiskMode is deliberately left unset: it does not apply to a physical-mode RDM, and
-    # sending an empty one is rejected as an invalid device configuration.
+
+    # SHIPPED AND HIT ON A LIVE RUN: with diskMode left unset, vCenter rejected the add
+    # with "Incompatible device backing specified for device '0'". A physical-mode RDM is
+    # independent-persistent by nature and that is what the client itself sends; saying so
+    # explicitly is what the server will accept.
+    $backing.DiskMode = 'independent_persistent'
 
     $disk = New-Object VMware.Vim.VirtualDisk
     $disk.Key = -100 - $UnitNumber
@@ -1652,7 +1713,13 @@ function Add-RdmDevice {
     $spec = New-Object VMware.Vim.VirtualMachineConfigSpec
     $spec.DeviceChange = @($change)
 
-    Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description "Attaching RDM at SCSI $ControllerBus`:$UnitNumber on '$($VM.Name)'"
+    # The whole backing, in the log, before it is sent: when vCenter refuses a device the
+    # message names neither the device nor the file, and this is the difference between a
+    # five-minute diagnosis and an afternoon.
+    Write-RichoLog "        device: $($backing.DeviceName), mode: $($backing.CompatibilityMode)/$($backing.DiskMode), file: '$($backing.FileName)', fileOperation: '$($change.FileOperation)'" -Level INFO
+
+    $attachDescription = "Attaching RDM at SCSI $ControllerBus`:$UnitNumber on '$($VM.Name)' (device $($backing.DeviceName), file '$($backing.FileName)')"
+    Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description $attachDescription
 
     $afterView = Get-View -Id $VM.Id -Property Config.Hardware.Device
     $attached = @(
@@ -2237,8 +2304,15 @@ function Resolve-MigrationPlan {
             Write-RichoLog '  -VerifyLunPresentation was supplied; reading the destination hosts back.' -Level INFO
             Confirm-LunPresentation -DestinationHosts $eligibleHosts -Svm $svm -Disks $resolvedDisks.ToArray()
         }
+        elseif ($SkipDeviceCheck) {
+            Write-RichoLog '  -SkipDeviceCheck was supplied; the devices are not checked at all before the VMs come down.' -Level WARN
+        }
         else {
-            Write-RichoLog '  Not verified. Supply -VerifyLunPresentation to have the hosts read back, at one storage enumeration each.' -Level INFO
+            # Only the hosts these VMs are actually going to, and only "is the device
+            # there" - a second or two, against a failure that lands mid-migration.
+            $placementHosts = @($vmItems | ForEach-Object { $_.DestinationHost } | Sort-Object -Property Name -Unique)
+            Write-RichoLog "  Confirming the $($resolvedDisks.Count) device(s) are visible on $($placementHosts.Count) destination host(s)." -Level INFO
+            Assert-DeviceVisible -DestinationHosts $placementHosts -Disks $resolvedDisks.ToArray()
         }
         Write-RichoLog '  -------------------------------------------------' -Level INFO
 

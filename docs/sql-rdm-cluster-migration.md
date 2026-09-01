@@ -258,10 +258,19 @@ What it does instead is **state it**, device by device, before anything changes:
   -------------------------------------------------
 ```
 
-Run a dry run first and that list is your work order. `-VerifyLunPresentation` reads the
-destination hosts back and fails if any LUN is missing or is a different device or size
-from the RDM being moved — worth it the first time through a new cluster, and skippable
-once the presentation is routine.
+Run a dry run first and that list is your work order.
+
+One thing **is** checked by default, because of where the failure lands otherwise: that
+each destination host can actually see the devices being re-attached. It is one storage
+read per destination host — the hosts the VMs are going to, not all of them — and it runs
+before anything is powered off. Without it, a device that was never presented is found at
+the attach, with the VMs already down, their RDMs detached and the machines relocated.
+`-SkipDeviceCheck` turns it off.
+
+`-VerifyLunPresentation` is the deeper check: it reads each host's storage paths and
+confirms SVM plus LUN ID resolves to the same device, of the same size, as the RDM being
+moved. Worth it the first time through a new cluster, and skippable once the presentation
+is routine.
 
 ## What it does at the destination
 

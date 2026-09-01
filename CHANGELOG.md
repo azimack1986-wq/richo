@@ -4506,3 +4506,34 @@ of it immediately.
 
 - Exclusions are summarised by reason with the hosts named, rather than one line per
   host. On a large cluster the list is the noise and the reason is the signal.
+
+### [2.11.0] — 2026-09-01
+
+#### Fixed
+
+- **SHIPPED AND HIT ON A LIVE RUN: vCenter refused the RDM device spec** with
+  `Incompatible device backing specified for device '0'`, after the VM had been powered
+  off, detached and relocated. The backing left `diskMode` unset, on the reasoning that
+  it does not apply to a physical-mode RDM. A physical RDM is independent-persistent by
+  nature and that is what the client itself sends, so the spec now says so:
+  `diskMode = independent_persistent`.
+
+#### Added
+
+- **The devices are checked before the VMs come down.** One `Get-ScsiLun` per destination
+  host — the hosts the VMs are actually going to, not every host in the cluster, and no
+  per-LUN path enumeration — confirming each device to be re-attached is visible there. A
+  device that was never presented now stops the run while everything is still up and
+  running, instead of at the attach, with the VMs down, detached and moved. Roughly two
+  seconds; `-SkipDeviceCheck` turns it off.
+
+- **The backing is logged before it is sent** — device path, compatibility and disk mode,
+  mapping file and file operation — and a failed attach names the device and the file.
+  When vCenter refuses a device it names neither.
+
+#### Tests
+
+- The simulator now refuses a physical-mode RDM with no disk mode, exactly as vCenter
+  did, so the regression cannot come back unnoticed.
+- A new simulation scenario removes a LUN from the destination host and asserts the run
+  stops with the device named, having changed nothing and powered nothing off.
