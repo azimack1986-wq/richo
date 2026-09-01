@@ -1,0 +1,2 @@
+vsphere_cluster,first_vm,other_vms_space_separated,svm,iSCSI_Data_Store,group_1_lun_IDs_ordered_space_separated,group_2_lun_IDs_ordered_space_separated,group_3_lun_IDs_ordered_space_separated,destination_resource_pool,destination_datastore_cluster
+LAB-SQL-CLUSTER,LABSQL01,LABSQL02 LABSQL03,lab-storage-svm01,LAB-RDM-POINTERS,40 41 42 43,50 51 52,,LAB-SQL-RP,LAB-VM-DATASTORES

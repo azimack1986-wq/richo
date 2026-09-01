@@ -48,6 +48,12 @@ Get-RichoConfig -Name lab
 Invoke-Pester -Path ./tests
 ```
 
+## Runbooks
+
+- [SQL RDM cluster migration](docs/sql-rdm-cluster-migration.md) — cold-migrating
+  clustered SQL VMs with physical-mode RDMs to another cluster, and putting every
+  shared disk back on the same SCSI address.
+
 ## Writing a script
 
 Copy `scripts/_template.ps1` into the right platform folder and rename it
@@ -153,3 +159,4 @@ They are independent, so any one can be run on its own:
 | `Test-IntersightDeployState.ps1` | Which `ConfigState` values mean a deploy is needed |
 | `Test-IntersightFailureKind.ps1` | Auth failure vs. a response the client cannot parse |
 | `Test-ModuleEnumerationCache.ps1` | Module enumeration happens once, not per lookup |
+| `Test-SqlRdmClusterMigration.ps1` | The SQL RDM migration tool: CSV rules, SCSI unit allocation, the change gate, and its own safety guards |

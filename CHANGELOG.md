@@ -4099,3 +4099,123 @@ authentication removed, for operators who apply their own
 - Everything else — CDP/LLDP detection, CSV name matching, UCS Manager, batching,
   host profile compliance, cluster health, the Step 27 menu — is byte-identical
   to the main controller and verified so by the parity test.
+
+---
+
+## Invoke-SqlRdmClusterMigration.ps1
+
+### [2.2.0] — 2026-09-01
+
+First revision in this repository. The tool arrived as a standalone package; this
+entry records what the review changed as it was brought in, because most of it is
+behavioural rather than cosmetic.
+
+#### Fixed
+
+- **RDM discovery crashed on any VM with a host-attached CD-ROM.** Devices were
+  matched by looking for a `DeviceName` on the backing and then reading
+  `CompatibilityMode`. A `VirtualCdromAtapiBackingInfo` also carries a `DeviceName`
+  and has no `CompatibilityMode` at all, so under `Set-StrictMode -Version Latest`
+  the read is a terminating error — in discovery, before the operator has seen a
+  plan. Devices are now matched by type: `VirtualDisk` with a
+  `VirtualDiskRawDiskMappingVer1BackingInfo` backing. A virtual-mode RDM is now
+  named and refused rather than silently skipped and later miscounted.
+
+- **The SCSI unit number was set by editing the disk after it was attached.** RDMs
+  were created with `New-HardDisk`, which takes the next free unit on the
+  controller, and a follow-up `ReconfigVM` then tried to move the disk to the unit
+  it was supposed to have. vSphere does not support changing the unit number of an
+  attached disk: it either fails the reconfigure or leaves the disk where it was,
+  and the address is precisely what a WSFC/SQL FCI node matches its shared disks
+  on. RDMs are now attached through an explicit `VirtualDeviceConfigSpec` that
+  names the controller key and unit number up front, and the VM is read back to
+  confirm the device that landed there is the one planned.
+
+- **The destination controller was always PVSCSI.** A cluster built on LSI Logic
+  SAS came back on hardware the guest may have no driver for, with its shared disks
+  arriving on a different controller type. The controller type and bus-sharing mode
+  are now taken from the source device.
+
+- **The new controller was given `UnitNumber = <SCSI bus number>`.** That is a PCI
+  slot, not a bus, so the controller was placed in whichever slot happened to share
+  that number and collided with whatever already held it. The unit number is now
+  left for vCenter to assign, and the parent PCI controller key is read from the VM
+  rather than assumed to be 100.
+
+- **Nothing checked that the destination LUN was the right size.** A mistyped LUN
+  ID that existed on the same SVM would be attached without complaint, and the
+  first sign of it would be SQL failing to bring a disk online. Each destination
+  LUN's capacity is now compared with the RDM it replaces, and two CSV LUN IDs that
+  resolve to the same device are refused.
+
+- **A LUN group larger than one controller produced an invalid spec.** Unit
+  allocation counted past 15 while skipping 7. It now stops at the controller's
+  limit, and the CSV validator rejects an over-full group before anything is
+  powered off.
+
+- **Power state was read from the plan, not from the VM.** Building the plan walks
+  every candidate host's storage and can take minutes. It is re-read immediately
+  before the VM is shut down.
+
+- **Array subexpressions wrapped `List[object]` collections** in six places — the
+  failure mode `tests/Test-ScriptLint.ps1` rule 6 exists for, where the throw lands
+  wherever the list is next read. All replaced with `.ToArray()`.
+
+#### Changed
+
+- **RDM mapping-file topology is reproduced, not assumed.** VMware's documented
+  cluster-across-boxes build gives the group one mapping file per LUN, created for
+  the first node and attached by the others; some estates give each node its own.
+  The source arrangement is detected and reproduced, and a group that mixes the two
+  is refused rather than guessed at.
+
+- **House style.** `Write-Host` throughout became `Write-RichoLog`; the module load
+  became a single guarded `Import-RequiredModules` that loads
+  `VMware.VimAutomation.Core` rather than the whole `VMware.PowerCLI` meta-module;
+  credentials resolve through `Get-RichoCredential` (`-CredentialName`, defaulting
+  to the vCenter FQDN) instead of a bare `Get-Credential`; and `$ScriptVersion` is
+  stamped onto every plan, result and verification row.
+
+- **`SupportsShouldProcess`, so `-WhatIf` is a genuine no-op** in both parameter
+  sets. `-DryRun` is still answered ahead of the host, so a dry run stays a dry run
+  even with `-Confirm`. Everything that asks "did this run change anything" — the
+  controller-emptiness check, the manifest label, post-migration verification —
+  consults both.
+
+- **Destination LUN lookup reads each host once.** It was one `esxcli` path
+  enumeration plus one `Get-ScsiLun` per LUN per host; twelve LUNs across eight
+  hosts was around 200 round trips to answer a question that takes two per host.
+
+- **Host exclusions are reported.** "No eligible destination host" now carries the
+  reason each host was excluded, and a group with only one eligible host warns that
+  every node of the cluster will land on it.
+
+#### Added
+
+- **Post-migration verification.** An execution run re-reads every VM and compares
+  each disk against the address, device, capacity and bus-sharing mode it was
+  planned for, writes `verification-<stamp>.csv`, and fails the run on any
+  mismatch.
+
+- **Cross-row CSV validation** — the same VM in two migration groups is rejected,
+  as is an empty required cell.
+
+- **Bus 0 guard.** A physical RDM found on SCSI bus 0 stops the run rather than
+  removing the controller the operating system boots from.
+
+#### Tests
+
+- `tests/Test-SqlRdmClusterMigration.ps1` — standalone, no Pester and no PowerCLI.
+  CSV validation, SCSI unit allocation including the reserved unit 7 and the
+  controller limit, the change gate in all three states (dry run, execute, refused
+  `ShouldProcess`), and exact-name inventory resolution. Plus structural guards: no
+  mutating VMware call outside a planned-change block, no `Write-Host`, no
+  hardcoded PVSCSI, no post-attach unit-number edit, RDM removal never permanent,
+  hard power-off gated, and the operator CSV never carrying an NAA.
+- The script is now a target of `tests/Test-ScriptLint.ps1`.
+
+#### Notes
+
+- PowerShell is not installed in the Claude Code web sandbox, so this revision was
+  reviewed statically and has not been executed, linted or run against vCenter.
+  Run the native tests and a dry run before trusting it.
