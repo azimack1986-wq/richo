@@ -4414,3 +4414,19 @@ behavioural rather than cosmetic.
   that disk named, in both modes, rather than being emptied or removed. Detaching
   someone's plain VMDK because it happened to share a controller with an RDM is not this
   tool's decision to make.
+
+### [2.8.1] — 2026-09-01
+
+#### Changed
+
+- **The LUN decides the controller.** 2.8.0 removed every SCSI controller above bus 0;
+  it now removes the ones that carried a LUN from this migration and leaves the rest
+  exactly where they are, empty or not. Removing a controller detaches whatever is on
+  it, so "leave it" is the only safe default for hardware this migration does not
+  describe. A kept controller is logged and recorded in the results file as Skipped,
+  with the reason.
+
+  Two cases still stop the run: a LUN-less controller sitting on a bus the plan needs at
+  the destination (the rebuild has nowhere to put those LUNs), and a controller carrying
+  this migration's LUNs alongside a disk the CSV does not describe (removing it would
+  detach someone else's disk).

@@ -176,7 +176,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.8.0'
+$ScriptVersion = '2.8.1'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -1732,6 +1732,11 @@ function Remove-RdmsAndControllers {
 
     .PARAMETER MigrationGroup
         Group name, for the plan and results files.
+
+    .PARAMETER PlannedBuses
+        The SCSI buses the plan will recreate at the destination. A controller left
+        behind on one of those is a conflict; on any other bus it is somebody else's
+        business.
     #>
     [CmdletBinding()]
     param(
@@ -1739,7 +1744,11 @@ function Remove-RdmsAndControllers {
         $VMItem,
 
         [Parameter(Mandatory)]
-        [string]$MigrationGroup
+        [string]$MigrationGroup,
+
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [int[]]$PlannedBuses = @()
     )
 
     $currentVM = Get-VM -Id $VMItem.VM.Id
@@ -1768,9 +1777,10 @@ function Remove-RdmsAndControllers {
         throw "VM '$($currentVM.Name)' has a physical RDM on SCSI 0; this tool will not touch the bus 0 controller."
     }
 
-    # Every OTHER SCSI controller goes with the LUNs, not just the ones the CSV named:
-    # the destination is rebuilt from the CSV, and a stray controller left on bus 3 would
-    # collide with the one the plan wants to create there.
+    # The rule for every OTHER controller is the LUN: a controller that carried one goes
+    # with it, and a controller that carried none is left exactly where it is, empty or
+    # not. Removing a controller detaches whatever is on it, so "leave it" is the only
+    # safe default for anything this migration does not describe.
     #
     # The device list is read rather than Get-ScsiController, which returns the
     # controllers of a VM's hard disks - so a controller emptied moments ago by the loop
@@ -1783,7 +1793,7 @@ function Remove-RdmsAndControllers {
     )
 
     if ($sharedControllers.Count -gt 0) {
-        Write-RichoLog "      Removing $($sharedControllers.Count) SCSI controller(s) from '$($currentVM.Name)'; SCSI 0 stays for the VMDK disks." -Level INFO
+        Write-RichoLog "      Reviewing $($sharedControllers.Count) SCSI controller(s) on '$($currentVM.Name)' above bus 0; SCSI 0 stays for the VMDK disks." -Level INFO
     }
 
     foreach ($controller in $sharedControllers) {
@@ -1795,23 +1805,40 @@ function Remove-RdmsAndControllers {
         )
 
         # In a dry run the RDMs are all still attached, so a controller carrying exactly
-        # its planned RDMs is what "empty after removal" looks like from here. Anything
-        # else on a non-zero controller - a plain VMDK, someone else's disk - is not this
-        # tool's to detach, in either mode.
+        # its planned RDMs is what "empty after removal" looks like from here.
         $plannedLabels = @(
             $VMItem.Layout.Rdms |
                 Where-Object { $_.ControllerBus -eq $bus } |
                 ForEach-Object { $_.Label }
         )
+        $otherLabels = @($attachedDisks | ForEach-Object { [string]$_.DeviceInfo.Label }) -join ', '
+
+        # No LUN of this migration on it, so it is not this migration's controller.
+        if ($plannedLabels.Count -eq 0) {
+            if ($bus -in $PlannedBuses) {
+                $conflict = if ($attachedDisks.Count -gt 0) { " It holds $otherLabels." } else { ' It is empty.' }
+                throw "SCSI $bus on '$($currentVM.Name)' carries no LUN from this migration, but the plan puts LUNs on SCSI $bus at the destination.$conflict Resolve that by hand before running this VM."
+            }
+
+            $reason = if ($attachedDisks.Count -gt 0) { "it holds $otherLabels" } else { 'it is empty' }
+            $level = if ($attachedDisks.Count -gt 0) { 'WARN' } else { 'INFO' }
+            Write-RichoLog "      SCSI $bus on '$($currentVM.Name)' carries no LUN from this migration ($reason); leaving it in place." -Level $level
+            Add-Result $MigrationGroup $currentVM.Name 'RemoveController' 'Skipped' "SCSI $bus kept: no LUN from this migration is on it ($reason)."
+            continue
+        }
+
+        # It carried LUNs, so it goes - unless something else is sharing it, which this
+        # tool will not detach on anyone's behalf.
         $unexpected = @($attachedDisks | Where-Object { [string]$_.DeviceInfo.Label -notin $plannedLabels })
         if ($unexpected.Count -gt 0) {
-            throw "SCSI $bus on '$($currentVM.Name)' carries disks the CSV does not describe: $(@($unexpected | ForEach-Object { $_.DeviceInfo.Label }) -join ', '). Move them to SCSI 0 or take them out of the migration."
+            $unexpectedLabels = @($unexpected | ForEach-Object { $_.DeviceInfo.Label }) -join ', '
+            throw "SCSI $bus on '$($currentVM.Name)' carries this migration's LUNs alongside disks the CSV does not describe ($unexpectedLabels). Move those to SCSI 0, or take this VM out of the migration."
         }
         if ((-not $DryRun) -and ($attachedDisks.Count -gt 0)) {
             throw "SCSI $bus on '$($currentVM.Name)' is not empty after RDM removal."
         }
 
-        $removeControllerDetail = "Remove SCSI controller $bus (bus sharing $($controller.SharedBus)); SCSI 0 is left in place."
+        $removeControllerDetail = "Remove SCSI controller $bus (bus sharing $($controller.SharedBus)) - it carried this migration's LUNs. SCSI 0 is left in place."
         Invoke-PlannedChange $MigrationGroup $currentVM.Name 'RemoveController' "SCSI $bus" $removeControllerDetail {
             Remove-SharedScsiController -VM (Get-VM -Id $VMItem.VM.Id) -BusNumber $bus
         }
@@ -2465,7 +2492,12 @@ try {
             Write-RichoLog "    [$vmIndex/$($groupPlan.VMItems.Count)] $($vmItem.VM.Name)" -Level INFO
             Write-Progress -Activity "Group $($groupPlan.Name): shutdown and detach" -Status $vmItem.VM.Name -PercentComplete ([int](($vmIndex / [math]::Max(1, $groupPlan.VMItems.Count)) * 100))
             Stop-VMForMigration -VMItem $vmItem -MigrationGroup $groupPlan.Name
-            Remove-RdmsAndControllers -VMItem $vmItem -MigrationGroup $groupPlan.Name
+            $removalParameters = @{
+                VMItem         = $vmItem
+                MigrationGroup = $groupPlan.Name
+                PlannedBuses   = [int[]]@($groupPlan.Disks | ForEach-Object { $_.ControllerBus } | Select-Object -Unique)
+            }
+            Remove-RdmsAndControllers @removalParameters
         }
         Write-Progress -Activity "Group $($groupPlan.Name): shutdown and detach" -Completed
 

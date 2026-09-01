@@ -228,11 +228,16 @@ Once the VMs are powered down, and before anything moves:
 
 - Every physical RDM named in the CSV is detached, never permanently deleted.
 - **SCSI 0 is left alone** — it carries the operating system and any plain VMDKs.
-- **Every other SCSI controller is removed**, not only the ones the CSV named. The
-  destination is rebuilt from the CSV, and a stray controller left behind on a bus the
-  plan wants would collide with the one it is about to create.
-- A non-zero controller carrying a disk the CSV does not describe stops the run rather
-  than being detached. Move that disk to SCSI 0, or take the VM out of the migration.
+- **A controller above bus 0 that carried a LUN is removed with it.** That is the whole
+  rule: LUN on it, it goes.
+- **A controller that carried no LUN is left where it is**, empty or not. Removing a
+  controller detaches whatever is on it, so anything this migration does not describe
+  stays put and is noted in the results file. The one exception is a controller sitting
+  on a bus the plan needs at the destination — that stops the run, because the rebuild
+  cannot put its LUNs there otherwise.
+- A controller carrying this migration's LUNs **alongside** a disk the CSV does not
+  describe also stops the run. Move that disk to SCSI 0, or take the VM out of the
+  migration.
 
 ## What it does at the destination
 

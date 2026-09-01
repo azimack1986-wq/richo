@@ -539,6 +539,10 @@ try {
     Invoke-NativeTest 'SCSI 0 is kept, every other SCSI controller goes with the LUNs' {
         Assert-True ($text -match '\[int\]\$_\.BusNumber -ne 0') 'Controller removal is not scoped to the non-zero buses.'
         Assert-True ($text -match 'this tool will not touch the bus 0 controller') 'The SCSI 0 guard is missing.'
+
+        # A controller that carried a LUN goes with it; one that carried none is left
+        # alone, empty or not, because removing it would detach whatever is on it.
+        Assert-True ($text -match 'carries no LUN from this migration') 'The leave-it-alone rule for LUN-less controllers is missing.'
     }
 
     Invoke-NativeTest 'A failure is reported against the line that failed' {
