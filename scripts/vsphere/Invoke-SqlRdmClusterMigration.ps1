@@ -176,7 +176,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.6.0'
+$ScriptVersion = '2.7.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -599,34 +599,135 @@ function Get-ExactObject {
     return $candidates[0]
 }
 
+function Format-Elapsed {
+    <#
+    .SYNOPSIS
+        Renders a duration the way an operator reads one.
+
+    .PARAMETER Elapsed
+        The duration.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [timespan]$Elapsed
+    )
+
+    if ($Elapsed.TotalMinutes -lt 1) { return "$([math]::Round($Elapsed.TotalSeconds, 1))s" }
+    if ($Elapsed.TotalHours -lt 1) { return "$([int]$Elapsed.TotalMinutes)m $($Elapsed.Seconds)s" }
+
+    return "$([int]$Elapsed.TotalHours)h $($Elapsed.Minutes)m"
+}
+
+function Wait-VMLongTask {
+    <#
+    .SYNOPSIS
+        Waits for a vCenter task, saying where it is up to while it runs.
+
+    .DESCRIPTION
+        A cold relocate of a large VM is minutes of nothing on screen, which reads as a
+        hung script. This polls the task, drives a progress bar, and prints a percentage
+        and an elapsed time at intervals so the run is visibly alive.
+
+    .PARAMETER Task
+        The PowerCLI task to wait for.
+
+    .PARAMETER Activity
+        What the task is doing, for the log and the progress bar.
+
+    .PARAMETER ReportEverySeconds
+        How often to print a progress line. The progress bar updates far more often.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Task,
+
+        [Parameter(Mandatory)]
+        [string]$Activity,
+
+        [Parameter()]
+        [ValidateRange(5, 300)]
+        [int]$ReportEverySeconds = 15
+    )
+
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastReport = 0
+    $current = $Task
+
+    while (($current.State -eq 'Running') -or ($current.State -eq 'Queued')) {
+        Start-Sleep -Seconds 2
+        $current = Get-Task -Id $Task.Id
+
+        $percent = 0
+        if ($null -ne $current.PercentComplete) { $percent = [int]$current.PercentComplete }
+        Write-Progress -Activity $Activity -Status "$percent% after $(Format-Elapsed -Elapsed $stopwatch.Elapsed)" -PercentComplete $percent
+
+        if (($stopwatch.Elapsed.TotalSeconds - $lastReport) -ge $ReportEverySeconds) {
+            $lastReport = $stopwatch.Elapsed.TotalSeconds
+            Write-RichoLog "      $Activity - $percent% ($(Format-Elapsed -Elapsed $stopwatch.Elapsed) elapsed)" -Level INFO
+        }
+    }
+
+    Write-Progress -Activity $Activity -Completed
+    $stopwatch.Stop()
+
+    if ($current.State -ne 'Success') {
+        $reason = ''
+        if ($current.ExtensionData.Info.Error) { $reason = " $($current.ExtensionData.Info.Error.LocalizedMessage)" }
+        throw "$Activity failed: task state is $($current.State).$reason"
+    }
+
+    Write-RichoLog "      $Activity finished in $(Format-Elapsed -Elapsed $stopwatch.Elapsed)." -Level INFO
+}
+
 function Get-DefaultRdmDatastoreName {
     <#
     .SYNOPSIS
-        Builds the conventional RDM pointer datastore name for a cluster.
+        Builds the conventional RDM pointer datastore name for a cluster and workload type.
 
     .DESCRIPTION
-        The estate names the RDM pointer datastore after the cluster that mounts it, with
-        an '_i_rdm' suffix - d85sql01 has d85sql01_i_rdm, d85sql01sit has
-        d85sql01sit_i_rdm, d85sql01dev has d85sql01dev_i_rdm. The environment is already
-        in the cluster name, so there is no environment logic here and none is wanted.
+        Clusters are shared: one cluster carries PROD, SIT and DEV workloads side by side.
+        What the workload type separates is the mapping-file directory, so the name is the
+        cluster plus the environment's own suffix plus '_i_rdm':
+
+            PROD  d24sql02      -> d24sql02_i_rdm
+            SIT   d24sql02      -> d24sql02sit_i_rdm
+            DEV   d24sql02      -> d24sql02dev_i_rdm
+
+        PROD adds nothing, which is why it is the one that looks like the cluster name.
 
         It is only ever a default. A CSV that names the datastore is obeyed as written.
 
     .PARAMETER ClusterName
-        The cluster the datastore belongs to.
+        The destination cluster, whose hosts must mount the datastore.
+
+    .PARAMETER WorkloadType
+        PROD, SIT or DEV.
 
     .EXAMPLE
-        Get-DefaultRdmDatastoreName -ClusterName 'd85sql01sit'   # d85sql01sit_i_rdm
+        Get-DefaultRdmDatastoreName -ClusterName 'd24sql02' -WorkloadType SIT   # d24sql02sit_i_rdm
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [Parameter(Mandatory)]
         [ValidateNotNullOrEmpty()]
-        [string]$ClusterName
+        [string]$ClusterName,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('PROD', 'SIT', 'DEV')]
+        [string]$WorkloadType
     )
 
-    return "${ClusterName}_i_rdm"
+    $suffix = switch ($WorkloadType) {
+        'SIT'   { 'sit' }
+        'DEV'   { 'dev' }
+        default { '' }
+    }
+
+    return "${ClusterName}${suffix}_i_rdm"
 }
 
 function Get-ScsiUnitNumberSequence {
@@ -1125,7 +1226,17 @@ function Get-EligibleDestinationHosts {
     $eligible = [System.Collections.Generic.List[object]]::new()
     $exclusions = [System.Collections.Generic.List[string]]::new()
 
-    foreach ($candidateHost in @(Get-VMHost -Location $Cluster)) {
+    $candidateHosts = @(Get-VMHost -Location $Cluster)
+    $activity = "Checking hosts in '$($Cluster.Name)'"
+    Write-RichoLog "  Checking $($candidateHosts.Count) host(s) in '$($Cluster.Name)' for datastore and LUN access. This is the slow part - one storage read per host." -Level INFO
+
+    $hostIndex = 0
+    $scanStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    foreach ($candidateHost in $candidateHosts) {
+        $hostIndex++
+        Write-Progress -Activity $activity -Status "$hostIndex of $($candidateHosts.Count): $($candidateHost.Name)" -PercentComplete ([int](($hostIndex / [math]::Max(1, $candidateHosts.Count)) * 100))
+
         if ($candidateHost.ConnectionState -ne 'Connected') {
             $exclusions.Add("$($candidateHost.Name): connection state is $($candidateHost.ConnectionState)")
             continue
@@ -1150,21 +1261,31 @@ function Get-EligibleDestinationHosts {
         }
 
         try {
+            # Said before the read, not after: the read is the slow bit, and a name on
+            # screen while it runs is the difference between working and hung.
+            Write-RichoLog "    [$hostIndex/$($candidateHosts.Count)] $($candidateHost.Name): reading storage paths and devices..." -Level INFO
+            $hostStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
             $storageMap = Get-HostStorageMap -VMHost $candidateHost
             $resolvedLuns = [System.Collections.Generic.List[object]]::new()
             foreach ($lunId in $LunIds) {
                 $resolvedLuns.Add((Resolve-DestinationLun -StorageMap $storageMap -Svm $Svm -LunId $lunId))
             }
+            $hostStopwatch.Stop()
             $eligible.Add([pscustomobject]@{
                 VMHost = $candidateHost
                 Luns   = $resolvedLuns.ToArray()
             })
+            Write-RichoLog "         all $($LunIds.Count) LUN(s) resolved ($(Format-Elapsed -Elapsed $hostStopwatch.Elapsed))." -Level INFO
         }
         catch {
             $exclusions.Add("$($candidateHost.Name): $($_.Exception.Message)")
-            Write-RichoLog "  Host excluded: $($candidateHost.Name) - $($_.Exception.Message)" -Level WARN
+            Write-RichoLog "         excluded - $($_.Exception.Message)" -Level WARN
         }
     }
+
+    Write-Progress -Activity $activity -Completed
+    $scanStopwatch.Stop()
+    Write-RichoLog "  $($eligible.Count) of $($candidateHosts.Count) host(s) can take these VMs ($(Format-Elapsed -Elapsed $scanStopwatch.Elapsed))." -Level INFO
 
     return [pscustomobject]@{
         Hosts      = $eligible.ToArray()
@@ -1192,11 +1313,7 @@ function Wait-VMReconfigureTask {
         [string]$Description
     )
 
-    $task = Get-Task -Id "Task-$($TaskReference.Value)"
-    $completed = Wait-Task -Task $task
-    if ($completed.State -ne 'Success') {
-        throw "$Description failed: task state is $($completed.State)."
-    }
+    Wait-VMLongTask -Task (Get-Task -Id "Task-$($TaskReference.Value)") -Activity $Description -ReportEverySeconds 10
 }
 
 function Get-PciControllerKey {
@@ -1301,6 +1418,64 @@ function New-SharedScsiController {
     $spec.DeviceChange = @($change)
 
     Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description "Adding SCSI controller $BusNumber to '$($VM.Name)'"
+}
+
+function Remove-SharedScsiController {
+    <#
+    .SYNOPSIS
+        Removes an empty SCSI controller from a VM.
+
+    .DESCRIPTION
+        SHIPPED AND HIT ON A LIVE RUN. This used to find the controller with
+        Get-ScsiController, which returns the controllers of a VM's *hard disks* - so the
+        moment the last RDM came off bus 1, the controller stopped being returned and the
+        run died with "SCSI controller bus 1 is no longer attached", having already
+        detached the disk. The device list says what is really on the VM, and an empty
+        controller is exactly what this function exists to remove.
+
+        The removal is an explicit device spec, matching how the controller is put back
+        at the destination.
+
+    .PARAMETER VM
+        The VM to remove the controller from.
+
+    .PARAMETER BusNumber
+        SCSI bus number of the controller.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $VM,
+
+        [Parameter(Mandatory)]
+        [int]$BusNumber
+    )
+
+    $vmView = Get-View -Id $VM.Id -Property Config.Hardware.Device
+    $controllers = @(
+        $vmView.Config.Hardware.Device |
+            Where-Object { ($_ -is [VMware.Vim.VirtualSCSIController]) -and ([int]$_.BusNumber -eq $BusNumber) }
+    )
+    if ($controllers.Count -ne 1) {
+        throw "VM '$($VM.Name)' has $($controllers.Count) SCSI controllers on bus $BusNumber; expected one."
+    }
+
+    $attached = @(
+        $vmView.Config.Hardware.Device |
+            Where-Object { ($_ -is [VMware.Vim.VirtualDisk]) -and ([int]$_.ControllerKey -eq [int]$controllers[0].Key) }
+    )
+    if ($attached.Count -gt 0) {
+        throw "SCSI bus $BusNumber on '$($VM.Name)' still carries $($attached.Count) disk(s); refusing to remove the controller."
+    }
+
+    $change = New-Object VMware.Vim.VirtualDeviceConfigSpec
+    $change.Operation = 'remove'
+    $change.Device = $controllers[0]
+
+    $spec = New-Object VMware.Vim.VirtualMachineConfigSpec
+    $spec.DeviceChange = @($change)
+
+    Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description "Removing SCSI controller $BusNumber from '$($VM.Name)'"
 }
 
 function Add-RdmDevice {
@@ -1457,16 +1632,35 @@ function Wait-VMGuestShutdown {
         [int]$TimeoutMinutes
     )
 
+    $activity = "Waiting for '$($VM.Name)' to power off"
     $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastReport = 0
     $currentVM = Get-VM -Id $VM.Id
+
     while (($currentVM.PowerState -ne 'PoweredOff') -and ((Get-Date) -lt $deadline)) {
         Start-Sleep -Seconds 5
         $currentVM = Get-VM -Id $VM.Id
+
+        $percent = [math]::Min(100, [int](($stopwatch.Elapsed.TotalMinutes / $TimeoutMinutes) * 100))
+        Write-Progress -Activity $activity -Status "$(Format-Elapsed -Elapsed $stopwatch.Elapsed) of $TimeoutMinutes minutes" -PercentComplete $percent
+
+        # Twenty minutes of an unresponsive guest should not look like twenty minutes of
+        # a hung script.
+        if (($stopwatch.Elapsed.TotalSeconds - $lastReport) -ge 30) {
+            $lastReport = $stopwatch.Elapsed.TotalSeconds
+            Write-RichoLog "      still waiting for '$($VM.Name)' to power off - $(Format-Elapsed -Elapsed $stopwatch.Elapsed) of $TimeoutMinutes minutes, state is $($currentVM.PowerState)." -Level INFO
+        }
     }
+
+    Write-Progress -Activity $activity -Completed
+    $stopwatch.Stop()
 
     if ($currentVM.PowerState -ne 'PoweredOff') {
         throw "VM '$($VM.Name)' did not power off within $TimeoutMinutes minutes."
     }
+
+    Write-RichoLog "      '$($VM.Name)' powered off after $(Format-Elapsed -Elapsed $stopwatch.Elapsed)." -Level INFO
 }
 
 function Stop-VMForMigration {
@@ -1550,6 +1744,9 @@ function Remove-RdmsAndControllers {
 
     $currentVM = Get-VM -Id $VMItem.VM.Id
     foreach ($rdm in @($VMItem.Layout.Rdms | Sort-Object ControllerBus, UnitNumber)) {
+        # Re-read the VM each time: a device removed a moment ago is still present on a
+        # VM object fetched before it.
+        $currentVM = Get-VM -Id $VMItem.VM.Id
         $hardDisk = Get-HardDisk -VM $currentVM |
             Where-Object { $_.Name -ceq $rdm.Label } |
             Select-Object -First 1
@@ -1571,16 +1768,21 @@ function Remove-RdmsAndControllers {
             throw "VM '$($currentVM.Name)' has a physical RDM on SCSI bus 0; this tool will not remove the bus 0 controller."
         }
 
-        $controller = Get-ScsiController -VM $currentVM |
-            Where-Object { $_.ExtensionData.BusNumber -eq $bus } |
-            Select-Object -First 1
-        if ($null -eq $controller) {
-            throw "SCSI controller bus $bus is no longer attached to '$($currentVM.Name)'."
+        # Read the device list rather than asking Get-ScsiController: that cmdlet returns
+        # the controllers of a VM's hard disks, so a controller emptied moments ago by the
+        # loop above is simply absent from its output.
+        $vmView = Get-View -Id $currentVM.Id -Property Config.Hardware.Device
+        $controllers = @(
+            $vmView.Config.Hardware.Device |
+                Where-Object { ($_ -is [VMware.Vim.VirtualSCSIController]) -and ([int]$_.BusNumber -eq $bus) }
+        )
+        if ($controllers.Count -ne 1) {
+            throw "VM '$($currentVM.Name)' has $($controllers.Count) SCSI controllers on bus $bus; expected one."
         }
 
         $attachedDisks = @(
-            Get-HardDisk -VM $currentVM |
-                Where-Object { $_.ExtensionData.ControllerKey -eq $controller.ExtensionData.Key }
+            $vmView.Config.Hardware.Device |
+                Where-Object { ($_ -is [VMware.Vim.VirtualDisk]) -and ([int]$_.ControllerKey -eq [int]$controllers[0].Key) }
         )
         if ($DryRun) {
             $plannedLabels = @(
@@ -1588,9 +1790,9 @@ function Remove-RdmsAndControllers {
                     Where-Object { $_.ControllerBus -eq $bus } |
                     ForEach-Object { $_.Label }
             )
-            $unexpected = @($attachedDisks | Where-Object { $_.Name -notin $plannedLabels })
+            $unexpected = @($attachedDisks | Where-Object { [string]$_.DeviceInfo.Label -notin $plannedLabels })
             if ($unexpected.Count -gt 0) {
-                throw "Controller bus $bus contains unplanned disks: $($unexpected.Name -join ', ')."
+                throw "Controller bus $bus contains unplanned disks: $(@($unexpected | ForEach-Object { $_.DeviceInfo.Label }) -join ', ')."
             }
         }
         elseif ($attachedDisks.Count -gt 0) {
@@ -1599,7 +1801,7 @@ function Remove-RdmsAndControllers {
 
         $removeControllerDetail = "Remove empty shared-bus SCSI controller on bus $bus."
         Invoke-PlannedChange $MigrationGroup $currentVM.Name 'RemoveController' "SCSI $bus" $removeControllerDetail {
-            Remove-ScsiController -ScsiController $controller -Confirm:$false | Out-Null
+            Remove-SharedScsiController -VM (Get-VM -Id $VMItem.VM.Id) -BusNumber $bus
         }
     }
 }
@@ -1718,21 +1920,9 @@ function Resolve-MigrationPlan {
         }
         Write-RichoLog "Resolving batch $batchNumber $workloadType migration group '$groupName' -> '$destinationClusterName'." -Level INFO
 
+        Write-RichoLog "  Resolving destination objects in vCenter." -Level INFO
         $cluster = Get-ExactObject -Name $destinationClusterName -ObjectType 'destination cluster' -Lookup {
             Get-Cluster -Name $destinationClusterName -ErrorAction SilentlyContinue
-        }
-
-        # The environment lives in the cluster name - d85sql01, d85sql01sit, d85sql01dev -
-        # so the CSV's workload type and the destination it names should agree. A row that
-        # sends PROD VMs at a dev cluster is a copy-paste away, and is worth saying out
-        # loud rather than stopping a run that may well be deliberate.
-        $destinationSuffix = ''
-        if ($destinationClusterName -imatch '(sit|dev)$') { $destinationSuffix = $Matches[1].ToUpperInvariant() }
-        $expectedSuffix = if ($workloadType -eq 'PROD') { '' } else { $workloadType }
-        if ($destinationSuffix -ne $expectedSuffix) {
-            $namingWarning = "Migration group '$groupName' is marked $workloadType but its destination cluster '$destinationClusterName' does not follow that naming. Check the row."
-            Write-RichoLog $namingWarning -Level WARN
-            Add-Result $groupName '' 'Preflight' 'Warning' $namingWarning
         }
 
         $resourcePool = Get-ExactObject -Name $resourcePoolName -ObjectType 'resource pool' -Lookup {
@@ -1748,8 +1938,8 @@ function Resolve-MigrationPlan {
         $rdmDatastoreName = [string]$row.iSCSI_Data_Store
         $rdmDatastoreDerived = [string]::IsNullOrWhiteSpace($rdmDatastoreName)
         if ($rdmDatastoreDerived) {
-            $rdmDatastoreName = Get-DefaultRdmDatastoreName -ClusterName $destinationClusterName
-            Write-RichoLog "No RDM pointer datastore in the CSV for '$groupName'; using the conventional name '$rdmDatastoreName'." -Level INFO
+            $rdmDatastoreName = Get-DefaultRdmDatastoreName -ClusterName $destinationClusterName -WorkloadType $workloadType
+            Write-RichoLog "No RDM pointer datastore in the CSV for '$groupName'; using the conventional $workloadType name '$rdmDatastoreName'." -Level INFO
         }
         $rdmDatastore = Get-ExactObject -Name $rdmDatastoreName -ObjectType 'RDM pointer datastore' -CaseInsensitive:$rdmDatastoreDerived -Lookup {
             Get-Datastore -Name $rdmDatastoreName -ErrorAction SilentlyContinue
@@ -1809,6 +1999,7 @@ function Resolve-MigrationPlan {
             }
         }
 
+        Write-RichoLog "  Reading the RDM topology of $($vmNames.Count) VM(s)." -Level INFO
         $vmItems = [System.Collections.Generic.List[object]]::new()
         $placementIndex = 0
         foreach ($vmName in $vmNames) {
@@ -1818,6 +2009,7 @@ function Resolve-MigrationPlan {
                 Get-VM -Name $vmName -ErrorAction SilentlyContinue
             }
             $layout = Get-VMRdmLayout -VM $vm
+            Write-RichoLog "  $vmName : $($layout.Rdms.Count) physical RDM(s), powered $($vm.PowerState), on host $($vm.VMHost.Name)." -Level INFO
             if ($layout.View.Snapshot) { throw "VM '$vmName' has a snapshot." }
             if ($layout.Rdms.Count -ne $allLunIds.Count) {
                 throw "VM '$vmName' has $($layout.Rdms.Count) physical RDMs but the CSV specifies $($allLunIds.Count)."
@@ -1948,6 +2140,8 @@ function Resolve-MigrationPlan {
                 $diskIndex++
             }
         }
+
+        Write-RichoLog "  Plan resolved: $($resolvedDisks.Count) LUN(s) across $($controllers.Count) controller(s), $mappingMode mapping files." -Level INFO
 
         $duplicateDevices = @(
             $resolvedDisks |
@@ -2188,8 +2382,16 @@ function Export-RunArtifact {
 }
 
 # Loaded before the try block so the logging function the catch and finally blocks rely
-# on is guaranteed to exist by the time either can run.
+# on is guaranteed to exist by the time either can run. PowerCLI takes tens of seconds
+# to load on a cold session, so say so first - through the host, since the logger this
+# script carries is not usable until its own definition has been reached, which it has.
+Write-RichoLog 'Loading PowerCLI. On a cold session this can take a minute.' -Level INFO
+$moduleStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 Import-RequiredModules
+$moduleStopwatch.Stop()
+Write-RichoLog "PowerCLI ready ($(Format-Elapsed -Elapsed $moduleStopwatch.Elapsed))." -Level INFO
+
+$script:RunStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 try {
     $bannerMode = if ($Execute) { 'EXECUTE' } else { 'DRY RUN - nothing will be changed' }
@@ -2205,8 +2407,11 @@ try {
         $Credential = Get-RichoCredential -Name $credentialTarget
     }
 
+    Write-RichoLog "Connecting to $VCenter." -Level INFO
+    $connectStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $connection = Connect-VIServer -Server $VCenter -Credential $Credential
-    Write-RichoLog "Connected to $($connection.Name) as $($connection.User)." -Level INFO
+    $connectStopwatch.Stop()
+    Write-RichoLog "Connected to $($connection.Name) as $($connection.User) ($(Format-Elapsed -Elapsed $connectStopwatch.Elapsed))." -Level INFO
 
     $rows = @(Import-MigrationCsv -Path $CsvPath)
     Write-RichoLog "Loaded $($rows.Count) migration group(s) from $CsvPath." -Level INFO
@@ -2215,7 +2420,11 @@ try {
     $script:RunScope = $selection.Scope
     Write-RichoLog "Running $($selection.Scope): $($selection.Rows.Count) migration group(s), in batch order." -Level INFO
 
+    Write-RichoLog 'Resolving the migration plan against live inventory. No changes are made in this phase.' -Level INFO
+    $planStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $plans = @(Resolve-MigrationPlan -Rows $selection.Rows)
+    $planStopwatch.Stop()
+    Write-RichoLog "Plan resolved for $($plans.Count) group(s) in $(Format-Elapsed -Elapsed $planStopwatch.Elapsed)." -Level INFO
 
     if (-not (Test-Path -LiteralPath $OutputFolder)) {
         New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
@@ -2237,22 +2446,38 @@ try {
         # Every VM in the group comes down and gives up its shared disks before any of them
         # moves. A half-migrated WSFC with one node still holding the RDMs is the state
         # this ordering exists to prevent.
+        Write-RichoLog "  Phase 1 of 3: powering down $($groupPlan.VMItems.Count) VM(s) and detaching their RDMs." -Level INFO
+        $vmIndex = 0
         foreach ($vmItem in $groupPlan.VMItems) {
+            $vmIndex++
+            Write-RichoLog "    [$vmIndex/$($groupPlan.VMItems.Count)] $($vmItem.VM.Name)" -Level INFO
+            Write-Progress -Activity "Group $($groupPlan.Name): shutdown and detach" -Status $vmItem.VM.Name -PercentComplete ([int](($vmIndex / [math]::Max(1, $groupPlan.VMItems.Count)) * 100))
             Stop-VMForMigration -VMItem $vmItem -MigrationGroup $groupPlan.Name
             Remove-RdmsAndControllers -VMItem $vmItem -MigrationGroup $groupPlan.Name
         }
+        Write-Progress -Activity "Group $($groupPlan.Name): shutdown and detach" -Completed
 
+        Write-RichoLog "  Phase 2 of 3: relocating and re-attaching. A cold move of a large VM takes minutes." -Level INFO
+        $vmIndex = 0
         foreach ($vmItem in $groupPlan.VMItems) {
+            $vmIndex++
+            Write-RichoLog "    [$vmIndex/$($groupPlan.VMItems.Count)] $($vmItem.VM.Name) -> $($vmItem.DestinationHost.Name)" -Level INFO
+            Write-Progress -Activity "Group $($groupPlan.Name): relocate and re-attach" -Status $vmItem.VM.Name -PercentComplete ([int](($vmIndex / [math]::Max(1, $groupPlan.VMItems.Count)) * 100))
             $relocateDetail = "Cold-relocate '$($vmItem.VM.Name)' to host '$($vmItem.DestinationHost.Name)', datastore cluster '$($groupPlan.DatastoreCluster.Name)' and resource pool '$($groupPlan.ResourcePool.Name)'."
             Invoke-PlannedChange $groupPlan.Name $vmItem.VM.Name 'ColdRelocate' $vmItem.DestinationHost.Name $relocateDetail {
+                # Run the relocate as a task so its percentage can be reported. A cold
+                # move of a large VM is otherwise several minutes of silence.
                 $moveParameters = @{
                     VM          = Get-VM -Id $vmItem.VM.Id
                     Destination = $vmItem.DestinationHost
                     Datastore   = $groupPlan.DatastoreCluster
+                    RunAsync    = $true
                     Confirm     = $false
                 }
-                Move-VM @moveParameters | Out-Null
+                $moveTask = Move-VM @moveParameters
+                Wait-VMLongTask -Task $moveTask -Activity "Relocating '$($vmItem.VM.Name)' to $($vmItem.DestinationHost.Name)"
 
+                Write-RichoLog "      Moving '$($vmItem.VM.Name)' into resource pool '$($groupPlan.ResourcePool.Name)'." -Level INFO
                 $currentView = Get-View -Id $vmItem.VM.Id
                 $poolView = Get-View -Id $groupPlan.ResourcePool.Id
                 $poolView.MoveIntoResourcePool([VMware.Vim.ManagedObjectReference[]]@($currentView.MoRef))
@@ -2260,7 +2485,9 @@ try {
 
             Add-DestinationRdms -VMItem $vmItem -GroupPlan $groupPlan
         }
+        Write-Progress -Activity "Group $($groupPlan.Name): relocate and re-attach" -Completed
 
+        Write-RichoLog "  Phase 3 of 3: verifying." -Level INFO
         if ($DryRun) {
             Add-Result $groupPlan.Name '' 'Verify' 'DryRun' 'Post-migration verification runs only in an execution run.'
         }
@@ -2282,6 +2509,10 @@ try {
         Write-RichoLog "Migration group $($groupPlan.Name): $groupStatus." -Level INFO
     }
 
+    $succeeded = @($script:Results | Where-Object { $_.Status -eq 'Succeeded' }).Count
+    $planned = @($script:Results | Where-Object { $_.Status -eq 'DryRun' }).Count
+    Write-RichoLog "All $($plans.Count) group(s) processed in $(Format-Elapsed -Elapsed $script:RunStopwatch.Elapsed): $succeeded change(s) made, $planned planned." -Level INFO
+
     # Every group is migrated and verified before anything boots, then the VMs come up a
     # workload type at a time.
     if ($PowerOnAfterMigration) {
@@ -2292,9 +2523,13 @@ try {
     }
 }
 catch {
-    Add-Result '' '' 'Fatal' 'Failed' $_.Exception.Message
-    Write-RichoLog "Failed: $($_.Exception.Message)" -Level ERROR
-    throw
+    # -ErrorAction Continue so the logger's own Write-Error does not become the
+    # terminating error: without it the rethrow below never runs and the failure is
+    # reported against the logging line instead of the line that actually failed.
+    $failure = $_
+    Add-Result '' '' 'Fatal' 'Failed' $failure.Exception.Message
+    Write-RichoLog "Failed: $($failure.Exception.Message)" -Level ERROR -ErrorAction Continue
+    throw $failure
 }
 finally {
     if (-not (Test-Path -LiteralPath $OutputFolder)) {
@@ -2307,5 +2542,9 @@ finally {
     }
     if ($connection) {
         Disconnect-VIServer -Server $connection -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    if ($script:RunStopwatch) {
+        $script:RunStopwatch.Stop()
+        Write-RichoLog "Run finished in $(Format-Elapsed -Elapsed $script:RunStopwatch.Elapsed)." -Level INFO
     }
 }

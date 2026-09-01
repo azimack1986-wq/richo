@@ -4347,3 +4347,53 @@ behavioural rather than cosmetic.
 - Batch is stamped on every plan, result and verification row next to the workload
   type, and the run scope is recorded in each manifest, so a change record says what
   the run covered rather than what the file contained.
+
+### [2.7.0] — 2026-09-01
+
+#### Fixed
+
+- **SHIPPED AND HIT ON A LIVE RUN: removing the last RDM from a controller made the
+  controller disappear.** `Get-ScsiController -VM` returns the controllers of a VM's
+  *hard disks*, so the moment the only RDM came off SCSI 1 the controller stopped being
+  returned and the run died with `SCSI controller bus 1 is no longer attached` — after
+  the disk had already been detached, leaving the VM half-migrated. Controllers are now
+  read from the VM's device list and removed with an explicit device spec, the same way
+  they are recreated at the destination. The VM is also re-read between device removals
+  rather than being carried as an object fetched before them.
+
+- **A failure was reported against the logging line, not the failing one.**
+  `Write-RichoLog ... -Level ERROR` calls `Write-Error`, which under
+  `$ErrorActionPreference = 'Stop'` becomes the terminating error itself, so the rethrow
+  never ran and the console showed `Line 2296 | Write-RichoLog ...`. The fatal log line
+  is now written with `-ErrorAction Continue` and the original error object is rethrown.
+
+- **The workload type no longer judges the cluster name.** Clusters are shared — one
+  cluster carries PROD, SIT and DEV — so the warning that a `SIT` row on cluster
+  `d24sql02` "does not follow that naming" was wrong every time it fired. Removed.
+
+#### Changed
+
+- **The derived RDM datastore name comes from the workload type**, which is what the
+  workload type is actually for: `<destination_cluster>` plus the environment suffix
+  plus `_i_rdm`, so cluster `d24sql02` has `d24sql02_i_rdm` for PROD,
+  `d24sql02sit_i_rdm` for SIT and `d24sql02dev_i_rdm` for DEV. PROD adds nothing, which
+  is why it looks like the bare cluster name. A datastore named in the CSV is still
+  used exactly as typed.
+
+- **The run says what it is doing.** Long stretches of a run are spent inside a handful
+  of slow VMware calls, and the script used to sit silent through all of them, which
+  reads as a hang:
+
+  - PowerCLI loading, the vCenter connection and plan resolution are announced and
+    timed.
+  - The host storage scan — the slowest phase of a dry run — names each host *before*
+    it reads it, then reports the LUNs resolved and how long it took, with a progress
+    bar across the cluster.
+  - Cold relocates run as tasks (`-RunAsync`) and report a percentage and elapsed time
+    every fifteen seconds; every reconfigure reports the same way.
+  - A guest shutdown wait prints `still waiting ... 2m of 20 minutes` every thirty
+    seconds instead of going quiet for the whole timeout.
+  - Each group announces `Phase 1 of 3` through `Phase 3 of 3` and numbers the VMs
+    within a phase, and the run closes with a count of changes and a total elapsed time.
+
+  Nothing now waits silently for more than about thirty seconds.

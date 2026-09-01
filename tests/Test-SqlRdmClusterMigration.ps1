@@ -162,6 +162,7 @@ try {
         'Invoke-PlannedChange',
         'Get-ExactObject',
         'Get-DefaultRdmDatastoreName',
+        'Format-Elapsed',
         'Get-ScsiUnitNumberSequence',
         'Import-MigrationCsv',
         'Select-MigrationRows'
@@ -236,10 +237,23 @@ try {
         Assert-Equal $rows[0].iSCSI_Data_Store '' 'A blank RDM datastore cell was not accepted.'
     }
 
-    Invoke-NativeTest 'Derived RDM datastore name follows the cluster naming convention' {
-        Assert-Equal (Get-DefaultRdmDatastoreName -ClusterName 'd85sql01') 'd85sql01_i_rdm' 'PROD name is wrong.'
-        Assert-Equal (Get-DefaultRdmDatastoreName -ClusterName 'd85sql01sit') 'd85sql01sit_i_rdm' 'SIT name is wrong.'
-        Assert-Equal (Get-DefaultRdmDatastoreName -ClusterName 'd85sql01dev') 'd85sql01dev_i_rdm' 'DEV name is wrong.'
+    Invoke-NativeTest 'Derived RDM datastore name is the cluster plus the workload suffix' {
+        # Clusters are shared, so one cluster has all three mapping directories.
+        Assert-Equal (Get-DefaultRdmDatastoreName -ClusterName 'd24sql02' -WorkloadType 'PROD') 'd24sql02_i_rdm' 'PROD name is wrong.'
+        Assert-Equal (Get-DefaultRdmDatastoreName -ClusterName 'd24sql02' -WorkloadType 'SIT') 'd24sql02sit_i_rdm' 'SIT name is wrong.'
+        Assert-Equal (Get-DefaultRdmDatastoreName -ClusterName 'd24sql02' -WorkloadType 'DEV') 'd24sql02dev_i_rdm' 'DEV name is wrong.'
+    }
+
+    Invoke-NativeTest 'The workload type never judges the cluster name' {
+        # Clusters carry PROD, SIT and DEV together, so a SIT row on a cluster whose name
+        # says nothing about SIT is normal and must not warn.
+        Assert-True ($text -notmatch 'does not follow that naming') 'The cluster-naming warning is back.'
+    }
+
+    Invoke-NativeTest 'Elapsed times are rendered for an operator, not a debugger' {
+        Assert-Equal (Format-Elapsed -Elapsed ([timespan]::FromSeconds(4.25))) '4.3s' 'Seconds are wrong.'
+        Assert-Equal (Format-Elapsed -Elapsed ([timespan]::FromSeconds(90))) '1m 30s' 'Minutes are wrong.'
+        Assert-Equal (Format-Elapsed -Elapsed ([timespan]::FromMinutes(75))) '1h 15m' 'Hours are wrong.'
     }
 
     Invoke-NativeTest 'Shipped sample CSV is accepted and matches the required header' {
@@ -468,7 +482,7 @@ try {
 
         $mutating = @(
             'Remove-HardDisk',
-            'Remove-ScsiController',
+            'Remove-SharedScsiController',
             'Move-VM',
             'Start-VM',
             'Stop-VM',
@@ -509,6 +523,36 @@ try {
                 ForEach-Object { "line $($_.Extent.StartLineNumber)" }
         )
         Assert-Equal $outside.Count 0 "Start-VM is called outside the workload power-on phase: $($outside -join ', ')."
+    }
+
+    Invoke-NativeTest 'Controllers are found in the device list, never via Get-ScsiController' {
+        # Get-ScsiController returns the controllers of a VM's HARD DISKS. Emptying a
+        # controller therefore removes it from that cmdlet's output, and a live run died
+        # with "SCSI controller bus 1 is no longer attached" one line after detaching the
+        # only RDM on it.
+        $scsiControllerCalls = @(Get-CommandAst -Ast $ast -Name 'Get-ScsiController')
+        Assert-Equal $scsiControllerCalls.Count 0 'Get-ScsiController is back; it cannot see an empty controller.'
+        Assert-True ($text -match '(?m)^function Remove-SharedScsiController') 'The device-spec controller removal is missing.'
+        Assert-True ($text -match '\[VMware\.Vim\.VirtualSCSIController\]') 'Controllers are not matched by device type.'
+    }
+
+    Invoke-NativeTest 'A failure is reported against the line that failed' {
+        # Write-RichoLog ERROR calls Write-Error, which under $ErrorActionPreference =
+        # 'Stop' becomes the terminating error itself - so the rethrow never ran and the
+        # console blamed the logging line.
+        Assert-True ($text -match '-Level ERROR -ErrorAction Continue') 'The fatal log line can still swallow the real error.'
+        Assert-True ($text -match '(?m)^\s*throw \$failure') 'The original error is not rethrown.'
+    }
+
+    Invoke-NativeTest 'Long operations report progress instead of going quiet' {
+        Assert-True ($text -match '(?m)^function Wait-VMLongTask') 'The task progress helper is missing.'
+        Assert-True ($text -match 'Write-Progress') 'Nothing drives a progress bar.'
+        Assert-True ($text -match 'RunAsync    = \$true') 'The cold relocate does not run as a task, so its percentage cannot be reported.'
+        Assert-True ($text -match 'still waiting for') 'The guest shutdown wait has no heartbeat.'
+
+        # The host storage scan is the slowest phase of a dry run; it has to name the host
+        # before the read, not only after it.
+        Assert-True ($text -match 'reading storage paths and devices') 'The host storage scan says nothing before it reads.'
     }
 
     Invoke-NativeTest 'There are two modes and one gate between them' {

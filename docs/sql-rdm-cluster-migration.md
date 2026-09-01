@@ -172,18 +172,24 @@ destination_datastore_cluster
 - `batch` groups rows into outage windows. It is stamped on every plan, result and
   verification row, and rows always run in batch order — batch 1 finishes before batch 2
   starts, whatever order the rows sit in the file.
-- `workload_type` is `PROD`, `SIT` or `DEV`, in any case. It is stamped on every plan,
-  result and verification row, so a change record can be filtered to one environment,
-  and it drives the power-on batching below. A row whose workload type disagrees with
-  its destination cluster name — `PROD` pointed at a `...dev` cluster — is logged as a
-  warning rather than blocked.
-- `iSCSI_Data_Store` may be left blank. Blank means the conventional name for the
-  destination cluster: `<destination_cluster>_i_rdm`, so `d85sql01` has
-  `d85sql01_i_rdm`, `d85sql01sit` has `d85sql01sit_i_rdm` and `d85sql01dev` has
-  `d85sql01dev_i_rdm`. The environment is already in the cluster name, so there is no
-  environment logic in the derivation. A name that *is* typed is used exactly as
-  typed; a derived name is matched without regard to case, since nobody typed it.
-  Either way the datastore must be mounted by the destination hosts.
+- `workload_type` is `PROD`, `SIT` or `DEV`, in any case. Clusters are shared — one
+  cluster carries all three — so the workload type says nothing about the cluster and is
+  never checked against its name. What it does is pick the RDM mapping directory, and
+  it is stamped on every plan, result and verification row so a change record can be
+  filtered to one environment, and it drives the power-on batching below.
+- `iSCSI_Data_Store` may be left blank. Blank means the conventional name for that
+  cluster and workload type — the cluster, the environment's suffix, then `_i_rdm`:
+
+  | Workload | Destination cluster | Derived datastore |
+  | --- | --- | --- |
+  | PROD | `d24sql02` | `d24sql02_i_rdm` |
+  | SIT | `d24sql02` | `d24sql02sit_i_rdm` |
+  | DEV | `d24sql02` | `d24sql02dev_i_rdm` |
+
+  PROD adds nothing, which is why it looks like the bare cluster name. A name that *is*
+  typed is used exactly as typed; a derived name is matched without regard to case,
+  since nobody typed it. Either way the datastore must be mounted by the destination
+  hosts.
 - LUN group N becomes SCSI bus N — group 1 to bus 1, and so on. Bus 0 is left alone;
   it carries the OS disk.
 - Within a group, LUNs are attached in the order written, at units 0, 1, 2 …,
@@ -255,6 +261,29 @@ All three scopes come out of the same CSV — you never edit the file to run par
   says what the run covered.
 - Nothing else changes with scope: the same validation, the same evidence files, and
   power-on still waits for every group **in that run**.
+
+## What it prints while it runs
+
+Most of a run is spent inside a handful of slow VMware calls, so each one says what it
+is doing, and the long ones report a percentage and an elapsed time as they go:
+
+```text
+2026-09-01 07:31:02Z [INFO ] Loading PowerCLI. On a cold session this can take a minute.
+2026-09-01 07:31:44Z [INFO ] PowerCLI ready (41.8s).
+2026-09-01 07:31:46Z [INFO ] Connected to vcenter01 as SVC-MIG (1.9s).
+2026-09-01 07:31:46Z [INFO ] Resolving the migration plan against live inventory. No changes are made in this phase.
+2026-09-01 07:31:47Z [INFO ]   Checking 8 host(s) in 'd24sql02' for datastore and LUN access. This is the slow part - one storage read per host.
+2026-09-01 07:31:47Z [INFO ]     [1/8] esx01: reading storage paths and devices...
+2026-09-01 07:32:04Z [INFO ]          all 7 LUN(s) resolved (16.4s).
+...
+2026-09-01 07:34:10Z [INFO ]   Phase 2 of 3: relocating and re-attaching. A cold move of a large VM takes minutes.
+2026-09-01 07:34:25Z [INFO ]       Relocating 'D24SQL01' to esx03 - 34% (15.1s elapsed)
+2026-09-01 07:36:58Z [INFO ]       Relocating 'D24SQL01' to esx03 finished in 2m 48s.
+```
+
+A guest shutdown says `still waiting ... 2m of 20 minutes` every thirty seconds, and
+progress bars run alongside for the host scan, the per-VM phases and every long task.
+Nothing waits silently for more than about half a minute.
 
 ## Power-on
 
