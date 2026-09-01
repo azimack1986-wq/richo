@@ -193,7 +193,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.12.1'
+$ScriptVersion = '2.13.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -1016,6 +1016,54 @@ function Select-MigrationRows {
     }
 }
 
+function Get-OptionalProperty {
+    <#
+    .SYNOPSIS
+        Reads a property that may not exist on this build of the VMware SDK.
+
+    .DESCRIPTION
+        SHIPPED AND HIT ON A DRY RUN. VirtualDisk.Sharing arrived in a later vSphere API
+        than some of the bindings in the field, and under Set-StrictMode reading a
+        property the object does not have is a terminating error - so discovery died on
+        the first VM it looked at.
+
+        Anything optional, or newer than the oldest PowerCLI this has to run against, is
+        read through here. The property bag answers "is it there" without throwing.
+
+    .PARAMETER InputObject
+        The object to read from.
+
+    .PARAMETER Name
+        The property name.
+
+    .PARAMETER Default
+        What to return when the property is absent or null.
+
+    .EXAMPLE
+        Get-OptionalProperty -InputObject $device -Name 'Sharing' -Default ''
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowNull()]
+        $InputObject,
+
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter()]
+        $Default = $null
+    )
+
+    if ($null -eq $InputObject) { return $Default }
+
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $Default }
+    if ($null -eq $property.Value) { return $Default }
+
+    return $property.Value
+}
+
 function Get-VMRdmLayout {
     <#
     .SYNOPSIS
@@ -1070,7 +1118,7 @@ function Get-VMRdmLayout {
         }
 
         $canonicalName = ([string]$backing.DeviceName -replace '^.*/', '').ToLowerInvariant()
-        $capacityBytes = [double]$device.CapacityInBytes
+        $capacityBytes = [double](Get-OptionalProperty -InputObject $device -Name 'CapacityInBytes' -Default 0)
         if ($capacityBytes -le 0) {
             $capacityBytes = [double]$device.CapacityInKB * 1024
         }
@@ -1080,15 +1128,16 @@ function Get-VMRdmLayout {
             CanonicalName  = $canonicalName
             DeviceName     = [string]$backing.DeviceName
             CompatibilityMode = [string]$backing.CompatibilityMode
-            DiskMode       = [string]$backing.DiskMode
-            Sharing        = [string]$device.Sharing
+            DiskMode       = [string](Get-OptionalProperty -InputObject $backing -Name 'DiskMode' -Default '')
+            Sharing        = [string](Get-OptionalProperty -InputObject $device -Name 'Sharing' -Default '')
             CapacityGB     = [math]::Round($capacityBytes / 1GB, 3)
+            CapacityInKB   = [long]($capacityBytes / 1KB)
             ControllerBus  = [int]$controller.BusNumber
             UnitNumber     = [int]$device.UnitNumber
             BusSharing     = [string]$controller.SharedBus
             ControllerKey  = [int]$device.ControllerKey
             ControllerType = $controller.GetType().FullName
-            LunUuid        = [string]$backing.LunUuid
+            LunUuid        = [string](Get-OptionalProperty -InputObject $backing -Name 'LunUuid' -Default '')
             BackingFile    = [string]$backing.FileName
         })
     }
@@ -1651,6 +1700,14 @@ function Add-RdmDevice {
     .PARAMETER Sharing
         Disk sharing read from the source RDM - sharingNone or sharingMultiWriter. Left
         alone when the source did not set it.
+
+    .PARAMETER LunUuid
+        The LUN's UUID as the source RDM recorded it. Part of the reference spec for an
+        RDM add and omitted here until a live run failed on the backing.
+
+    .PARAMETER CapacityInKB
+        The disk's capacity as the source RDM recorded it. Also part of the reference
+        spec, and also omitted here until that failure.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -1684,7 +1741,14 @@ function Add-RdmDevice {
 
         [Parameter()]
         [AllowEmptyString()]
-        [string]$Sharing
+        [string]$Sharing,
+
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$LunUuid,
+
+        [Parameter()]
+        [long]$CapacityInKB = 0
     )
 
     $vmView = Get-View -Id $VM.Id -Property Config.Hardware.Device
@@ -1721,12 +1785,23 @@ function Add-RdmDevice {
     # independent-persistent by nature, which is what the client itself sends.
     $backing.DiskMode = if ($DiskMode) { $DiskMode } else { 'independent_persistent' }
 
+    # The published reference spec for an RDM add - William Lam's rdmManagmement.pl -
+    # carries the LUN's UUID on the backing and a capacity on the device. This script
+    # carried neither, and a live run was refused with "Incompatible device backing
+    # specified for device '0'". Both are set from what the source RDM recorded.
+    if ($LunUuid) { $backing.LunUuid = $LunUuid }
+
     $disk = New-Object VMware.Vim.VirtualDisk
     $disk.Key = -100 - $UnitNumber
     $disk.ControllerKey = $controllerKey
     $disk.UnitNumber = $UnitNumber
     $disk.Backing = $backing
-    if ($Sharing) { $disk.Sharing = $Sharing }
+    if ($CapacityInKB -gt 0) { $disk.CapacityInKB = $CapacityInKB }
+    # Same care setting it: a binding without the property cannot be told about sharing,
+    # and a source that never had it does not need to be.
+    if ($Sharing -and ($null -ne $disk.PSObject.Properties['Sharing'])) {
+        $disk.Sharing = $Sharing
+    }
 
     $change = New-Object VMware.Vim.VirtualDeviceConfigSpec
     $change.Operation = 'add'
@@ -1747,7 +1822,9 @@ function Add-RdmDevice {
     # The whole backing, in the log, before it is sent: when vCenter refuses a device the
     # message names neither the device nor the file, and this is the difference between a
     # five-minute diagnosis and an afternoon.
-    Write-RichoLog "        device: $($backing.DeviceName), mode: $($backing.CompatibilityMode)/$($backing.DiskMode), sharing: '$($disk.Sharing)', file: '$($backing.FileName)', fileOperation: '$($change.FileOperation)'" -Level INFO
+    $sharingSent = [string](Get-OptionalProperty -InputObject $disk -Name 'Sharing' -Default '')
+    Write-RichoLog "        device: $($backing.DeviceName), mode: $($backing.CompatibilityMode)/$($backing.DiskMode), sharing: '$sharingSent'" -Level INFO
+    Write-RichoLog "        lunUuid: '$($backing.LunUuid)', capacityInKB: $($disk.CapacityInKB), file: '$($backing.FileName)', fileOperation: '$($change.FileOperation)'" -Level INFO
 
     $attachDescription = "Attaching RDM at SCSI $ControllerBus`:$UnitNumber on '$($VM.Name)' (device $($backing.DeviceName), file '$($backing.FileName)')"
     Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description $attachDescription
@@ -2075,6 +2152,8 @@ function Add-DestinationRdms {
                 CompatibilityMode   = $disk.CompatibilityMode
                 DiskMode            = $disk.DiskMode
                 Sharing             = $disk.Sharing
+                LunUuid             = $disk.LunUuid
+                CapacityInKB        = $disk.CapacityInKB
             }
             $mappingFile = Add-RdmDevice @addParameters
             if (-not $GroupPlan.MappingFiles.ContainsKey($addressKey)) {
@@ -2324,6 +2403,8 @@ function Resolve-MigrationPlan {
                     DiskMode          = $reference.DiskMode
                     Sharing           = $reference.Sharing
                     BusSharing        = $reference.BusSharing
+                    LunUuid           = $reference.LunUuid
+                    CapacityInKB      = $reference.CapacityInKB
                 })
                 $diskIndex++
             }

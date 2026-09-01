@@ -162,6 +162,7 @@ try {
         'Invoke-PlannedChange',
         'Get-ExactObject',
         'Get-DefaultRdmDatastoreName',
+        'Get-OptionalProperty',
         'Format-Elapsed',
         'Get-ScsiUnitNumberSequence',
         'Import-MigrationCsv',
@@ -647,6 +648,27 @@ try {
         Assert-True ($text -notmatch 'New-Object VMware\.Vim\.ParaVirtualSCSIController') 'The controller type is hardcoded to PVSCSI.'
         Assert-True ($text -match 'New-Object -TypeName \$ControllerTypeName') 'The controller is not built from the source type.'
         Assert-True ($text -match 'ControllerType = \$controller\.GetType\(\)\.FullName') 'The source controller type is not recorded.'
+    }
+
+    Invoke-NativeTest 'Optional SDK properties are read without assuming they exist' {
+        # SHIPPED. VirtualDisk.Sharing is newer than some bindings in the field, and under
+        # Set-StrictMode reading a property the object does not have is a terminating
+        # error - discovery died on the first VM it looked at.
+        $withSharing = [pscustomobject]@{ Sharing = 'sharingMultiWriter' }
+        $withoutSharing = [pscustomobject]@{ Label = 'Hard disk 2' }
+
+        Assert-Equal (Get-OptionalProperty -InputObject $withSharing -Name 'Sharing' -Default '') 'sharingMultiWriter' 'A present property was not returned.'
+        Assert-Equal (Get-OptionalProperty -InputObject $withoutSharing -Name 'Sharing' -Default '') '' 'An absent property did not fall back to the default.'
+        Assert-Equal (Get-OptionalProperty -InputObject $null -Name 'Sharing' -Default 'none') 'none' 'A null object did not fall back to the default.'
+
+        # Scoped to the function that reads devices back from vCenter. Properties the
+        # script sets on a backing it built itself are its own and cannot be missing.
+        $layoutFunction = @($functionAsts | Where-Object { $_.Name -eq 'Get-VMRdmLayout' })
+        Assert-Equal $layoutFunction.Count 1 'Get-VMRdmLayout is missing.'
+        $layoutText = $layoutFunction[0].Extent.Text
+        foreach ($direct in @('\$device\.Sharing', '\$device\.CapacityInBytes', '\$backing\.LunUuid', '\$backing\.DiskMode')) {
+            Assert-True ($layoutText -notmatch $direct) "An optional property is read directly from a device vCenter returned: $direct"
+        }
     }
 
     Invoke-NativeTest 'Capacity is checked everywhere it still can be' {

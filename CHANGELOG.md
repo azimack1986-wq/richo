@@ -4575,3 +4575,32 @@ of it immediately.
   traceback showed the run had been a stale copy on a share, three versions behind the
   fixes for both. A version alone did not settle it, because the version was never in the
   pasted log; the path and timestamp now are.
+
+### [2.12.2] — 2026-09-01
+
+#### Fixed
+
+- **Discovery died on the first VM it read.** `VirtualDisk.Sharing`, added in 2.12.0, is
+  newer than some PowerCLI bindings in the field, and under `Set-StrictMode` reading a
+  property an object does not have is a terminating error. Optional and
+  version-dependent properties — `Sharing`, `CapacityInBytes`, `DiskMode`, `LunUuid` —
+  are now read through `Get-OptionalProperty`, which asks the property bag rather than
+  assuming, and the `Sharing` setter is guarded the same way. A test covers the absent
+  case directly and a static guard keeps the direct reads out of discovery.
+
+### [2.13.0] — 2026-09-01
+
+#### Changed
+
+- **The RDM add spec now matches the published reference.** Compared against William
+  Lam's `rdmManagmement.pl`, which is the closest thing to an authoritative example, this
+  script's spec was missing two fields it sets: `lunUuid` on the backing and
+  `capacityInKB` on the device. Both are now taken from what the source RDM recorded.
+  That is the strongest remaining candidate for the `Incompatible device backing
+  specified for device '0'` refusal — the disk mode added in 2.11.0 is, per the API
+  reference, *ignored* in physical compatibility mode, so it was never likely to be the
+  cause even though the reference sets it too.
+
+- The attach now logs the whole spec over two lines — device, modes and sharing, then
+  LUN UUID, capacity, mapping file and file operation — so what was sent can be compared
+  against what vCenter produces for a hand-built RDM in the same estate.
