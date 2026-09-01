@@ -7,11 +7,15 @@
     LUN ID and are then verified internally by canonical device identity and capacity, so
     the operator never types an NAA value.
 
+    Source and destination clusters are separate: 'vsphere_cluster' is where the VMs are
+    now, 'destination_cluster' is where they are going, and each VM must actually be in
+    the source cluster or the run stops.
+
     Per migration group the script:
 
-      1. Resolves the destination cluster, resource pool, datastore cluster and RDM
-         pointer datastore, and the eligible destination hosts that can see all of them
-         plus every LUN in the CSV.
+      1. Resolves the source cluster, then the destination cluster, resource pool,
+         datastore cluster and RDM pointer datastore, and the eligible destination hosts
+         that can see all of them plus every LUN in the CSV.
       2. Reads the source RDM topology from the first VM and proves every other VM in the
          group matches it - same controller bus, unit number, capacity and controller type.
       3. Shuts the VMs down (guest shutdown; hard power-off only with the explicit opt-in
@@ -71,8 +75,9 @@
     powered-on VM whose Tools are unavailable stops the migration.
 
 .PARAMETER PowerOnAfterMigration
-    Power the VMs on at the destination, in CSV order, once every VM in the group has been
-    relocated and re-attached.
+    Power the VMs on at the destination once every migration group has been relocated,
+    re-attached and verified - a workload type at a time, groups in CSV order and VMs in
+    power-on order within each group. Without it the VMs are left powered off.
 
 .PARAMETER OutputFolder
     Where the manifest, plan, results and verification files are written.
@@ -143,12 +148,18 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.3.0'
+$ScriptVersion = '2.4.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
 # happen, -Execute does it. Nothing else in the script decides whether to change a VM.
 $script:RunMode = if ($DryRun) { 'DryRun' } else { 'Execute' }
+
+# Workload type is per migration group, and stamping it on every plan, result and
+# verification row is what lets a change record be filtered to PROD alone. Held here so
+# the row builders can reach it without every call site passing it along.
+$script:WorkloadTypeByGroup = @{}
+$script:ValidWorkloadTypes = @('PROD', 'SIT', 'DEV')
 
 $script:Plan = [System.Collections.Generic.List[object]]::new()
 $script:Results = [System.Collections.Generic.List[object]]::new()
@@ -335,6 +346,29 @@ function ConvertTo-ValueList {
     )
 }
 
+function Get-WorkloadType {
+    <#
+    .SYNOPSIS
+        Returns the workload type recorded for a migration group.
+
+    .PARAMETER MigrationGroup
+        The group name, or an empty string for rows that belong to no group yet.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$MigrationGroup
+    )
+
+    if ($MigrationGroup -and $script:WorkloadTypeByGroup.ContainsKey($MigrationGroup)) {
+        return [string]$script:WorkloadTypeByGroup[$MigrationGroup]
+    }
+
+    return ''
+}
+
 function Add-Result {
     <#
     .SYNOPSIS
@@ -380,6 +414,7 @@ function Add-Result {
         Timestamp      = (Get-Date).ToString('o')
         ScriptVersion  = $ScriptVersion
         MigrationGroup = $MigrationGroup
+        WorkloadType   = (Get-WorkloadType -MigrationGroup $MigrationGroup)
         VM             = $VM
         Phase          = $Phase
         Status         = $Status
@@ -442,6 +477,7 @@ function Invoke-PlannedChange {
         ScriptVersion  = $ScriptVersion
         Mode           = $script:RunMode
         MigrationGroup = $MigrationGroup
+        WorkloadType   = (Get-WorkloadType -MigrationGroup $MigrationGroup)
         VM             = $VM
         Action         = $Action
         Target         = $Target
@@ -477,6 +513,11 @@ function Get-ExactObject {
 
     .PARAMETER Lookup
         Block that returns the candidates.
+
+    .PARAMETER CaseInsensitive
+        Match without regard to case. Used only for a name the script derived itself,
+        where holding the operator to a case they never typed helps nobody. A name from
+        the CSV is always matched exactly.
     #>
     [CmdletBinding()]
     param(
@@ -487,15 +528,50 @@ function Get-ExactObject {
         [string]$ObjectType,
 
         [Parameter(Mandatory)]
-        [scriptblock]$Lookup
+        [scriptblock]$Lookup,
+
+        [Parameter()]
+        [switch]$CaseInsensitive
     )
 
-    $candidates = @(& $Lookup | Where-Object { $_.Name -ceq $Name })
+    $candidates = @(& $Lookup | Where-Object {
+        if ($CaseInsensitive) { $_.Name -ieq $Name } else { $_.Name -ceq $Name }
+    })
     if ($candidates.Count -ne 1) {
         throw "Expected exactly one $ObjectType named '$Name'; found $($candidates.Count)."
     }
 
     return $candidates[0]
+}
+
+function Get-DefaultRdmDatastoreName {
+    <#
+    .SYNOPSIS
+        Builds the conventional RDM pointer datastore name for a cluster.
+
+    .DESCRIPTION
+        The estate names the RDM pointer datastore after the cluster that mounts it, with
+        an '_i_rdm' suffix - d85sql01 has d85sql01_i_rdm, d85sql01sit has
+        d85sql01sit_i_rdm, d85sql01dev has d85sql01dev_i_rdm. The environment is already
+        in the cluster name, so there is no environment logic here and none is wanted.
+
+        It is only ever a default. A CSV that names the datastore is obeyed as written.
+
+    .PARAMETER ClusterName
+        The cluster the datastore belongs to.
+
+    .EXAMPLE
+        Get-DefaultRdmDatastoreName -ClusterName 'd85sql01sit'   # d85sql01sit_i_rdm
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ClusterName
+    )
+
+    return "${ClusterName}_i_rdm"
 }
 
 function Get-ScsiUnitNumberSequence {
@@ -560,6 +636,8 @@ function Import-MigrationCsv {
 
     $requiredColumns = @(
         'vsphere_cluster',
+        'destination_cluster',
+        'workload_type',
         'first_vm',
         'other_vms_space_separated',
         'svm',
@@ -591,9 +669,10 @@ function Import-MigrationCsv {
 
         foreach ($column in @(
             'vsphere_cluster',
+            'destination_cluster',
+            'workload_type',
             'first_vm',
             'svm',
-            'iSCSI_Data_Store',
             'destination_resource_pool',
             'destination_datastore_cluster'
         )) {
@@ -601,6 +680,20 @@ function Import-MigrationCsv {
                 throw "CSV line $lineNumber has an empty '$column'."
             }
             $row.$column = ([string]$row.$column).Trim()
+        }
+
+        # The RDM pointer datastore is the one cell allowed to be blank: left empty it is
+        # derived from the destination cluster name at resolution time.
+        $row.iSCSI_Data_Store = ([string]$row.iSCSI_Data_Store).Trim()
+
+        $workloadType = ([string]$row.workload_type).ToUpperInvariant()
+        if ($workloadType -notin $script:ValidWorkloadTypes) {
+            throw "CSV line $lineNumber has workload_type '$($row.workload_type)'; expected one of $($script:ValidWorkloadTypes -join ', ')."
+        }
+        $row.workload_type = $workloadType
+
+        if (([string]$row.vsphere_cluster) -ieq ([string]$row.destination_cluster)) {
+            throw "CSV line $lineNumber has the same source and destination cluster '$($row.vsphere_cluster)'."
         }
 
         $vmNames = @([string]$row.first_vm) + @(ConvertTo-ValueList ([string]$row.other_vms_space_separated))
@@ -1462,23 +1555,56 @@ function Resolve-MigrationPlan {
 
     foreach ($row in $Rows) {
         $groupName = [string]$row.vsphere_cluster
+        $sourceClusterName = [string]$row.vsphere_cluster
+        $destinationClusterName = [string]$row.destination_cluster
+        $workloadType = [string]$row.workload_type
         $resourcePoolName = [string]$row.destination_resource_pool
         $datastoreClusterName = [string]$row.destination_datastore_cluster
-        $rdmDatastoreName = [string]$row.iSCSI_Data_Store
         $svm = [string]$row.svm
 
-        Write-RichoLog "Resolving migration group '$groupName'." -Level INFO
+        $script:WorkloadTypeByGroup[$groupName] = $workloadType
+        Write-RichoLog "Resolving $workloadType migration group '$groupName' -> '$destinationClusterName'." -Level INFO
 
-        $cluster = Get-ExactObject -Name $groupName -ObjectType 'destination cluster' -Lookup {
-            Get-Cluster -Name $groupName -ErrorAction SilentlyContinue
+        $sourceCluster = Get-ExactObject -Name $sourceClusterName -ObjectType 'source cluster' -Lookup {
+            Get-Cluster -Name $sourceClusterName -ErrorAction SilentlyContinue
         }
+        $cluster = Get-ExactObject -Name $destinationClusterName -ObjectType 'destination cluster' -Lookup {
+            Get-Cluster -Name $destinationClusterName -ErrorAction SilentlyContinue
+        }
+        if ($sourceCluster.Id -eq $cluster.Id) {
+            throw "Source and destination cluster both resolve to '$($cluster.Name)'; there is nothing to migrate."
+        }
+
+        # The environment lives in the cluster name - d85sql01, d85sql01sit, d85sql01dev -
+        # so the CSV's workload type and the destination it names should agree. A row that
+        # sends PROD VMs at a dev cluster is a copy-paste away, and is worth saying out
+        # loud rather than stopping a run that may well be deliberate.
+        $destinationSuffix = ''
+        if ($destinationClusterName -imatch '(sit|dev)$') { $destinationSuffix = $Matches[1].ToUpperInvariant() }
+        $expectedSuffix = if ($workloadType -eq 'PROD') { '' } else { $workloadType }
+        if ($destinationSuffix -ne $expectedSuffix) {
+            $namingWarning = "Migration group '$groupName' is marked $workloadType but its destination cluster '$destinationClusterName' does not follow that naming. Check the row."
+            Write-RichoLog $namingWarning -Level WARN
+            Add-Result $groupName '' 'Preflight' 'Warning' $namingWarning
+        }
+
         $resourcePool = Get-ExactObject -Name $resourcePoolName -ObjectType 'resource pool' -Lookup {
             Get-ResourcePool -Location $cluster -Name $resourcePoolName -ErrorAction SilentlyContinue
         }
         $datastoreCluster = Get-ExactObject -Name $datastoreClusterName -ObjectType 'datastore cluster' -Lookup {
             Get-DatastoreCluster -Name $datastoreClusterName -ErrorAction SilentlyContinue
         }
-        $rdmDatastore = Get-ExactObject -Name $rdmDatastoreName -ObjectType 'RDM pointer datastore' -Lookup {
+
+        # An empty cell means "the conventional name for the destination cluster". A
+        # derived name is matched without case, because the operator never typed it; a
+        # name from the CSV is still held to the letter.
+        $rdmDatastoreName = [string]$row.iSCSI_Data_Store
+        $rdmDatastoreDerived = [string]::IsNullOrWhiteSpace($rdmDatastoreName)
+        if ($rdmDatastoreDerived) {
+            $rdmDatastoreName = Get-DefaultRdmDatastoreName -ClusterName $destinationClusterName
+            Write-RichoLog "No RDM pointer datastore in the CSV for '$groupName'; using the conventional name '$rdmDatastoreName'." -Level INFO
+        }
+        $rdmDatastore = Get-ExactObject -Name $rdmDatastoreName -ObjectType 'RDM pointer datastore' -CaseInsensitive:$rdmDatastoreDerived -Lookup {
             Get-Datastore -Name $rdmDatastoreName -ErrorAction SilentlyContinue
         }
 
@@ -1539,8 +1665,10 @@ function Resolve-MigrationPlan {
         $vmItems = [System.Collections.Generic.List[object]]::new()
         $placementIndex = 0
         foreach ($vmName in $vmNames) {
-            $vm = Get-ExactObject -Name $vmName -ObjectType 'VM' -Lookup {
-                Get-VM -Name $vmName -ErrorAction SilentlyContinue
+            # Scoped to the source cluster, so a VM that is not there is not found, and a
+            # name that also exists in another cluster cannot be picked up by mistake.
+            $vm = Get-ExactObject -Name $vmName -ObjectType "VM in source cluster '$sourceClusterName'" -Lookup {
+                Get-VM -Name $vmName -Location $sourceCluster -ErrorAction SilentlyContinue
             }
             $layout = Get-VMRdmLayout -VM $vm
             if ($layout.View.Snapshot) { throw "VM '$vmName' has a snapshot." }
@@ -1668,18 +1796,21 @@ function Resolve-MigrationPlan {
         }
 
         $plans.Add([pscustomobject]@{
-            Name             = $groupName
-            Svm              = $svm
-            Cluster          = $cluster
-            ResourcePool     = $resourcePool
-            DatastoreCluster = $datastoreCluster
-            RdmDatastore     = $rdmDatastore
-            VMItems          = $vmItems.ToArray()
-            Disks            = $resolvedDisks.ToArray()
-            Controllers      = $controllers.ToArray()
-            MappingMode      = $mappingMode
-            MappingFiles     = @{}
-            HostExclusions   = $eligibility.Exclusions
+            Name                = $groupName
+            WorkloadType        = $workloadType
+            Svm                 = $svm
+            SourceCluster       = $sourceCluster
+            Cluster             = $cluster
+            ResourcePool        = $resourcePool
+            DatastoreCluster    = $datastoreCluster
+            RdmDatastore        = $rdmDatastore
+            RdmDatastoreDerived = $rdmDatastoreDerived
+            VMItems             = $vmItems.ToArray()
+            Disks               = $resolvedDisks.ToArray()
+            Controllers         = $controllers.ToArray()
+            MappingMode         = $mappingMode
+            MappingFiles        = @{}
+            HostExclusions      = $eligibility.Exclusions
         })
     }
 
@@ -1706,11 +1837,14 @@ function New-MigrationManifest {
         Generated                   = (Get-Date).ToString('o')
         VCenter                     = $VCenter
         MigrationGroup              = $GroupPlan.Name
+        WorkloadType                = $GroupPlan.WorkloadType
         Svm                         = $GroupPlan.Svm
+        SourceCluster               = $GroupPlan.SourceCluster.Name
         DestinationCluster          = $GroupPlan.Cluster.Name
         DestinationResourcePool     = $GroupPlan.ResourcePool.Name
         DestinationDatastoreCluster = $GroupPlan.DatastoreCluster.Name
         RdmDatastore                = $GroupPlan.RdmDatastore.Name
+        RdmDatastoreDerived         = $GroupPlan.RdmDatastoreDerived
         RdmMappingMode              = $GroupPlan.MappingMode
         ExcludedHosts               = $GroupPlan.HostExclusions
         Controllers                 = $GroupPlan.Controllers
@@ -1790,6 +1924,7 @@ function Confirm-MigrationOutcome {
             $records.Add([pscustomobject]@{
                 ScriptVersion  = $ScriptVersion
                 MigrationGroup = $GroupPlan.Name
+                WorkloadType   = $GroupPlan.WorkloadType
                 VM             = $currentVM.Name
                 VMHost         = [string]$currentVM.VMHost.Name
                 ResourcePool   = $poolName
@@ -1803,6 +1938,49 @@ function Confirm-MigrationOutcome {
     }
 
     return $records.ToArray()
+}
+
+function Invoke-WorkloadPowerOn {
+    <#
+    .SYNOPSIS
+        Powers the migrated VMs on, a workload type at a time.
+
+    .DESCRIPTION
+        Nothing is powered on until every LUN in every group of that workload type is
+        mapped back at the destination and verified. A SQL FCI node that boots while a
+        sibling group is still mid-migration can bring shared disks online against a
+        half-assembled cluster, so the wait is the point.
+
+        Within a workload type the groups run in CSV order and the VMs in each group in
+        power-on order - first_vm, then the rest as listed. A group that fails throws and
+        the run stops before this is reached, so nothing here powers on after a failure.
+
+    .PARAMETER Plans
+        Every resolved migration group in the run.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$Plans
+    )
+
+    $workloadTypes = @($Plans | ForEach-Object { $_.WorkloadType } | Select-Object -Unique)
+
+    foreach ($workloadType in $workloadTypes) {
+        $groups = @($Plans | Where-Object { $_.WorkloadType -eq $workloadType })
+        $vmCount = @($groups | ForEach-Object { $_.VMItems } | Measure-Object).Count
+        Write-RichoLog "===== Powering on $workloadType workloads: $vmCount VM(s) across $($groups.Count) group(s) =====" -Level INFO
+
+        foreach ($groupPlan in $groups) {
+            foreach ($vmItem in @($groupPlan.VMItems | Sort-Object PowerOnOrder)) {
+                $powerOnDetail = "Power on $workloadType VM '$($vmItem.VM.Name)' in sequence position $($vmItem.PowerOnOrder) of group '$($groupPlan.Name)'."
+                Invoke-PlannedChange $groupPlan.Name $vmItem.VM.Name 'PowerOn' $vmItem.VM.Name $powerOnDetail {
+                    Start-VM -VM (Get-VM -Id $vmItem.VM.Id) -Confirm:$false | Out-Null
+                }
+            }
+        }
+    }
 }
 
 function Export-RunArtifact {
@@ -1870,8 +2048,8 @@ try {
     }
 
     foreach ($groupPlan in $plans) {
-        Write-RichoLog "===== Migration group $($groupPlan.Name) =====" -Level INFO
-        Write-RichoLog "$($groupPlan.VMItems.Count) VM(s), $($groupPlan.Disks.Count) RDM(s), $($groupPlan.MappingMode) mapping files, destination $($groupPlan.Cluster.Name)/$($groupPlan.ResourcePool.Name)." -Level INFO
+        Write-RichoLog "===== Migration group $($groupPlan.Name) [$($groupPlan.WorkloadType)] =====" -Level INFO
+        Write-RichoLog "$($groupPlan.VMItems.Count) VM(s), $($groupPlan.Disks.Count) RDM(s), $($groupPlan.MappingMode) mapping files, $($groupPlan.SourceCluster.Name) -> $($groupPlan.Cluster.Name)/$($groupPlan.ResourcePool.Name), RDM pointers on $($groupPlan.RdmDatastore.Name)." -Level INFO
 
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $modeLabel = if ($DryRun) { 'dryrun' } else { 'execution' }
@@ -1909,15 +2087,6 @@ try {
             Add-DestinationRdms -VMItem $vmItem -GroupPlan $groupPlan
         }
 
-        if ($PowerOnAfterMigration) {
-            foreach ($vmItem in @($groupPlan.VMItems | Sort-Object PowerOnOrder)) {
-                $powerOnDetail = "Power on '$($vmItem.VM.Name)' in sequence position $($vmItem.PowerOnOrder)."
-                Invoke-PlannedChange $groupPlan.Name $vmItem.VM.Name 'PowerOn' $vmItem.VM.Name $powerOnDetail {
-                    Start-VM -VM (Get-VM -Id $vmItem.VM.Id) -Confirm:$false | Out-Null
-                }
-            }
-        }
-
         if ($DryRun) {
             Add-Result $groupPlan.Name '' 'Verify' 'DryRun' 'Post-migration verification runs only in an execution run.'
         }
@@ -1937,6 +2106,15 @@ try {
         $groupStatus = if ($DryRun) { 'DryRunPassed' } else { 'Succeeded' }
         Add-Result $groupPlan.Name '' 'Group' $groupStatus 'Migration group processing completed.'
         Write-RichoLog "Migration group $($groupPlan.Name): $groupStatus." -Level INFO
+    }
+
+    # Every group is migrated and verified before anything boots, then the VMs come up a
+    # workload type at a time.
+    if ($PowerOnAfterMigration) {
+        Invoke-WorkloadPowerOn -Plans $plans
+    }
+    else {
+        Write-RichoLog 'PowerOnAfterMigration was not requested; the VMs have been left powered off.' -Level INFO
     }
 }
 catch {

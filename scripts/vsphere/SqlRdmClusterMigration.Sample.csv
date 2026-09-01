@@ -1,2 +1,4 @@
-vsphere_cluster,first_vm,other_vms_space_separated,svm,iSCSI_Data_Store,group_1_lun_IDs_ordered_space_separated,group_2_lun_IDs_ordered_space_separated,group_3_lun_IDs_ordered_space_separated,destination_resource_pool,destination_datastore_cluster
-LAB-SQL-CLUSTER,LABSQL01,LABSQL02 LABSQL03,lab-storage-svm01,LAB-RDM-POINTERS,40 41 42 43,50 51 52,,LAB-SQL-RP,LAB-VM-DATASTORES
+vsphere_cluster,destination_cluster,workload_type,first_vm,other_vms_space_separated,svm,iSCSI_Data_Store,group_1_lun_IDs_ordered_space_separated,group_2_lun_IDs_ordered_space_separated,group_3_lun_IDs_ordered_space_separated,destination_resource_pool,destination_datastore_cluster
+labsql01,labsql02,PROD,LABSQL01,LABSQL02 LABSQL03,lab-storage-svm01,,40 41 42 43,50 51 52,,LAB-SQL-RP,LAB-VM-DATASTORES
+labsql01sit,labsql02sit,SIT,LABSQLSIT01,LABSQLSIT02,lab-storage-svm01,labsql02sit_i_rdm,60 61,,,LAB-SIT-RP,LAB-SIT-DATASTORES
+labsql01dev,labsql02dev,DEV,LABSQLDEV01,LABSQLDEV02,lab-storage-svm01,,70 71,,,LAB-DEV-RP,LAB-DEV-DATASTORES

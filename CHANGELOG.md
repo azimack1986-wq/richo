@@ -4250,3 +4250,49 @@ behavioural rather than cosmetic.
   self-contained — no shared-module import, no unguarded `Import-Module`, no
   environment configuration file, no install or update of a module, and its own copies
   of the logging and credential helpers present.
+
+### [2.4.0] — 2026-09-01
+
+#### Added
+
+- **`destination_cluster`, and `vsphere_cluster` now means the source.** The script
+  had one cluster column and treated it as the destination, so a run could only ever
+  have relocated VMs inside the cluster they were already in. Source and destination
+  are separate columns, they must differ, and each VM is looked up *inside* the source
+  cluster — a VM that is not there is not found, and a VM of the same name in another
+  cluster cannot be picked up by mistake.
+
+- **`workload_type` — PROD, SIT or DEV.** Validated and normalised at import, stamped
+  on every plan, result and verification row so a change record can be filtered to one
+  environment, and recorded in the manifest. A row whose workload type disagrees with
+  its destination cluster name — PROD pointed at a `...dev` cluster — is warned about
+  and written to the results file, not blocked.
+
+- **The RDM pointer datastore can be derived.** A blank `iSCSI_Data_Store` cell means
+  the conventional name for the destination cluster, `<cluster>_i_rdm`: `d85sql01` has
+  `d85sql01_i_rdm`, `d85sql01sit` has `d85sql01sit_i_rdm`, `d85sql01dev` has
+  `d85sql01dev_i_rdm`. The environment is already in the cluster name, so there is no
+  environment logic in the derivation. A name typed into the CSV is still matched
+  exactly; a derived name is matched without case, because the operator never typed
+  it. The derived name is logged, and the manifest records that it was derived.
+
+#### Changed
+
+- **Power-on is batched by workload type, after every group.** It used to happen at
+  the end of each migration group. Nothing is powered on now until every group in the
+  run has been relocated, re-attached and verified; the VMs then come up a workload
+  type at a time, groups in CSV order and `first_vm` first within each group. A SQL FCI
+  node that boots while a sibling group is still mid-migration can bring shared disks
+  online against a half-assembled cluster. Still opt-in with `-PowerOnAfterMigration`,
+  and a run without it now says the VMs have been left off.
+
+- The sample CSV carries all three workload types, one row with the RDM datastore
+  named explicitly and two leaving it to the convention.
+
+#### Tests
+
+- New coverage for the source/destination split, the workload-type value set and its
+  normalisation, the same-cluster rejection, a blank RDM datastore cell, the derived
+  datastore name, case-insensitive matching for a derived name, workload-type stamping
+  on result rows, and an AST check that `Start-VM` is only ever called from the
+  workload power-on phase.

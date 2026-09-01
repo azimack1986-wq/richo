@@ -42,7 +42,7 @@ the repository layout, so the same file works in both places.
     -Execute -PowerAction ShutdownGuest -ShutdownTimeoutMinutes 20 `
     -OutputFolder .\SqlRdmClusterMigrationOutput
 
-# Live run with automatic power-on at the destination, in CSV order.
+# Live run, powering the VMs on a workload type at a time once every group is done.
 .\scripts\vsphere\Invoke-SqlRdmClusterMigration.ps1 `
     -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv `
     -Execute -PowerAction ShutdownGuest -ShutdownTimeoutMinutes 20 -PowerOnAfterMigration
@@ -111,7 +111,8 @@ would normally use.
                 v
 +-------------------------------+
 | 7. POWER ON, OPTIONAL         |
-| Automatic or by hand          |
+| One workload type at a time,  |
+| after every group is done     |
 +---------------+---------------+
                 |
                 v
@@ -142,11 +143,13 @@ destination device is resolved from SVM plus LUN ID and then verified by canonic
 identity and capacity.
 
 ```text
-vsphere_cluster
+vsphere_cluster                            source cluster - where the VMs are now
+destination_cluster                        where they are going
+workload_type                              PROD, SIT or DEV
 first_vm
 other_vms_space_separated
 svm
-iSCSI_Data_Store
+iSCSI_Data_Store                           may be left blank - see below
 group_1_lun_IDs_ordered_space_separated
 group_2_lun_IDs_ordered_space_separated
 group_3_lun_IDs_ordered_space_separated
@@ -154,8 +157,22 @@ destination_resource_pool
 destination_datastore_cluster
 ```
 
-- `vsphere_cluster` is the **destination** cluster and also names the migration
-  group. One row per destination cluster.
+- `vsphere_cluster` is the **source** cluster and also names the migration group;
+  `destination_cluster` is where the VMs are going. They must differ, and each VM is
+  looked up inside the source cluster, so a VM that is not there is not found — and a
+  VM of the same name in another cluster cannot be picked up by mistake.
+- `workload_type` is `PROD`, `SIT` or `DEV`, in any case. It is stamped on every plan,
+  result and verification row, so a change record can be filtered to one environment,
+  and it drives the power-on batching below. A row whose workload type disagrees with
+  its destination cluster name — `PROD` pointed at a `...dev` cluster — is logged as a
+  warning rather than blocked.
+- `iSCSI_Data_Store` may be left blank. Blank means the conventional name for the
+  destination cluster: `<destination_cluster>_i_rdm`, so `d85sql01` has
+  `d85sql01_i_rdm`, `d85sql01sit` has `d85sql01sit_i_rdm` and `d85sql01dev` has
+  `d85sql01dev_i_rdm`. The environment is already in the cluster name, so there is no
+  environment logic in the derivation. A name that *is* typed is used exactly as
+  typed; a derived name is matched without regard to case, since nobody typed it.
+  Either way the datastore must be mounted by the destination hosts.
 - LUN group N becomes SCSI bus N — group 1 to bus 1, and so on. Bus 0 is left alone;
   it carries the OS disk.
 - Within a group, LUNs are attached in the order written, at units 0, 1, 2 …,
@@ -183,6 +200,7 @@ still up:
 - No two CSV LUN IDs resolve to the same device.
 - Each destination LUN's capacity matches the RDM it replaces, within 1 GB. This is
   what catches a mistyped LUN ID that happens to exist on the same SVM.
+- Every VM named in the row is in the source cluster the row names.
 - Every VM in the group has the same RDM topology as the first: same buses, units,
   capacities and controller type, all on physical-sharing controllers, and no
   snapshots.
@@ -202,19 +220,33 @@ still up:
 - Spreads the VMs across the eligible destination hosts round-robin, and warns when
   only one host qualifies — every node of the cluster would land on it.
 
+## Power-on
+
+Nothing is powered on until **every** migration group in the run has been relocated,
+re-attached and verified. The VMs then come up a workload type at a time — all `PROD`
+groups, then all `SIT`, then all `DEV`, in the order the types first appear in the
+CSV — with groups in CSV order and, within a group, `first_vm` before the rest.
+
+A SQL FCI node that boots while a sibling group is still mid-migration can bring
+shared disks online against a half-assembled cluster, which is what the wait is for. A
+group that fails throws and stops the run before anything is powered on.
+
+Power-on still only happens with `-PowerOnAfterMigration`. Without it the run says so
+and leaves the VMs off for you to start by hand.
+
 ## Output
 
 Written to `-OutputFolder` (default `.\SqlRdmClusterMigrationOutput`):
 
 | File | Contents |
 | --- | --- |
-| `<group>-<mode>-manifest-<stamp>.json` | Pre-change evidence: source and destination placement, every source RDM, every resolved destination LUN, excluded hosts, mapping mode |
+| `<group>-<mode>-manifest-<stamp>.json` | Pre-change evidence: workload type, source and destination cluster, source and destination placement, every source RDM, every resolved destination LUN, whether the RDM datastore name was derived, excluded hosts, mapping mode |
 | `change-plan-<stamp>.csv` | Every change the run intended, in order — identical in a dry run and a live run |
 | `results-<stamp>.csv` | Every change attempted and its outcome |
 | `verification-<stamp>.csv` | Post-migration disk-by-disk comparison against the plan (execution runs only) |
 
-Every row carries `$ScriptVersion`, so a change record traces back to the revision
-that produced it.
+Every row carries `$ScriptVersion` and `WorkloadType`, so a change record traces back
+to the revision that produced it and can be filtered to one environment.
 
 ## Run the tests
 
@@ -234,7 +266,8 @@ writes its temporary CSVs to the temporary directory and deletes them.
 - RDM removal always uses `-DeletePermanently:$false`.
 - A hard power-off is unavailable unless the explicit force switch is supplied, and
   then only when VMware Tools is not running.
-- Power-on happens only with `-PowerOnAfterMigration`.
+- Power-on happens only with `-PowerOnAfterMigration`, and only after every group in
+  the run has been verified.
 - Out of scope, and still yours: DRS rules and VM-VM anti-affinity at the
   destination, in-guest WSFC and SQL validation, and backup or SRM re-protection.
 - Prove the whole workflow on non-production VMs and LUNs before using it in anger.

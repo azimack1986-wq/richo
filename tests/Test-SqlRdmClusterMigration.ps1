@@ -67,6 +67,8 @@ $script:TempFiles = [System.Collections.Generic.List[string]]::new()
 $ScriptVersion = 'test'
 $DryRun = $true
 $script:RunMode = 'DryRun'
+$script:WorkloadTypeByGroup = @{}
+$script:ValidWorkloadTypes = @('PROD', 'SIT', 'DEV')
 $script:MaxScsiUnitNumber = 15
 $script:ReservedScsiUnitNumber = 7
 $script:CapacityToleranceGB = 1
@@ -154,9 +156,11 @@ try {
 
     $requiredFunctions = @(
         'ConvertTo-ValueList',
+        'Get-WorkloadType',
         'Add-Result',
         'Invoke-PlannedChange',
         'Get-ExactObject',
+        'Get-DefaultRdmDatastoreName',
         'Get-ScsiUnitNumberSequence',
         'Import-MigrationCsv'
     )
@@ -175,8 +179,8 @@ try {
         Invoke-Expression $functionAst[0].Extent.Text
     }
 
-    $header = 'vsphere_cluster,first_vm,other_vms_space_separated,svm,iSCSI_Data_Store,group_1_lun_IDs_ordered_space_separated,group_2_lun_IDs_ordered_space_separated,group_3_lun_IDs_ordered_space_separated,destination_resource_pool,destination_datastore_cluster'
-    $valid = 'LAB-SQL-CLUSTER,LABSQL01,LABSQL02 LABSQL03,lab-storage-svm01,LAB-RDM-POINTERS,40 41 42,50 51,,LAB-SQL-RP,LAB-VM-DATASTORES'
+    $header = 'vsphere_cluster,destination_cluster,workload_type,first_vm,other_vms_space_separated,svm,iSCSI_Data_Store,group_1_lun_IDs_ordered_space_separated,group_2_lun_IDs_ordered_space_separated,group_3_lun_IDs_ordered_space_separated,destination_resource_pool,destination_datastore_cluster'
+    $valid = 'labsql01,labsql02,PROD,LABSQL01,LABSQL02 LABSQL03,lab-storage-svm01,LAB-RDM-POINTERS,40 41 42,50 51,,LAB-SQL-RP,LAB-VM-DATASTORES'
 
     # ---------------------------------------------------------------- CSV validation ----
 
@@ -184,6 +188,47 @@ try {
         $rows = @(Import-MigrationCsv -Path (New-TestCsv @($header, $valid)))
         Assert-Equal $rows.Count 1 'Unexpected row count.'
         Assert-Equal $rows[0].first_vm 'LABSQL01' 'Unexpected first VM.'
+        Assert-Equal $rows[0].vsphere_cluster 'labsql01' 'Unexpected source cluster.'
+        Assert-Equal $rows[0].destination_cluster 'labsql02' 'Unexpected destination cluster.'
+    }
+
+    Invoke-NativeTest 'Missing destination cluster is rejected' {
+        $badHeader = $header -replace ',destination_cluster,', ','
+        $badRow = $valid -replace ',labsql02,', ','
+        Assert-ThrowsLike {
+            Import-MigrationCsv -Path (New-TestCsv @($badHeader, $badRow))
+        } '*destination_cluster*' 'Missing source/destination split was accepted.'
+    }
+
+    Invoke-NativeTest 'Source and destination cluster must differ' {
+        $bad = $valid -replace '^labsql01,labsql02,', 'labsql01,LABSQL01,'
+        Assert-ThrowsLike {
+            Import-MigrationCsv -Path (New-TestCsv @($header, $bad))
+        } '*same source and destination cluster*' 'A row migrating a cluster to itself was accepted.'
+    }
+
+    Invoke-NativeTest 'Workload type is limited to PROD, SIT and DEV' {
+        foreach ($accepted in @('PROD', 'sit', 'Dev')) {
+            $row = $valid -replace ',PROD,', ",$accepted,"
+            $rows = @(Import-MigrationCsv -Path (New-TestCsv @($header, $row)))
+            Assert-Equal $rows[0].workload_type $accepted.ToUpperInvariant() 'Workload type was not normalised to upper case.'
+        }
+        $bad = $valid -replace ',PROD,', ',UAT,'
+        Assert-ThrowsLike {
+            Import-MigrationCsv -Path (New-TestCsv @($header, $bad))
+        } '*expected one of PROD, SIT, DEV*' 'An unknown workload type was accepted.'
+    }
+
+    Invoke-NativeTest 'A blank RDM pointer datastore is allowed, to be derived later' {
+        $blank = $valid -replace ',LAB-RDM-POINTERS,', ',,'
+        $rows = @(Import-MigrationCsv -Path (New-TestCsv @($header, $blank)))
+        Assert-Equal $rows[0].iSCSI_Data_Store '' 'A blank RDM datastore cell was not accepted.'
+    }
+
+    Invoke-NativeTest 'Derived RDM datastore name follows the cluster naming convention' {
+        Assert-Equal (Get-DefaultRdmDatastoreName -ClusterName 'd85sql01') 'd85sql01_i_rdm' 'PROD name is wrong.'
+        Assert-Equal (Get-DefaultRdmDatastoreName -ClusterName 'd85sql01sit') 'd85sql01sit_i_rdm' 'SIT name is wrong.'
+        Assert-Equal (Get-DefaultRdmDatastoreName -ClusterName 'd85sql01dev') 'd85sql01dev_i_rdm' 'DEV name is wrong.'
     }
 
     Invoke-NativeTest 'Shipped sample CSV is accepted and matches the required header' {
@@ -238,7 +283,7 @@ try {
     }
 
     Invoke-NativeTest 'The same VM in two migration groups is rejected' {
-        $second = $valid -replace '^LAB-SQL-CLUSTER', 'LAB-SQL-CLUSTER-2'
+        $second = $valid -replace '^labsql01,', 'labsql01b,'
         Assert-ThrowsLike {
             Import-MigrationCsv -Path (New-TestCsv @($header, $valid, $second))
         } '*repeats VM*' 'Cross-row duplicate VM validation failed.'
@@ -300,6 +345,17 @@ try {
 
     # ------------------------------------------------------- exact-name object lookup ----
 
+    Invoke-NativeTest 'Result rows carry the workload type of their migration group' {
+        $script:Plan = [System.Collections.Generic.List[object]]::new()
+        $script:Results = [System.Collections.Generic.List[object]]::new()
+        $script:WorkloadTypeByGroup = @{ 'labsql01' = 'PROD' }
+        Add-Result 'labsql01' 'LABSQL01' 'Test' 'Passed' 'workload stamping'
+        Add-Result 'unknown-group' '' 'Test' 'Passed' 'no workload type known'
+        Assert-Equal $script:Results[0].WorkloadType 'PROD' 'The result row was not stamped with the workload type.'
+        Assert-Equal $script:Results[1].WorkloadType '' 'An unknown group produced something other than an empty workload type.'
+        $script:WorkloadTypeByGroup = @{}
+    }
+
     Invoke-NativeTest 'Exact-name lookup returns the single match' {
         $found = Get-ExactObject -Name 'LABSQL01' -ObjectType 'VM' -Lookup {
             @([pscustomobject]@{ Name = 'LABSQL01' }, [pscustomobject]@{ Name = 'LABSQL02' })
@@ -313,6 +369,13 @@ try {
                 @([pscustomobject]@{ Name = 'labsql01' })
             }
         } '*found 0*' 'A case-different name was accepted.'
+    }
+
+    Invoke-NativeTest 'Exact-name lookup can be case-insensitive for a derived name' {
+        $found = Get-ExactObject -Name 'labsql02_i_rdm' -ObjectType 'datastore' -CaseInsensitive -Lookup {
+            @([pscustomobject]@{ Name = 'LABSQL02_I_RDM' })
+        }
+        Assert-Equal $found.Name 'LABSQL02_I_RDM' 'A derived name did not match without case.'
     }
 
     Invoke-NativeTest 'Exact-name lookup refuses an ambiguous match' {
@@ -362,6 +425,22 @@ try {
                 ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.GetCommandName())" }
         )
         Assert-Equal $unguarded.Count 0 "Unguarded mutating calls: $($unguarded -join '; ')."
+    }
+
+    Invoke-NativeTest 'Power-on happens once, batched by workload type' {
+        $powerOnFunction = @($functionAsts | Where-Object { $_.Name -eq 'Invoke-WorkloadPowerOn' })
+        Assert-Equal $powerOnFunction.Count 1 'Invoke-WorkloadPowerOn is missing.'
+        $startCalls = @(Get-CommandAst -Ast $ast -Name 'Start-VM')
+        Assert-True ($startCalls.Count -gt 0) 'Nothing powers a VM on at all.'
+        $outside = @(
+            $startCalls |
+                Where-Object {
+                    ($_.Extent.StartOffset -lt $powerOnFunction[0].Extent.StartOffset) -or
+                    ($_.Extent.EndOffset -gt $powerOnFunction[0].Extent.EndOffset)
+                } |
+                ForEach-Object { "line $($_.Extent.StartLineNumber)" }
+        )
+        Assert-Equal $outside.Count 0 "Start-VM is called outside the workload power-on phase: $($outside -join ', ')."
     }
 
     Invoke-NativeTest 'There are two modes and one gate between them' {
