@@ -25,6 +25,10 @@ SqlRdmClusterMigration.Sample.csv   (or your completed migration CSV)
 The test script looks for the migration script beside itself first and falls back to
 the repository layout, so the same file works in both places.
 
+Nothing about it assumes a particular shell — a VS Code integrated terminal, a plain
+PowerShell window or a scheduled run all work the same way, since the only inputs are
+the parameters and the CSV.
+
 ## Usage
 
 ```powershell
@@ -143,6 +147,7 @@ destination device is resolved from SVM plus LUN ID and then verified by canonic
 identity and capacity.
 
 ```text
+batch                                      whole number, 1 or more
 destination_cluster                        where the VMs are going - required
 workload_type                              PROD, SIT or DEV
 first_vm
@@ -164,6 +169,9 @@ destination_datastore_cluster
 - `destination_cluster` is required. The migration group is named after its `first_vm`,
   which is what appears in the manifest filename and in the plan, results and
   verification rows.
+- `batch` groups rows into outage windows. It is stamped on every plan, result and
+  verification row, and rows always run in batch order — batch 1 finishes before batch 2
+  starts, whatever order the rows sit in the file.
 - `workload_type` is `PROD`, `SIT` or `DEV`, in any case. It is stamped on every plan,
   result and verification row, so a change record can be filtered to one environment,
   and it drives the power-on batching below. A row whose workload type disagrees with
@@ -221,6 +229,32 @@ still up:
   gets its own. A group that mixes the two is refused rather than guessed at.
 - Spreads the VMs across the eligible destination hosts round-robin, and warns when
   only one host qualifies — every node of the cluster would land on it.
+
+## Choosing what to run
+
+All three scopes come out of the same CSV — you never edit the file to run part of it.
+
+```powershell
+# Everything in the file, in batch order.
+.\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01 -CsvPath .\migration.csv -DryRun
+
+# One batch at a time.
+.\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01 -CsvPath .\migration.csv -Execute -Batch 1
+.\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01 -CsvPath .\migration.csv -Execute -Batch 2,3
+
+# A single line, named by any VM in it.
+.\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01 -CsvPath .\migration.csv -Execute -VMName LABSQL01
+```
+
+- `-VMName` selects the **row** the VM appears in, and the whole row runs. A row is one
+  SQL cluster; moving one node while its siblings still hold the shared RDMs is not
+  something this tool will do. Naming a second or third node selects the same row.
+- `-VMName` and `-Batch` cannot be combined, and either one naming nothing in the file
+  stops the run — an unknown batch says which batches the file does have.
+- The scope is logged at the start and written into every manifest, so a change record
+  says what the run covered.
+- Nothing else changes with scope: the same validation, the same evidence files, and
+  power-on still waits for every group **in that run**.
 
 ## Power-on
 

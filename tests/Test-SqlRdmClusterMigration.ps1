@@ -67,7 +67,7 @@ $script:TempFiles = [System.Collections.Generic.List[string]]::new()
 $ScriptVersion = 'test'
 $DryRun = $true
 $script:RunMode = 'DryRun'
-$script:WorkloadTypeByGroup = @{}
+$script:GroupInfoByName = @{}
 $script:ValidWorkloadTypes = @('PROD', 'SIT', 'DEV')
 $script:MaxScsiUnitNumber = 15
 $script:ReservedScsiUnitNumber = 7
@@ -157,12 +157,14 @@ try {
     $requiredFunctions = @(
         'ConvertTo-ValueList',
         'Get-WorkloadType',
+        'Get-GroupBatch',
         'Add-Result',
         'Invoke-PlannedChange',
         'Get-ExactObject',
         'Get-DefaultRdmDatastoreName',
         'Get-ScsiUnitNumberSequence',
-        'Import-MigrationCsv'
+        'Import-MigrationCsv',
+        'Select-MigrationRows'
     )
     $functionAsts = @(
         $ast.FindAll({
@@ -179,8 +181,8 @@ try {
         Invoke-Expression $functionAst[0].Extent.Text
     }
 
-    $header = 'destination_cluster,workload_type,first_vm,other_vms_space_separated,svm,iSCSI_Data_Store,group_1_lun_IDs_ordered_space_separated,group_2_lun_IDs_ordered_space_separated,group_3_lun_IDs_ordered_space_separated,destination_resource_pool,destination_datastore_cluster'
-    $valid = 'labsql02,PROD,LABSQL01,LABSQL02 LABSQL03,lab-storage-svm01,LAB-RDM-POINTERS,40 41 42,50 51,,LAB-SQL-RP,LAB-VM-DATASTORES'
+    $header = 'batch,destination_cluster,workload_type,first_vm,other_vms_space_separated,svm,iSCSI_Data_Store,group_1_lun_IDs_ordered_space_separated,group_2_lun_IDs_ordered_space_separated,group_3_lun_IDs_ordered_space_separated,destination_resource_pool,destination_datastore_cluster'
+    $valid = '1,labsql02,PROD,LABSQL01,LABSQL02 LABSQL03,lab-storage-svm01,LAB-RDM-POINTERS,40 41 42,50 51,,LAB-SQL-RP,LAB-VM-DATASTORES'
 
     # ---------------------------------------------------------------- CSV validation ----
 
@@ -192,8 +194,8 @@ try {
     }
 
     Invoke-NativeTest 'Missing destination cluster is rejected' {
-        $badHeader = $header -replace '^destination_cluster,', ''
-        $badRow = $valid -replace '^labsql02,', ''
+        $badHeader = $header -replace ',destination_cluster,', ','
+        $badRow = $valid -replace ',labsql02,', ','
         Assert-ThrowsLike {
             Import-MigrationCsv -Path (New-TestCsv @($badHeader, $badRow))
         } '*destination_cluster*' 'A CSV with no destination cluster was accepted.'
@@ -203,6 +205,17 @@ try {
         Assert-True ($header -notmatch 'vsphere_cluster') 'The sample header still carries a source cluster column.'
         Assert-True ($text -notmatch "'vsphere_cluster'") 'The script still requires a source cluster column.'
         Assert-True ($text -match '\$groupName = \[string\]\$row\.first_vm') 'The migration group is not named after its first VM.'
+    }
+
+    Invoke-NativeTest 'Batch must be a whole number of 1 or more' {
+        $rows = @(Import-MigrationCsv -Path (New-TestCsv @($header, $valid)))
+        Assert-Equal $rows[0].batch 1 'The batch number was not read as a number.'
+        foreach ($bad in @('0', '-1', 'one', '')) {
+            $badRow = $valid -replace '^1,', "$bad,"
+            Assert-ThrowsLike {
+                Import-MigrationCsv -Path (New-TestCsv @($header, $badRow))
+            } '*batch*' "Batch '$bad' was accepted."
+        }
     }
 
     Invoke-NativeTest 'Workload type is limited to PROD, SIT and DEV' {
@@ -275,7 +288,7 @@ try {
     }
 
     Invoke-NativeTest 'The same VM in two migration groups is rejected' {
-        $second = $valid -replace '^labsql02,', 'labsql02b,'
+        $second = $valid -replace ',labsql02,', ',labsql02b,'
         Assert-ThrowsLike {
             Import-MigrationCsv -Path (New-TestCsv @($header, $valid, $second))
         } '*repeats VM*' 'Cross-row duplicate VM validation failed.'
@@ -288,6 +301,64 @@ try {
         Assert-Equal (@(ConvertTo-ValueList '  A   B  ') -join '|') 'A|B' 'Padding was not collapsed.'
         Assert-Equal @(ConvertTo-ValueList '').Count 0 'An empty cell did not produce an empty list.'
         Assert-Equal @(ConvertTo-ValueList '   ').Count 0 'A whitespace cell did not produce an empty list.'
+    }
+
+    # -------------------------------------------------------------- run selection ----
+
+    $selectionRows = @(
+        $header,
+        '2,labsql02,PROD,LABSQL01,LABSQL02 LABSQL03,lab-storage-svm01,,40 41,,,LAB-SQL-RP,LAB-VM-DATASTORES',
+        '1,labsql02sit,SIT,LABSQLSIT01,LABSQLSIT02,lab-storage-svm01,,60 61,,,LAB-SIT-RP,LAB-SIT-DATASTORES',
+        '1,labsql02dev,DEV,LABSQLDEV01,LABSQLDEV02,lab-storage-svm01,,70 71,,,LAB-DEV-RP,LAB-DEV-DATASTORES'
+    )
+
+    Invoke-NativeTest 'With no selector every row runs, in batch order' {
+        $rows = @(Import-MigrationCsv -Path (New-TestCsv $selectionRows))
+        $selection = Select-MigrationRows -Rows $rows
+        Assert-Equal $selection.Rows.Count 3 'Not every row was selected.'
+        Assert-Equal (@($selection.Rows | ForEach-Object { $_.first_vm }) -join ',') 'LABSQLSIT01,LABSQLDEV01,LABSQL01' 'Rows were not ordered by batch, then by CSV order.'
+        Assert-True ($selection.Scope -like '*3 row*') "Unexpected scope '$($selection.Scope)'."
+    }
+
+    Invoke-NativeTest 'A batch selects only its own rows' {
+        $rows = @(Import-MigrationCsv -Path (New-TestCsv $selectionRows))
+        $selection = Select-MigrationRows -Rows $rows -Batch 1
+        Assert-Equal $selection.Rows.Count 2 'Batch 1 did not select two rows.'
+        Assert-Equal (@($selection.Rows | ForEach-Object { $_.workload_type }) -join ',') 'SIT,DEV' 'Batch 1 selected the wrong rows.'
+        Assert-Equal (Select-MigrationRows -Rows $rows -Batch 1, 2).Rows.Count 3 'Two batches did not select every row.'
+    }
+
+    Invoke-NativeTest 'An unknown batch is rejected and says which exist' {
+        $rows = @(Import-MigrationCsv -Path (New-TestCsv $selectionRows))
+        Assert-ThrowsLike {
+            Select-MigrationRows -Rows $rows -Batch 9
+        } '*The file has batch 1, 2*' 'An empty batch was accepted.'
+    }
+
+    Invoke-NativeTest 'A VM name selects the one row it appears in' {
+        $rows = @(Import-MigrationCsv -Path (New-TestCsv $selectionRows))
+        $selection = Select-MigrationRows -Rows $rows -VMName 'LABSQL01'
+        Assert-Equal $selection.Rows.Count 1 'Selecting by first VM did not return one row.'
+        Assert-Equal $selection.Rows[0].first_vm 'LABSQL01' 'The wrong row was selected.'
+
+        # A name from other_vms picks the same row - the whole cluster, not one node.
+        $bySecondNode = Select-MigrationRows -Rows $rows -VMName 'labsql03'
+        Assert-Equal $bySecondNode.Rows.Count 1 'Selecting by a non-first VM did not return one row.'
+        Assert-Equal $bySecondNode.Rows[0].first_vm 'LABSQL01' 'A non-first VM name selected the wrong row.'
+    }
+
+    Invoke-NativeTest 'An unknown VM name is rejected' {
+        $rows = @(Import-MigrationCsv -Path (New-TestCsv $selectionRows))
+        Assert-ThrowsLike {
+            Select-MigrationRows -Rows $rows -VMName 'NOSUCHVM'
+        } "*No CSV row names VM 'NOSUCHVM'*" 'An unknown VM name was accepted.'
+    }
+
+    Invoke-NativeTest 'Selecting by VM and by batch at once is rejected' {
+        $rows = @(Import-MigrationCsv -Path (New-TestCsv $selectionRows))
+        Assert-ThrowsLike {
+            Select-MigrationRows -Rows $rows -VMName 'LABSQL01' -Batch 1
+        } '*not both*' 'Two selectors at once were accepted.'
     }
 
     # ------------------------------------------------------------- SCSI unit numbers ----
@@ -340,15 +411,17 @@ try {
 
     # ------------------------------------------------------- exact-name object lookup ----
 
-    Invoke-NativeTest 'Result rows carry the workload type of their migration group' {
+    Invoke-NativeTest 'Result rows carry the workload type and batch of their migration group' {
         $script:Plan = [System.Collections.Generic.List[object]]::new()
         $script:Results = [System.Collections.Generic.List[object]]::new()
-        $script:WorkloadTypeByGroup = @{ 'labsql01' = 'PROD' }
-        Add-Result 'labsql01' 'LABSQL01' 'Test' 'Passed' 'workload stamping'
+        $script:GroupInfoByName = @{ 'LABSQL01' = [pscustomobject]@{ WorkloadType = 'PROD'; Batch = 2 } }
+        Add-Result 'LABSQL01' 'LABSQL01' 'Test' 'Passed' 'workload stamping'
         Add-Result 'unknown-group' '' 'Test' 'Passed' 'no workload type known'
         Assert-Equal $script:Results[0].WorkloadType 'PROD' 'The result row was not stamped with the workload type.'
+        Assert-Equal $script:Results[0].Batch '2' 'The result row was not stamped with the batch.'
         Assert-Equal $script:Results[1].WorkloadType '' 'An unknown group produced something other than an empty workload type.'
-        $script:WorkloadTypeByGroup = @{}
+        Assert-Equal $script:Results[1].Batch '' 'An unknown group produced something other than an empty batch.'
+        $script:GroupInfoByName = @{}
     }
 
     Invoke-NativeTest 'Exact-name lookup returns the single match' {

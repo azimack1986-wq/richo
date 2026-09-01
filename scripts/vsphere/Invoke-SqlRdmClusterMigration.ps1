@@ -57,6 +57,14 @@
 .PARAMETER Execute
     Perform the migration.
 
+.PARAMETER VMName
+    Run only the CSV rows that name these VMs - one line at a time. The whole row runs:
+    a row is one SQL cluster, and moving one node while its siblings keep the shared
+    RDMs is not something this tool will do.
+
+.PARAMETER Batch
+    Run only the rows carrying these batch numbers. Accepts more than one.
+
 .PARAMETER Credential
     vCenter credential. When omitted it is resolved by the credential helper below,
     which tries SecretManagement, then the RICHO_* environment variables, then a prompt.
@@ -94,7 +102,18 @@
 .EXAMPLE
     .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -PowerAction ShutdownGuest -ShutdownTimeoutMinutes 20 -PowerOnAfterMigration
 
-    Migrates the groups in the CSV and powers the VMs on at the destination in CSV order.
+    Migrates every row in the CSV and powers the VMs on at the destination, a workload
+    type at a time.
+
+.EXAMPLE
+    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -VMName LABSQL01 -PowerAction ShutdownGuest
+
+    Runs the single CSV row that names LABSQL01 - that VM and the rest of its cluster.
+
+.EXAMPLE
+    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -Batch 1 -PowerAction ShutdownGuest
+
+    Runs every row marked batch 1, in CSV order.
 #>
 #Requires -Version 5.1
 # Deliberately no SupportsShouldProcess, and so a departure from the repo convention:
@@ -116,6 +135,14 @@ param(
 
     [Parameter(Mandatory, ParameterSetName = 'Execute')]
     [switch]$Execute,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string[]]$VMName,
+
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [int[]]$Batch,
 
     [Parameter()]
     [pscredential]$Credential,
@@ -149,17 +176,19 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.5.0'
+$ScriptVersion = '2.6.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
 # happen, -Execute does it. Nothing else in the script decides whether to change a VM.
 $script:RunMode = if ($DryRun) { 'DryRun' } else { 'Execute' }
 
-# Workload type is per migration group, and stamping it on every plan, result and
-# verification row is what lets a change record be filtered to PROD alone. Held here so
-# the row builders can reach it without every call site passing it along.
-$script:WorkloadTypeByGroup = @{}
+# Workload type and batch are per migration group, and stamping them on every plan,
+# result and verification row is what lets a change record be filtered to one batch of
+# PROD. Held here so the row builders can reach them without every call site passing
+# them along.
+$script:GroupInfoByName = @{}
+$script:RunScope = 'all rows in the CSV'
 $script:ValidWorkloadTypes = @('PROD', 'SIT', 'DEV')
 
 $script:Plan = [System.Collections.Generic.List[object]]::new()
@@ -363,8 +392,31 @@ function Get-WorkloadType {
         [string]$MigrationGroup
     )
 
-    if ($MigrationGroup -and $script:WorkloadTypeByGroup.ContainsKey($MigrationGroup)) {
-        return [string]$script:WorkloadTypeByGroup[$MigrationGroup]
+    if ($MigrationGroup -and $script:GroupInfoByName.ContainsKey($MigrationGroup)) {
+        return [string]$script:GroupInfoByName[$MigrationGroup].WorkloadType
+    }
+
+    return ''
+}
+
+function Get-GroupBatch {
+    <#
+    .SYNOPSIS
+        Returns the batch number recorded for a migration group.
+
+    .PARAMETER MigrationGroup
+        The group name, or an empty string for rows that belong to no group yet.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$MigrationGroup
+    )
+
+    if ($MigrationGroup -and $script:GroupInfoByName.ContainsKey($MigrationGroup)) {
+        return [string]$script:GroupInfoByName[$MigrationGroup].Batch
     }
 
     return ''
@@ -416,6 +468,7 @@ function Add-Result {
         ScriptVersion  = $ScriptVersion
         MigrationGroup = $MigrationGroup
         WorkloadType   = (Get-WorkloadType -MigrationGroup $MigrationGroup)
+        Batch          = (Get-GroupBatch -MigrationGroup $MigrationGroup)
         VM             = $VM
         Phase          = $Phase
         Status         = $Status
@@ -479,6 +532,7 @@ function Invoke-PlannedChange {
         Mode           = $script:RunMode
         MigrationGroup = $MigrationGroup
         WorkloadType   = (Get-WorkloadType -MigrationGroup $MigrationGroup)
+        Batch          = (Get-GroupBatch -MigrationGroup $MigrationGroup)
         VM             = $VM
         Action         = $Action
         Target         = $Target
@@ -636,6 +690,7 @@ function Import-MigrationCsv {
     }
 
     $requiredColumns = @(
+        'batch',
         'destination_cluster',
         'workload_type',
         'first_vm',
@@ -668,6 +723,7 @@ function Import-MigrationCsv {
         $lineNumber++
 
         foreach ($column in @(
+            'batch',
             'destination_cluster',
             'workload_type',
             'first_vm',
@@ -684,6 +740,16 @@ function Import-MigrationCsv {
         # The RDM pointer datastore is the one cell allowed to be blank: left empty it is
         # derived from the destination cluster name at resolution time.
         $row.iSCSI_Data_Store = ([string]$row.iSCSI_Data_Store).Trim()
+
+        $batchNumber = 0
+        if (-not [int]::TryParse([string]$row.batch, [ref]$batchNumber) -or $batchNumber -lt 1) {
+            throw "CSV line $lineNumber has batch '$($row.batch)'; expected a whole number of 1 or more."
+        }
+        $row.batch = $batchNumber
+
+        # The line number rides along so a batch can be ordered without losing CSV order
+        # inside it - Sort-Object is not a stable sort on Windows PowerShell.
+        Add-Member -InputObject $row -NotePropertyName 'csv_line' -NotePropertyValue $lineNumber -Force
 
         $workloadType = ([string]$row.workload_type).ToUpperInvariant()
         if ($workloadType -notin $script:ValidWorkloadTypes) {
@@ -733,6 +799,97 @@ function Import-MigrationCsv {
     }
 
     return $rows
+}
+
+function Select-MigrationRows {
+    <#
+    .SYNOPSIS
+        Picks the CSV rows this run will migrate, and says what was picked.
+
+    .DESCRIPTION
+        Three scopes, all driven from the CSV itself:
+
+          * one line, by naming a VM that appears in it - the whole row runs, because a
+            row is one SQL cluster and moving one node while its siblings still hold the
+            shared RDMs is not something this tool will do;
+          * one or more batches, by the batch column;
+          * everything in the file, which is what happens when neither is given.
+
+        Rows come back in batch order, and in CSV order inside a batch, so batch 1 is
+        finished before batch 2 begins whatever order the file happens to be in.
+
+    .PARAMETER Rows
+        Every row from the CSV.
+
+    .PARAMETER VMName
+        VM names to select rows by.
+
+    .PARAMETER Batch
+        Batch numbers to select rows by.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$Rows,
+
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [string[]]$VMName,
+
+        [Parameter()]
+        [AllowEmptyCollection()]
+        [int[]]$Batch
+    )
+
+    $namesGiven = @($VMName | Where-Object { $_ })
+    $batchesGiven = @($Batch | Where-Object { $_ })
+
+    if (($namesGiven.Count -gt 0) -and ($batchesGiven.Count -gt 0)) {
+        throw 'Choose either -VMName or -Batch, not both.'
+    }
+
+    $selected = $Rows
+    $scope = "all $($Rows.Count) row(s) in the CSV"
+
+    if ($namesGiven.Count -gt 0) {
+        $matched = [System.Collections.Generic.List[object]]::new()
+        foreach ($name in $namesGiven) {
+            $rowsForName = @(
+                $Rows |
+                    Where-Object {
+                        $rowVMNames = @([string]$_.first_vm) + @(ConvertTo-ValueList ([string]$_.other_vms_space_separated))
+                        @($rowVMNames | Where-Object { $_ -ieq $name }).Count -gt 0
+                    }
+            )
+            if ($rowsForName.Count -eq 0) {
+                throw "No CSV row names VM '$name'."
+            }
+            foreach ($row in $rowsForName) {
+                if ($matched -notcontains $row) { $matched.Add($row) }
+            }
+        }
+        $selected = $matched.ToArray()
+        $scope = "the row(s) naming $($namesGiven -join ', ')"
+    }
+    elseif ($batchesGiven.Count -gt 0) {
+        $selected = @($Rows | Where-Object { [int]$_.batch -in $batchesGiven })
+        if ($selected.Count -eq 0) {
+            $available = @($Rows | ForEach-Object { [int]$_.batch } | Sort-Object -Unique)
+            throw "No CSV row is in batch $($batchesGiven -join ', '). The file has batch $($available -join ', ')."
+        }
+        $scope = "batch $($batchesGiven -join ', ')"
+    }
+
+    $ordered = @(
+        $selected |
+            Sort-Object -Property @{ Expression = { [int]$_.batch } }, @{ Expression = { [int]$_.csv_line } }
+    )
+
+    return [pscustomobject]@{
+        Rows  = $ordered
+        Scope = $scope
+    }
 }
 
 function Get-VMRdmLayout {
@@ -1554,8 +1711,12 @@ function Resolve-MigrationPlan {
         $datastoreClusterName = [string]$row.destination_datastore_cluster
         $svm = [string]$row.svm
 
-        $script:WorkloadTypeByGroup[$groupName] = $workloadType
-        Write-RichoLog "Resolving $workloadType migration group '$groupName' -> '$destinationClusterName'." -Level INFO
+        $batchNumber = [int]$row.batch
+        $script:GroupInfoByName[$groupName] = [pscustomobject]@{
+            WorkloadType = $workloadType
+            Batch        = $batchNumber
+        }
+        Write-RichoLog "Resolving batch $batchNumber $workloadType migration group '$groupName' -> '$destinationClusterName'." -Level INFO
 
         $cluster = Get-ExactObject -Name $destinationClusterName -ObjectType 'destination cluster' -Lookup {
             Get-Cluster -Name $destinationClusterName -ErrorAction SilentlyContinue
@@ -1801,6 +1962,7 @@ function Resolve-MigrationPlan {
         $plans.Add([pscustomobject]@{
             Name                = $groupName
             WorkloadType        = $workloadType
+            Batch               = $batchNumber
             Svm                 = $svm
             SourceClusters      = $sourceClusterNames
             SourceClusterLabel  = $sourceClusterLabel
@@ -1838,10 +2000,12 @@ function New-MigrationManifest {
     return [ordered]@{
         ScriptVersion               = $ScriptVersion
         Mode                        = $script:RunMode
+        RunScope                    = $script:RunScope
         Generated                   = (Get-Date).ToString('o')
         VCenter                     = $VCenter
         MigrationGroup              = $GroupPlan.Name
         WorkloadType                = $GroupPlan.WorkloadType
+        Batch                       = $GroupPlan.Batch
         Svm                         = $GroupPlan.Svm
         SourceClusters              = $GroupPlan.SourceClusters
         DestinationCluster          = $GroupPlan.Cluster.Name
@@ -1930,6 +2094,7 @@ function Confirm-MigrationOutcome {
                 ScriptVersion  = $ScriptVersion
                 MigrationGroup = $GroupPlan.Name
                 WorkloadType   = $GroupPlan.WorkloadType
+                Batch          = $GroupPlan.Batch
                 VM             = $currentVM.Name
                 VMHost         = [string]$currentVM.VMHost.Name
                 ResourcePool   = $poolName
@@ -2046,14 +2211,18 @@ try {
     $rows = @(Import-MigrationCsv -Path $CsvPath)
     Write-RichoLog "Loaded $($rows.Count) migration group(s) from $CsvPath." -Level INFO
 
-    $plans = @(Resolve-MigrationPlan -Rows $rows)
+    $selection = Select-MigrationRows -Rows $rows -VMName $VMName -Batch $Batch
+    $script:RunScope = $selection.Scope
+    Write-RichoLog "Running $($selection.Scope): $($selection.Rows.Count) migration group(s), in batch order." -Level INFO
+
+    $plans = @(Resolve-MigrationPlan -Rows $selection.Rows)
 
     if (-not (Test-Path -LiteralPath $OutputFolder)) {
         New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
     }
 
     foreach ($groupPlan in $plans) {
-        Write-RichoLog "===== Migration group $($groupPlan.Name) [$($groupPlan.WorkloadType)] =====" -Level INFO
+        Write-RichoLog "===== Migration group $($groupPlan.Name) [batch $($groupPlan.Batch), $($groupPlan.WorkloadType)] =====" -Level INFO
         Write-RichoLog "$($groupPlan.VMItems.Count) VM(s), $($groupPlan.Disks.Count) RDM(s), $($groupPlan.MappingMode) mapping files, $($groupPlan.SourceClusterLabel) -> $($groupPlan.Cluster.Name)/$($groupPlan.ResourcePool.Name), RDM pointers on $($groupPlan.RdmDatastore.Name)." -Level INFO
 
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'

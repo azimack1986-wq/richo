@@ -4322,3 +4322,28 @@ behavioural rather than cosmetic.
   cluster, and a group whose VMs come from more than one cluster. Both are things the
   operator should look at before a live run, and neither is wrong often enough to stop
   one.
+
+### [2.6.0] — 2026-09-01
+
+#### Added
+
+- **Three run scopes, all driven from the CSV.** `-VMName` runs the single row that
+  names that VM; `-Batch` runs the rows carrying those batch numbers, one or several;
+  neither runs the whole file. Nothing is edited out of the CSV to run part of it, and
+  the two selectors cannot be combined.
+
+  `-VMName` selects the **row**, and the whole row runs — a row is one SQL cluster, and
+  moving one node while its siblings still hold the shared RDMs is not something this
+  tool will do. Naming any node of a cluster selects its row.
+
+  A selector that matches nothing stops the run, and an unknown batch says which
+  batches the file actually has.
+
+- **A `batch` column**, a whole number of 1 or more. Rows always run in batch order and
+  in CSV order inside a batch — batch 1 finishes before batch 2 starts, whatever order
+  the rows sit in the file. The line number is carried alongside each row to make that
+  ordering stable, because `Sort-Object` is not a stable sort on Windows PowerShell.
+
+- Batch is stamped on every plan, result and verification row next to the workload
+  type, and the run scope is recorded in each manifest, so a change record says what
+  the run covered rather than what the file contained.
