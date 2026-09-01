@@ -176,7 +176,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.7.0'
+$ScriptVersion = '2.8.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -1760,46 +1760,58 @@ function Remove-RdmsAndControllers {
         }
     }
 
-    foreach ($bus in @($VMItem.Layout.Rdms | ForEach-Object { $_.ControllerBus } | Select-Object -Unique | Sort-Object)) {
-        # Bus 0 carries the boot disk on every VM this tool is meant for. If an RDM was
-        # found there the source topology is not what the CSV describes, and removing that
-        # controller would take the operating system with it.
-        if ($bus -eq 0) {
-            throw "VM '$($currentVM.Name)' has a physical RDM on SCSI bus 0; this tool will not remove the bus 0 controller."
-        }
+    # SCSI 0 keeps the operating system and any plain VMDKs and is never touched. If a
+    # physical RDM turns up there the source is not what the CSV describes, and removing
+    # that controller would take the OS disk with it.
+    $rdmOnBusZero = @($VMItem.Layout.Rdms | Where-Object { $_.ControllerBus -eq 0 })
+    if ($rdmOnBusZero.Count -gt 0) {
+        throw "VM '$($currentVM.Name)' has a physical RDM on SCSI 0; this tool will not touch the bus 0 controller."
+    }
 
-        # Read the device list rather than asking Get-ScsiController: that cmdlet returns
-        # the controllers of a VM's hard disks, so a controller emptied moments ago by the
-        # loop above is simply absent from its output.
-        $vmView = Get-View -Id $currentVM.Id -Property Config.Hardware.Device
-        $controllers = @(
-            $vmView.Config.Hardware.Device |
-                Where-Object { ($_ -is [VMware.Vim.VirtualSCSIController]) -and ([int]$_.BusNumber -eq $bus) }
-        )
-        if ($controllers.Count -ne 1) {
-            throw "VM '$($currentVM.Name)' has $($controllers.Count) SCSI controllers on bus $bus; expected one."
-        }
+    # Every OTHER SCSI controller goes with the LUNs, not just the ones the CSV named:
+    # the destination is rebuilt from the CSV, and a stray controller left on bus 3 would
+    # collide with the one the plan wants to create there.
+    #
+    # The device list is read rather than Get-ScsiController, which returns the
+    # controllers of a VM's hard disks - so a controller emptied moments ago by the loop
+    # above is simply absent from its output.
+    $vmView = Get-View -Id $currentVM.Id -Property Config.Hardware.Device
+    $sharedControllers = @(
+        $vmView.Config.Hardware.Device |
+            Where-Object { ($_ -is [VMware.Vim.VirtualSCSIController]) -and ([int]$_.BusNumber -ne 0) } |
+            Sort-Object { [int]$_.BusNumber }
+    )
+
+    if ($sharedControllers.Count -gt 0) {
+        Write-RichoLog "      Removing $($sharedControllers.Count) SCSI controller(s) from '$($currentVM.Name)'; SCSI 0 stays for the VMDK disks." -Level INFO
+    }
+
+    foreach ($controller in $sharedControllers) {
+        $bus = [int]$controller.BusNumber
 
         $attachedDisks = @(
             $vmView.Config.Hardware.Device |
-                Where-Object { ($_ -is [VMware.Vim.VirtualDisk]) -and ([int]$_.ControllerKey -eq [int]$controllers[0].Key) }
+                Where-Object { ($_ -is [VMware.Vim.VirtualDisk]) -and ([int]$_.ControllerKey -eq [int]$controller.Key) }
         )
-        if ($DryRun) {
-            $plannedLabels = @(
-                $VMItem.Layout.Rdms |
-                    Where-Object { $_.ControllerBus -eq $bus } |
-                    ForEach-Object { $_.Label }
-            )
-            $unexpected = @($attachedDisks | Where-Object { [string]$_.DeviceInfo.Label -notin $plannedLabels })
-            if ($unexpected.Count -gt 0) {
-                throw "Controller bus $bus contains unplanned disks: $(@($unexpected | ForEach-Object { $_.DeviceInfo.Label }) -join ', ')."
-            }
+
+        # In a dry run the RDMs are all still attached, so a controller carrying exactly
+        # its planned RDMs is what "empty after removal" looks like from here. Anything
+        # else on a non-zero controller - a plain VMDK, someone else's disk - is not this
+        # tool's to detach, in either mode.
+        $plannedLabels = @(
+            $VMItem.Layout.Rdms |
+                Where-Object { $_.ControllerBus -eq $bus } |
+                ForEach-Object { $_.Label }
+        )
+        $unexpected = @($attachedDisks | Where-Object { [string]$_.DeviceInfo.Label -notin $plannedLabels })
+        if ($unexpected.Count -gt 0) {
+            throw "SCSI $bus on '$($currentVM.Name)' carries disks the CSV does not describe: $(@($unexpected | ForEach-Object { $_.DeviceInfo.Label }) -join ', '). Move them to SCSI 0 or take them out of the migration."
         }
-        elseif ($attachedDisks.Count -gt 0) {
-            throw "Controller bus $bus is not empty after RDM removal."
+        if ((-not $DryRun) -and ($attachedDisks.Count -gt 0)) {
+            throw "SCSI $bus on '$($currentVM.Name)' is not empty after RDM removal."
         }
 
-        $removeControllerDetail = "Remove empty shared-bus SCSI controller on bus $bus."
+        $removeControllerDetail = "Remove SCSI controller $bus (bus sharing $($controller.SharedBus)); SCSI 0 is left in place."
         Invoke-PlannedChange $MigrationGroup $currentVM.Name 'RemoveController' "SCSI $bus" $removeControllerDetail {
             Remove-SharedScsiController -VM (Get-VM -Id $VMItem.VM.Id) -BusNumber $bus
         }

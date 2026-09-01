@@ -536,6 +536,11 @@ try {
         Assert-True ($text -match '\[VMware\.Vim\.VirtualSCSIController\]') 'Controllers are not matched by device type.'
     }
 
+    Invoke-NativeTest 'SCSI 0 is kept, every other SCSI controller goes with the LUNs' {
+        Assert-True ($text -match '\[int\]\$_\.BusNumber -ne 0') 'Controller removal is not scoped to the non-zero buses.'
+        Assert-True ($text -match 'this tool will not touch the bus 0 controller') 'The SCSI 0 guard is missing.'
+    }
+
     Invoke-NativeTest 'A failure is reported against the line that failed' {
         # Write-RichoLog ERROR calls Write-Error, which under $ErrorActionPreference =
         # 'Stop' becomes the terminating error itself - so the rethrow never ran and the

@@ -4397,3 +4397,20 @@ behavioural rather than cosmetic.
     within a phase, and the run closes with a count of changes and a total elapsed time.
 
   Nothing now waits silently for more than about thirty seconds.
+
+### [2.8.0] — 2026-09-01
+
+#### Changed
+
+- **SCSI 0 is kept; every other SCSI controller is removed with the LUNs.** Removal
+  used to cover only the buses the CSV's LUN groups named, so a controller sitting on a
+  bus with no RDMs survived the move — and then collided with the controller the plan
+  creates on that bus at the destination. The removal now walks the VM's device list and
+  takes every SCSI controller whose bus is not 0, once the RDMs are off it. SCSI 0 keeps
+  the operating system and any plain VMDKs and is never touched, and a physical RDM
+  found on SCSI 0 still stops the run.
+
+- A non-zero controller carrying a disk the CSV does not describe now stops the run with
+  that disk named, in both modes, rather than being emptied or removed. Detaching
+  someone's plain VMDK because it happened to share a controller with an RDM is not this
+  tool's decision to make.

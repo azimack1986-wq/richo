@@ -222,6 +222,18 @@ still up:
   snapshots.
 - The source topology matches the CSV order, LUN by LUN.
 
+## What it removes at the source
+
+Once the VMs are powered down, and before anything moves:
+
+- Every physical RDM named in the CSV is detached, never permanently deleted.
+- **SCSI 0 is left alone** — it carries the operating system and any plain VMDKs.
+- **Every other SCSI controller is removed**, not only the ones the CSV named. The
+  destination is rebuilt from the CSV, and a stray controller left behind on a bus the
+  plan wants would collide with the one it is about to create.
+- A non-zero controller carrying a disk the CSV does not describe stops the run rather
+  than being detached. Move that disk to SCSI 0, or take the VM out of the migration.
+
 ## What it does at the destination
 
 - Recreates each shared SCSI controller **using the source's own controller type**
