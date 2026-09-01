@@ -143,8 +143,7 @@ destination device is resolved from SVM plus LUN ID and then verified by canonic
 identity and capacity.
 
 ```text
-vsphere_cluster                            source cluster - where the VMs are now
-destination_cluster                        where they are going
+destination_cluster                        where the VMs are going - required
 workload_type                              PROD, SIT or DEV
 first_vm
 other_vms_space_separated
@@ -157,10 +156,14 @@ destination_resource_pool
 destination_datastore_cluster
 ```
 
-- `vsphere_cluster` is the **source** cluster and also names the migration group;
-  `destination_cluster` is where the VMs are going. They must differ, and each VM is
-  looked up inside the source cluster, so a VM that is not there is not found — and a
-  VM of the same name in another cluster cannot be picked up by mistake.
+- There is no source column. The VMs are found **by name** across the vCenter — each
+  name must match exactly one VM, case-sensitively — and where they are now is read off
+  them and recorded in the manifest rather than asserted in the CSV. A VM already
+  sitting in the destination cluster, or a group whose VMs come from more than one
+  cluster, is warned about rather than blocked.
+- `destination_cluster` is required. The migration group is named after its `first_vm`,
+  which is what appears in the manifest filename and in the plan, results and
+  verification rows.
 - `workload_type` is `PROD`, `SIT` or `DEV`, in any case. It is stamped on every plan,
   result and verification row, so a change record can be filtered to one environment,
   and it drives the power-on batching below. A row whose workload type disagrees with
@@ -200,7 +203,6 @@ still up:
 - No two CSV LUN IDs resolve to the same device.
 - Each destination LUN's capacity matches the RDM it replaces, within 1 GB. This is
   what catches a mistyped LUN ID that happens to exist on the same SVM.
-- Every VM named in the row is in the source cluster the row names.
 - Every VM in the group has the same RDM topology as the first: same buses, units,
   capacities and controller type, all on physical-sharing controllers, and no
   snapshots.
@@ -240,7 +242,7 @@ Written to `-OutputFolder` (default `.\SqlRdmClusterMigrationOutput`):
 
 | File | Contents |
 | --- | --- |
-| `<group>-<mode>-manifest-<stamp>.json` | Pre-change evidence: workload type, source and destination cluster, source and destination placement, every source RDM, every resolved destination LUN, whether the RDM datastore name was derived, excluded hosts, mapping mode |
+| `<group>-<mode>-manifest-<stamp>.json` | Pre-change evidence: workload type, the clusters the VMs came from and the destination, source and destination placement, every source RDM, every resolved destination LUN, whether the RDM datastore name was derived, excluded hosts, mapping mode |
 | `change-plan-<stamp>.csv` | Every change the run intended, in order — identical in a dry run and a live run |
 | `results-<stamp>.csv` | Every change attempted and its outcome |
 | `verification-<stamp>.csv` | Post-migration disk-by-disk comparison against the plan (execution runs only) |

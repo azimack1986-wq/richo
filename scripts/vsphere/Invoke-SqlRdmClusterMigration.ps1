@@ -7,15 +7,16 @@
     LUN ID and are then verified internally by canonical device identity and capacity, so
     the operator never types an NAA value.
 
-    Source and destination clusters are separate: 'vsphere_cluster' is where the VMs are
-    now, 'destination_cluster' is where they are going, and each VM must actually be in
-    the source cluster or the run stops.
+    The CSV names only where the VMs are going. The VMs themselves are found by name
+    across the vCenter - each name must match exactly one VM - and where they are now is
+    read off them and recorded as evidence rather than asserted in the CSV. A migration
+    group is named after its first VM.
 
     Per migration group the script:
 
-      1. Resolves the source cluster, then the destination cluster, resource pool,
-         datastore cluster and RDM pointer datastore, and the eligible destination hosts
-         that can see all of them plus every LUN in the CSV.
+      1. Resolves the destination cluster, resource pool, datastore cluster and RDM
+         pointer datastore, and the eligible destination hosts that can see all of them
+         plus every LUN in the CSV.
       2. Reads the source RDM topology from the first VM and proves every other VM in the
          group matches it - same controller bus, unit number, capacity and controller type.
       3. Shuts the VMs down (guest shutdown; hard power-off only with the explicit opt-in
@@ -45,7 +46,7 @@
     prerequisites - see docs/sql-rdm-cluster-migration.md.
 
 .PARAMETER VCenter
-    FQDN of the vCenter Server that holds both the source VMs and the destination cluster.
+    FQDN of the vCenter Server that holds both the VMs and the destination cluster.
 
 .PARAMETER CsvPath
     Path to the migration CSV. See docs/sql-rdm-cluster-migration.md for the columns.
@@ -148,7 +149,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.4.0'
+$ScriptVersion = '2.5.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -635,7 +636,6 @@ function Import-MigrationCsv {
     }
 
     $requiredColumns = @(
-        'vsphere_cluster',
         'destination_cluster',
         'workload_type',
         'first_vm',
@@ -668,7 +668,6 @@ function Import-MigrationCsv {
         $lineNumber++
 
         foreach ($column in @(
-            'vsphere_cluster',
             'destination_cluster',
             'workload_type',
             'first_vm',
@@ -691,10 +690,6 @@ function Import-MigrationCsv {
             throw "CSV line $lineNumber has workload_type '$($row.workload_type)'; expected one of $($script:ValidWorkloadTypes -join ', ')."
         }
         $row.workload_type = $workloadType
-
-        if (([string]$row.vsphere_cluster) -ieq ([string]$row.destination_cluster)) {
-            throw "CSV line $lineNumber has the same source and destination cluster '$($row.vsphere_cluster)'."
-        }
 
         $vmNames = @([string]$row.first_vm) + @(ConvertTo-ValueList ([string]$row.other_vms_space_separated))
         if (@($vmNames | Group-Object | Where-Object { $_.Count -gt 1 }).Count -gt 0) {
@@ -735,10 +730,6 @@ function Import-MigrationCsv {
         if (@($lunIds | Group-Object | Where-Object { $_.Count -gt 1 }).Count -gt 0) {
             throw "CSV line $lineNumber contains duplicate LUN IDs."
         }
-    }
-
-    if (@($rows | Group-Object vsphere_cluster | Where-Object { $_.Count -gt 1 }).Count -gt 0) {
-        throw 'CSV contains duplicate vsphere_cluster rows.'
     }
 
     return $rows
@@ -1554,8 +1545,9 @@ function Resolve-MigrationPlan {
     $plans = [System.Collections.Generic.List[object]]::new()
 
     foreach ($row in $Rows) {
-        $groupName = [string]$row.vsphere_cluster
-        $sourceClusterName = [string]$row.vsphere_cluster
+        # The first VM names the group. It is unique across the CSV - a VM may appear in
+        # only one row - so it identifies the row without a column of its own.
+        $groupName = [string]$row.first_vm
         $destinationClusterName = [string]$row.destination_cluster
         $workloadType = [string]$row.workload_type
         $resourcePoolName = [string]$row.destination_resource_pool
@@ -1565,14 +1557,8 @@ function Resolve-MigrationPlan {
         $script:WorkloadTypeByGroup[$groupName] = $workloadType
         Write-RichoLog "Resolving $workloadType migration group '$groupName' -> '$destinationClusterName'." -Level INFO
 
-        $sourceCluster = Get-ExactObject -Name $sourceClusterName -ObjectType 'source cluster' -Lookup {
-            Get-Cluster -Name $sourceClusterName -ErrorAction SilentlyContinue
-        }
         $cluster = Get-ExactObject -Name $destinationClusterName -ObjectType 'destination cluster' -Lookup {
             Get-Cluster -Name $destinationClusterName -ErrorAction SilentlyContinue
-        }
-        if ($sourceCluster.Id -eq $cluster.Id) {
-            throw "Source and destination cluster both resolve to '$($cluster.Name)'; there is nothing to migrate."
         }
 
         # The environment lives in the cluster name - d85sql01, d85sql01sit, d85sql01dev -
@@ -1665,10 +1651,10 @@ function Resolve-MigrationPlan {
         $vmItems = [System.Collections.Generic.List[object]]::new()
         $placementIndex = 0
         foreach ($vmName in $vmNames) {
-            # Scoped to the source cluster, so a VM that is not there is not found, and a
-            # name that also exists in another cluster cannot be picked up by mistake.
-            $vm = Get-ExactObject -Name $vmName -ObjectType "VM in source cluster '$sourceClusterName'" -Lookup {
-                Get-VM -Name $vmName -Location $sourceCluster -ErrorAction SilentlyContinue
+            # Found by name across the vCenter, and the name must be unique: two VMs of the
+            # same name is the one case where guessing which was meant is unacceptable.
+            $vm = Get-ExactObject -Name $vmName -ObjectType 'VM' -Lookup {
+                Get-VM -Name $vmName -ErrorAction SilentlyContinue
             }
             $layout = Get-VMRdmLayout -VM $vm
             if ($layout.View.Snapshot) { throw "VM '$vmName' has a snapshot." }
@@ -1681,15 +1667,32 @@ function Resolve-MigrationPlan {
                 }
             }
 
+            # Where the VM is now is read off it, not asserted in the CSV, and travels
+            # into the manifest so the change record says where it came from.
+            $vmClusters = @(Get-Cluster -VM $vm -ErrorAction SilentlyContinue)
+            $vmClusterName = if ($vmClusters.Count -eq 1) { [string]$vmClusters[0].Name } else { '' }
+            if ($vmClusterName -ieq $destinationClusterName) {
+                Write-RichoLog "VM '$vmName' is already in destination cluster '$destinationClusterName'. Check the row before running this live." -Level WARN
+            }
+
             $destinationRecord = $eligibleHosts[$placementIndex % $eligibleHosts.Count]
             $placementIndex++
             $vmItems.Add([pscustomobject]@{
                 VM              = $vm
                 Layout          = $layout
+                SourceCluster   = $vmClusterName
                 DestinationHost = $destinationRecord.VMHost
                 PowerOnOrder    = $placementIndex
             })
         }
+
+        # Nodes of one SQL cluster normally live together. Coming from more than one
+        # place is not fatal, but it is not what the row describes either.
+        $sourceClusterNames = @($vmItems | ForEach-Object { $_.SourceCluster } | Where-Object { $_ } | Select-Object -Unique)
+        if ($sourceClusterNames.Count -gt 1) {
+            Write-RichoLog "Migration group '$groupName' draws VMs from more than one cluster: $($sourceClusterNames -join ', ')." -Level WARN
+        }
+        $sourceClusterLabel = if ($sourceClusterNames.Count -gt 0) { $sourceClusterNames -join ', ' } else { 'unknown' }
 
         $referenceItem = $vmItems[0]
         $referenceRdms = @($referenceItem.Layout.Rdms | Sort-Object ControllerBus, UnitNumber)
@@ -1799,7 +1802,8 @@ function Resolve-MigrationPlan {
             Name                = $groupName
             WorkloadType        = $workloadType
             Svm                 = $svm
-            SourceCluster       = $sourceCluster
+            SourceClusters      = $sourceClusterNames
+            SourceClusterLabel  = $sourceClusterLabel
             Cluster             = $cluster
             ResourcePool        = $resourcePool
             DatastoreCluster    = $datastoreCluster
@@ -1839,7 +1843,7 @@ function New-MigrationManifest {
         MigrationGroup              = $GroupPlan.Name
         WorkloadType                = $GroupPlan.WorkloadType
         Svm                         = $GroupPlan.Svm
-        SourceCluster               = $GroupPlan.SourceCluster.Name
+        SourceClusters              = $GroupPlan.SourceClusters
         DestinationCluster          = $GroupPlan.Cluster.Name
         DestinationResourcePool     = $GroupPlan.ResourcePool.Name
         DestinationDatastoreCluster = $GroupPlan.DatastoreCluster.Name
@@ -1853,6 +1857,7 @@ function New-MigrationManifest {
                 Name               = $_.VM.Name
                 Id                 = $_.VM.Id
                 OriginalPowerState = [string]$_.VM.PowerState
+                SourceCluster      = [string]$_.SourceCluster
                 SourceHost         = [string]$_.VM.VMHost.Name
                 DestinationHost    = [string]$_.DestinationHost.Name
                 PowerOnOrder       = $_.PowerOnOrder
@@ -2049,7 +2054,7 @@ try {
 
     foreach ($groupPlan in $plans) {
         Write-RichoLog "===== Migration group $($groupPlan.Name) [$($groupPlan.WorkloadType)] =====" -Level INFO
-        Write-RichoLog "$($groupPlan.VMItems.Count) VM(s), $($groupPlan.Disks.Count) RDM(s), $($groupPlan.MappingMode) mapping files, $($groupPlan.SourceCluster.Name) -> $($groupPlan.Cluster.Name)/$($groupPlan.ResourcePool.Name), RDM pointers on $($groupPlan.RdmDatastore.Name)." -Level INFO
+        Write-RichoLog "$($groupPlan.VMItems.Count) VM(s), $($groupPlan.Disks.Count) RDM(s), $($groupPlan.MappingMode) mapping files, $($groupPlan.SourceClusterLabel) -> $($groupPlan.Cluster.Name)/$($groupPlan.ResourcePool.Name), RDM pointers on $($groupPlan.RdmDatastore.Name)." -Level INFO
 
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $modeLabel = if ($DryRun) { 'dryrun' } else { 'execution' }

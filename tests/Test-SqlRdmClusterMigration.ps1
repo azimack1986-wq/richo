@@ -179,8 +179,8 @@ try {
         Invoke-Expression $functionAst[0].Extent.Text
     }
 
-    $header = 'vsphere_cluster,destination_cluster,workload_type,first_vm,other_vms_space_separated,svm,iSCSI_Data_Store,group_1_lun_IDs_ordered_space_separated,group_2_lun_IDs_ordered_space_separated,group_3_lun_IDs_ordered_space_separated,destination_resource_pool,destination_datastore_cluster'
-    $valid = 'labsql01,labsql02,PROD,LABSQL01,LABSQL02 LABSQL03,lab-storage-svm01,LAB-RDM-POINTERS,40 41 42,50 51,,LAB-SQL-RP,LAB-VM-DATASTORES'
+    $header = 'destination_cluster,workload_type,first_vm,other_vms_space_separated,svm,iSCSI_Data_Store,group_1_lun_IDs_ordered_space_separated,group_2_lun_IDs_ordered_space_separated,group_3_lun_IDs_ordered_space_separated,destination_resource_pool,destination_datastore_cluster'
+    $valid = 'labsql02,PROD,LABSQL01,LABSQL02 LABSQL03,lab-storage-svm01,LAB-RDM-POINTERS,40 41 42,50 51,,LAB-SQL-RP,LAB-VM-DATASTORES'
 
     # ---------------------------------------------------------------- CSV validation ----
 
@@ -188,23 +188,21 @@ try {
         $rows = @(Import-MigrationCsv -Path (New-TestCsv @($header, $valid)))
         Assert-Equal $rows.Count 1 'Unexpected row count.'
         Assert-Equal $rows[0].first_vm 'LABSQL01' 'Unexpected first VM.'
-        Assert-Equal $rows[0].vsphere_cluster 'labsql01' 'Unexpected source cluster.'
         Assert-Equal $rows[0].destination_cluster 'labsql02' 'Unexpected destination cluster.'
     }
 
     Invoke-NativeTest 'Missing destination cluster is rejected' {
-        $badHeader = $header -replace ',destination_cluster,', ','
-        $badRow = $valid -replace ',labsql02,', ','
+        $badHeader = $header -replace '^destination_cluster,', ''
+        $badRow = $valid -replace '^labsql02,', ''
         Assert-ThrowsLike {
             Import-MigrationCsv -Path (New-TestCsv @($badHeader, $badRow))
-        } '*destination_cluster*' 'Missing source/destination split was accepted.'
+        } '*destination_cluster*' 'A CSV with no destination cluster was accepted.'
     }
 
-    Invoke-NativeTest 'Source and destination cluster must differ' {
-        $bad = $valid -replace '^labsql01,labsql02,', 'labsql01,LABSQL01,'
-        Assert-ThrowsLike {
-            Import-MigrationCsv -Path (New-TestCsv @($header, $bad))
-        } '*same source and destination cluster*' 'A row migrating a cluster to itself was accepted.'
+    Invoke-NativeTest 'No source cluster column is required' {
+        Assert-True ($header -notmatch 'vsphere_cluster') 'The sample header still carries a source cluster column.'
+        Assert-True ($text -notmatch "'vsphere_cluster'") 'The script still requires a source cluster column.'
+        Assert-True ($text -match '\$groupName = \[string\]\$row\.first_vm') 'The migration group is not named after its first VM.'
     }
 
     Invoke-NativeTest 'Workload type is limited to PROD, SIT and DEV' {
@@ -276,17 +274,14 @@ try {
         } '*SCSI controller carries at most*' 'Controller-capacity validation failed.'
     }
 
-    Invoke-NativeTest 'Duplicate migration-group rows are rejected' {
-        Assert-ThrowsLike {
-            Import-MigrationCsv -Path (New-TestCsv @($header, $valid, $valid))
-        } '*duplicate vsphere_cluster*' 'Duplicate-group validation failed.'
-    }
-
     Invoke-NativeTest 'The same VM in two migration groups is rejected' {
-        $second = $valid -replace '^labsql01,', 'labsql01b,'
+        $second = $valid -replace '^labsql02,', 'labsql02b,'
         Assert-ThrowsLike {
             Import-MigrationCsv -Path (New-TestCsv @($header, $valid, $second))
         } '*repeats VM*' 'Cross-row duplicate VM validation failed.'
+        Assert-ThrowsLike {
+            Import-MigrationCsv -Path (New-TestCsv @($header, $valid, $valid))
+        } '*repeats VM*' 'An identical row twice was accepted.'
     }
 
     Invoke-NativeTest 'Value lists tolerate padding and empty cells' {

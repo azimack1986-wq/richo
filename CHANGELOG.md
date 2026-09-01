@@ -4296,3 +4296,29 @@ behavioural rather than cosmetic.
   datastore name, case-insensitive matching for a derived name, workload-type stamping
   on result rows, and an AST check that `Start-VM` is only ever called from the
   workload power-on phase.
+
+### [2.5.0] — 2026-09-01
+
+#### Removed
+
+- **The source cluster column.** The CSV now says only where the VMs are going. VMs are
+  found by name across the vCenter — each name must still match exactly one VM,
+  case-sensitively, because two VMs of the same name is the one case where guessing
+  which was meant is unacceptable. Where a VM is now is read off it and recorded in the
+  manifest rather than asserted in the CSV, which removes a column that could disagree
+  with reality and stop a run that was otherwise correct.
+
+- The duplicate-`vsphere_cluster` row check went with it. Rows are identified by
+  `first_vm`, which the cross-row VM check already holds to one appearance in the file,
+  so a duplicated row is still rejected — now by name of the VM it repeats.
+
+#### Changed
+
+- **`destination_cluster` is required**, and the migration group is named after its
+  `first_vm` — that is what appears in the manifest filename and in every plan, result
+  and verification row.
+
+- Two new warnings, neither of them fatal: a VM already sitting in the destination
+  cluster, and a group whose VMs come from more than one cluster. Both are things the
+  operator should look at before a live run, and neither is wrong often enough to stop
+  one.
