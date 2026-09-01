@@ -10,6 +10,48 @@ versioning is [semantic](https://semver.org/) per script.
 
 ---
 
+## Test-UcsVnicVlanConsistency.ps1
+
+### [1.0.0] — 2026-09-01
+
+#### Added
+
+- **A read-only check for VLAN drift between UCS Manager and the vDS in front of
+  the same blades.** Nothing here writes to either side; the output is a list of
+  findings for a change to act on.
+
+  It signs in to vCenter once, identifies the UCS domain behind each host from
+  CDP and LLDP, and passes the proven vCenter credential straight through to UCS
+  Manager — the same passthrough the firmware scripts use, with the same lockout
+  guards: a rejected credential is discarded rather than replayed, attempts are
+  counted, and at the limit no further UCS sign-in is attempted for the rest of
+  the run.
+
+  What it reports:
+
+  - **VLAN definitions.** One id under two names, one name carrying two ids that
+    are not simply the two fabrics, ids in the UCS Manager reserved range
+    4030–4047, and an Ethernet VLAN colliding with a VSAN's FCoE VLAN.
+  - **vNIC pair symmetry.** vNICs 0/1, 2/3 and 4/5 by default (`-VnicPairGroup`).
+    The VLAN set, native VLAN, MTU, network control, QoS and adapter policies and
+    template type must agree; the fabric must *not*, because a pair on one FI is
+    a single point of failure wearing a redundant pair's name.
+  - **Drift from a vNIC's own template**, which an initial-template edited after
+    the profile was stamped produces silently.
+  - **The vSphere cross-check.** Each vmnic is mapped to the vDS that owns it
+    through `Config.Network.ProxySwitch`, and the VLANs that vDS's port groups
+    need are checked against the VLANs UCS trunks to those same vmnics. A port
+    group VLAN UCS does not trunk is an error; the reverse is only INFO.
+  - **Discovery protocol agreement** — a vDS set to CDP in front of a network
+    control policy with CDP disabled, which is why hosts report no neighbour and
+    is what breaks the UCS discovery this script itself depends on.
+
+  Findings are folded by what is wrong rather than by host, so a service profile
+  template's one mistake is one line naming the hosts it affects rather than forty
+  copies of it.
+
+---
+
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
 ### [23.32.0] — 2026-08-21
