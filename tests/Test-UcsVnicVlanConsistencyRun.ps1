@@ -151,6 +151,9 @@ function Get-UcsVlan { param($Ucs, $ErrorAction) @(
     [pscustomobject]@{ Name = 'PROD_250'; Id = 250;  SwitchId = 'dual' }
     # And an id that is also a VSAN's FCoE VLAN.
     [pscustomobject]@{ Name = 'STORAGE';  Id = 4048; SwitchId = 'dual' }
+    # Created on the fabric and never added to a template: the network half of a
+    # change that was never finished on the server side.
+    [pscustomobject]@{ Name = 'SPARE-777'; Id = 777; SwitchId = 'dual' }
 ) }
 function Get-UcsVsan { param($Ucs, $ErrorAction) @([pscustomobject]@{ Name = 'VSAN-A'; Id = 100; FcoeVlan = 4048 }) }
 
@@ -165,6 +168,10 @@ function Get-UcsVnicTemplate { param($Ucs, $ErrorAction) @(
     (New-Template 'eth2-tmpl' 'A' '9000' 'CDP-ON')
     # Fabric A again: the pair is not a pair, and nothing in vCenter shows it.
     (New-Template 'eth3-tmpl' 'A' '9000' 'CDP-ON')
+    # A pair with nothing wrong with it, so there is something for the clean
+    # path to record. Not in the ProxySwitch map, so no vDS cross-check.
+    (New-Template 'eth4-tmpl' 'A' '9000' 'CDP-ON')
+    (New-Template 'eth5-tmpl' 'B' '9000' 'CDP-ON')
 ) }
 
 function New-Vnic { param($Name, $Order, $Template)
@@ -176,6 +183,8 @@ function Get-UcsVnic { param($Ucs, $ErrorAction) @(
     (New-Vnic 'eth1' '2' 'eth1-tmpl')
     (New-Vnic 'eth2' '3' 'eth2-tmpl')
     (New-Vnic 'eth3' '4' 'eth3-tmpl')
+    (New-Vnic 'eth4' '5' 'eth4-tmpl')
+    (New-Vnic 'eth5' '6' 'eth5-tmpl')
 ) }
 
 function New-Interface { param($Parent, $Name, $Vnet, $Native = 'no')
@@ -194,6 +203,8 @@ function Get-UcsVnicInterface { param($Ucs, $ErrorAction) @(
     # on the blade.
     (New-Interface 'org-root/lan-conn-templ-eth2-tmpl' 'MGMT-10' 10)
     (New-Interface 'org-root/lan-conn-templ-eth3-tmpl' 'PROD-250' 250)
+    (New-Interface 'org-root/lan-conn-templ-eth4-tmpl' 'PROD-250' 250)
+    (New-Interface 'org-root/lan-conn-templ-eth5-tmpl' 'PROD-250' 250)
 
     # --- below the service profile's vNICs ---
     # eth0 carries MGMT and PROD; eth1, its partner, is missing PROD.
@@ -202,6 +213,8 @@ function Get-UcsVnicInterface { param($Ucs, $ErrorAction) @(
     (New-Interface 'org-root/ls-esx01/ether-eth1' 'MGMT-10' 10 'yes')
     (New-Interface 'org-root/ls-esx01/ether-eth2' 'PROD-250' 250)
     (New-Interface 'org-root/ls-esx01/ether-eth3' 'PROD-250' 250)
+    (New-Interface 'org-root/ls-esx01/ether-eth4' 'PROD-250' 250)
+    (New-Interface 'org-root/ls-esx01/ether-eth5' 'PROD-250' 250)
 ) }
 
 function Get-UcsNetworkControlPolicy { param($Ucs, $ErrorAction) @(
@@ -269,6 +282,33 @@ Assert-Equal 'no false MTU finding'             0 (Get-Check 'VdsMtuExceedsVnicM
 # The uplink port group trunks nothing in particular and must not be measured.
 Assert-Equal 'the uplink port group was skipped' $false ([bool]@($findings | Where-Object { $_.Subject -match 'uplinks' }).Count)
 
+Write-Host "`n=== VLANs the fabric carries that no vNIC template uses ===" -ForegroundColor Cyan
+# Three VLANs exist on this fabric that no template carries: the deliberate
+# SPARE-777, the STORAGE VLAN that also collides with FCoE, and PROD_250 - the
+# second name for id 250, which is exactly the signal that says which of the two
+# duplicate names is the one nothing is actually using.
+$unassigned = @((Get-Check 'VlanNotOnAnyVnicTemplate') | ForEach-Object { $_.Subject } | Sort-Object)
+Assert-Equal 'every unused fabric VLAN is reported' 3 $unassigned.Count
+Assert-Equal 'and they are the right three'         'PROD_250 (250); SPARE-777 (777); STORAGE (4048)' ($unassigned -join '; ')
+# STORAGE is on no template either, but it is the FCoE collision VLAN and is
+# already reported as an error; both are true and both are reported.
+Assert-Equal 'a VLAN that IS on a template is not' $false ([bool]@((Get-Check 'VlanNotOnAnyVnicTemplate') | Where-Object { $_.Subject -match 'PROD-250' }).Count)
+
+Write-Host "`n=== Checks that ran clean are recorded, not just omitted ===" -ForegroundColor Cyan
+Assert-Equal 'the clean vNIC pair is recorded'  1     (Get-Check 'VnicPair').Count
+Assert-Equal 'and it is eth4/eth5'              'eth4/eth5' (Get-Check 'VnicPair')[0].Subject
+Assert-Equal 'and it is an OK row'              'OK'  (Get-Check 'VnicPair')[0].Severity
+# eth0/eth1 has a VLAN mismatch and eth2/eth3 is on one fabric, so neither may
+# be recorded as clean - an OK row on a pair that failed would be worse than no
+# row at all.
+Assert-Equal 'no OK row for the mismatched pair' $false ([bool]@((Get-Check 'VnicPair') | Where-Object { $_.Subject -eq 'eth0/eth1' }).Count)
+Assert-Equal 'no OK row for the same-fabric pair' $false ([bool]@((Get-Check 'VnicPair') | Where-Object { $_.Subject -eq 'eth2/eth3' }).Count)
+# dvs-prod has an untrunked port group; dvs-mgmt does not.
+Assert-Equal 'dvs-mgmt coverage is recorded clean' $true ([bool]@((Get-Check 'VdsVlanCoverage') | Where-Object { $_.Subject -eq 'dvs-mgmt' }).Count)
+Assert-Equal 'dvs-prod coverage is not'            $false ([bool]@((Get-Check 'VdsVlanCoverage') | Where-Object { $_.Subject -eq 'dvs-prod' }).Count)
+# The VLAN table has a duplicate id and an FCoE collision, so it is not clean.
+Assert-Equal 'the VLAN table is not recorded clean' 0 (Get-Check 'VlanDefinitions').Count
+
 Write-Host "`n=== Discovery protocol ===" -ForegroundColor Cyan
 # dvs-mgmt is set to CDP; eth0 and eth1 sit behind CDP-OFF. This is the fault
 # that hides every other fault.
@@ -276,8 +316,9 @@ Assert-Equal 'CDP disabled under a CDP vDS is found' 2 (Get-Check 'CdpDisabledOn
 Assert-Equal 'and not for the vDS whose policy has CDP on' $false ([bool]@((Get-Check 'CdpDisabledOnUcs') | Where-Object { $_.Subject -match 'dvs-prod' }).Count)
 
 Write-Host "`n=== The report itself ===" -ForegroundColor Cyan
-Assert-Equal 'every finding names the host' $true (-not [bool]@($findings | Where-Object { $_.Scope -ne 'UCS' -and $_.HostCount -eq 0 }).Count)
-Assert-Equal 'severities are the expected set' $true (-not [bool]@($findings | Where-Object { $_.Severity -notin @('ERROR', 'WARN', 'INFO') }).Count)
+Assert-Equal 'every cross-check row names the host' $true (-not [bool]@($findings | Where-Object { $_.Scope -eq 'CrossCheck' -and $_.HostCount -eq 0 }).Count)
+Assert-Equal 'every row carries a PASS/REVIEW status'  $true (-not [bool]@($findings | Where-Object { $_.Status -notin @('PASS', 'REVIEW', 'NOTE') }).Count)
+Assert-Equal 'severities are the expected set' $true (-not [bool]@($findings | Where-Object { $_.Severity -notin @('ERROR', 'WARN', 'INFO', 'OK') }).Count)
 
 Write-Host "`n=== The -Cluster and -CsvPath paths ===" -ForegroundColor Cyan
 # Neither is exercised by the run above, and both are the sort of thing that only
@@ -290,6 +331,9 @@ try {
     Assert-Equal 'the cluster filter still finds the faults' $true ($filtered.Count -gt 0)
     # -IncludeInformational was not passed this time.
     Assert-Equal 'INFO findings are withheld by default'     0 @($filtered | Where-Object { $_.Severity -eq 'INFO' }).Count
+    # The clean rows are the point of the CSV: a fault list alone cannot be told
+    # apart from a run where the check never happened.
+    Assert-Equal 'clean checks are still reported'           $true (@($filtered | Where-Object { $_.Severity -eq 'OK' }).Count -gt 0)
     Assert-Equal 'the CSV was written'                       $true (Test-Path $csvPath)
     $fromCsv = @(Import-Csv -Path $csvPath)
     Assert-Equal 'and holds every returned finding'          $filtered.Count $fromCsv.Count

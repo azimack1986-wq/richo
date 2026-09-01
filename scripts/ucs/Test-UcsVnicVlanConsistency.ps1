@@ -7,6 +7,23 @@
     READ ONLY. Nothing here writes to UCS Manager or to vCenter. The output is a
     list of findings for someone else - or a later change - to act on.
 
+    SELF-CONTAINED. One file, no repo, no config file, no helper module - copy it
+    to a jump host and run it. The only things it needs are VMware PowerCLI and
+    the Cisco UCS PowerTool already being present, and it checks for the cmdlets
+    it actually calls before it does anything else. It imports nothing: a jump
+    host with a pinned module bundle already loaded should not have this script
+    fighting it.
+
+    WHAT IT REPORTS
+
+      Every check that runs writes a row, whether or not it found anything: ERROR
+      and WARN for a discrepancy, OK for a check that ran clean. That is the
+      difference between a report you can review and one you can only scan - a
+      list of faults alone cannot be told apart from a run where the check never
+      happened, and on this script a domain that could not be signed in to, a
+      host with no CDP neighbour and a perfectly configured host all produce no
+      fault lines.
+
     WHAT IT CHECKS
 
       1. VLAN definitions in each UCS domain. The same VLAN id defined under two
@@ -14,23 +31,29 @@
          range, and an Ethernet VLAN colliding with a VSAN's FCoE VLAN. Each of
          those is a silent config error until traffic is placed on it.
 
-      2. vNIC pair symmetry. The two legs of a pair are the same connection over
+      2. VLANs on the fabric that no vNIC template uses. A VLAN created in the
+         domain and never added to a template is a half-finished change: the
+         network side was done, the server side was not, and nothing in UCS
+         Manager marks it. Reported separately from a VLAN that reaches a blade
+         through a vNIC configured off-template, which is a different problem.
+
+      3. vNIC pair symmetry. The two legs of a pair are the same connection over
          two fabrics, so everything about them must match except the fabric. By
          default vNICs 0/1, 2/3 and 4/5 are compared as pairs (-VnicPairGroup);
          the VLAN set, the native VLAN, the MTU, the network control, QoS and
          adapter policies and the template type must agree, and the two legs must
          sit on different fabric interconnects.
 
-      3. Per-vNIC settings. MTU against -ExpectedMtu when given, and CDP/LLDP as
+      4. Per-vNIC settings. MTU against -ExpectedMtu when given, and CDP/LLDP as
          set by the network control policy bound to each vNIC.
 
-      4. The vSphere cross-check. For each host, the physical NICs are mapped to
+      5. The vSphere cross-check. For each host, the physical NICs are mapped to
          the distributed switch that owns them, and the VLANs the vDS port groups
          actually need are checked against the VLANs UCS trunks to those same
          vmnics. A port group VLAN that UCS does not trunk is a black hole; the
          reverse is only noise, so it is reported as INFO.
 
-      5. Discovery protocol agreement. A vDS set to CDP in front of a network
+      6. Discovery protocol agreement. A vDS set to CDP in front of a network
          control policy with CDP disabled is why hosts report no neighbour - and
          is what breaks the UCS discovery this very script depends on.
 
@@ -52,16 +75,12 @@
       further UCS sign-in is attempted at all - replaying a wrong password at each
       domain in turn is how an account gets locked out.
 
-.PARAMETER Environment
-    Environment key from config/environments.json. Defaults to the file's
-    "default" entry. Ignored when -VIServer is given.
-
 .PARAMETER VIServer
-    vCenter to connect to, overriding the environment config.
+    vCenter to connect to. Prompted for when omitted.
 
 .PARAMETER Credential
-    vCenter credential. When omitted it is resolved through Get-RichoCredential
-    using the environment's vcenter.credentialName.
+    vCenter credential. Prompted for when omitted, and then passed through to UCS
+    Manager unless -UcsCredential is given.
 
 .PARAMETER UcsCredential
     UCS Manager credential. When omitted the proven vCenter credential is used.
@@ -89,28 +108,45 @@
     rather than as a missing-VLAN error. Defaults to 64. Uplink port groups trunk
     everything by design and demanding UCS carry all of it is pure noise.
 
+.PARAMETER MaxUnassignedVlanDetail
+    How many fabric VLANs that no vNIC template uses to report one by one before
+    rolling them into a single finding. Defaults to 25. A domain commonly defines
+    far more VLANs than any one set of templates carries.
+
 .PARAMETER MaxCredentialAttempt
     Failed UCS sign-ins tolerated before no further UCS login is attempted this
     run. Defaults to 2.
 
 .PARAMETER CsvPath
-    Write the findings to this CSV as well as returning them.
+    Write the findings to this CSV as well as returning them. One row per check,
+    faults first and the clean rows after, with a Status column of REVIEW, NOTE
+    or PASS so a reviewer can filter or colour it in a spreadsheet without
+    reading every line.
 
 .PARAMETER IncludeInformational
-    Return INFO findings too. By default only WARN and ERROR are returned.
+    Return INFO findings too. By default the report carries the faults (ERROR and
+    WARN) and the checks that came back clean (OK), but not the INFO context.
 
 .PARAMETER Transcript
-    Start a transcript through Start-RichoTranscript.
+    Record the run to a timestamped .log in the current directory, for change
+    evidence.
 
 .EXAMPLE
-    .\Test-UcsVnicVlanConsistency.ps1 -Environment prod -Cluster 'PRD-*' | Format-Table -AutoSize
+    .\Test-UcsVnicVlanConsistency.ps1 -VIServer vcenter01.example.com
 
-    Check every host in the matching clusters and show the findings.
+    Prompts for the credential, checks every host it can reach, prints a summary
+    and returns the findings.
 
 .EXAMPLE
-    .\Test-UcsVnicVlanConsistency.ps1 -Environment prod -Cluster PRD-CL01 -CsvPath .\output\vlan-drift.csv
+    .\Test-UcsVnicVlanConsistency.ps1 -VIServer vcenter01.example.com -Cluster 'PRD-*' | Format-Table -AutoSize
 
-    The same, with the full finding list written to CSV for a change request.
+    Check every host in the matching clusters and show the findings as a table.
+
+.EXAMPLE
+    .\Test-UcsVnicVlanConsistency.ps1 -VIServer vcenter01.example.com -Cluster PRD-CL01 -CsvPath .\vlan-drift.csv -Transcript
+
+    The same, with the full finding list written to CSV and the run recorded, for
+    a change request.
 
 .EXAMPLE
     .\Test-UcsVnicVlanConsistency.ps1 -VIServer vcenter01.example.com -UcsManager ucsm01.example.com -ExpectedMtu 9000 -IncludeInformational
@@ -119,13 +155,18 @@
 
 .NOTES
     Read-only, so there is no -WhatIf: there is nothing to suppress.
+
+    Nothing is written to disk except the CSV and the transcript you ask for, and
+    no credential is stored, cached beyond the run, or logged. Passwords are held
+    as the SecureString inside a PSCredential and dropped when the script ends,
+    however it ends.
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
 [OutputType([pscustomobject])]
 param(
-    [string]$Environment,
-
+    [Parameter(Mandatory)]
+    [ValidateNotNullOrEmpty()]
     [string]$VIServer,
 
     [pscredential]$Credential,
@@ -147,6 +188,9 @@ param(
     [ValidateRange(1, 4094)]
     [int]$LargeTrunkThreshold = 64,
 
+    [ValidateRange(1, 4094)]
+    [int]$MaxUnassignedVlanDetail = 25,
+
     [ValidateRange(1, 10)]
     [int]$MaxCredentialAttempt = 2,
 
@@ -160,7 +204,58 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path $PSScriptRoot '..\..\modules\Richo.Common\Richo.Common.psd1') -Force
+# NOTHING IS IMPORTED. This runs on a prepared jump host where PowerCLI and the
+# UCS PowerTool are already loaded or auto-loading, and an import here would
+# either duplicate the host build's job or fight a pinned bundle already in the
+# session. What the script needs is checked by cmdlet, once, before any work.
+
+function Write-Log {
+    <#
+    .SYNOPSIS
+        A timestamped, levelled progress line, written to the host only.
+
+    .DESCRIPTION
+        To the HOST, deliberately, not to the success stream. The findings are
+        this script's return value and anything else written to the pipeline ends
+        up mixed into them, so a caller doing 'Export-Csv' or '| Format-Table'
+        gets progress chatter in the report.
+
+        DEBUG lines appear only under -Verbose. ERROR goes to the host like the
+        rest rather than to the error stream: with $ErrorActionPreference = 'Stop'
+        a Write-Error would terminate the run at the point it was trying to
+        explain, which is how one unreachable domain would abandon every other.
+
+    .PARAMETER Message
+        The text to log.
+
+    .PARAMETER Level
+        DEBUG, INFO, WARN or ERROR. Defaults to INFO.
+
+    .EXAMPLE
+        Write-Log "Connected to UCS Manager 'ucs01'." -Level INFO
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, Position = 0)]
+        [AllowEmptyString()]
+        [string]$Message,
+
+        [Parameter(Position = 1)]
+        [ValidateSet('DEBUG', 'INFO', 'WARN', 'ERROR')]
+        [string]$Level = 'INFO'
+    )
+
+    if ($Level -eq 'DEBUG' -and -not $script:VerboseLogging) { return }
+
+    $colour = switch ($Level) {
+        'DEBUG' { 'DarkGray' }
+        'WARN'  { 'Yellow' }
+        'ERROR' { 'Red' }
+        default { 'Gray' }
+    }
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ')
+    Write-Host ('{0} [{1,-5}] {2}' -f $stamp, $Level, $Message) -ForegroundColor $colour
+}
 
 # ---- Run state -------------------------------------------------------------
 # Script scope, initialised here. Under Set-StrictMode a first read of an unset
@@ -175,7 +270,7 @@ $script:UcsCredentialAttempt     = 0
 $script:UcsCredentialBlocked     = $false
 $script:UcsSessions              = @{}
 $script:DiscoveryCache           = @{}
-$script:UcsCredentialName        = 'ucsm'
+$script:VerboseLogging           = ($VerbosePreference -ne 'SilentlyContinue')
 
 # UCS Manager reserves this band for its own use; a VLAN created inside it is
 # rejected or silently unusable depending on the release.
@@ -307,7 +402,13 @@ function Add-Finding {
 
     .PARAMETER Severity
         ERROR for something that breaks or will break traffic, WARN for drift
-        that should be corrected, INFO for context.
+        that should be corrected, INFO for context, OK for a check that ran and
+        found nothing wrong.
+
+        OK rows are the point of reading the report rather than scanning it. A
+        report that lists only faults cannot be told apart from a report where
+        the check never ran, and 'no findings' is exactly what a broken discovery
+        step also looks like.
 
     .PARAMETER Scope
         Where it was found: UCS, vCenter, or CrossCheck.
@@ -340,7 +441,7 @@ function Add-Finding {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('ERROR', 'WARN', 'INFO')]
+        [ValidateSet('ERROR', 'WARN', 'INFO', 'OK')]
         [string]$Severity,
 
         [Parameter(Mandatory)]
@@ -387,6 +488,87 @@ function Add-Finding {
 
     $script:FindingIndex[$key] = $finding
     [void]$script:Findings.Add($finding)
+}
+
+function Add-CheckResult {
+    <#
+    .SYNOPSIS
+        Records what a check found - or, when it found nothing, that it ran clean.
+
+    .DESCRIPTION
+        Every check goes through here so that a clean result is written down
+        rather than merely absent. A report listing only faults cannot be
+        distinguished from a report where the check never ran, and on this script
+        that distinction matters: a domain that could not be signed in to, a host
+        with no CDP neighbour and a host that is perfectly configured all produce
+        no fault lines.
+
+        A check is clean when it produced no ERROR and no WARN. INFO does not
+        spoil it - INFO is context, not a discrepancy.
+
+        The OK line is deliberately written without host-specific text, so
+        Add-Finding folds the identical result from every host in a cluster into
+        one row naming them all rather than forty copies.
+
+    .PARAMETER Finding
+        What the check returned: objects with Severity, Check, Subject, Expected,
+        Actual and Detail.
+
+    .PARAMETER Scope
+        UCS, vCenter or CrossCheck.
+
+    .PARAMETER Check
+        The check name to record when it is clean.
+
+    .PARAMETER Detail
+        The sentence to record when it is clean - what was verified.
+
+    .PARAMETER Subject
+        What was checked: a vNIC pair, a vDS, a domain.
+
+    .PARAMETER Domain
+        The UCS domain this belongs to.
+
+    .PARAMETER HostName
+        The host it was checked on, folded into an identical result from another.
+
+    .EXAMPLE
+        Add-CheckResult -Finding $found -Scope UCS -Check VnicPair -Subject 'eth0/eth1' `
+            -Detail 'VLANs, native VLAN, MTU and policies match across both fabrics.'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0)]
+        [AllowEmptyCollection()]
+        [array]$Finding = @(),
+
+        [Parameter(Mandatory)]
+        [ValidateSet('UCS', 'vCenter', 'CrossCheck')]
+        [string]$Scope,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Check,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Detail,
+
+        [string]$Subject = '',
+        [string]$Domain = '',
+        [string]$HostName = ''
+    )
+
+    foreach ($entry in $Finding) {
+        Add-Finding -Severity $entry.Severity -Scope $Scope -Check $entry.Check -Domain $Domain -HostName $HostName `
+            -Subject $entry.Subject -Expected $entry.Expected -Actual $entry.Actual -Detail $entry.Detail
+    }
+
+    $faults = @($Finding | Where-Object { ($_.Severity -eq 'ERROR') -or ($_.Severity -eq 'WARN') })
+    if ($faults.Count -gt 0) { return }
+
+    Add-Finding -Severity 'OK' -Scope $Scope -Check $Check -Domain $Domain -HostName $HostName `
+        -Subject $Subject -Expected '' -Actual 'checked, no discrepancy' -Detail $Detail
 }
 
 # ============================================================================
@@ -556,6 +738,130 @@ function Test-UcsVlanInventory {
         }
     }
 
+    return $results.ToArray()
+}
+
+function Test-UcsVlanAssignment {
+    <#
+    .SYNOPSIS
+        Findings for VLANs the fabric carries that no vNIC template uses.
+
+    .DESCRIPTION
+        A VLAN created in the domain and never added to a vNIC template is a
+        half-finished change. The network side was done - the VLAN exists, the
+        uplinks carry it - and the server side was not, so no blade can ever see
+        it. Nothing in UCS Manager marks the difference between that and a VLAN
+        deliberately held in reserve, which is why it has to be looked for.
+
+        Two outcomes, because they have different fixes:
+
+          - on no template and on no vNIC at all: nothing in this domain can use
+            it. Either finish the change or delete the VLAN.
+          - on a service profile's vNIC but on no template: a blade does have it,
+            but it was put there by hand. The next template push does not know
+            about it and rebuilding that profile loses it.
+
+        VLAN 1 is skipped. It always exists, it is almost never on a template on
+        purpose, and reporting it on every run is how the rest of this list stops
+        being read. Test-UcsVlanInventory already notes it separately.
+
+        A domain commonly defines far more VLANs than any one set of templates
+        carries, so past -MaxIndividual the finding is rolled up into one line
+        naming them rather than hundreds of lines saying the same thing.
+
+    .PARAMETER Vlan
+        fabricVlan objects: Name, Id.
+
+    .PARAMETER TemplateVlanName
+        VLAN names referenced by a vNIC template in this domain.
+
+    .PARAMETER ProfileVlanName
+        VLAN names referenced directly by a service profile's vNICs.
+
+    .PARAMETER MaxIndividual
+        Above this many unused VLANs, report one rolled-up finding instead of one
+        per VLAN.
+
+    .EXAMPLE
+        Test-UcsVlanAssignment -Vlan $vlans -TemplateVlanName $onTemplates -ProfileVlanName $onVnics
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Position = 0)]
+        [AllowEmptyCollection()]
+        [array]$Vlan = @(),
+
+        [Parameter(Position = 1)]
+        [AllowEmptyCollection()]
+        [string[]]$TemplateVlanName = @(),
+
+        [Parameter(Position = 2)]
+        [AllowEmptyCollection()]
+        [string[]]$ProfileVlanName = @(),
+
+        [ValidateRange(1, 4094)]
+        [int]$MaxIndividual = 25
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+
+    $onTemplate = @{}
+    foreach ($name in $TemplateVlanName) { if ($name) { $onTemplate[$name] = $true } }
+    $onVnic = @{}
+    foreach ($name in $ProfileVlanName) { if ($name) { $onVnic[$name] = $true } }
+
+    $orphans = New-Object System.Collections.Generic.List[object]
+    $offTemplate = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+
+    foreach ($row in $Vlan) {
+        $name = [string](Get-MoProperty $row 'Name' '')
+        $id = [int](Get-MoProperty $row 'Id' 0)
+        if (-not $name -or $id -eq 1) { continue }
+        if ($seen.ContainsKey($name)) { continue }
+        $seen[$name] = $true
+
+        if ($onTemplate.ContainsKey($name)) { continue }
+        $entry = [pscustomobject]@{ Name = $name; Id = $id }
+        if ($onVnic.ContainsKey($name)) { [void]$offTemplate.Add($entry) } else { [void]$orphans.Add($entry) }
+    }
+
+    if ($orphans.Count -gt $MaxIndividual) {
+        $ids = @($orphans.ToArray() | ForEach-Object { [int]$_.Id })
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Check = 'VlanNotOnAnyVnicTemplate'
+            Subject  = "$($orphans.Count) VLANs"
+            Expected = 'every VLAN on the fabric carried by a vNIC template'
+            Actual   = (Format-IdList -Id $ids -MaxItem 30)
+            Detail   = ("{0} VLANs are defined on this fabric and are on no vNIC template and no service profile vNIC: {1}. No blade in this domain can use any of them - either the change that created them was never finished on the server side, or they are left over." -f $orphans.Count, (Format-IdList -Id $ids -MaxItem 30))
+        })
+    }
+    else {
+        foreach ($entry in $orphans.ToArray()) {
+            [void]$results.Add([pscustomobject]@{
+                Severity = 'WARN'; Check = 'VlanNotOnAnyVnicTemplate'
+                Subject  = "$($entry.Name) ($($entry.Id))"
+                Expected = 'a vNIC template carrying it'
+                Actual   = 'on no vNIC template and no service profile vNIC'
+                Detail   = ("VLAN '{0}' (id {1}) is defined on this fabric but is on no vNIC template and no service profile vNIC, so no blade in this domain can use it. Either the change that created it was never finished on the server side, or it is left over." -f $entry.Name, $entry.Id)
+            })
+        }
+    }
+
+    foreach ($entry in $offTemplate.ToArray()) {
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'INFO'; Check = 'VlanOnVnicButNoTemplate'
+            Subject  = "$($entry.Name) ($($entry.Id))"
+            Expected = 'a vNIC template carrying it'
+            Actual   = 'added directly to a service profile vNIC'
+            Detail   = ("VLAN '{0}' (id {1}) reaches a blade through a vNIC configured directly on a service profile rather than through a template. It survives until that profile is rebuilt, and no template push will restore it." -f $entry.Name, $entry.Id)
+        })
+    }
+
+    # No leading comma. The elements are finding objects, not arrays, so there is
+    # nothing to protect from unrolling - and ',@()' would hand the caller a
+    # one-element array wrapping an empty one, which reads as a finding.
     return $results.ToArray()
 }
 
@@ -1435,12 +1741,12 @@ function Get-EsxiDiscoveryCandidate {
                 }
             }
             catch {
-                Write-RichoLog "QueryNetworkHint failed for $hostName/$($pnic.Device): $($_.Exception.Message)" -Level DEBUG
+                Write-Log "QueryNetworkHint failed for $hostName/$($pnic.Device): $($_.Exception.Message)" -Level DEBUG
             }
         }
     }
     catch {
-        Write-RichoLog "Could not read CDP/LLDP for ${hostName}: $($_.Exception.Message)" -Level WARN
+        Write-Log "Could not read CDP/LLDP for ${hostName}: $($_.Exception.Message)" -Level WARN
     }
 
     $rows = $found.ToArray()
@@ -1517,17 +1823,19 @@ function Get-UcsRunCredential {
     if ($script:UcsCredentialBlocked) { return $null }
 
     if ($null -ne $script:UcsCredentialCache) {
-        Write-RichoLog "UCS Manager: using '$($script:UcsCredentialCache.UserName)', held from earlier in this run." -Level DEBUG
+        Write-Log "UCS Manager: using '$($script:UcsCredentialCache.UserName)', held from earlier in this run." -Level DEBUG
         return $script:UcsCredentialCache
     }
 
     if ($null -ne $script:SharedCredential -and -not $script:SharedCredentialRejected) {
-        Write-RichoLog "UCS Manager: using '$($script:SharedCredential.UserName)', already accepted by $($script:SharedCredentialSource)." -Level INFO
+        Write-Log "UCS Manager: using '$($script:SharedCredential.UserName)', already accepted by $($script:SharedCredentialSource)." -Level INFO
         return $script:SharedCredential
     }
 
-    Write-RichoLog "UCS Manager: no usable credential held; resolving '$($script:UcsCredentialName)'." -Level INFO
-    $resolved = Get-RichoCredential -Name $script:UcsCredentialName
+    Write-Log 'UCS Manager: no usable credential to pass through; asking for one.' -Level INFO
+    $resolved = $null
+    try { $resolved = Get-Credential -Message 'Credentials for UCS Manager' } catch { $resolved = $null }
+    if ($null -eq $resolved -or [string]::IsNullOrWhiteSpace($resolved.GetNetworkCredential().Password)) { return $null }
     $script:UcsCredentialCache = $resolved
     return $resolved
 }
@@ -1576,7 +1884,7 @@ function Register-UcsCredentialResult {
 
     if ($null -ne $script:SharedCredential -and $null -eq $script:UcsCredentialCache) {
         $script:SharedCredentialRejected = $true
-        Write-RichoLog "UCS Manager rejected the $($script:SharedCredentialSource) credential; it will not be offered to UCS again." -Level WARN
+        Write-Log "UCS Manager rejected the $($script:SharedCredentialSource) credential; it will not be offered to UCS again." -Level WARN
     }
 
     $script:UcsCredentialCache = $null
@@ -1584,15 +1892,14 @@ function Register-UcsCredentialResult {
 
     if ($script:UcsCredentialAttempt -ge $MaxCredentialAttempt) {
         $script:UcsCredentialBlocked = $true
-        # WARN, not ERROR. Write-RichoLog ERROR writes to the error stream, and
-        # with $ErrorActionPreference = 'Stop' that terminates the run - which
-        # would abandon every other domain over one domain's bad password. The
-        # run continues; the domains it could not check are findings of their own.
-        Write-RichoLog "UCS Manager sign-in has failed $($script:UcsCredentialAttempt) time(s). No further UCS login will be attempted this run, to avoid locking the account." -Level WARN
+        # WARN, not ERROR. The run continues past a domain it cannot sign in to -
+        # abandoning every other domain over one domain's bad password helps
+        # nobody - and the domains it could not check become findings of their own.
+        Write-Log "UCS Manager sign-in has failed $($script:UcsCredentialAttempt) time(s). No further UCS login will be attempted this run, to avoid locking the account." -Level WARN
         return
     }
 
-    Write-RichoLog "The held UCS credential has been discarded - attempt $($script:UcsCredentialAttempt) of $MaxCredentialAttempt." -Level WARN
+    Write-Log "The held UCS credential has been discarded - attempt $($script:UcsCredentialAttempt) of $MaxCredentialAttempt." -Level WARN
 }
 
 function Connect-UcsForTarget {
@@ -1626,17 +1933,17 @@ function Connect-UcsForTarget {
     if ($script:UcsSessions.ContainsKey($clean)) { return $script:UcsSessions[$clean] }
 
     if ($script:UcsCredentialBlocked) {
-        Write-RichoLog "Skipping UCS Manager '$clean' - UCS sign-in is blocked for this run." -Level WARN
+        Write-Log "Skipping UCS Manager '$clean' - UCS sign-in is blocked for this run." -Level WARN
         return $null
     }
 
     $credential = Get-UcsRunCredential
     if ($null -eq $credential) {
-        Write-RichoLog "No credential available for UCS Manager '$clean'." -Level WARN
+        Write-Log "No credential available for UCS Manager '$clean'." -Level WARN
         return $null
     }
 
-    Write-RichoLog "Connecting to UCS Manager '$clean' as '$($credential.UserName)'." -Level INFO
+    Write-Log "Connecting to UCS Manager '$clean' as '$($credential.UserName)'." -Level INFO
     $session = $null
     try {
         $session = Connect-Ucs -Name $clean -Credential $credential -ErrorAction Stop
@@ -1647,7 +1954,7 @@ function Connect-UcsForTarget {
         }
         catch {
             $failure = $_.Exception.Message
-            Write-RichoLog "UCS Manager '$clean' sign-in failed: $failure" -Level WARN
+            Write-Log "UCS Manager '$clean' sign-in failed: $failure" -Level WARN
             Register-UcsCredentialResult -Succeeded $false -Message $failure
             return $null
         }
@@ -1655,7 +1962,7 @@ function Connect-UcsForTarget {
 
     Register-UcsCredentialResult -Succeeded $true
     $script:UcsSessions[$clean] = $session
-    Write-RichoLog "Connected to UCS Manager '$clean'." -Level INFO
+    Write-Log "Connected to UCS Manager '$clean'." -Level INFO
     return $session
 }
 
@@ -1700,12 +2007,12 @@ function Get-UcsInventory {
 
     if (Get-Command -Name $Cmdlet -ErrorAction SilentlyContinue) {
         try { return @(& $Cmdlet -Ucs $Session -ErrorAction Stop) }
-        catch { Write-RichoLog "$Cmdlet failed ($($_.Exception.Message)); falling back to class $ClassId." -Level DEBUG }
+        catch { Write-Log "$Cmdlet failed ($($_.Exception.Message)); falling back to class $ClassId." -Level DEBUG }
     }
 
     try { return @(Get-UcsManagedObject -Ucs $Session -ClassId $ClassId -ErrorAction Stop) }
     catch {
-        Write-RichoLog "Could not read $ClassId from UCS: $($_.Exception.Message)" -Level WARN
+        Write-Log "Could not read $ClassId from UCS: $($_.Exception.Message)" -Level WARN
         return @()
     }
 }
@@ -1972,46 +2279,50 @@ function Resolve-UcsServiceProfile {
 # Main
 # ============================================================================
 
-$transcriptPath = if ($Transcript) { Start-RichoTranscript } else { $null }
+$transcriptPath = $null
+if ($Transcript) {
+    $transcriptPath = Join-Path (Get-Location).Path ('Test-UcsVnicVlanConsistency-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
+    Start-Transcript -Path $transcriptPath | Out-Null
+}
 
 try {
     $pairGroups = ConvertTo-OrdinalGroup -Group $VnicPairGroup
-    Write-RichoLog ("Comparing vNIC groups: {0}." -f (@($pairGroups | ForEach-Object { '[' + ($_ -join '/') + ']' }) -join ' ')) -Level INFO
+    Write-Log ("Comparing vNIC groups: {0}." -f (@($pairGroups | ForEach-Object { '[' + ($_ -join '/') + ']' }) -join ' ')) -Level INFO
 
-    Assert-RichoModule -Name VMware.VimAutomation.Core, VMware.VimAutomation.Vds
-    if (-not (Get-Command -Name Connect-Ucs -ErrorAction SilentlyContinue)) {
-        throw "Cisco UCS PowerTool is not available - Connect-Ucs was not found. Install it with: Install-Module -Name Cisco.UCSManager -Scope CurrentUser"
+    # By CMDLET, not by module name. PowerCLI has been split and renamed across
+    # releases and the UCS PowerTool ships under more than one module name, so a
+    # name check fails on hosts where the cmdlets are right there. This also
+    # avoids enumerating the module path, which on a host with PowerCLI installed
+    # is slow enough to look like a hang.
+    $missing = New-Object System.Collections.Generic.List[string]
+    foreach ($requirement in @(
+        [pscustomobject]@{ Cmdlet = 'Connect-VIServer'; From = 'VMware PowerCLI (Install-Module VMware.PowerCLI)' }
+        [pscustomobject]@{ Cmdlet = 'Get-VMHost';       From = 'VMware PowerCLI (Install-Module VMware.PowerCLI)' }
+        [pscustomobject]@{ Cmdlet = 'Get-VDSwitch';     From = 'VMware PowerCLI (Install-Module VMware.PowerCLI)' }
+        [pscustomobject]@{ Cmdlet = 'Connect-Ucs';      From = 'Cisco UCS PowerTool (Install-Module Cisco.UCSManager)' }
+    )) {
+        if (-not (Get-Command -Name $requirement.Cmdlet -ErrorAction SilentlyContinue)) {
+            [void]$missing.Add(('{0} - from {1}' -f $requirement.Cmdlet, $requirement.From))
+        }
+    }
+    if ($missing.Count -gt 0) {
+        throw ("This script needs cmdlets that are not available in this session:`n  " + ($missing.ToArray() -join "`n  "))
     }
 
     # ---- Where to connect --------------------------------------------------
     $viTarget = $VIServer
     $viCredential = $Credential
-
-    if (-not $viTarget -or -not $viCredential) {
-        $config = Get-RichoConfig -Name $Environment
-        Write-RichoLog "Targeting environment '$($config.Name)'." -Level INFO
-        $vcenter = Get-MoProperty $config 'vcenter' $null
-        if (-not $viTarget) { $viTarget = [string](Get-MoProperty $vcenter 'server' '') }
-        if (-not $viCredential) {
-            $credentialName = [string](Get-MoProperty $vcenter 'credentialName' '')
-            if (-not $credentialName) { throw "The environment config has no vcenter.credentialName; pass -Credential instead." }
-            $viCredential = Get-RichoCredential -Name $credentialName
-        }
-        # 'ucsm', matching config/environments.example.json. Only the credential
-        # name is taken: the domain to connect to comes from the host's own
-        # CDP/LLDP neighbour, or from -UcsManager, never from a config entry that
-        # may name a different domain than the blades in front of you.
-        $ucsName = [string](Get-MoProperty (Get-MoProperty $config 'ucsm' $null) 'credentialName' '')
-        if ($ucsName) { $script:UcsCredentialName = $ucsName }
+    if ($null -eq $viCredential) {
+        $viCredential = Get-Credential -Message "Credentials for vCenter '$viTarget'"
     }
+    if ($null -eq $viCredential) { throw "No credential supplied for vCenter '$viTarget'." }
 
-    if (-not $viTarget) { throw 'No vCenter to connect to. Pass -VIServer, or set vcenter.server in the environment config.' }
     if ($PSBoundParameters.ContainsKey('UcsCredential')) { $script:UcsCredentialCache = $UcsCredential }
 
     # ---- vCenter -----------------------------------------------------------
-    Write-RichoLog "Connecting to vCenter '$viTarget' as '$($viCredential.UserName)'." -Level INFO
+    Write-Log "Connecting to vCenter '$viTarget' as '$($viCredential.UserName)'." -Level INFO
     $viConnection = Connect-VIServer -Server $viTarget -Credential $viCredential -ErrorAction Stop
-    Write-RichoLog "Connected to vCenter '$($viConnection.Name)'." -Level INFO
+    Write-Log "Connected to vCenter '$($viConnection.Name)'." -Level INFO
 
     # Proven, and only now. The point of replaying a credential is that it is
     # known good; replaying an unproven one at each UCS domain in turn is how an
@@ -2039,13 +2350,13 @@ try {
 
     $targetHosts = @($targetHosts | Where-Object { $_.ConnectionState -eq 'Connected' -or $_.ConnectionState -eq 'Maintenance' } | Sort-Object Name)
     if ($targetHosts.Count -eq 0) { throw 'No connected hosts matched the given -Cluster/-VMHostName filters.' }
-    Write-RichoLog "$($targetHosts.Count) host(s) in scope." -Level INFO
+    Write-Log "$($targetHosts.Count) host(s) in scope." -Level INFO
 
     # ---- vDS inventory, read once -----------------------------------------
     $vdsByName = @{}
     $portGroupsByVds = @{}
     foreach ($vds in @(Get-VDSwitch -ErrorAction SilentlyContinue)) { $vdsByName[[string]$vds.Name] = $vds }
-    Write-RichoLog "$($vdsByName.Count) distributed switch(es) visible in this vCenter." -Level DEBUG
+    Write-Log "$($vdsByName.Count) distributed switch(es) visible in this vCenter." -Level DEBUG
 
     # ---- Map each host to a UCS domain -------------------------------------
     $hostsByTarget = @{}
@@ -2053,7 +2364,7 @@ try {
         $targets = if ($UcsManager) { @($UcsManager) } else { @(Get-UcsTargetForHost -VMHostObject $esx) }
 
         if ($targets.Count -eq 0) {
-            Write-RichoLog "$($esx.Name) reports no CDP or LLDP neighbour, so its UCS domain is unknown. Skipping it." -Level WARN
+            Write-Log "$($esx.Name) reports no CDP or LLDP neighbour, so its UCS domain is unknown. Skipping it." -Level WARN
             Add-Finding -Severity 'WARN' -Scope 'vCenter' -Check 'NoDiscoveryNeighbour' -HostName $esx.Name `
                 -Subject $esx.Name -Expected 'a CDP or LLDP neighbour on at least one vmnic' -Actual 'none reported' `
                 -Detail "$($esx.Name) reports no CDP or LLDP neighbour on any physical NIC, so the UCS domain in front of it could not be identified. Either discovery is disabled on the vNIC's network control policy, or the vDS is set to a protocol the fabric does not send."
@@ -2062,13 +2373,13 @@ try {
 
         $target = $targets[0]
         if ($targets.Count -gt 1) {
-            Write-RichoLog "$($esx.Name) reports several neighbour names ($($targets -join ', ')); using '$target'." -Level DEBUG
+            Write-Log "$($esx.Name) reports several neighbour names ($($targets -join ', ')); using '$target'." -Level DEBUG
         }
         if (-not $hostsByTarget.ContainsKey($target)) { $hostsByTarget[$target] = New-Object System.Collections.Generic.List[object] }
         [void]$hostsByTarget[$target].Add($esx)
     }
 
-    Write-RichoLog "$($hostsByTarget.Count) UCS domain(s) to check: $((@($hostsByTarget.Keys) | Sort-Object) -join ', ')." -Level INFO
+    Write-Log "$($hostsByTarget.Count) UCS domain(s) to check: $((@($hostsByTarget.Keys) | Sort-Object) -join ', ')." -Level INFO
 
     # ---- Per UCS domain ----------------------------------------------------
     foreach ($target in @($hostsByTarget.Keys | Sort-Object)) {
@@ -2081,7 +2392,7 @@ try {
             continue
         }
 
-        Write-RichoLog "Reading the VLAN and vNIC configuration of '$target'." -Level INFO
+        Write-Log "Reading the VLAN and vNIC configuration of '$target'." -Level INFO
         $vlans = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVlan' -ClassId 'fabricVlan')
         $vsans = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVsan' -ClassId 'fabricVsan')
         $templates = @(Get-UcsInventory -Session $session -Cmdlet 'Get-UcsVnicTemplate' -ClassId 'vnicLanConnTempl')
@@ -2107,9 +2418,27 @@ try {
         }
 
         $templateByName = @{}
+        $templateDn = @{}
         foreach ($template in $templates) {
             $name = [string](Get-MoProperty $template 'Name' '')
             if ($name -and -not $templateByName.ContainsKey($name)) { $templateByName[$name] = $template }
+            $dn = [string](Get-MoProperty $template 'Dn' '')
+            if ($dn) { $templateDn[$dn] = $true }
+        }
+
+        # Every VLAN name reached from a template, and every one reached only
+        # from a service profile's own vNIC. The parent Dn of an interface row is
+        # what separates them - templates and vNICs hold their VLANs the same way.
+        $vlanOnTemplate = New-Object System.Collections.Generic.List[string]
+        $vlanOnVnic = New-Object System.Collections.Generic.List[string]
+        foreach ($interface in $interfaces) {
+            $name = [string](Get-MoProperty $interface 'Name' '')
+            if (-not $name) { continue }
+            $parent = Get-ParentDn -Dn ([string](Get-MoProperty $interface 'Dn' ''))
+            if ($templateDn.ContainsKey($parent)) {
+                if (-not $vlanOnTemplate.Contains($name)) { [void]$vlanOnTemplate.Add($name) }
+            }
+            elseif (-not $vlanOnVnic.Contains($name)) { [void]$vlanOnVnic.Add($name) }
         }
 
         $controlPolicyByName = @{}
@@ -2126,13 +2455,18 @@ try {
             [void]$vnicsByProfile[$parent].Add($vnic)
         }
 
-        Write-RichoLog ("'{0}': {1} VLAN(s), {2} vNIC template(s), {3} service profile(s)." -f $target, $vlans.Count, $templates.Count, $profiles.Count) -Level INFO
+        Write-Log ("'{0}': {1} VLAN(s), {2} vNIC template(s), {3} service profile(s)." -f $target, $vlans.Count, $templates.Count, $profiles.Count) -Level INFO
 
         # --- domain-wide VLAN definitions ------------------------------------
-        foreach ($finding in @(Test-UcsVlanInventory -Vlan $vlans -Vsan $vsans)) {
-            Add-Finding -Severity $finding.Severity -Scope 'UCS' -Check $finding.Check -Domain $target `
-                -Subject $finding.Subject -Expected $finding.Expected -Actual $finding.Actual -Detail $finding.Detail
-        }
+        Add-CheckResult -Finding @(Test-UcsVlanInventory -Vlan $vlans -Vsan $vsans) `
+            -Scope 'UCS' -Domain $target -Check 'VlanDefinitions' -Subject "$target VLAN table" `
+            -Detail ("All {0} VLAN definitions in this domain are unique by id and by name, inside the usable range, and none collide with a VSAN's FCoE VLAN." -f $vlans.Count)
+
+        # --- VLANs the fabric carries that no vNIC template uses --------------
+        Add-CheckResult -Finding @(Test-UcsVlanAssignment -Vlan $vlans -TemplateVlanName $vlanOnTemplate.ToArray() `
+                    -ProfileVlanName $vlanOnVnic.ToArray() -MaxIndividual $MaxUnassignedVlanDetail) `
+            -Scope 'UCS' -Domain $target -Check 'VlanAssignment' -Subject "$target vNIC templates" `
+            -Detail ("Every VLAN defined on this fabric is carried by at least one vNIC template - {0} VLAN(s) across {1} template(s)." -f $vlanOnTemplate.Count, $templates.Count)
 
         # --- per host --------------------------------------------------------
         foreach ($esx in $domainHosts) {
@@ -2143,7 +2477,7 @@ try {
                 $hostUuid = [string](Get-MoProperty (Get-MoProperty (Get-MoProperty $hostView 'Hardware' $null) 'SystemInfo' $null) 'Uuid' '')
             }
             catch {
-                Write-RichoLog "Could not read the host view for $($esx.Name): $($_.Exception.Message)" -Level WARN
+                Write-Log "Could not read the host view for $($esx.Name): $($_.Exception.Message)" -Level WARN
             }
 
             $serviceProfile = Resolve-UcsServiceProfile -HostName $esx.Name -HostUuid $hostUuid -Profile $profiles
@@ -2166,7 +2500,7 @@ try {
             }
 
             $ordinalMap = Get-VnicOrdinalMap -Vnic $profileVnics
-            Write-RichoLog ("{0}: service profile '{1}', {2} vNIC(s), ordinals derived from {3}." -f $esx.Name, (Get-MoProperty $serviceProfile 'Name' ''), $profileVnics.Count, $ordinalMap.Source) -Level DEBUG
+            Write-Log ("{0}: service profile '{1}', {2} vNIC(s), ordinals derived from {3}." -f $esx.Name, (Get-MoProperty $serviceProfile 'Name' ''), $profileVnics.Count, $ordinalMap.Source) -Level DEBUG
 
             if ($ordinalMap.Source -eq 'order') {
                 Add-Finding -Severity 'INFO' -Scope 'UCS' -Check 'VnicOrdinalDerived' -Domain $target -HostName $esx.Name `
@@ -2205,16 +2539,16 @@ try {
             foreach ($group in $pairGroups) {
                 $members = @($group | Where-Object { $memberByOrdinal.ContainsKey($_) } | ForEach-Object { $memberByOrdinal[$_] })
                 if ($members.Count -eq 0) { continue }
-                foreach ($finding in @(Compare-VnicGroup -Member $members -ExpectedMtu $ExpectedMtu)) {
-                    Add-Finding -Severity $finding.Severity -Scope 'UCS' -Check $finding.Check -Domain $target -HostName $esx.Name `
-                        -Subject $finding.Subject -Expected $finding.Expected -Actual $finding.Actual -Detail $finding.Detail
-                }
+                $label = (@($members | ForEach-Object { $_.VnicName }) -join '/')
+                Add-CheckResult -Finding @(Compare-VnicGroup -Member $members -ExpectedMtu $ExpectedMtu) `
+                    -Scope 'UCS' -Domain $target -HostName $esx.Name -Check 'VnicPair' -Subject $label `
+                    -Detail ("{0} match on VLANs ({1}), native VLAN, MTU {2} and their network control, QoS and adapter policies, and sit on separate fabric interconnects." -f $label, (Format-IdList -Id @($members[0].VlanIds)), $members[0].Mtu)
             }
 
             # --- the vSphere cross-check --------------------------------------
             $uplinkMap = Get-HostUplinkMap -HostView $hostView
             if ($uplinkMap.Count -eq 0) {
-                Write-RichoLog "$($esx.Name) has no distributed switch uplinks; nothing to cross-check." -Level DEBUG
+                Write-Log "$($esx.Name) has no distributed switch uplinks; nothing to cross-check." -Level DEBUG
                 continue
             }
 
@@ -2241,7 +2575,7 @@ try {
                 $nativeId = if ($natives.Count -ge 1) { $natives[0] } else { 0 }
 
                 if (-not $vdsByName.ContainsKey($vdsName)) {
-                    Write-RichoLog "vDS '$vdsName' is on $($esx.Name) but was not returned by Get-VDSwitch; skipping its port groups." -Level WARN
+                    Write-Log "vDS '$vdsName' is on $($esx.Name) but was not returned by Get-VDSwitch; skipping its port groups." -Level WARN
                     continue
                 }
                 $vds = $vdsByName[$vdsName]
@@ -2261,20 +2595,27 @@ try {
                     $portGroupsByVds[$vdsName] = $rows.ToArray()
                 }
 
-                foreach ($finding in @(Compare-VdsVlanCoverage -VdsName $vdsName -PortGroup $portGroupsByVds[$vdsName] `
-                        -TrunkedVlanId $trunked -NativeVlanId $nativeId -LargeTrunkThreshold $LargeTrunkThreshold)) {
-                    Add-Finding -Severity $finding.Severity -Scope 'CrossCheck' -Check $finding.Check -Domain $target -HostName $esx.Name `
-                        -Subject $finding.Subject -Expected $finding.Expected -Actual $finding.Actual -Detail $finding.Detail
-                }
+                Add-CheckResult -Finding @(Compare-VdsVlanCoverage -VdsName $vdsName -PortGroup $portGroupsByVds[$vdsName] `
+                        -TrunkedVlanId $trunked -NativeVlanId $nativeId -LargeTrunkThreshold $LargeTrunkThreshold) `
+                    -Scope 'CrossCheck' -Domain $target -HostName $esx.Name -Check 'VdsVlanCoverage' -Subject $vdsName `
+                    -Detail ("Every VLAN the {0} port group(s) on '{1}' need is trunked to the vmnics behind it ({2})." -f @($portGroupsByVds[$vdsName]).Count, $vdsName, (Format-IdList -Id $trunked))
 
                 # --- MTU: the vDS cannot carry more than the vNIC does ---------
                 $vdsMtu = [int](Get-MoProperty (Get-MoProperty $vds.ExtensionData 'Config' $null) 'MaxMtu' 0)
                 if ($vdsMtu -gt 0) {
+                    $mtuFindings = New-Object System.Collections.Generic.List[object]
                     foreach ($member in @($backing | Where-Object { [int]$_.Mtu -gt 0 -and [int]$_.Mtu -lt $vdsMtu })) {
-                        Add-Finding -Severity 'ERROR' -Scope 'CrossCheck' -Check 'VdsMtuExceedsVnicMtu' -Domain $target -HostName $esx.Name `
-                            -Subject "$vdsName / $($member.VnicName)" -Expected "a vNIC MTU of at least $vdsMtu" -Actual "$($member.Mtu)" `
-                            -Detail "'$vdsName' is set to MTU $vdsMtu but $($member.VnicName) (template '$($member.TemplateName)') is MTU $($member.Mtu). Frames above $($member.Mtu) are dropped at the fabric interconnect."
+                        [void]$mtuFindings.Add([pscustomobject]@{
+                            Severity = 'ERROR'; Check = 'VdsMtuExceedsVnicMtu'
+                            Subject  = "$vdsName / $($member.VnicName)"
+                            Expected = "a vNIC MTU of at least $vdsMtu"
+                            Actual   = "$($member.Mtu)"
+                            Detail   = "'$vdsName' is set to MTU $vdsMtu but $($member.VnicName) (template '$($member.TemplateName)') is MTU $($member.Mtu). Frames above $($member.Mtu) are dropped at the fabric interconnect."
+                        })
                     }
+                    Add-CheckResult -Finding $mtuFindings.ToArray() `
+                        -Scope 'CrossCheck' -Domain $target -HostName $esx.Name -Check 'VdsMtu' -Subject $vdsName `
+                        -Detail ("'{0}' is set to MTU {1} and every UCS vNIC behind it carries at least that." -f $vdsName, $vdsMtu)
                 }
 
                 # --- discovery protocol ---------------------------------------
@@ -2283,6 +2624,7 @@ try {
                 # neighbour and the domain in front of it cannot be identified.
                 $discovery = Get-VdsDiscoveryProtocol -VdsView $vds.ExtensionData
                 if ($discovery.Protocol -and $discovery.Operation -notmatch '^(none|)$') {
+                    $discoveryFindings = New-Object System.Collections.Generic.List[object]
                     foreach ($member in $backing) {
                         $policy = $null
                         if ($member.NetworkControlPolicy -and $controlPolicyByName.ContainsKey($member.NetworkControlPolicy)) {
@@ -2293,20 +2635,31 @@ try {
                         if ($discovery.Protocol -eq 'cdp') {
                             $cdp = [string](Get-MoProperty $policy 'Cdp' 'disabled')
                             if ($cdp -ne 'enabled') {
-                                Add-Finding -Severity 'WARN' -Scope 'CrossCheck' -Check 'CdpDisabledOnUcs' -Domain $target -HostName $esx.Name `
-                                    -Subject "$vdsName / $($member.VnicName)" -Expected 'CDP enabled on the network control policy' -Actual $cdp `
-                                    -Detail "'$vdsName' is set to CDP ($($discovery.Operation)) but network control policy '$($member.NetworkControlPolicy)' behind $($member.VnicName) has CDP $cdp. The host will report no neighbour on that uplink."
+                                [void]$discoveryFindings.Add([pscustomobject]@{
+                                    Severity = 'WARN'; Check = 'CdpDisabledOnUcs'
+                                    Subject  = "$vdsName / $($member.VnicName)"
+                                    Expected = 'CDP enabled on the network control policy'
+                                    Actual   = $cdp
+                                    Detail   = "'$vdsName' is set to CDP ($($discovery.Operation)) but network control policy '$($member.NetworkControlPolicy)' behind $($member.VnicName) has CDP $cdp. The host will report no neighbour on that uplink."
+                                })
                             }
                         }
                         elseif ($discovery.Protocol -eq 'lldp') {
                             $transmit = [string](Get-MoProperty $policy 'LldpTransmit' 'unknown')
                             if ($transmit -eq 'disabled') {
-                                Add-Finding -Severity 'WARN' -Scope 'CrossCheck' -Check 'LldpDisabledOnUcs' -Domain $target -HostName $esx.Name `
-                                    -Subject "$vdsName / $($member.VnicName)" -Expected 'LLDP transmit enabled on the network control policy' -Actual $transmit `
-                                    -Detail "'$vdsName' is set to LLDP ($($discovery.Operation)) but network control policy '$($member.NetworkControlPolicy)' behind $($member.VnicName) has LLDP transmit disabled. The host will report no neighbour on that uplink."
+                                [void]$discoveryFindings.Add([pscustomobject]@{
+                                    Severity = 'WARN'; Check = 'LldpDisabledOnUcs'
+                                    Subject  = "$vdsName / $($member.VnicName)"
+                                    Expected = 'LLDP transmit enabled on the network control policy'
+                                    Actual   = $transmit
+                                    Detail   = "'$vdsName' is set to LLDP ($($discovery.Operation)) but network control policy '$($member.NetworkControlPolicy)' behind $($member.VnicName) has LLDP transmit disabled. The host will report no neighbour on that uplink."
+                                })
                             }
                         }
                     }
+                    Add-CheckResult -Finding $discoveryFindings.ToArray() `
+                        -Scope 'CrossCheck' -Domain $target -HostName $esx.Name -Check 'DiscoveryProtocol' -Subject $vdsName `
+                        -Detail ("'{0}' is set to {1} ({2}) and the UCS network control policies behind it have {1} enabled, so the blades report their neighbour." -f $vdsName, $discovery.Protocol.ToUpperInvariant(), $discovery.Operation)
                 }
             }
         }
@@ -2317,25 +2670,32 @@ try {
     $errorCount = @($all | Where-Object { $_.Severity -eq 'ERROR' }).Count
     $warnCount = @($all | Where-Object { $_.Severity -eq 'WARN' }).Count
     $infoCount = @($all | Where-Object { $_.Severity -eq 'INFO' }).Count
-    Write-RichoLog "$errorCount error(s), $warnCount warning(s), $infoCount informational finding(s)." -Level INFO
+    $okCount = @($all | Where-Object { $_.Severity -eq 'OK' }).Count
+    Write-Log "$errorCount error(s), $warnCount warning(s), $infoCount informational, $okCount clean." -Level INFO
 
+    # OK rows stay in by default - they are what makes the report reviewable
+    # rather than merely scannable. INFO is context and stays behind the switch.
     $selected = if ($IncludeInformational) { $all } else { @($all | Where-Object { $_.Severity -ne 'INFO' }) }
 
-    $order = @{ 'ERROR' = 0; 'WARN' = 1; 'INFO' = 2 }
+    # Faults first, then context, then the clean rows. Column order is for
+    # reading left to right in a spreadsheet: how bad, what was checked, what it
+    # was checked on, then what should have been true and what is.
+    $order = @{ 'ERROR' = 0; 'WARN' = 1; 'INFO' = 2; 'OK' = 3 }
     $output = @($selected |
         Sort-Object -Property @{ Expression = { $order[$_.Severity] } }, Domain, Scope, Check, Subject |
         ForEach-Object {
             [pscustomobject]@{
                 Severity  = $_.Severity
+                Status    = $(if ($_.Severity -eq 'OK') { 'PASS' } elseif ($_.Severity -eq 'INFO') { 'NOTE' } else { 'REVIEW' })
                 Scope     = $_.Scope
-                Domain    = $_.Domain
                 Check     = $_.Check
                 Subject   = $_.Subject
+                Domain    = $_.Domain
+                HostCount = $_.Hosts.Count
+                Hosts     = ($_.Hosts.ToArray() -join '; ')
                 Expected  = $_.Expected
                 Actual    = $_.Actual
                 Detail    = $_.Detail
-                HostCount = $_.Hosts.Count
-                Hosts     = ($_.Hosts.ToArray() -join '; ')
             }
         })
 
@@ -2343,17 +2703,56 @@ try {
         $directory = Split-Path -Path $CsvPath -Parent
         if ($directory -and -not (Test-Path $directory)) { New-Item -Path $directory -ItemType Directory -Force | Out-Null }
         $output | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-        Write-RichoLog "Wrote $($output.Count) finding(s) to $CsvPath." -Level INFO
+        Write-Log "Wrote $($output.Count) row(s) to $CsvPath - $errorCount error(s), $warnCount warning(s), $okCount clean." -Level INFO
     }
 
-    if ($output.Count -eq 0) {
-        Write-RichoLog 'No VLAN, MTU or discovery mismatches found in the hosts checked.' -Level INFO
+    # ---- On screen ---------------------------------------------------------
+    # Printed as well as returned. Someone who has downloaded one file and run it
+    # should not have to know to pipe it into Format-Table to see the answer, and
+    # this goes to the host, so '| Export-Csv' still gets the objects and nothing
+    # else. Findings stay on the success stream as objects for anyone who wants
+    # to sort or filter them.
+    Write-Host ''
+    Write-Host '=====================================================================' -ForegroundColor Cyan
+    Write-Host ' VLAN AND vNIC CONSISTENCY' -ForegroundColor Cyan
+    Write-Host '=====================================================================' -ForegroundColor Cyan
+
+    if ($all.Count -eq 0) {
+        Write-Host ' Nothing was checked. No host reached a UCS domain - see the log above.' -ForegroundColor Yellow
     }
+    else {
+        foreach ($finding in $output) {
+            $colour = switch ($finding.Severity) {
+                'ERROR' { 'Red' }
+                'WARN'  { 'Yellow' }
+                'OK'    { 'Green' }
+                default { 'Gray' }
+            }
+            Write-Host (' [{0,-5}] {1,-26} {2}' -f $finding.Severity, $finding.Check, $finding.Subject) -ForegroundColor $colour
+            Write-Host ("         $($finding.Detail)") -ForegroundColor DarkGray
+            if ($finding.HostCount -gt 0) {
+                Write-Host ("         on $($finding.HostCount) host(s): $($finding.Hosts)") -ForegroundColor DarkGray
+            }
+        }
+        if (-not $IncludeInformational -and $infoCount -gt 0) {
+            Write-Host ''
+            Write-Host " $infoCount informational finding(s) withheld. Re-run with -IncludeInformational to see them." -ForegroundColor DarkGray
+        }
+    }
+
+    Write-Host ''
+    if ($errorCount -eq 0 -and $warnCount -eq 0 -and $okCount -gt 0) {
+        Write-Host (' CLEAN - {0} check(s) ran and none found a discrepancy.' -f $okCount) -ForegroundColor Green
+    }
+    else {
+        Write-Host (' {0} error(s), {1} warning(s) to review. {2} check(s) clean, {3} informational.' -f $errorCount, $warnCount, $okCount, $infoCount) -ForegroundColor $(if ($errorCount -gt 0) { 'Red' } else { 'Yellow' })
+    }
+    Write-Host '=====================================================================' -ForegroundColor Cyan
 
     $output
 }
 catch {
-    Write-RichoLog "Failed: $($_.Exception.Message)" -Level ERROR
+    Write-Log "Failed: $($_.Exception.Message)" -Level ERROR
     throw
 }
 finally {

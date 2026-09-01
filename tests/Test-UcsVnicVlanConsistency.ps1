@@ -30,6 +30,7 @@ if ($errors) { throw ("parse errors in $scriptPath : " + (($errors | ForEach-Obj
 
 $underTest = @(
     'Get-MoProperty', 'Format-IdList', 'Get-VlanIdReservation', 'Test-UcsVlanInventory',
+    'Test-UcsVlanAssignment',
     'Get-VlanSummary', 'Get-VnicOrdinal', 'Get-VnicOrdinalMap', 'ConvertTo-OrdinalGroup',
     'Compare-VnicGroup', 'ConvertTo-VlanIdList', 'Test-UplinkPortGroup', 'Get-HostUplinkMap',
     'Get-VdsDiscoveryProtocol', 'Compare-VdsVlanCoverage', 'Get-LldpSystemName',
@@ -132,6 +133,35 @@ $findings = Test-UcsVlanInventory -Vlan @((New-Vlan 'DATA' 4048)) -Vsan @((New-V
 Assert-Equal 'an FCoE collision is reported' 1 (Get-Check $findings 'VlanFcoeCollision').Count
 $findings = Test-UcsVlanInventory -Vlan @((New-Vlan 'DATA' 250)) -Vsan @((New-Vsan 'VSAN-A' 4048))
 Assert-Equal 'no collision when the ids differ' 0 (Get-Check $findings 'VlanFcoeCollision').Count
+
+Write-Host "`n=== VLANs the fabric carries that no vNIC template uses ===" -ForegroundColor Cyan
+$fabric = @((New-Vlan 'MGMT-10' 10), (New-Vlan 'PROD-250' 250), (New-Vlan 'ORPHAN-900' 900))
+
+# The half-finished change: the VLAN exists on the fabric and no blade can use it.
+$findings = Test-UcsVlanAssignment -Vlan $fabric -TemplateVlanName @('MGMT-10', 'PROD-250') -ProfileVlanName @()
+Assert-Equal 'an unused VLAN is reported'      1 (Get-Check $findings 'VlanNotOnAnyVnicTemplate').Count
+Assert-Equal 'and it names the VLAN'           'ORPHAN-900 (900)' (Get-Check $findings 'VlanNotOnAnyVnicTemplate')[0].Subject
+Assert-Equal 'a VLAN on a template is not'     0 @((Get-Check $findings 'VlanNotOnAnyVnicTemplate') | Where-Object { $_.Subject -match 'MGMT' }).Count
+
+# A VLAN reaching a blade only through a hand-edited service profile is a
+# different problem with a different fix, so it is a different finding.
+$findings = Test-UcsVlanAssignment -Vlan $fabric -TemplateVlanName @('MGMT-10') -ProfileVlanName @('PROD-250')
+Assert-Equal 'a VLAN on a vNIC but no template' 1 (Get-Check $findings 'VlanOnVnicButNoTemplate').Count
+Assert-Equal 'and it is INFO, not a warning'    'INFO' (Get-Check $findings 'VlanOnVnicButNoTemplate')[0].Severity
+Assert-Equal 'and is not double-reported'       1 (Get-Check $findings 'VlanNotOnAnyVnicTemplate').Count
+
+# VLAN 1 always exists and is almost never on a template on purpose. Reporting it
+# every run is how the rest of the list stops being read.
+Assert-Equal 'VLAN 1 is skipped' 0 (Get-Check (Test-UcsVlanAssignment -Vlan @((New-Vlan 'default' 1)) -TemplateVlanName @() -ProfileVlanName @()) 'VlanNotOnAnyVnicTemplate').Count
+
+# A domain commonly defines far more VLANs than one set of templates carries.
+$many = @(1..40 | ForEach-Object { New-Vlan "VL$_" (100 + $_) })
+$findings = Test-UcsVlanAssignment -Vlan $many -TemplateVlanName @() -ProfileVlanName @() -MaxIndividual 25
+Assert-Equal 'past the threshold they roll up into one' 1 (Get-Check $findings 'VlanNotOnAnyVnicTemplate').Count
+Assert-Equal 'and the one names the count'              '40 VLANs' (Get-Check $findings 'VlanNotOnAnyVnicTemplate')[0].Subject
+Assert-Equal 'below it they are listed individually'    40 (Get-Check (Test-UcsVlanAssignment -Vlan $many -TemplateVlanName @() -ProfileVlanName @() -MaxIndividual 100) 'VlanNotOnAnyVnicTemplate').Count
+
+Assert-Equal 'a fully used fabric is clean' 0 @(Test-UcsVlanAssignment -Vlan $fabric -TemplateVlanName @('MGMT-10', 'PROD-250', 'ORPHAN-900') -ProfileVlanName @()).Count
 
 Write-Host "`n=== VLANs on a template or a vNIC ===" -ForegroundColor Cyan
 $index = @{

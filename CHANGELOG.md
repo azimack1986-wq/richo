@@ -12,6 +12,57 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Test-UcsVnicVlanConsistency.ps1
 
+### [1.1.0] — 2026-09-01
+
+#### Changed
+
+- **One file, no dependencies.** The script no longer imports `Richo.Common`,
+  reads `config/environments.json`, or resolves credentials through
+  SecretManagement. Copy it to a jump host and run it: `-VIServer` is prompted
+  for when omitted, the credential is prompted for and then passed through to UCS
+  Manager, and everything it used to borrow — the logger, the dependency check,
+  the transcript — is in the file.
+
+  Dependencies are checked **by cmdlet**, not by module name. PowerCLI has been
+  split and renamed across releases and the UCS PowerTool ships under more than
+  one module name, so a name check fails on hosts where the cmdlets are right
+  there. Nothing is imported: a jump host with a pinned bundle already loaded
+  should not have this script fighting it.
+
+  It is now covered by `tests/Test-ScriptLint.ps1` along with the other
+  standalone scripts, which the module import previously made impossible.
+
+- **Clean checks are recorded, not merely absent.** Every check writes a row —
+  `OK` in green when it ran and found nothing. A report listing only faults
+  cannot be told apart from a run where the check never happened, and here a
+  domain that could not be signed in to, a host with no CDP neighbour and a
+  perfectly configured host all produce no fault lines.
+
+  The CSV gained a `Status` column (`REVIEW` / `NOTE` / `PASS`) and its columns
+  were reordered for reading left to right — severity, what was checked, what it
+  was checked on, then expected against actual. Faults sort first, clean rows
+  last. `OK` rows fold across hosts the same way faults do, so a cluster of forty
+  identical blades is one clean row naming them, not forty.
+
+#### Added
+
+- **VLANs on the fabric that no vNIC template uses.** A VLAN created in the
+  domain and never added to a template is a half-finished change: the network
+  side was done, the server side was not, and nothing in UCS Manager marks it.
+
+  Two findings, because they have different fixes — on no template *and* no vNIC
+  at all (nothing in the domain can use it), versus on a service profile's vNIC
+  but no template (a blade has it, but by hand, and a rebuild loses it). VLAN 1
+  is skipped, and past `-MaxUnassignedVlanDetail` the list rolls up into a single
+  finding rather than hundreds of identical ones.
+
+  In passing this is also what identifies which of two duplicate VLAN *names* is
+  the one nothing actually uses.
+
+---
+
+## Test-UcsVnicVlanConsistency.ps1
+
 ### [1.0.0] — 2026-09-01
 
 #### Added
