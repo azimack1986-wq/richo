@@ -113,12 +113,21 @@
       7. A vNIC that has drifted from its own template, which an initial-template
          edited after the profile was stamped produces silently.
 
-      8. The vSphere cross-check. For each host, the physical NICs are mapped to
-         the distributed switch that owns them, and the VLANs the vDS port groups
-         actually need are checked against the VLANs UCS trunks to those same
-         vmnics. A port group VLAN that UCS does not trunk is a black hole; the
-         reverse is only noise, so it is reported as INFO. The vDS MTU is checked
-         against the vNIC MTU behind it.
+      8. The vSphere cross-check, both ways. The physical NICs are mapped to the
+         distributed switch that owns them, and the VLANs the vDS port groups
+         need are checked against the VLANs UCS trunks to those same vmnics.
+
+         A port group VLAN that UCS does not trunk is a black hole - an error
+         however few of them there are.
+
+         The other direction is weighed by scale (-VlanGapThreshold). A couple of
+         spare VLANs is headroom and stays one informational line; a vDS using
+         twelve of the hundred and eighty its uplinks carry is a gap, and the
+         kind nobody sees because everything works. The finding names the counts
+         and the proportion, and says how many of the unused VLANs are actually
+         arriving rather than merely permitted.
+
+         The vDS MTU is checked against the vNIC MTU behind it.
 
       9. What the host actually sees. The VLANs ESXi has observed arriving on a
          vDS's uplinks, against the VLANs its port groups need and the VLANs UCS
@@ -218,6 +227,12 @@
     rather than as a missing-VLAN error. Defaults to 64. Uplink port groups trunk
     everything by design and demanding UCS carry all of it is pure noise.
 
+.PARAMETER VlanGapThreshold
+    How many VLANs trunked to a host's uplinks but used by no port group on that
+    vDS make a gap rather than headroom. Defaults to 10. At or above it the
+    finding is a warning naming the counts and the proportion; below it, one
+    informational line.
+
 .PARAMETER MaxUnassignedVlanDetail
     How many fabric VLANs that no vNIC template uses to report one by one before
     rolling them into a single finding. Defaults to 25. A domain commonly defines
@@ -312,6 +327,9 @@ param(
 
     [ValidateRange(1, 4094)]
     [int]$LargeTrunkThreshold = 64,
+
+    [ValidateRange(1, 4094)]
+    [int]$VlanGapThreshold = 10,
 
     [ValidateRange(1, 4094)]
     [int]$MaxUnassignedVlanDetail = 25,
@@ -1592,11 +1610,21 @@ function Compare-VdsVlanCoverage {
         Findings for the VLANs a vDS needs against the VLANs UCS trunks to it.
 
     .DESCRIPTION
-        The direction that matters is one way. A VLAN a port group needs and UCS
-        does not trunk is a black hole - the port group exists, VMs attach to it,
-        and the frames are dropped at the fabric interconnect. The reverse, a
-        VLAN trunked to the blade that no port group uses, costs nothing and is
-        usually deliberate headroom, so it is INFO.
+        BOTH DIRECTIONS, WEIGHTED DIFFERENTLY.
+
+        A VLAN a port group needs and UCS does not trunk is a black hole - the
+        port group exists, VMs attach to it, and the frames are dropped at the
+        fabric interconnect. That is an error however few of them there are.
+
+        The reverse depends entirely on scale. A couple of VLANs trunked to a
+        blade that no port group uses is deliberate headroom and is left as one
+        informational line. A vDS using twelve of the hundred and eighty its
+        uplinks carry is a gap, and it is the kind nobody sees, because
+        everything works: what it costs is broadcast and flood traffic on every
+        unused VLAN arriving at the adapter to be discarded, MAC table space on
+        the fabric interconnect, and a blast radius covering every VLAN in the
+        trunk instead of the ones the cluster runs. -GapThreshold is where one
+        becomes the other.
 
         A port group trunking more than -LargeTrunkThreshold VLANs is not held to
         the same standard. Those are the transit and uplink-style port groups
@@ -1621,6 +1649,15 @@ function Compare-VdsVlanCoverage {
     .PARAMETER LargeTrunkThreshold
         Port groups wider than this are reported by count instead.
 
+    .PARAMETER GapThreshold
+        How many trunked-but-unused VLANs make a gap rather than headroom. At or
+        above it the finding is a warning naming the counts and the proportion;
+        below it, one informational line.
+
+    .PARAMETER ObservedVlanId
+        VLAN ids the host has actually seen arriving, used only to say how much
+        of the gap is real traffic rather than merely permitted. Optional.
+
     .EXAMPLE
         Compare-VdsVlanCoverage -VdsName dvs01 -PortGroup $groups -TrunkedVlanId $ids -NativeVlanId 0
     #>
@@ -1642,7 +1679,13 @@ function Compare-VdsVlanCoverage {
         [int]$NativeVlanId = 0,
 
         [ValidateRange(1, 4094)]
-        [int]$LargeTrunkThreshold = 64
+        [int]$LargeTrunkThreshold = 64,
+
+        [ValidateRange(1, 4094)]
+        [int]$GapThreshold = 10,
+
+        [AllowEmptyCollection()]
+        [int[]]$ObservedVlanId = @()
     )
 
     $results = New-Object System.Collections.Generic.List[object]
@@ -1692,14 +1735,46 @@ function Compare-VdsVlanCoverage {
         })
     }
 
+    # ---- The gap between what the blade is given and what the vDS uses ------
+    # A couple of spare VLANs is headroom. A vDS using twelve of the hundred and
+    # eighty its uplinks carry is a different thing entirely, and it is the one
+    # nobody sees: everything works, so nothing reports it. What it costs is
+    # every broadcast and every unknown-unicast flood on all the unused VLANs
+    # arriving at the blade's adapter to be discarded there, MAC table space on
+    # the fabric interconnect, and a blast radius that includes every VLAN in the
+    # trunk rather than the ones this cluster actually runs.
+    #
+    # Reported by size, not by presence: the count, the proportion, and - where
+    # the runtime data was gathered - how many of the unused VLANs are not merely
+    # permitted but actually arriving.
     $unused = @($trunked | Where-Object { -not $used.Contains($_) })
-    if ($unused.Count -gt 0) {
+    $consumed = @($trunked | Where-Object { $used.Contains($_) })
+
+    if ($unused.Count -ge $GapThreshold) {
+        $share = 0
+        if ($trunked.Count -gt 0) { $share = [math]::Round(100.0 * $consumed.Count / $trunked.Count) }
+
+        $arriving = @($ObservedVlanId | Where-Object { $unused -contains $_ } | Sort-Object -Unique)
+        $arrivingText = ''
+        if ($arriving.Count -gt 0) {
+            $arrivingText = (" {0} of them are not merely permitted but actually arriving on the wire ({1}), so the flooding is real rather than theoretical." -f $arriving.Count, (Format-IdList -Id $arriving -MaxItem 12))
+        }
+
+        [void]$results.Add([pscustomobject]@{
+            Severity = 'WARN'; Check = 'VdsVlanGap'
+            Subject  = $VdsName
+            Expected = ("port groups for the {0} VLAN(s) trunked to these uplinks" -f $trunked.Count)
+            Actual   = ("{0} of {1} used ({2}%); {3} unused: {4}" -f $consumed.Count, $trunked.Count, $share, $unused.Count, (Format-IdList -Id $unused -MaxItem 30))
+            Detail   = ("UCS trunks {0} VLAN(s) to the vmnics behind '{1}' and its port groups use {2} of them ({3}%). {4} VLAN(s) are delivered to the blade and consumed by nothing: {5}.{6} Either port groups are missing from this vDS, or the vNIC templates trunk far more than this cluster needs - and every unused VLAN costs broadcast and flood traffic at the adapter and widens the blast radius of any VLAN change." -f $trunked.Count, $VdsName, $consumed.Count, $share, $unused.Count, (Format-IdList -Id $unused -MaxItem 30), $arrivingText)
+        })
+    }
+    elseif ($unused.Count -gt 0) {
         [void]$results.Add([pscustomobject]@{
             Severity = 'INFO'; Check = 'TrunkedVlanUnused'
             Subject  = $VdsName
             Expected = ''
             Actual   = (Format-IdList -Id $unused)
-            Detail   = ("UCS trunks VLAN(s) {0} to the vmnics behind '{1}' that no port group uses. Harmless, but it is either headroom or a leftover." -f (Format-IdList -Id $unused), $VdsName)
+            Detail   = ("UCS trunks VLAN(s) {0} to the vmnics behind '{1}' that no port group uses. At this scale it is headroom rather than a gap." -f (Format-IdList -Id $unused), $VdsName)
         })
     }
 
@@ -3651,17 +3726,22 @@ try {
                 $portGroupsByVds[$vdsName] = $rows.ToArray()
             }
 
+            # Read before the coverage comparison, which uses it to say how much
+            # of any gap is real traffic rather than merely permitted.
+            $requiredVlan = @(@($portGroupsByVds[$vdsName] | ForEach-Object { $_.VlanIds }) | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+            $observedVlan = @()
+            if (-not $SkipObservedVlan) { $observedVlan = @(Get-EsxiObservedVlan -VMHostObject $esx -Vmnic $vmnics) }
+
             Add-CheckResult -Finding @(Compare-VdsVlanCoverage -VdsName $vdsName -PortGroup $portGroupsByVds[$vdsName] `
-                    -TrunkedVlanId $trunked -NativeVlanId $nativeId -LargeTrunkThreshold $LargeTrunkThreshold) `
+                    -TrunkedVlanId $trunked -NativeVlanId $nativeId -LargeTrunkThreshold $LargeTrunkThreshold `
+                    -GapThreshold $VlanGapThreshold -ObservedVlanId $observedVlan) `
                 -Scope 'CrossCheck' -Domain $target -HostName $hostName -Check 'VdsVlanCoverage' -Subject $vdsName `
-                -Detail ("Every VLAN the {0} port group(s) on '{1}' need is trunked to the vmnics behind it ({2})." -f @($portGroupsByVds[$vdsName]).Count, $vdsName, (Format-IdList -Id $trunked))
+                -Detail ("Every VLAN the {0} port group(s) on '{1}' need is trunked to the vmnics behind it, and the {2} VLAN(s) trunked there are close to the {3} the port groups use." -f @($portGroupsByVds[$vdsName]).Count, $vdsName, $trunked.Count, $requiredVlan.Count)
 
             # --- what the host actually sees arriving --------------------------
             # The one place this script compares configuration against something
             # other than more configuration.
             if (-not $SkipObservedVlan) {
-                $requiredVlan = @(@($portGroupsByVds[$vdsName] | ForEach-Object { $_.VlanIds }) | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
-                $observedVlan = @(Get-EsxiObservedVlan -VMHostObject $esx -Vmnic $vmnics)
                 Add-CheckResult -Finding @(Compare-VdsObservedVlan -VdsName $vdsName -ObservedVlanId $observedVlan `
                         -RequiredVlanId $requiredVlan -TrunkedVlanId $trunked -Vmnic $vmnics) `
                     -Scope 'CrossCheck' -Domain $target -HostName $hostName -Check 'ObservedVlan' -Subject $vdsName `

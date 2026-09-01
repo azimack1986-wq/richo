@@ -12,6 +12,35 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Test-UcsVnicVlanConsistency.ps1
 
+### [2.3.0] — 2026-09-01
+
+#### Changed
+
+- **The gap between what a blade is given and what its vDS uses is now called
+  out, weighed by scale.** It used to be one informational line saying "UCS
+  trunks these VLANs that nothing uses — harmless". In an estate where the port
+  groups are a small fraction of what the uplinks carry, that is the finding, and
+  it was the one buried at the bottom.
+
+  `VdsVlanGap` (WARN) names the counts and the proportion — *"UCS trunks 180
+  VLAN(s) to the vmnics behind 'dvs-prod' and its port groups use 12 of them
+  (7%)"* — lists the unused ids, and where the runtime read ran, says how many of
+  them are **actually arriving** rather than merely permitted, so the cost is not
+  theoretical.
+
+  This is the kind of gap nobody sees, because everything works. What it costs is
+  broadcast and unknown-unicast flood traffic on every unused VLAN arriving at
+  the adapter to be discarded, MAC table space on the fabric interconnect, and a
+  blast radius covering every VLAN in the trunk instead of the ones the cluster
+  runs.
+
+  `-VlanGapThreshold` (default 10) is where headroom becomes a gap. Below it the
+  old informational line stands, reworded to say so.
+
+---
+
+## Test-UcsVnicVlanConsistency.ps1
+
 ### [2.2.0] — 2026-09-01
 
 #### Added

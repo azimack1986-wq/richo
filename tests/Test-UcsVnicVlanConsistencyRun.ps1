@@ -138,7 +138,9 @@ $global:Hints = @{
     # group uses it - the fabric is delivering something nobody consumes.
     'vmnic2' = [pscustomobject]@{
         ConnectedSwitchPort = $null; LldpInfo = $null
-        Subnet = (New-Observed @(250, 600))
+        # 805 is one of the trunked-but-unused block, and it is arriving: the
+        # flooding is real rather than theoretical.
+        Subnet = (New-Observed @(250, 600, 805))
     }
     'vmnic3' = [pscustomobject]@{
         ConnectedSwitchPort = $null; LldpInfo = $null
@@ -199,7 +201,9 @@ function Get-UcsVlan { param($Ucs, $ErrorAction) @(
     # Created on the fabric and never added to a template: the network half of a
     # change that was never finished on the server side.
     [pscustomobject]@{ Name = 'SPARE-777'; Id = 777; SwitchId = 'dual' }
-) }
+    # Fifteen VLANs trunked to the blade that no port group on dvs-prod uses.
+    # Everything works, so nothing reports it - which is the point.
+) + @(801..815 | ForEach-Object { [pscustomobject]@{ Name = "TRANSIT-$_"; Id = $_; SwitchId = 'dual' } }) }
 function Get-UcsVsan { param($Ucs, $ErrorAction) @([pscustomobject]@{ Name = 'VSAN-A'; Id = 100; FcoeVlan = 4048 }) }
 
 function New-Template { param($Name, $SwitchId, $Mtu, $Ncp, $TemplType = 'updating-template', $Qos = 'BestEffort')
@@ -274,6 +278,12 @@ function Get-UcsVnicInterface { param($Ucs, $ErrorAction) @(
     (New-Interface 'org-root/lan-conn-templ-eth5-tmpl' 'MGMT-10' 10)
     (New-Interface 'org-root/lan-conn-templ-eth6-tmpl' 'PROD-250' 250 'yes')
     (New-Interface 'org-root/lan-conn-templ-eth6-tmpl' 'MGMT-10' 10 'yes')
+) + @(801..815 | ForEach-Object {
+    (New-Interface 'org-root/lan-conn-templ-eth2-tmpl' "TRANSIT-$_" $_),
+    (New-Interface 'org-root/lan-conn-templ-eth3-tmpl' "TRANSIT-$_" $_),
+    (New-Interface 'org-root/ls-esx01/ether-eth2' "TRANSIT-$_" $_),
+    (New-Interface 'org-root/ls-esx01/ether-eth3' "TRANSIT-$_" $_)
+}) + @(
 
     # --- below the service profile's vNICs ---
     # The design: several VLANs trunked per vNIC, exactly one of them native.
@@ -455,11 +465,26 @@ Assert-Equal 'as a mismatch, not a recommendation' 'Consistency' (Get-Check 'Vni
 $boundOk = @((Get-Check 'VnicTemplateBinding') | Where-Object { $_.Severity -eq 'OK' }).Count
 Assert-Equal 'and the bound ones are recorded clean' 7 $boundOk
 
+Write-Host "`n=== The gap between what the blade is given and what the vDS uses ===" -ForegroundColor Cyan
+# dvs-prod's uplinks carry PROD-250 plus fifteen transit VLANs; one port group
+# uses one of them. Everything works, which is why nothing else reports it.
+Assert-Equal 'the gap is called out'      1 (Get-Check 'VdsVlanGap').Count
+Assert-Equal 'against dvs-prod'           'dvs-prod' (Get-Check 'VdsVlanGap')[0].Subject
+Assert-Equal 'as a warning, not a note'   'WARN' (Get-Check 'VdsVlanGap')[0].Severity
+Assert-Equal 'naming the counts'          $true ((Get-Check 'VdsVlanGap')[0].Actual -match '1 of 16 used \(6%\)')
+Assert-Equal 'and the unused range'       $true ((Get-Check 'VdsVlanGap')[0].Actual -match '801-815')
+# One of the unused VLANs is actually arriving, so the cost is not theoretical.
+Assert-Equal 'and how much is real traffic' $true ((Get-Check 'VdsVlanGap')[0].Detail -match '1 of them are not merely permitted')
+# dvs-mgmt has one spare VLAN, which is headroom rather than a gap.
+Assert-Equal 'a small gap stays informational' 1 (Get-Check 'TrunkedVlanUnused').Count
+Assert-Equal 'and it is dvs-mgmt'              'dvs-mgmt' (Get-Check 'TrunkedVlanUnused')[0].Subject
+
 Write-Host "`n=== What the host sees on the wire ===" -ForegroundColor Cyan
 # VLAN 600 arrives on dvs-prod's uplinks and no port group uses it. Strong
 # evidence - the frames are there - so it is a warning, not a hint.
-Assert-Equal 'a VLAN arriving that nothing uses' 1 (Get-Check 'VlanObservedNotOnVds').Count
-Assert-Equal 'and it names the VLAN'             'dvs-prod / VLAN 600' (Get-Check 'VlanObservedNotOnVds')[0].Subject
+$arriving = @((Get-Check 'VlanObservedNotOnVds') | ForEach-Object { $_.Subject } | Sort-Object)
+Assert-Equal 'every VLAN arriving that nothing uses' 2 $arriving.Count
+Assert-Equal 'and it names both'                 'dvs-prod / VLAN 600; dvs-prod / VLAN 805' ($arriving -join '; ')
 Assert-Equal 'as a warning'                      'WARN' (Get-Check 'VlanObservedNotOnVds')[0].Severity
 # 600 is not in the UCS trunk list either, so the config and the wire disagree.
 Assert-Equal 'and that it is outside the trunk'  1 (Get-Check 'VlanObservedNotTrunked').Count

@@ -467,8 +467,39 @@ $findings = @(Compare-VdsVlanCoverage -VdsName 'dvs-prod' -PortGroup $groups -Tr
 Assert-Equal 'an untrunked port group VLAN is an error' 1 (Get-Check $findings 'PortGroupVlanNotTrunked').Count
 Assert-True  'and it names the VLAN'  ((Get-Check $findings 'PortGroupVlanNotTrunked')[0].Detail -match '999')
 
-# The reverse costs nothing and is usually deliberate headroom.
+# A couple of spare VLANs is headroom, not a gap.
 Assert-Equal 'a VLAN nobody uses is only INFO' 'INFO' (Get-Check $findings 'TrunkedVlanUnused')[0].Severity
+
+Write-Host "`n=== The gap: what the blade is given against what the vDS uses ===" -ForegroundColor Cyan
+# The case nobody sees, because everything works. A vDS using two of the
+# twenty-two VLANs its uplinks carry costs broadcast and flood traffic on the
+# other twenty, and widens the blast radius of every VLAN change to all of them.
+$wide = @(200..220)
+$findings = @(Compare-VdsVlanCoverage -VdsName 'dvs-prod' -PortGroup @((New-PortGroup 'PG-250' 'Access' @(250))) -TrunkedVlanId (@(250) + $wide))
+Assert-Equal 'a large gap is a warning, not a note' 1 (Get-Check $findings 'VdsVlanGap').Count
+Assert-Equal 'and it is a WARN'                     'WARN' (Get-Check $findings 'VdsVlanGap')[0].Severity
+Assert-Equal 'and not also reported as headroom'    0 (Get-Check $findings 'TrunkedVlanUnused').Count
+# The counts and the proportion are the point - a list of ids alone does not say
+# how lopsided it is.
+Assert-Equal 'it names the counts'      $true ((Get-Check $findings 'VdsVlanGap')[0].Actual -match '1 of 22 used \(5%\)')
+Assert-Equal 'and lists the unused'     $true ((Get-Check $findings 'VdsVlanGap')[0].Actual -match '200-220')
+
+# Below the threshold it stays one informational line.
+$small = @(Compare-VdsVlanCoverage -VdsName 'dvs' -PortGroup @((New-PortGroup 'PG-250' 'Access' @(250))) -TrunkedVlanId @(250, 300, 301))
+Assert-Equal 'a small gap is headroom'  1 (Get-Check $small 'TrunkedVlanUnused').Count
+Assert-Equal 'and not a gap finding'    0 (Get-Check $small 'VdsVlanGap').Count
+# The line between them is a parameter, not a hardcoded opinion.
+Assert-Equal 'the threshold moves it'   1 (Get-Check (Compare-VdsVlanCoverage -VdsName 'dvs' -PortGroup @((New-PortGroup 'PG-250' 'Access' @(250))) -TrunkedVlanId @(250, 300, 301) -GapThreshold 2) 'VdsVlanGap').Count
+
+# Unused AND arriving is worse than unused and quiet: the flooding is real.
+$arriving = @(Compare-VdsVlanCoverage -VdsName 'dvs-prod' -PortGroup @((New-PortGroup 'PG-250' 'Access' @(250))) `
+    -TrunkedVlanId (@(250) + $wide) -ObservedVlanId @(250, 205, 206))
+Assert-Equal 'it says how much is real traffic' $true ((Get-Check $arriving 'VdsVlanGap')[0].Detail -match '2 of them are not merely permitted')
+# And says nothing about it when the runtime read was skipped.
+Assert-Equal 'and stays silent without it'      $false ((Get-Check $findings 'VdsVlanGap')[0].Detail -match 'not merely permitted')
+
+# A vDS with no port groups at all is the extreme of the same thing.
+Assert-Equal 'an empty vDS is a gap' 1 (Get-Check (Compare-VdsVlanCoverage -VdsName 'dvs' -PortGroup @() -TrunkedVlanId $wide) 'VdsVlanGap').Count
 
 $findings = @(Compare-VdsVlanCoverage -VdsName 'dvs-prod' -PortGroup @((New-PortGroup 'PG-250' 'Access' @(250))) -TrunkedVlanId @(250))
 Assert-Equal 'full coverage produces no error' 0 @($findings | Where-Object { $_.Severity -eq 'ERROR' }).Count
