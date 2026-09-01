@@ -218,8 +218,9 @@ still up:
 - The devices to re-attach are the ones the VMs already have — same LUNs, re-presented —
   so nothing has to scan a host to find them and the operator never types an NAA.
 - Every VM in the group has the same RDM topology as the first: same buses, units,
-  capacities and controller type, all on physical-sharing controllers, and no
-  snapshots.
+  capacities, controller type, bus sharing, disk sharing and compatibility mode, and no
+  snapshots. Bus sharing is **read, not required** — whether these controllers share
+  their bus is the estate's business, and whatever is found is what goes back.
 - The source topology matches the CSV order, LUN by LUN.
 
 ## What it removes at the source
@@ -274,8 +275,14 @@ is routine.
 
 ## What it does at the destination
 
-- Recreates each shared SCSI controller **using the source's own controller type**
-  and bus-sharing mode.
+- Recreates each SCSI controller **using the source's own controller type and
+  bus-sharing mode** — no sharing stays no sharing, physical sharing stays physical
+  sharing.
+- Re-attaches each RDM with the source's own **compatibility mode, disk mode and disk
+  sharing**. Nothing is assumed and nothing is normalised: the guest finds its disks
+  exactly as it left them. The one substitution is a disk mode the source never
+  recorded, which becomes `independent_persistent` — vCenter rejects a physical-mode
+  backing outright when the mode is absent.
 - Attaches each RDM with an explicit device spec at the exact bus and unit it had,
   then reads the VM back and fails if the device that landed there is not the one
   planned.

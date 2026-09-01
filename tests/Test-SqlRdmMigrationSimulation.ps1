@@ -114,7 +114,7 @@ namespace VMware.Vim {
     public class VirtualSCSIController : VirtualController { public int BusNumber; public string SharedBus; }
     public class ParaVirtualSCSIController : VirtualSCSIController { }
     public class VirtualLsiLogicSASController : VirtualSCSIController { }
-    public class VirtualDisk : VirtualDevice { public long CapacityInKB; public long CapacityInBytes; }
+    public class VirtualDisk : VirtualDevice { public long CapacityInKB; public long CapacityInBytes; public string Sharing; }
     public class VirtualCdrom : VirtualDevice { }
     public class VirtualDeviceConfigSpec {
         public string Operation;
@@ -173,6 +173,7 @@ function New-SimRdm {
     param([int]$Key, [int]$ControllerKey, [int]$UnitNumber, [string]$Label, [string]$Naa, [double]$CapacityGB, [string]$MappingFile)
     $backing = New-Object VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo
     $backing.CompatibilityMode = 'physicalMode'
+    $backing.DiskMode = 'independent_persistent'
     $backing.DeviceName = "/vmfs/devices/disks/$Naa"
     $backing.FileName = $MappingFile
     $backing.LunUuid = "uuid-$Naa"
@@ -185,6 +186,7 @@ function New-SimRdm {
     $disk.Backing = $backing
     $disk.CapacityInBytes = [long]($CapacityGB * 1GB)
     $disk.CapacityInKB = [long]($CapacityGB * 1MB)
+    $disk.Sharing = 'sharingNone'
     return $disk
 }
 
@@ -226,9 +228,10 @@ function New-SimVM {
     $cdrom.Backing = $cdromBacking
     $devices.Add($cdrom)
 
-    # SCSI 1: LSI Logic SAS with physical bus sharing, carrying the cluster's RDMs. The
-    # mapping files belong to the first node and are attached by the rest.
-    $sharedController = New-SimScsiController -TypeName 'VMware.Vim.VirtualLsiLogicSASController' -Key (1001 + $Index * 10) -BusNumber 1 -SharedBus 'physicalSharing' -Label 'SCSI controller 1'
+    # SCSI 1: LSI Logic SAS carrying the cluster's RDMs, with NO bus sharing - which is
+    # how this estate builds them, and which the script must reproduce rather than
+    # correct. The mapping files belong to the first node and are attached by the rest.
+    $sharedController = New-SimScsiController -TypeName 'VMware.Vim.VirtualLsiLogicSASController' -Key (1001 + $Index * 10) -BusNumber 1 -SharedBus 'noSharing' -Label 'SCSI controller 1'
     $devices.Add($sharedController)
 
     $capacities = @(100, 250, 500)
@@ -704,12 +707,15 @@ function Get-SimRdms {
             Where-Object { $_.Backing -is [VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo] } |
             ForEach-Object {
                 [pscustomobject]@{
-                    Bus            = [int]$controllers[[int]$_.ControllerKey].BusNumber
-                    Unit           = [int]$_.UnitNumber
-                    Naa            = ([string]$_.Backing.DeviceName -replace '^.*/', '')
-                    MappingFile    = [string]$_.Backing.FileName
-                    ControllerType = $controllers[[int]$_.ControllerKey].GetType().Name
-                    SharedBus      = [string]$controllers[[int]$_.ControllerKey].SharedBus
+                    Bus               = [int]$controllers[[int]$_.ControllerKey].BusNumber
+                    Unit              = [int]$_.UnitNumber
+                    Naa               = ([string]$_.Backing.DeviceName -replace '^.*/', '')
+                    MappingFile       = [string]$_.Backing.FileName
+                    ControllerType    = $controllers[[int]$_.ControllerKey].GetType().Name
+                    SharedBus         = [string]$controllers[[int]$_.ControllerKey].SharedBus
+                    Sharing           = [string]$_.Sharing
+                    CompatibilityMode = [string]$_.Backing.CompatibilityMode
+                    DiskMode          = [string]$_.Backing.DiskMode
                 }
             } |
             Sort-Object Bus, Unit
@@ -797,11 +803,17 @@ try {
         }
     }
 
-    Invoke-SimTest 'The controller type and bus sharing come back as they were' {
+    Invoke-SimTest 'Every device setting comes back exactly as the source had it' {
         foreach ($name in @('SIMSQLA', 'SIMSQLB')) {
             $rdms = @(Get-SimRdms -VMName $name)
             Assert-Equal (@($rdms | ForEach-Object { $_.ControllerType } | Select-Object -Unique) -join ',') 'VirtualLsiLogicSASController' "$name came back on the wrong controller type."
-            Assert-Equal (@($rdms | ForEach-Object { $_.SharedBus } | Select-Object -Unique) -join ',') 'physicalSharing' "$name came back without physical bus sharing."
+
+            # The source has no bus sharing and no disk sharing. The tool must reproduce
+            # that, not impose the arrangement it expects to see.
+            Assert-Equal (@($rdms | ForEach-Object { $_.SharedBus } | Select-Object -Unique) -join ',') 'noSharing' "$name came back with the wrong bus sharing."
+            Assert-Equal (@($rdms | ForEach-Object { $_.Sharing } | Select-Object -Unique) -join ',') 'sharingNone' "$name came back with the wrong disk sharing."
+            Assert-Equal (@($rdms | ForEach-Object { $_.CompatibilityMode } | Select-Object -Unique) -join ',') 'physicalMode' "$name came back with the wrong compatibility mode."
+            Assert-Equal (@($rdms | ForEach-Object { $_.DiskMode } | Select-Object -Unique) -join ',') 'independent_persistent' "$name came back with the wrong disk mode."
         }
     }
 

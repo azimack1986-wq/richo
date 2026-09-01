@@ -193,7 +193,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.11.0'
+$ScriptVersion = '2.12.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -1079,6 +1079,9 @@ function Get-VMRdmLayout {
             Label          = [string]$device.DeviceInfo.Label
             CanonicalName  = $canonicalName
             DeviceName     = [string]$backing.DeviceName
+            CompatibilityMode = [string]$backing.CompatibilityMode
+            DiskMode       = [string]$backing.DiskMode
+            Sharing        = [string]$device.Sharing
             CapacityGB     = [math]::Round($capacityBytes / 1GB, 3)
             ControllerBus  = [int]$controller.BusNumber
             UnitNumber     = [int]$device.UnitNumber
@@ -1489,7 +1492,7 @@ function New-SharedScsiController {
         Full VMware.Vim type name of the source controller.
 
     .PARAMETER SharedBus
-        Bus-sharing mode taken from the source controller, normally physicalSharing.
+        Bus-sharing mode taken from the source controller, whatever it is.
     #>
     [CmdletBinding()]
     param(
@@ -1635,6 +1638,19 @@ function Add-RdmDevice {
 
     .PARAMETER ExistingMappingFile
         Datastore path of a mapping file to attach instead of creating one.
+
+    .PARAMETER CompatibilityMode
+        Compatibility mode read from the source RDM. Physical, for everything this tool
+        handles, but taken from the device rather than assumed.
+
+    .PARAMETER DiskMode
+        Disk mode read from the source RDM. When the source did not carry one,
+        independent_persistent is used: vCenter rejects the backing outright when the
+        mode is absent.
+
+    .PARAMETER Sharing
+        Disk sharing read from the source RDM - sharingNone or sharingMultiWriter. Left
+        alone when the source did not set it.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -1656,7 +1672,19 @@ function Add-RdmDevice {
 
         [Parameter()]
         [AllowEmptyString()]
-        [string]$ExistingMappingFile
+        [string]$ExistingMappingFile,
+
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$CompatibilityMode = 'physicalMode',
+
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$DiskMode,
+
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$Sharing
     )
 
     $vmView = Get-View -Id $VM.Id -Property Config.Hardware.Device
@@ -1681,21 +1709,24 @@ function Add-RdmDevice {
         throw "SCSI $ControllerBus`:$UnitNumber on '$($VM.Name)' is already occupied."
     }
 
+    # Everything the device had, put back as it was. The point of a migration is that the
+    # guest finds its disks exactly where, and how, it left them.
     $backing = New-Object VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo
-    $backing.CompatibilityMode = 'physicalMode'
+    $backing.CompatibilityMode = if ($CompatibilityMode) { $CompatibilityMode } else { 'physicalMode' }
     $backing.DeviceName = $ConsoleDeviceName
 
     # SHIPPED AND HIT ON A LIVE RUN: with diskMode left unset, vCenter rejected the add
-    # with "Incompatible device backing specified for device '0'". A physical-mode RDM is
-    # independent-persistent by nature and that is what the client itself sends; saying so
-    # explicitly is what the server will accept.
-    $backing.DiskMode = 'independent_persistent'
+    # with "Incompatible device backing specified for device '0'". The source's own mode
+    # is used when it has one; a physical-mode RDM with no mode recorded is
+    # independent-persistent by nature, which is what the client itself sends.
+    $backing.DiskMode = if ($DiskMode) { $DiskMode } else { 'independent_persistent' }
 
     $disk = New-Object VMware.Vim.VirtualDisk
     $disk.Key = -100 - $UnitNumber
     $disk.ControllerKey = $controllerKey
     $disk.UnitNumber = $UnitNumber
     $disk.Backing = $backing
+    if ($Sharing) { $disk.Sharing = $Sharing }
 
     $change = New-Object VMware.Vim.VirtualDeviceConfigSpec
     $change.Operation = 'add'
@@ -1716,7 +1747,7 @@ function Add-RdmDevice {
     # The whole backing, in the log, before it is sent: when vCenter refuses a device the
     # message names neither the device nor the file, and this is the difference between a
     # five-minute diagnosis and an afternoon.
-    Write-RichoLog "        device: $($backing.DeviceName), mode: $($backing.CompatibilityMode)/$($backing.DiskMode), file: '$($backing.FileName)', fileOperation: '$($change.FileOperation)'" -Level INFO
+    Write-RichoLog "        device: $($backing.DeviceName), mode: $($backing.CompatibilityMode)/$($backing.DiskMode), sharing: '$($disk.Sharing)', file: '$($backing.FileName)', fileOperation: '$($change.FileOperation)'" -Level INFO
 
     $attachDescription = "Attaching RDM at SCSI $ControllerBus`:$UnitNumber on '$($VM.Name)' (device $($backing.DeviceName), file '$($backing.FileName)')"
     Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description $attachDescription
@@ -2041,6 +2072,9 @@ function Add-DestinationRdms {
                 ConsoleDeviceName   = $disk.ConsoleDeviceName
                 RdmDatastoreName    = $GroupPlan.RdmDatastore.Name
                 ExistingMappingFile = $existingMappingFile
+                CompatibilityMode   = $disk.CompatibilityMode
+                DiskMode            = $disk.DiskMode
+                Sharing             = $disk.Sharing
             }
             $mappingFile = Add-RdmDevice @addParameters
             if (-not $GroupPlan.MappingFiles.ContainsKey($addressKey)) {
@@ -2167,10 +2201,12 @@ function Resolve-MigrationPlan {
             if ($layout.Rdms.Count -ne $allLunIds.Count) {
                 throw "VM '$vmName' has $($layout.Rdms.Count) physical RDMs but the CSV specifies $($allLunIds.Count)."
             }
+            # Bus sharing is read, not required. These LUNs are physical-mode RDMs; whether
+            # their controller shares its bus, and whether the disk itself is marked
+            # shared, is the source's business and is put back exactly as found.
             foreach ($rdm in $layout.Rdms) {
-                if ($rdm.BusSharing -ne 'physicalSharing') {
-                    throw "VM '$vmName' RDM '$($rdm.Label)' is on a controller with bus sharing '$($rdm.BusSharing)', not physicalSharing."
-                }
+                $sharingNote = if ($rdm.Sharing) { $rdm.Sharing } else { 'sharingNone' }
+                Write-RichoLog "    $($rdm.Label): $($rdm.CompatibilityMode) RDM, bus sharing $($rdm.BusSharing), disk sharing $sharingNote." -Level INFO
             }
 
             # Where the VM is now is read off it, not asserted in the CSV, and travels
@@ -2214,6 +2250,9 @@ function Resolve-MigrationPlan {
                 if (($current.ControllerBus -ne $reference.ControllerBus) -or
                     ($current.UnitNumber -ne $reference.UnitNumber) -or
                     ($current.ControllerType -ne $reference.ControllerType) -or
+                    ($current.BusSharing -ne $reference.BusSharing) -or
+                    ($current.Sharing -ne $reference.Sharing) -or
+                    ($current.CompatibilityMode -ne $reference.CompatibilityMode) -or
                     ([math]::Abs($current.CapacityGB - $reference.CapacityGB) -gt $script:CapacityToleranceGB)) {
                     throw "VM '$($vmItem.VM.Name)' RDM topology differs from '$($referenceItem.VM.Name)' at index $index."
                 }
@@ -2281,6 +2320,10 @@ function Resolve-MigrationPlan {
                     ControllerBus     = $diskGroup.ControllerBus
                     UnitNumber        = $unitNumber
                     SourceLabel       = $reference.Label
+                    CompatibilityMode = $reference.CompatibilityMode
+                    DiskMode          = $reference.DiskMode
+                    Sharing           = $reference.Sharing
+                    BusSharing        = $reference.BusSharing
                 })
                 $diskIndex++
             }
@@ -2453,8 +2496,14 @@ function Confirm-MigrationOutcome {
             elseif ([math]::Abs($actual[0].CapacityGB - $disk.CapacityGB) -gt $script:CapacityToleranceGB) {
                 $detail = "Capacity is $($actual[0].CapacityGB) GB, expected $($disk.CapacityGB) GB."
             }
-            elseif ($actual[0].BusSharing -ne 'physicalSharing') {
-                $detail = "Bus sharing is '$($actual[0].BusSharing)', expected physicalSharing."
+            elseif ($actual[0].BusSharing -ne $disk.BusSharing) {
+                $detail = "Bus sharing is '$($actual[0].BusSharing)', expected '$($disk.BusSharing)' as it was at the source."
+            }
+            elseif ($actual[0].Sharing -ne $disk.Sharing) {
+                $detail = "Disk sharing is '$($actual[0].Sharing)', expected '$($disk.Sharing)' as it was at the source."
+            }
+            elseif ($actual[0].CompatibilityMode -ne $disk.CompatibilityMode) {
+                $detail = "Compatibility mode is '$($actual[0].CompatibilityMode)', expected '$($disk.CompatibilityMode)'."
             }
             else {
                 $status = 'Passed'

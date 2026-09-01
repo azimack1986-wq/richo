@@ -4537,3 +4537,31 @@ of it immediately.
   did, so the regression cannot come back unnoticed.
 - A new simulation scenario removes a LUN from the destination host and asserts the run
   stops with the device named, having changed nothing and powered nothing off.
+
+### [2.12.0] — 2026-09-01
+
+#### Changed
+
+- **Bus sharing is read, not required.** The plan used to refuse any RDM whose controller
+  was not set to `physicalSharing`, which is wrong for an estate that builds these LUNs
+  as physical-mode RDMs on controllers with no bus sharing — the run stopped before it
+  started. Whatever the source has is recorded, reproduced at the destination, and
+  verified against the source afterwards rather than against an assumption.
+
+- **Every device setting is carried across.** Compatibility mode, disk mode and disk
+  sharing (`sharingNone` / `sharingMultiWriter`) are read off the source RDM and put back
+  on the re-attached device, alongside the controller type and bus sharing that were
+  already preserved. The only substitution is a disk mode the source never recorded,
+  which becomes `independent_persistent`, because vCenter rejects a physical-mode backing
+  with no mode at all.
+
+- The per-VM discovery line now names what it found — compatibility mode, bus sharing and
+  disk sharing, per disk — so the settings being preserved are visible in the log before
+  anything is touched, and the attach line shows the sharing it is sending.
+
+#### Tests
+
+- The simulated estate now matches this one: physical-mode RDMs on **no-sharing**
+  controllers, with `sharingNone` disks and an explicit disk mode. The assertion is
+  round-trip fidelity — every setting comes back exactly as the source had it — so a
+  future change that normalises any of them fails here rather than in a guest.
