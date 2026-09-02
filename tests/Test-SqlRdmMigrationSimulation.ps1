@@ -949,6 +949,45 @@ try {
         Assert-Equal (@($plan | Where-Object { $_.WorkloadType -ne 'SIT' }).Count) 0 'A plan row is missing its workload type.'
     }
 
+    Invoke-SimTest 'A clean dry run says it is complete, and why nothing started' {
+        $log = Get-Content -LiteralPath $dryRunLog -Raw
+        Assert-True ($log -match 'DRY RUN COMPLETE') 'The dry run did not announce that it completed.'
+        Assert-True ($log -match 'Nothing was changed\.') 'The dry run did not say that nothing was changed.'
+        Assert-True ($log -match 'none could be: a dry run maps no LUNs') 'The dry run did not explain why nothing was powered on.'
+        Assert-True ($log -match 'expected, not a failure') 'The dry run did not say the absent power-on is expected.'
+        Assert-True ($log -match 'Nothing was found that would stop a live run\.') 'A clean dry run reported blockers.'
+        Assert-True ($log -notmatch '\[ERROR\]') 'A clean dry run logged an error.'
+    }
+
+    # --------------------------------------------------- dry run that finds a blocker -
+    Reset-SimInventory
+    $blockerFolder = Join-Path $script:WorkFolder 'blocker'
+    $blockerLog = Join-Path $script:WorkFolder 'blocker.log'
+    $blockerThrew = $false
+
+    try {
+        & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -DryRun -Credential $credential `
+            -OutputFolder $blockerFolder *> $blockerLog
+    }
+    catch {
+        $blockerThrew = $true
+    }
+
+    Invoke-SimTest 'A dry run reports what would stop a live run instead of dying on it' {
+        Assert-True (-not $blockerThrew) 'The dry run threw on a condition a live run would stop on.'
+        $log = Get-Content -LiteralPath $blockerLog -Raw
+        Assert-True ($log -match 'WOULD STOP A LIVE RUN') 'The blocker was not called out where it was found.'
+        Assert-True ($log -match '-PowerAction is None') 'The blocker did not name the missing -PowerAction.'
+        Assert-True ($log -match 'DRY RUN COMPLETE') 'The dry run did not announce that it completed.'
+        Assert-True ($log -match '2 thing\(s\) would stop a live run') 'Both nodes should have been reported as blocked.'
+        Assert-True ($log -notmatch '\[ERROR\]') 'A blocker was reported as a failure of the run.'
+        Assert-Equal $global:Sim.Events.Count 0 'A dry run that found a blocker still changed something.'
+
+        $results = @(Import-Csv -LiteralPath (Get-ChildItem -Path $blockerFolder -Filter 'results-*.csv' | Select-Object -First 1).FullName)
+        Assert-Equal (@($results | Where-Object { $_.Status -eq 'Blocked' }).Count) 2 'The blockers were not recorded in the results.'
+        Assert-Equal (@($results | Where-Object { $_.Phase -eq 'Fatal' }).Count) 0 'The dry run recorded a fatal row.'
+    }
+
     # ------------------------------------------------------------------- execution ----
     Reset-SimInventory
     $global:Sim.PromptAnswers.Add('y')

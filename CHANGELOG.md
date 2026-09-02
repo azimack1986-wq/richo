@@ -4756,3 +4756,37 @@ last of them showed why it could not work.
   sentence that says why — rather than at the relocate, with the VMs already down and
   their RDMs detached. The check reads the property defensively, so a PowerCLI binding
   that does not expose `DrsEnabled` does not stop a run over a property.
+
+### [3.5.0] — 2026-09-02
+
+#### Added
+
+- **A dry run now ends by saying it is complete, and why nothing started.** A clean
+  rehearsal used to finish with nothing but the last log line before it, and the last
+  line was often a shutdown blocker written at `[ERROR]` — a run that had worked
+  perfectly read as a broken tool. The close is now explicit:
+
+  ```
+  ================ DRY RUN COMPLETE ================
+  1 group(s) walked end to end in 41s. 12 change(s) recorded in the plan. Nothing was changed.
+  No VMs were powered on, and none could be: a dry run maps no LUNs, so there is nothing
+  to bring up. That is expected, not a failure.
+  Nothing was found that would stop a live run.
+  Review the change plan and results CSVs, then re-run with -Execute to make the changes.
+  ==================================================
+  ```
+
+  An execution run gets the matching `EXECUTION COMPLETE` line.
+
+- **Dry-run blockers, collected rather than fatal.** A condition that would legitimately
+  stop a live run — a powered-on VM with `-PowerAction None`, or one whose VMware Tools
+  are not running without `-ForcePowerOffIfGuestShutdownUnavailable` — no longer ends the
+  dry run at the first VM it hits. It is logged where it is found as
+  `WOULD STOP A LIVE RUN: …`, recorded in the results CSV with status `Blocked`, and
+  every one of them is repeated in the closing block with what to do about it. One pass
+  now finds all of them. The live run still throws on exactly the same conditions.
+
+#### Fixed
+
+- `$ScriptVersion` had been left at `3.3.0` while 3.4.0's changes shipped, so results and
+  verification CSVs from those runs are stamped a release behind. It reads `3.5.0` now.

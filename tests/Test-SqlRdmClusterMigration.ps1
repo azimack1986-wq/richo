@@ -538,6 +538,23 @@ try {
         Assert-True (($askIndex -gt $showIndex)) 'The operator is asked before the mapping is shown.'
     }
 
+    Invoke-NativeTest 'A dry run finishes and says so, rather than dying on a blocker' {
+        Assert-True ($text -match '(?m)^function Add-DryRunBlocker') 'Blockers have nowhere to go.'
+        Assert-True ($text -match 'DRY RUN COMPLETE') 'A finished dry run never says it finished.'
+        Assert-True ($text -match 'none could be: a dry run maps no LUNs') 'A dry run never explains why nothing was powered on.'
+        Assert-True ($text -match 'expected, not a failure') 'A dry run never says the absent power-on is expected.'
+
+        # Every condition Stop-VMForMigration would throw on has to be a recorded blocker
+        # in dry-run mode, so one pass reports all of them instead of ending on the first.
+        $stopFunction = @($functionAsts | Where-Object { $_.Name -eq 'Stop-VMForMigration' })
+        Assert-Equal $stopFunction.Count 1 'Stop-VMForMigration is missing.'
+        $stopText = $stopFunction[0].Extent.Text
+        $throwCount = ([regex]::Matches($stopText, '(?m)^\s*throw ')).Count
+        $blockerCount = ([regex]::Matches($stopText, 'Add-DryRunBlocker')).Count
+        Assert-True ($throwCount -gt 0) 'Stop-VMForMigration no longer stops a live run at all.'
+        Assert-Equal $blockerCount $throwCount 'A live-run stop condition is not recorded as a dry-run blocker.'
+    }
+
     Invoke-NativeTest 'Power-on happens once per line item, after it is verified' {
         $powerOnFunction = @($functionAsts | Where-Object { $_.Name -eq 'Invoke-GroupPowerOn' })
         Assert-Equal $powerOnFunction.Count 1 'Invoke-GroupPowerOn is missing.'

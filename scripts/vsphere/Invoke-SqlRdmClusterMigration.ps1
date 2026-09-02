@@ -168,7 +168,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '3.3.0'
+$ScriptVersion = '3.5.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -190,6 +190,10 @@ $script:Results = [System.Collections.Generic.List[object]]::new()
 # name in the main body replaced this list with an array, which broke every execution run
 # at the point it wrote its evidence.
 $script:VerificationRows = [System.Collections.Generic.List[object]]::new()
+# Conditions that a dry run finds and a live run would stop dead on. A dry run records
+# them and carries on so one pass reports every one of them, rather than ending on the
+# first and looking like a failure of the tool.
+$script:Blockers = [System.Collections.Generic.List[string]]::new()
 
 # Highest SCSI unit number on a controller. Unit 7 is reserved for the controller itself.
 $script:MaxScsiUnitNumber = 15
@@ -470,6 +474,46 @@ function Add-Result {
         Status         = $Status
         Detail         = $Detail
     })
+}
+
+function Add-DryRunBlocker {
+    <#
+    .SYNOPSIS
+        Records something that would stop a live run, and lets the dry run continue.
+
+    .DESCRIPTION
+        A dry run exists to find every problem in one pass. Throwing on the first one
+        ends the run and reads as a tool failure, so in dry-run mode the condition is
+        recorded here instead and repeated in the closing summary. The equivalent live
+        run still throws - see the call sites.
+
+    .PARAMETER MigrationGroup
+        The migration group the blocker belongs to.
+
+    .PARAMETER VM
+        The VM the blocker concerns, or an empty string for group-level blockers.
+
+    .PARAMETER Reason
+        What would stop the live run, and what to do about it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$MigrationGroup,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$VM,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Reason
+    )
+
+    $script:Blockers.Add($Reason)
+    Write-RichoLog "      WOULD STOP A LIVE RUN: $Reason" -Level WARN
+    Add-Result $MigrationGroup $VM 'Blocker' 'Blocked' $Reason
 }
 
 function Invoke-PlannedChange {
@@ -1336,7 +1380,12 @@ function Stop-VMForMigration {
     }
 
     if ($PowerAction -eq 'None') {
-        throw "VM '$($currentVM.Name)' is powered on and PowerAction is None."
+        $noActionReason = "VM '$($currentVM.Name)' is powered on and -PowerAction is None, so nothing would shut it down. A live run needs -PowerAction ShutdownGuest."
+        if ($DryRun) {
+            Add-DryRunBlocker -MigrationGroup $MigrationGroup -VM $currentVM.Name -Reason $noActionReason
+            return
+        }
+        throw $noActionReason
     }
 
     $toolsRunning = ([string]$currentVM.ExtensionData.Guest.ToolsRunningStatus -eq 'guestToolsRunning')
@@ -1350,7 +1399,12 @@ function Stop-VMForMigration {
     }
 
     if (-not $ForcePowerOffIfGuestShutdownUnavailable) {
-        throw "VM '$($currentVM.Name)' is powered on but VMware Tools is not running. Use -ForcePowerOffIfGuestShutdownUnavailable only when hard power-off is explicitly approved."
+        $noToolsReason = "VM '$($currentVM.Name)' is powered on but VMware Tools is not running, so it cannot be shut down gracefully. A live run needs -ForcePowerOffIfGuestShutdownUnavailable, and only when a hard power-off is explicitly approved."
+        if ($DryRun) {
+            Add-DryRunBlocker -MigrationGroup $MigrationGroup -VM $currentVM.Name -Reason $noToolsReason
+            return
+        }
+        throw $noToolsReason
     }
 
     $forcePowerOffDetail = "Force power off '$($currentVM.Name)' because VMware Tools is unavailable and the explicit opt-in switch was supplied."
@@ -2441,7 +2495,8 @@ try {
         # The line item is complete: relocated, mapped and verified. What landed where is
         # printed, and then it is the operator's call.
         if ($DryRun) {
-            Add-Result $groupPlan.Name '' 'PowerOn' 'DryRun' 'An execution run prints the mapping and asks before powering anything on.'
+            Write-RichoLog "  Nothing to power on: a dry run maps no LUNs, so there is nothing to start. An execution run prints the mapping here and asks. Expected, not a failure." -Level INFO
+            Add-Result $groupPlan.Name '' 'PowerOn' 'DryRun' 'Nothing to power on: a dry run maps no LUNs. An execution run prints the mapping and asks. Expected, not a failure.'
         }
         else {
             Show-RdmMapping -GroupPlan $groupPlan
@@ -2460,8 +2515,32 @@ try {
     }
 
     $succeeded = @($script:Results | Where-Object { $_.Status -eq 'Succeeded' }).Count
-    $planned = @($script:Results | Where-Object { $_.Status -eq 'DryRun' }).Count
-    Write-RichoLog "All $($plans.Count) group(s) processed in $(Format-Elapsed -Elapsed $script:RunStopwatch.Elapsed): $succeeded change(s) made, $planned planned." -Level INFO
+    $planned = $script:Plan.Count
+
+    if ($DryRun) {
+        # A dry run that reaches here has done its job. Said plainly, because the last
+        # thing on screen used to be a shutdown blocker logged as an error, and a clean
+        # rehearsal looked like a broken tool.
+        Write-RichoLog '================ DRY RUN COMPLETE ================' -Level INFO
+        Write-RichoLog "$($plans.Count) group(s) walked end to end in $(Format-Elapsed -Elapsed $script:RunStopwatch.Elapsed). $planned change(s) recorded in the plan. Nothing was changed." -Level INFO
+        Write-RichoLog 'No VMs were powered on, and none could be: a dry run maps no LUNs, so there is nothing to bring up. That is expected, not a failure.' -Level INFO
+        if ($script:Blockers.Count -gt 0) {
+            Write-RichoLog "$($script:Blockers.Count) thing(s) would stop a live run - fix these before running with -Execute:" -Level WARN
+            $blockerIndex = 0
+            foreach ($blocker in $script:Blockers) {
+                $blockerIndex++
+                Write-RichoLog "  $blockerIndex. $blocker" -Level WARN
+            }
+        }
+        else {
+            Write-RichoLog 'Nothing was found that would stop a live run.' -Level INFO
+        }
+        Write-RichoLog 'Review the change plan and results CSVs, then re-run with -Execute to make the changes.' -Level INFO
+        Write-RichoLog '==================================================' -Level INFO
+    }
+    else {
+        Write-RichoLog "EXECUTION COMPLETE: all $($plans.Count) group(s) processed in $(Format-Elapsed -Elapsed $script:RunStopwatch.Elapsed), $succeeded change(s) made." -Level INFO
+    }
 }
 catch {
     # -ErrorAction Continue so the logger's own Write-Error does not become the

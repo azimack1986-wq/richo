@@ -304,6 +304,41 @@ recorded in the results file.
 The summary is read back off the VMs rather than recited from the plan: it is the last
 thing anyone sees before booting a SQL cluster, so it has to be what is actually there.
 
+## What a finished dry run looks like
+
+A dry run that reaches the end says so, and says why nothing was started:
+
+```text
+================ DRY RUN COMPLETE ================
+1 group(s) walked end to end in 41s. 12 change(s) recorded in the plan. Nothing was changed.
+No VMs were powered on, and none could be: a dry run maps no LUNs, so there is nothing
+to bring up. That is expected, not a failure.
+Nothing was found that would stop a live run.
+Review the change plan and results CSVs, then re-run with -Execute to make the changes.
+==================================================
+```
+
+The absent power-on is not a fault. A dry run maps no LUNs, so a VM brought up at the
+end of one would be a SQL node without its disks — there is nothing to show and nothing
+to start. The block exists because a clean rehearsal used to end on whatever line came
+last, and that was often a shutdown blocker written at `[ERROR]`.
+
+Conditions that would legitimately stop a **live** run are collected rather than thrown,
+so one pass reports all of them:
+
+```text
+      WOULD STOP A LIVE RUN: VM 'D24SQL01' is powered on and -PowerAction is None, so
+      nothing would shut it down. A live run needs -PowerAction ShutdownGuest.
+...
+2 thing(s) would stop a live run - fix these before running with -Execute:
+  1. VM 'D24SQL01' is powered on and -PowerAction is None, ...
+  2. VM 'D24SQL02' is powered on and -PowerAction is None, ...
+```
+
+Each one is also a row in `results-<stamp>.csv` with status `Blocked`. An execution run
+still stops dead on exactly these conditions — the difference is only that a rehearsal
+finishes and hands back the whole list.
+
 ## Excluding rows
 
 Put a `#` at the start of a row and it is skipped — not validated, not counted, not run:
@@ -330,7 +365,7 @@ Written to `-OutputFolder` (default `.\SqlRdmClusterMigrationOutput`):
 | --- | --- |
 | `<group>-<mode>-manifest-<stamp>.json` | Pre-change evidence: workload type, the clusters the VMs came from and the destination, source and destination placement, every source RDM, every resolved destination LUN, whether the RDM datastore name was derived, excluded hosts, mapping mode |
 | `change-plan-<stamp>.csv` | Every change the run intended, in order — identical in a dry run and a live run |
-| `results-<stamp>.csv` | Every change attempted and its outcome |
+| `results-<stamp>.csv` | Every change attempted and its outcome, including `Blocked` rows for anything a dry run found that would stop a live run |
 | `verification-<stamp>.csv` | Post-migration disk-by-disk comparison against the plan (execution runs only) |
 
 Every row carries `$ScriptVersion` and `WorkloadType`, so a change record traces back
