@@ -288,6 +288,10 @@ function Reset-SimInventory {
     # When set, Get-ScsiController -VM returns only controllers that carry a disk - the
     # binding behaviour the mapping has to cope with when it has just added an empty one.
     $global:Sim.HideEmptyControllers = $false
+    # When set, a created RDM's backing DeviceName comes back as the vml path vCenter
+    # persists rather than the naa console path it was made with - which is what the
+    # mapping summary was printing at an operator who wanted the naa.
+    $global:Sim.VmlBackings = $false
 
     $naas = @('naa.6000000000000040', 'naa.6000000000000041', 'naa.6000000000000042')
     $global:Sim.VMs['SIMSQLA'] = New-SimVM -Name 'SIMSQLA' -Index 1 -Naas $naas -MappingOwner 'SIMSQLA'
@@ -447,7 +451,10 @@ function Invoke-SimReconfigure {
                             throw "Incompatible device backing specified for device '0'."
                         }
 
+                        # A persisted RDM's DeviceName is a vml path; the LUN uuid is what
+                        # still names the device, as it does on a real host.
                         $canonical = ([string]$device.Backing.DeviceName) -replace '^.*/', ''
+                        if ($canonical -like 'vml.*') { $canonical = ([string]$device.Backing.LunUuid) -replace '^uuid-', '' }
                         $lun = @($global:Sim.HostLuns['sim-esx02'] | Where-Object { $_.CanonicalName -eq $canonical })
                         if ($lun.Count -ne 1) { throw "Simulated attach of unknown device '$canonical'." }
                         $device.CapacityInBytes = [long]($lun[0].CapacityGB * 1GB)
@@ -773,7 +780,7 @@ function Get-HardDisk {
                     Name              = [string]$_.DeviceInfo.Label
                     SimVMName         = $vm.Name
                     DiskType          = $(if ($_.Backing -is [VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo]) { 'RawPhysical' } else { 'Flat' })
-                    ScsiCanonicalName = $(if ($_.Backing -is [VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo]) { ([string]$_.Backing.DeviceName -replace '^.*/', '') } else { '' })
+                    ScsiCanonicalName = $(if ($_.Backing -is [VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo]) { ([string]$_.Backing.LunUuid -replace '^uuid-', '') } else { '' })
                     ExtensionData     = $_
                 }
             }
@@ -812,6 +819,9 @@ function New-HardDisk {
     $disk = New-SimRdm -Key $global:Sim.NextDeviceKey -ControllerKey ([int]$target.Key) -UnitNumber $unit `
         -Label "Hard disk $($diskCount + 1)" -Naa $canonical -CapacityGB ([double]$lun[0].CapacityGB) `
         -MappingFile "[$($Datastore.Name)] $($vm.Name)/$($vm.Name)_$($global:Sim.NextDeviceKey).vmdk"
+    if ($global:Sim.VmlBackings) {
+        $disk.Backing.DeviceName = "vml.0200000000$($canonical -replace '^naa\.', '')4c554e20432d"
+    }
     $vm.Devices.Add($disk)
     Add-SimEvent "new-harddisk $($vm.Name) $canonical -> bus $($target.BusNumber) unit $unit"
 
@@ -1294,10 +1304,20 @@ try {
 
     Invoke-SimTest 'The mapping is printed before the operator is asked' {
         $log = Get-Content -LiteralPath $executeLog -Raw
-        Assert-True ($log -match '===== Mapped LUNs for') 'The mapping summary was not printed.'
-        Assert-True ($log -match 'SCSI 1\s+VirtualLsiLogicSASController, bus sharing noSharing') 'The summary does not name the controller and its sharing.'
-        foreach ($naa in @('naa.6000000000000040', 'naa.6000000000000041', 'naa.6000000000000042')) {
-            Assert-True ($log -match [regex]::Escape($naa)) "The summary does not list device $naa."
+        Assert-True ($log -match "MAPPED LUNs - SIT group 'SIMSQLA', batch 1") 'The mapping summary was not printed.'
+        Assert-True ($log -match 'SCSI controller 1 - VirtualLsiLogicSASController, bus sharing noSharing') 'The summary does not name the controller and its sharing.'
+        Assert-True ($log -match 'ORDER\s+SCSI\s+LUN ID\s+NAA\s+SIZE\s+MODE') 'The summary has no column headings.'
+
+        # Every mapping is listed with everything needed to check it against the array:
+        # its order in the CSV column, its SCSI address, its LUN ID, its NAA and its size.
+        $expected = @(
+            @{ Order = 1; Address = '1:0'; Lun = 40; Naa = 'naa.6000000000000040'; SizeGB = 100 },
+            @{ Order = 2; Address = '1:1'; Lun = 41; Naa = 'naa.6000000000000041'; SizeGB = 250 },
+            @{ Order = 3; Address = '1:2'; Lun = 42; Naa = 'naa.6000000000000042'; SizeGB = 500 }
+        )
+        foreach ($row in $expected) {
+            $pattern = "$($row.Order)\s+$([regex]::Escape($row.Address))\s+$($row.Lun)\s+$([regex]::Escape($row.Naa))\s+$($row.SizeGB) GB\s+physicalMode"
+            Assert-True ($log -match $pattern) "The summary row for LUN $($row.Lun) is missing or incomplete."
         }
 
         $events = @($global:Sim.Events)
@@ -1542,6 +1562,36 @@ try {
 
         Assert-Equal (Get-SimRdms -VMName 'SIMSQLB').Count 3 'SIMSQLB did not get its RDMs back.'
         Assert-Equal $global:Sim.VMs['SIMSQLB'].PowerState 'PoweredOn' 'SIMSQLB was not powered back on.'
+    }
+
+    Invoke-SimTest 'The summary names the naa even when the backing has become a vml' {
+        # SHIPPED. Once vCenter has persisted an RDM its backing DeviceName is a vml path,
+        # so the summary read out vml.0200000000600a098038... at an operator who needs the
+        # naa to match it against the array.
+        Reset-SimInventory
+        $global:Sim.VmlBackings = $true
+        $global:Sim.PromptAnswers.Add('y')
+        $vmlFolder = Join-Path $script:WorkFolder 'vml'
+        $vmlLog = Join-Path $script:WorkFolder 'vml.log'
+
+        & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
+            -OutputFolder $vmlFolder *> $vmlLog
+
+        $log = Get-Content -LiteralPath $vmlLog -Raw
+        $summary = $log.Substring($log.IndexOf('MAPPED LUNs'))
+        Assert-True ($summary -notmatch 'vml\.') 'The summary is still printing vml identifiers.'
+        foreach ($naa in @('naa.6000000000000040', 'naa.6000000000000041', 'naa.6000000000000042')) {
+            Assert-True ($summary -match [regex]::Escape($naa)) "The summary does not name $naa."
+        }
+
+        # And the backings really did come back as vml, so the test proves something.
+        $vm = $global:Sim.VMs['SIMSQLA']
+        $backings = @(
+            $vm.Devices |
+                Where-Object { $_.Backing -is [VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo] } |
+                ForEach-Object { [string]$_.Backing.DeviceName }
+        )
+        Assert-Equal (@($backings | Where-Object { $_ -like 'vml.*' }).Count) 3 'The simulated backings were not vml paths after all.'
     }
 
     Invoke-SimTest 'A controller it cannot find stops the run rather than falling back to SCSI 0' {

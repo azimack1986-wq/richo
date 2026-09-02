@@ -360,17 +360,42 @@ LUN mapped on every node, and the placement verified — the run prints what act
 landed where and asks:
 
 ```text
-  ===== Mapped LUNs for 'D24SQL01' =====
-    D24SQL01 on esx02 - 3 RDM(s), powered PoweredOff
-      SCSI 1  VirtualLsiLogicSASController, bus sharing noSharing
-        1:0    naa.600a098038314953...4c31                    100 GB  physicalMode
-        1:1    naa.600a098038314953...4c32                    250 GB  physicalMode
-        1:2    naa.600a098038314953...4c33                    500 GB  physicalMode
-    D24SQL02 on esx04 - 3 RDM(s), powered PoweredOff
+  ==========================================================================================
+  MAPPED LUNs - SIT group 'D24SQL01', batch 1
+  ==========================================================================================
+
+  D24SQL01 on esx02 - 3 RDM(s), powered PoweredOff
+    SCSI controller 1 - VirtualLsiLogicSASController, bus sharing noSharing
+      ORDER SCSI   LUN ID  NAA                                            SIZE  MODE
+      1     1:0    40      naa.600a0980383149534c31                     100 GB  physicalMode
+      2     1:1    41      naa.600a0980383149534c32                     250 GB  physicalMode
+      3     1:2    42      naa.600a0980383149534c33                     500 GB  physicalMode
+
+  D24SQL02 on esx04 - 3 RDM(s), powered PoweredOff
+    SCSI controller 1 - VirtualLsiLogicSASController, bus sharing noSharing
+      ORDER SCSI   LUN ID  NAA                                            SIZE  MODE
+      1     1:0    40      naa.600a0980383149534c31                     100 GB  physicalMode
       ...
-  ================================================
+  ==========================================================================================
   Mapping above looks right - power on the 2 VM(s) of 'D24SQL01' now? [y/N]:
 ```
+
+**The whole block prints in green**, because it is the one thing that has to be read
+rather than scrolled past. The colour goes through the information stream as a
+`HostInformationMessage`, so a redirected run (`*> run.log`) still gets plain text and the
+log file is unchanged.
+
+Every mapping carries what it takes to check it against the array without opening the
+vSphere client:
+
+| Column | What it is |
+| --- | --- |
+| `ORDER` | Position in the CSV column, so the order can be read straight off the sheet |
+| `SCSI` | `bus:unit` — the address a WSFC node cares about |
+| `LUN ID` | The LUN ID from the CSV, joined on from the plan |
+| `NAA` | The device's canonical name. Not the `vml.` identifier its backing carries once vCenter has persisted it |
+| `SIZE` | Capacity as vCenter reports it |
+| `MODE` | Always `physicalMode` for these |
 
 Answer `y` and the row's VMs start in CSV order, `first_vm` first. Anything else — `n`,
 Enter, or a session with nothing on the other end of the console — leaves them migrated,
@@ -379,6 +404,8 @@ recorded in the results file.
 
 The summary is read back off the VMs rather than recited from the plan: it is the last
 thing anyone sees before booting a SQL cluster, so it has to be what is actually there.
+Only the `ORDER` and `LUN ID` columns come from the plan, because the VM does not carry
+either.
 
 ## What a finished dry run looks like
 

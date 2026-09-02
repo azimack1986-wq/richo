@@ -4942,3 +4942,45 @@ last of them showed why it could not work.
 - The simulation harness gained a mode where `Get-ScsiController -VM` hides empty
   controllers, and proves the run stops with SCSI 0 untouched rather than falling back to
   it; and one where Storage DRS refuses a spec with no host, as the live one did.
+
+### [3.9.0] — 2026-09-02
+
+#### Changed
+
+- **The mapping summary prints in green, and says everything needed to check it.** It is
+  the one block that has to be read rather than scrolled past — it is what an operator
+  answers `y` to before booting a SQL cluster — and it used to be the same colour as
+  every other line in the run.
+
+  ```
+  ==========================================================================================
+  MAPPED LUNs - SIT group 'D24SQL01', batch 1
+  ==========================================================================================
+
+  D24SQL01 on esx02 - 3 RDM(s), powered PoweredOff
+    SCSI controller 1 - VirtualLsiLogicSASController, bus sharing noSharing
+      ORDER SCSI   LUN ID  NAA                                            SIZE  MODE
+      1     1:0    40      naa.600a0980383149534c31                     100 GB  physicalMode
+      2     1:1    41      naa.600a0980383149534c32                     250 GB  physicalMode
+      3     1:2    42      naa.600a0980383149534c33                     500 GB  physicalMode
+  ==========================================================================================
+  ```
+
+  Every mapping now carries its order in the CSV column, its SCSI address, its LUN ID, its
+  NAA, its size and its mode. `ORDER` and `LUN ID` are joined on from the plan by SCSI
+  address — the VM carries neither.
+
+- `Write-RichoLog` gained `-Highlight`, which draws an INFO line green by putting a
+  `HostInformationMessage` on the information stream rather than calling `Write-Host`. A
+  redirected run still gets plain text and the log file is byte for byte what it was. The
+  `DRY RUN COMPLETED SUCCESSFULLY` and `EXECUTION COMPLETE` verdicts are highlighted too.
+
+#### Fixed
+
+- **The summary printed a `vml.` identifier where the operator wanted the `naa.`.** An
+  RDM's backing `DeviceName` becomes a vml path once vCenter has persisted it, and the
+  layout read the device name straight off the backing — so a mapped LUN read out as
+  `vml.0200000000600a09803831455a443f5a2f4c4f716d4c554e20432d`, which matches nothing on
+  the array without decoding it by hand. `Get-VMRdmLayout` now takes the canonical name
+  from `Get-HardDisk`, and falls back to the backing only for a disk that cmdlet does not
+  return. Verification compares the better name too.

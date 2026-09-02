@@ -734,6 +734,39 @@ try {
         Assert-True ($text -notmatch '(?i)Install-Module|Update-Module') 'The script installs or updates a module.'
     }
 
+    Invoke-NativeTest 'The mapping summary stands out, and says everything needed to check it' {
+        Assert-True ($text -match '\[switch\]\$Highlight') 'Write-RichoLog cannot draw a line in colour.'
+        Assert-True ($text -match 'HostInformationMessage') 'The colour is not carried through the information stream.'
+        Assert-True ($text -match '\[System\.ConsoleColor\]::Green') 'The highlight is not green.'
+
+        $show = @($functionAsts | Where-Object { $_.Name -eq 'Show-RdmMapping' })
+        Assert-Equal $show.Count 1 'Show-RdmMapping is missing.'
+        $showText = $show[0].Extent.Text
+
+        # Every line of the summary is highlighted, or the block does not stand out.
+        $logCalls = @(
+            $show[0].FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.CommandAst]
+            }, $true) |
+                Where-Object { $_.GetCommandName() -eq 'Write-RichoLog' } |
+                Where-Object { $_.Extent.Text -notmatch '-Level WARN' } |
+                Where-Object { $_.Extent.Text -notmatch '-Highlight' }
+        )
+        Assert-Equal $logCalls.Count 0 "$($logCalls.Count) line(s) of the mapping summary are not highlighted."
+
+        # LUN ID, NAA, size, order and the SCSI address, for every mapping.
+        Assert-True ($showText -match "'ORDER', 'SCSI', 'LUN ID', 'NAA', 'SIZE', 'MODE'") 'The summary has no column headings.'
+        Assert-True ($showText -match '\$plannedByAddress') 'The LUN ID and order are not joined on from the plan.'
+        Assert-True ($showText -match '\$rdm\.CanonicalName') 'The summary does not print the device name.'
+        Assert-True ($showText -match '\$rdm\.CapacityGB') 'The summary does not print the size.'
+
+        # The naa, not the vml the backing carries once vCenter has persisted it.
+        $layout = @($functionAsts | Where-Object { $_.Name -eq 'Get-VMRdmLayout' })[0]
+        Assert-True (($layout.Extent.Text -match '\$canonicalByLabel')) 'The layout still reads its device name from the backing alone.'
+        Assert-True (($layout.Extent.Text -match 'ScsiCanonicalName')) 'The canonical name does not come from the disk.'
+    }
+
     Invoke-NativeTest 'Output goes through Write-RichoLog, never Write-Host' {
         Assert-True ($text -notmatch '(?m)^\s*Write-Host') 'A Write-Host call was found.'
         Assert-True ($text -match 'Write-RichoLog') 'No Write-RichoLog call was found.'

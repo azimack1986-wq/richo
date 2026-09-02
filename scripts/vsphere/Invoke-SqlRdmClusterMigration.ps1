@@ -155,7 +155,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '3.8.0'
+$ScriptVersion = '3.9.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -218,6 +218,12 @@ function Write-RichoLog {
     .PARAMETER Path
         Optional log file to append to. Defaults to $env:RICHO_LOG_FILE when set.
 
+    .PARAMETER Highlight
+        Draw this line in green. For the mapping summary, which is the one thing an
+        operator has to actually read before booting a SQL cluster and which used to
+        scroll past in the same colour as everything else. The line written to the log
+        file is unchanged - the colour is for the console only.
+
     .EXAMPLE
         Write-RichoLog 'Connected to vCenter.' -Level INFO
     #>
@@ -233,18 +239,34 @@ function Write-RichoLog {
 
         [Parameter()]
         [AllowEmptyString()]
-        [string]$Path = $env:RICHO_LOG_FILE
+        [string]$Path = $env:RICHO_LOG_FILE,
+
+        [Parameter()]
+        [switch]$Highlight
     )
 
     process {
         $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ')
         $line = '{0} [{1,-5}] {2}' -f $stamp, $Level, $Message
 
-        switch ($Level) {
-            'DEBUG' { Write-Verbose $line }
-            'INFO'  { Write-Information $line -InformationAction Continue }
-            'WARN'  { Write-Warning $line }
-            'ERROR' { Write-Error $line }
+        # A HostInformationMessage carries the colour through the information stream, so
+        # the console gets green and a redirected run still gets the plain line. That is
+        # what Write-Host does internally, without being Write-Host.
+        if ($Highlight -and ($Level -eq 'INFO')) {
+            $coloured = [System.Management.Automation.HostInformationMessage]@{
+                Message         = $line
+                ForegroundColor = [System.ConsoleColor]::Green
+                NoNewline       = $false
+            }
+            Write-Information $coloured -InformationAction Continue
+        }
+        else {
+            switch ($Level) {
+                'DEBUG' { Write-Verbose $line }
+                'INFO'  { Write-Information $line -InformationAction Continue }
+                'WARN'  { Write-Warning $line }
+                'ERROR' { Write-Error $line }
+            }
         }
 
         if ($Path) {
@@ -1151,6 +1173,16 @@ function Get-VMRdmLayout {
         }
     }
 
+    # SHIPPED. An RDM's backing DeviceName is a vml path once vCenter has persisted it,
+    # so the summary printed vml.0200000000600a098038... where the operator wanted the
+    # naa they can match against the array. Get-HardDisk knows the canonical name; the
+    # backing is only the fallback for a disk it does not return.
+    $canonicalByLabel = @{}
+    foreach ($hardDisk in @(Get-HardDisk -VM $VM)) {
+        $scsiName = [string](Get-OptionalProperty -InputObject $hardDisk -Name 'ScsiCanonicalName' -Default '')
+        if ($scsiName) { $canonicalByLabel[[string]$hardDisk.Name] = $scsiName }
+    }
+
     $rdms = [System.Collections.Generic.List[object]]::new()
     foreach ($device in @($view.Config.Hardware.Device)) {
         if ($device -isnot [VMware.Vim.VirtualDisk]) { continue }
@@ -1170,7 +1202,11 @@ function Get-VMRdmLayout {
             throw "VM '$($VM.Name)' RDM '$($device.DeviceInfo.Label)' has no resolvable SCSI controller."
         }
 
+        $label = [string]$device.DeviceInfo.Label
         $canonicalName = ([string]$backing.DeviceName -replace '^.*/', '').ToLowerInvariant()
+        if ($canonicalByLabel.ContainsKey($label)) {
+            $canonicalName = ([string]$canonicalByLabel[$label]).ToLowerInvariant()
+        }
         $capacityBytes = [double](Get-OptionalProperty -InputObject $device -Name 'CapacityInBytes' -Default 0)
         if ($capacityBytes -le 0) {
             $capacityBytes = [double]$device.CapacityInKB * 1024
@@ -2520,6 +2556,7 @@ function Resolve-MigrationPlan {
                 }
 
                 $plannedDisks.Add([pscustomobject]@{
+                    Order         = $diskIndex + 1
                     LunId         = $lunId
                     ControllerBus = $diskGroup.ControllerBus
                     UnitNumber    = $unitNumber
@@ -2771,30 +2808,53 @@ function Show-RdmMapping {
         $GroupPlan
     )
 
-    Write-RichoLog "  ===== Mapped LUNs for '$($GroupPlan.Name)' =====" -Level INFO
+    # The plan is what says which LUN ID and which position in its CSV column a disk
+    # came from - the VM itself does not carry either - so it is joined on by address.
+    $plannedByAddress = @{}
+    foreach ($plannedDisk in @($GroupPlan.Disks)) {
+        $plannedByAddress["$($plannedDisk.ControllerBus):$($plannedDisk.UnitNumber)"] = $plannedDisk
+    }
+
+    $rule = '  ' + ('=' * 90)
+    Write-RichoLog $rule -Level INFO -Highlight
+    Write-RichoLog "  MAPPED LUNs - $($GroupPlan.WorkloadType) group '$($GroupPlan.Name)', batch $($GroupPlan.Batch)" -Level INFO -Highlight
+    Write-RichoLog $rule -Level INFO -Highlight
 
     foreach ($vmItem in @($GroupPlan.VMItems | Sort-Object PowerOnOrder)) {
         $currentVM = Get-VM -Id $vmItem.VM.Id
         $layout = Get-VMRdmLayout -VM $currentVM
         $rdms = @($layout.Rdms | Sort-Object ControllerBus, UnitNumber)
 
-        Write-RichoLog "    $($currentVM.Name) on $($currentVM.VMHost.Name) - $($rdms.Count) RDM(s), powered $($currentVM.PowerState)" -Level INFO
+        Write-RichoLog '' -Level INFO -Highlight
+        Write-RichoLog "  $($currentVM.Name) on $($currentVM.VMHost.Name) - $($rdms.Count) RDM(s), powered $($currentVM.PowerState)" -Level INFO -Highlight
 
         foreach ($busGroup in @($rdms | Group-Object ControllerBus)) {
             $sample = $busGroup.Group[0]
             $shortType = ($sample.ControllerType -split '\.')[-1]
-            Write-RichoLog "      SCSI $($busGroup.Name)  $shortType, bus sharing $($sample.BusSharing)" -Level INFO
+            Write-RichoLog "    SCSI controller $($busGroup.Name) - $shortType, bus sharing $($sample.BusSharing)" -Level INFO -Highlight
+            Write-RichoLog ("      {0,-5} {1,-6} {2,-7} {3,-40} {4,10}  {5}" -f 'ORDER', 'SCSI', 'LUN ID', 'NAA', 'SIZE', 'MODE') -Level INFO -Highlight
+
             foreach ($rdm in $busGroup.Group) {
-                Write-RichoLog ("        {0,-6} {1,-40} {2,10} GB  {3}" -f "$($rdm.ControllerBus):$($rdm.UnitNumber)", $rdm.CanonicalName, $rdm.CapacityGB, $rdm.CompatibilityMode) -Level INFO
+                $address = "$($rdm.ControllerBus):$($rdm.UnitNumber)"
+                $order = '-'
+                $lunId = '-'
+                if ($plannedByAddress.ContainsKey($address)) {
+                    $order = [string]$plannedByAddress[$address].Order
+                    $lunId = [string]$plannedByAddress[$address].LunId
+                }
+
+                $row = '      {0,-5} {1,-6} {2,-7} {3,-40} {4,7} GB  {5}' -f
+                    $order, $address, $lunId, $rdm.CanonicalName, $rdm.CapacityGB, $rdm.CompatibilityMode
+                Write-RichoLog $row -Level INFO -Highlight
             }
         }
 
         if ($rdms.Count -eq 0) {
-            Write-RichoLog '      no RDMs are attached' -Level WARN
+            Write-RichoLog '    no RDMs are attached' -Level WARN
         }
     }
 
-    Write-RichoLog "  ================================================" -Level INFO
+    Write-RichoLog $rule -Level INFO -Highlight
 }
 
 function Request-PowerOnConfirmation {
@@ -3052,7 +3112,7 @@ try {
             }
         }
         else {
-            Write-RichoLog 'DRY RUN COMPLETED SUCCESSFULLY - nothing flagged. Ready to execute.' -Level INFO
+            Write-RichoLog 'DRY RUN COMPLETED SUCCESSFULLY - nothing flagged. Ready to execute.' -Level INFO -Highlight
         }
 
         Write-RichoLog "$($plans.Count) group(s) walked end to end in $(Format-Elapsed -Elapsed $script:RunStopwatch.Elapsed). $planned change(s) recorded in the plan. Nothing was changed." -Level INFO
@@ -3062,7 +3122,7 @@ try {
         Write-RichoLog '==================================================' -Level INFO
     }
     else {
-        Write-RichoLog "EXECUTION COMPLETE: all $($plans.Count) group(s) processed in $(Format-Elapsed -Elapsed $script:RunStopwatch.Elapsed), $succeeded change(s) made." -Level INFO
+        Write-RichoLog "EXECUTION COMPLETE: all $($plans.Count) group(s) processed in $(Format-Elapsed -Elapsed $script:RunStopwatch.Elapsed), $succeeded change(s) made." -Level INFO -Highlight
     }
 }
 catch {
