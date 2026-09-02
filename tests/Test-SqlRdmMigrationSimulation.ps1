@@ -140,6 +140,7 @@ $global:Sim = @{
     HostPaths         = @{}
     HostLuns          = @{}
     Tasks             = @{}
+    PromptAnswers     = [System.Collections.Generic.List[string]]::new()
     NextDeviceKey     = 5000
     NextTask          = 0
     Events            = [System.Collections.Generic.List[string]]::new()
@@ -261,6 +262,7 @@ function New-SimVM {
 function Reset-SimInventory {
     $global:Sim.VMs = [ordered]@{}
     $global:Sim.Tasks = @{}
+    $global:Sim.PromptAnswers = [System.Collections.Generic.List[string]]::new()
     $global:Sim.NextDeviceKey = 5000
     $global:Sim.NextTask = 0
     $global:Sim.Events = [System.Collections.Generic.List[string]]::new()
@@ -804,6 +806,19 @@ function Start-VM {
     Add-SimEvent "power-on $($vm.Name)"
 }
 
+function Read-Host {
+    [CmdletBinding()]
+    param([Parameter(Position = 0)][string]$Prompt)
+
+    $answer = ''
+    if ($global:Sim.PromptAnswers.Count -gt 0) {
+        $answer = [string]$global:Sim.PromptAnswers[0]
+        $global:Sim.PromptAnswers.RemoveAt(0)
+    }
+    Add-SimEvent "prompt '$answer'"
+    return $answer
+}
+
 function Connect-VIServer {
     [CmdletBinding()]
     param([string]$Server, $Credential)
@@ -889,7 +904,7 @@ try {
 
     try {
         & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -DryRun -Credential $credential `
-            -PowerAction ShutdownGuest -PowerOnAfterMigration -OutputFolder $dryRunFolder *> $dryRunLog
+            -PowerAction ShutdownGuest -OutputFolder $dryRunFolder *> $dryRunLog
     }
     catch {
         $script:Failed++
@@ -919,12 +934,13 @@ try {
 
     # ------------------------------------------------------------------- execution ----
     Reset-SimInventory
+    $global:Sim.PromptAnswers.Add('y')
     $executeFolder = Join-Path $script:WorkFolder 'execute'
     $executeLog = Join-Path $script:WorkFolder 'execute.log'
 
     try {
         & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
-            -PowerAction ShutdownGuest -PowerOnAfterMigration -OutputFolder $executeFolder *> $executeLog
+            -PowerAction ShutdownGuest -OutputFolder $executeFolder *> $executeLog
     }
     catch {
         # Recorded rather than rethrown: the assertions below then report what state the
@@ -1003,6 +1019,21 @@ try {
         }
         Assert-True ($lastRemoval -ge 0) 'No RDM was ever removed.'
         Assert-True ($firstRelocate -gt $lastRemoval) 'A VM was relocated before every node had given up its RDMs.'
+    }
+
+    Invoke-SimTest 'The mapping is printed before the operator is asked' {
+        $log = Get-Content -LiteralPath $executeLog -Raw
+        Assert-True ($log -match '===== Mapped LUNs for') 'The mapping summary was not printed.'
+        Assert-True ($log -match 'SCSI 1\s+VirtualLsiLogicSASController, bus sharing noSharing') 'The summary does not name the controller and its sharing.'
+        foreach ($naa in @('naa.6000000000000040', 'naa.6000000000000041', 'naa.6000000000000042')) {
+            Assert-True ($log -match [regex]::Escape($naa)) "The summary does not list device $naa."
+        }
+
+        $events = @($global:Sim.Events)
+        $promptIndex = [array]::FindIndex($events, [Predicate[string]] { param($e) $e -like 'prompt *' })
+        $firstPowerOn = [array]::FindIndex($events, [Predicate[string]] { param($e) $e -like 'power-on *' })
+        Assert-True ($promptIndex -ge 0) 'The operator was never asked.'
+        Assert-True (($firstPowerOn -lt 0) -or ($firstPowerOn -gt $promptIndex)) 'A VM was powered on before the operator was asked.'
     }
 
     Invoke-SimTest 'Power-on happens last, in CSV order' {
@@ -1126,6 +1157,53 @@ try {
         $order = @([regex]::Matches($log, 'Resolving batch (\d+) (\w+) migration group') | ForEach-Object { "$($_.Groups[1].Value)$($_.Groups[2].Value)" })
         Assert-Equal ($order -join ',') '1SIT,1DEV,2PROD' "Groups were resolved in the wrong order: $($order -join ',')"
         Assert-Equal $global:Sim.Events.Count 0 "The dry run changed $($global:Sim.Events.Count) thing(s)."
+    }
+
+    # ------------------------------------------- answering no, and hashed-out rows ----
+    Reset-SimInventory
+    $global:Sim.PromptAnswers.Add('n')
+    $declineFolder = Join-Path $script:WorkFolder 'decline'
+    $declineLog = Join-Path $script:WorkFolder 'decline.log'
+    try {
+        & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
+            -PowerAction ShutdownGuest -OutputFolder $declineFolder *> $declineLog
+    }
+    catch {
+        $script:Failed++
+        Write-Host '[FAIL] The declined-power-on run threw' -ForegroundColor Red
+        Write-Host "       $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    Invoke-SimTest 'Answering no leaves the VMs migrated, mapped and off' {
+        Assert-Equal (@($global:Sim.Events | Where-Object { $_ -like 'power-on *' }).Count) 0 'A VM was powered on after the operator declined.'
+        foreach ($name in @('SIMSQLA', 'SIMSQLB')) {
+            Assert-Equal $global:Sim.VMs[$name].PowerState 'PoweredOff' "$name should still be off."
+            Assert-Equal $global:Sim.VMs[$name].VMHostName 'sim-esx02' "$name should still have been migrated."
+            Assert-Equal (@(Get-SimRdms -VMName $name)).Count 3 "$name should still have its RDMs mapped."
+        }
+        $results = @(Import-Csv -LiteralPath (Get-ChildItem -Path $declineFolder -Filter 'results-*.csv' | Select-Object -First 1).FullName)
+        Assert-Equal (@($results | Where-Object { ($_.Phase -eq 'PowerOn') -and ($_.Status -eq 'Skipped') }).Count) 1 'The declined power-on was not recorded.'
+    }
+
+    Invoke-SimTest 'A row commented out with # is skipped entirely' {
+        $hashedCsv = Join-Path $script:WorkFolder 'hashed.csv'
+        @(
+            'batch,destination_cluster,workload_type,first_vm,other_vms_space_separated,svm,iSCSI_Data_Store,group_1_lun_IDs_ordered_space_separated,group_2_lun_IDs_ordered_space_separated,group_3_lun_IDs_ordered_space_separated,destination_resource_pool,destination_datastore_cluster',
+            '#2,simsql02,PROD,SIMSQLPRD,,sim-svm01,,43,,,SIM-SQL-RP,SIM-VM-DSC',
+            '1,simsql02,SIT,SIMSQLA,SIMSQLB,sim-svm01,,40 41 42,,,SIM-SQL-RP,SIM-VM-DSC',
+            '# this row is nonsense and must never be validated,,,,,,,,,,,'
+        ) | Set-Content -LiteralPath $hashedCsv -Encoding UTF8
+
+        Reset-SimInventory
+        $hashedFolder = Join-Path $script:WorkFolder 'hashed'
+        $hashedLog = Join-Path $script:WorkFolder 'hashed.log'
+        & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $hashedCsv -DryRun -Credential $credential `
+            -PowerAction ShutdownGuest -OutputFolder $hashedFolder *> $hashedLog
+
+        $log = Get-Content -LiteralPath $hashedLog -Raw
+        Assert-True ($log -match '2 of 3 CSV row\(s\) are commented out') 'The commented rows were not reported.'
+        Assert-True ($log -match "Resolving batch 1 SIT migration group 'SIMSQLA'") 'The live row did not run.'
+        Assert-True ($log -notmatch 'SIMSQLPRD') 'A commented-out row was processed.'
     }
 
     Write-Host ''

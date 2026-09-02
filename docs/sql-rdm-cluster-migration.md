@@ -46,10 +46,10 @@ the parameters and the CSV.
     -Execute -PowerAction ShutdownGuest -ShutdownTimeoutMinutes 20 `
     -OutputFolder .\SqlRdmClusterMigrationOutput
 
-# Live run, powering the VMs on a workload type at a time once every group is done.
+# Live run. Each row is mapped, printed, and offered for power-on as it completes.
 .\scripts\vsphere\Invoke-SqlRdmClusterMigration.ps1 `
     -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv `
-    -Execute -PowerAction ShutdownGuest -ShutdownTimeoutMinutes 20 -PowerOnAfterMigration
+    -Execute -PowerAction ShutdownGuest -ShutdownTimeoutMinutes 20
 
 # Live run allowing a hard power-off only where VMware Tools is unavailable.
 .\scripts\vsphere\Invoke-SqlRdmClusterMigration.ps1 `
@@ -278,17 +278,48 @@ which bus each group landed on rather than demanding a particular one.
 
 ## Power-on
 
-A line item in the CSV is one SQL cluster, and it comes back up as one. As soon as a
-group is complete — every VM in the row relocated, every LUN mapped on every node, and
-the placement verified — that group's VMs are powered on, in CSV order, `first_vm`
-first. The next group then starts from the top.
+There is no switch. When a line item is complete — every VM in the row relocated, every
+LUN mapped on every node, and the placement verified — the run prints what actually
+landed where and asks:
 
-A node that boots while a sibling is still being mapped can bring shared disks online
-against a half-assembled cluster, which is what the wait is for. A group that fails
-throws and stops the run before anything in it is powered on.
+```text
+  ===== Mapped LUNs for 'D24SQL01' =====
+    D24SQL01 on esx02 - 3 RDM(s), powered PoweredOff
+      SCSI 1  VirtualLsiLogicSASController, bus sharing noSharing
+        1:0    naa.600a098038314953...4c31                    100 GB  physicalMode
+        1:1    naa.600a098038314953...4c32                    250 GB  physicalMode
+        1:2    naa.600a098038314953...4c33                    500 GB  physicalMode
+    D24SQL02 on esx04 - 3 RDM(s), powered PoweredOff
+      ...
+  ================================================
+  Mapping above looks right - power on the 2 VM(s) of 'D24SQL01' now? [y/N]:
+```
 
-Power-on still only happens with `-PowerOnAfterMigration`. Without it the run says so
-and leaves the VMs off for you to start by hand.
+Answer `y` and the row's VMs start in CSV order, `first_vm` first. Anything else — `n`,
+Enter, or a session with nothing on the other end of the console — leaves them migrated,
+mapped and powered off, and the run moves on to the next row. Either way the answer is
+recorded in the results file.
+
+The summary is read back off the VMs rather than recited from the plan: it is the last
+thing anyone sees before booting a SQL cluster, so it has to be what is actually there.
+
+## Excluding rows
+
+Put a `#` at the start of a row and it is skipped — not validated, not counted, not run:
+
+```text
+batch,destination_cluster,workload_type,first_vm,...
+#2,d24sql02,PROD,D24SQL01,...        <- skipped
+1,d24sql02,SIT,D24SQLSIT01,...       <- runs
+1,d24sql02,DEV,D24SQLDEV01,...       <- runs
+```
+
+It is how one line of a sheet is taken out of a night's work without editing anything
+else, and how a twenty-row sheet is run a row at a time. Because a hashed row is never
+validated, it can hold notes or a half-finished line. The run says how many it skipped,
+and refuses to start if every row is hashed out.
+
+`-Batch` and `-VMName` still work alongside it, on whatever rows are left.
 
 ## Output
 
@@ -322,8 +353,9 @@ writes its temporary CSVs to the temporary directory and deletes them.
 - RDM removal always uses `-DeletePermanently:$false`.
 - A hard power-off is unavailable unless the explicit force switch is supplied, and
   then only when VMware Tools is not running.
-- Power-on happens only with `-PowerOnAfterMigration`, and only after every group in
-  the run has been verified.
+- Power-on happens only when the operator answers yes to the mapping shown on screen,
+  and only after that row has been mapped and verified. Anything but an explicit yes
+  leaves the VMs off.
 - Out of scope, and still yours: DRS rules and VM-VM anti-affinity at the
   destination, in-guest WSFC and SQL validation, and backup or SRM re-protection.
 - Prove the whole workflow on non-production VMs and LUNs before using it in anger.

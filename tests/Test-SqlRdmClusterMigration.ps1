@@ -209,6 +209,19 @@ try {
         Assert-True ($text -match '\$groupName = \[string\]\$row\.first_vm') 'The migration group is not named after its first VM.'
     }
 
+    Invoke-NativeTest 'Rows commented out with # are skipped, and never validated' {
+        # The junk row must not be validated: hashing a row out is how one line of a
+        # sheet is taken out of a night's work, and it has to work on a row that would
+        # otherwise fail validation.
+        $rows = @(Import-MigrationCsv -Path (New-TestCsv @($header, "#$valid", $valid, '#nonsense,,,,,,,,,,,')))
+        Assert-Equal $rows.Count 1 'Exactly one row should have survived the hashes.'
+        Assert-Equal $rows[0].first_vm 'LABSQL01' 'The wrong row survived.'
+
+        Assert-ThrowsLike {
+            Import-MigrationCsv -Path (New-TestCsv @($header, "#$valid"))
+        } '*Every row in the CSV is commented out*' 'An all-commented CSV was accepted.'
+    }
+
     Invoke-NativeTest 'Batch must be a whole number of 1 or more' {
         $rows = @(Import-MigrationCsv -Path (New-TestCsv @($header, $valid)))
         Assert-Equal $rows[0].batch 1 'The batch number was not read as a number.'
@@ -510,6 +523,19 @@ try {
                 ForEach-Object { "line $($_.Extent.StartLineNumber): $($_.GetCommandName())" }
         )
         Assert-Equal $unguarded.Count 0 "Unguarded mutating calls: $($unguarded -join '; ')."
+    }
+
+    Invoke-NativeTest 'Power-on is the operator''s call, not a switch' {
+        Assert-True ($text -notmatch 'PowerOnAfterMigration') 'The power-on switch is back.'
+        Assert-True ($text -match '(?m)^function Show-RdmMapping') 'The mapping summary is missing.'
+        Assert-True ($text -match '(?m)^function Request-PowerOnConfirmation') 'The confirmation prompt is missing.'
+        Assert-True ($text -match "-match '\^\(y\|yes\)\$'") 'Anything but an explicit yes should mean no.'
+
+        # The mapping has to be on screen before the question is asked.
+        $showIndex = $text.IndexOf('Show-RdmMapping -GroupPlan $groupPlan')
+        $askIndex = $text.IndexOf('Request-PowerOnConfirmation -GroupPlan $groupPlan')
+        Assert-True ($showIndex -ge 0) 'The mapping is never shown in the run.'
+        Assert-True (($askIndex -gt $showIndex)) 'The operator is asked before the mapping is shown.'
     }
 
     Invoke-NativeTest 'Power-on happens once per line item, after it is verified' {

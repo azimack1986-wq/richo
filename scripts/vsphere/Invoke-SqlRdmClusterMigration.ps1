@@ -83,11 +83,6 @@
     Allow a hard power-off, and only when VMware Tools is not running. Without it a
     powered-on VM whose Tools are unavailable stops the migration.
 
-.PARAMETER PowerOnAfterMigration
-    Power each migration group's VMs on as soon as that line item is complete - every VM
-    in the row relocated, every LUN mapped on every node, and the placement verified -
-    in CSV order, first_vm first. Without it the VMs are left powered off.
-
 .PARAMETER OutputFolder
     Where the manifest, plan, results and verification files are written.
 
@@ -100,10 +95,10 @@
     Validates the CSV against live inventory and writes the plan without changing anything.
 
 .EXAMPLE
-    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -PowerAction ShutdownGuest -ShutdownTimeoutMinutes 20 -PowerOnAfterMigration
+    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -PowerAction ShutdownGuest -ShutdownTimeoutMinutes 20
 
-    Migrates every row in the CSV and powers the VMs on at the destination, a workload
-    type at a time.
+    Migrates every row in the CSV. After each row is mapped and verified it prints what
+    landed where and asks whether to power that row's VMs on.
 
 .EXAMPLE
     .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -VMName LABSQL01 -PowerAction ShutdownGuest
@@ -163,9 +158,6 @@ param(
     [switch]$ForcePowerOffIfGuestShutdownUnavailable,
 
     [Parameter()]
-    [switch]$PowerOnAfterMigration,
-
-    [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$OutputFolder = (Join-Path (Get-Location) 'SqlRdmClusterMigrationOutput'),
 
@@ -176,7 +168,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '3.1.0'
+$ScriptVersion = '3.2.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -791,9 +783,23 @@ function Import-MigrationCsv {
         [string]$Path
     )
 
-    $rows = @(Import-Csv -LiteralPath $Path)
-    if ($rows.Count -eq 0) {
+    $allRows = @(Import-Csv -LiteralPath $Path)
+    if ($allRows.Count -eq 0) {
         throw 'CSV contains no data rows.'
+    }
+
+    # A row whose first cell starts with # is commented out and never looked at again -
+    # not validated, not counted, not run. It is how one row of a sheet is taken out of a
+    # night's work without editing anything else, and how a sheet of twenty rows is run
+    # one row at a time.
+    $firstColumn = @($allRows[0].PSObject.Properties.Name)[0]
+    $rows = @($allRows | Where-Object { -not ([string]$_.$firstColumn).Trim().StartsWith('#') })
+    $commentedOut = $allRows.Count - $rows.Count
+    if ($commentedOut -gt 0) {
+        Write-RichoLog "$commentedOut of $($allRows.Count) CSV row(s) are commented out with # and will be skipped." -Level INFO
+    }
+    if ($rows.Count -eq 0) {
+        throw "Every row in the CSV is commented out with #; there is nothing to do."
     }
 
     $requiredColumns = @(
@@ -2246,6 +2252,75 @@ function Confirm-MigrationOutcome {
     return $records.ToArray()
 }
 
+function Show-RdmMapping {
+    <#
+    .SYNOPSIS
+        Prints what each VM in the group ended up with, controller by controller.
+
+    .DESCRIPTION
+        Read back off the VMs, not recited from the plan: this is the last thing an
+        operator sees before deciding whether to boot a SQL cluster, so it has to be what
+        is actually there.
+
+    .PARAMETER GroupPlan
+        The resolved migration group.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $GroupPlan
+    )
+
+    Write-RichoLog "  ===== Mapped LUNs for '$($GroupPlan.Name)' =====" -Level INFO
+
+    foreach ($vmItem in @($GroupPlan.VMItems | Sort-Object PowerOnOrder)) {
+        $currentVM = Get-VM -Id $vmItem.VM.Id
+        $layout = Get-VMRdmLayout -VM $currentVM
+        $rdms = @($layout.Rdms | Sort-Object ControllerBus, UnitNumber)
+
+        Write-RichoLog "    $($currentVM.Name) on $($currentVM.VMHost.Name) - $($rdms.Count) RDM(s), powered $($currentVM.PowerState)" -Level INFO
+
+        foreach ($busGroup in @($rdms | Group-Object ControllerBus)) {
+            $sample = $busGroup.Group[0]
+            $shortType = ($sample.ControllerType -split '\.')[-1]
+            Write-RichoLog "      SCSI $($busGroup.Name)  $shortType, bus sharing $($sample.BusSharing)" -Level INFO
+            foreach ($rdm in $busGroup.Group) {
+                Write-RichoLog ("        {0,-6} {1,-40} {2,10} GB  {3}" -f "$($rdm.ControllerBus):$($rdm.UnitNumber)", $rdm.CanonicalName, $rdm.CapacityGB, $rdm.CompatibilityMode) -Level INFO
+            }
+        }
+
+        if ($rdms.Count -eq 0) {
+            Write-RichoLog '      no RDMs are attached' -Level WARN
+        }
+    }
+
+    Write-RichoLog "  ================================================" -Level INFO
+}
+
+function Request-PowerOnConfirmation {
+    <#
+    .SYNOPSIS
+        Asks the operator whether to power the group on.
+
+    .DESCRIPTION
+        Anything but an explicit yes means no. A run with nothing on the other end of the
+        console - a scheduled task, a redirected session - reads an empty line and leaves
+        the VMs off, which is the safe way round for a SQL cluster.
+
+    .PARAMETER GroupPlan
+        The resolved migration group.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        $GroupPlan
+    )
+
+    $answer = Read-Host "  Mapping above looks right - power on the $($GroupPlan.VMItems.Count) VM(s) of '$($GroupPlan.Name)' now? [y/N]"
+    return ([string]$answer).Trim() -match '^(y|yes)$'
+}
+
 function Invoke-GroupPowerOn {
     <#
     .SYNOPSIS
@@ -2451,12 +2526,20 @@ try {
             Add-Result $groupPlan.Name '' 'Verify' 'Passed' "All $($groupVerification.Count) disk placements match the plan."
         }
 
-        # The line item is complete: relocated, mapped and verified. Now it can boot.
-        if ($PowerOnAfterMigration) {
-            Invoke-GroupPowerOn -GroupPlan $groupPlan
+        # The line item is complete: relocated, mapped and verified. What landed where is
+        # printed, and then it is the operator's call.
+        if ($DryRun) {
+            Add-Result $groupPlan.Name '' 'PowerOn' 'DryRun' 'An execution run prints the mapping and asks before powering anything on.'
         }
         else {
-            Write-RichoLog "  PowerOnAfterMigration was not requested; '$($groupPlan.Name)' has been left powered off." -Level INFO
+            Show-RdmMapping -GroupPlan $groupPlan
+            if (Request-PowerOnConfirmation -GroupPlan $groupPlan) {
+                Invoke-GroupPowerOn -GroupPlan $groupPlan
+            }
+            else {
+                Write-RichoLog "  Left powered off at your request. '$($groupPlan.Name)' is migrated and mapped; start the VMs when you are ready." -Level INFO
+                Add-Result $groupPlan.Name '' 'PowerOn' 'Skipped' 'The operator chose not to power the group on.'
+            }
         }
 
         $groupStatus = if ($DryRun) { 'DryRunPassed' } else { 'Succeeded' }

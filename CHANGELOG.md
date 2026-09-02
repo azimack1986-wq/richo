@@ -4680,3 +4680,37 @@ last of them showed why it could not work.
 - Per-disk plan lines in the dry run: every LUN, the SCSI address it is going back to,
   the disk it replaces and that disk's size. The mapping phase itself is one planned
   change per LUN group, so without these a dry run said less than it used to.
+
+### [3.2.0] — 2026-09-02
+
+#### Removed
+
+- **`-PowerOnAfterMigration`.** Whether a SQL cluster boots is not a decision to make at
+  the command line, minutes before the evidence exists.
+
+#### Added
+
+- **The mapping is printed, and then the operator decides.** When a line item is
+  relocated, mapped and verified, the run reads the VMs back and prints what actually
+  landed where — per VM, per controller, with its type and bus sharing, and every LUN's
+  address, device and size — then asks whether to power that row on. `y` starts the row's
+  VMs in CSV order; anything else, including an empty answer from a session with nothing
+  on the other end of the console, leaves them migrated, mapped and off, and the run
+  moves to the next row. Either answer is recorded in the results file.
+
+  The summary is read back off the VMs rather than recited from the plan: it is the last
+  thing anyone sees before booting a cluster, so it has to be what is actually there.
+
+- **Rows commented out with `#` are skipped** — not validated, not counted, not run. One
+  line of a sheet comes out of a night's work without editing anything else, and a
+  twenty-row sheet can be run a row at a time. Because a hashed row is never validated it
+  can hold notes or a half-written line. The run reports how many it skipped and refuses
+  to start if every row is hashed out. `-Batch` and `-VMName` still apply to what is left.
+
+#### Tests
+
+- The simulator now scripts the prompt: one run answers yes and asserts the mapping was
+  printed before the question and that power-on followed; another answers no and asserts
+  the VMs are migrated, mapped, still off, and the decision recorded. A third run proves a
+  hashed row is skipped while its neighbour runs, with a deliberately invalid hashed row
+  to prove hashing skips validation too.
