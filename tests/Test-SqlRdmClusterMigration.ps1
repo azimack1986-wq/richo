@@ -487,12 +487,11 @@ try {
         $mutating = @(
             'Remove-HardDisk',
             'Remove-SharedScsiController',
+            'New-RdmDiskGroup',
             'Move-VM',
             'Start-VM',
             'Stop-VM',
-            'Stop-VMGuest',
-            'New-SharedScsiController',
-            'Add-RdmDevice'
+            'Stop-VMGuest'
         )
         $unguarded = @(
             $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true) |
@@ -529,13 +528,18 @@ try {
         Assert-Equal $outside.Count 0 "Start-VM is called outside the workload power-on phase: $($outside -join ', ')."
     }
 
-    Invoke-NativeTest 'Controllers are found in the device list, never via Get-ScsiController' {
+    Invoke-NativeTest 'Removal finds controllers in the device list, not via Get-ScsiController' {
         # Get-ScsiController returns the controllers of a VM's HARD DISKS. Emptying a
         # controller therefore removes it from that cmdlet's output, and a live run died
         # with "SCSI controller bus 1 is no longer attached" one line after detaching the
-        # only RDM on it.
-        $scsiControllerCalls = @(Get-CommandAst -Ast $ast -Name 'Get-ScsiController')
-        Assert-Equal $scsiControllerCalls.Count 0 'Get-ScsiController is back; it cannot see an empty controller.'
+        # only RDM on it. It is still the right cmdlet for asking which controller a disk
+        # is on, which is all the mapping sequence uses it for.
+        $byVM = @(
+            Get-CommandAst -Ast $ast -Name 'Get-ScsiController' |
+                Where-Object { $_.Extent.Text -notmatch '-HardDisk' } |
+                ForEach-Object { "line $($_.Extent.StartLineNumber)" }
+        )
+        Assert-Equal $byVM.Count 0 "Get-ScsiController is being asked for a VM's controllers: $($byVM -join ', ')."
         Assert-True ($text -match '(?m)^function Remove-SharedScsiController') 'The device-spec controller removal is missing.'
         Assert-True ($text -match '\[VMware\.Vim\.VirtualSCSIController\]') 'Controllers are not matched by device type.'
     }
@@ -593,9 +597,7 @@ try {
         Assert-True ($text -match 'RunAsync    = \$true') 'The cold relocate does not run as a task, so its percentage cannot be reported.'
         Assert-True ($text -match 'still waiting for') 'The guest shutdown wait has no heartbeat.'
 
-        # The host storage scan is the slowest phase of a dry run; it has to name the host
-        # before the read, not only after it.
-        Assert-True ($text -match 'reading storage paths and devices') 'The host storage scan says nothing before it reads.'
+        Assert-True ($text -match 'Resolving \$\(\$LunIds\.Count\) LUN\(s\)') 'The LUN resolution says nothing before it reads the host.'
     }
 
     Invoke-NativeTest 'There are two modes and one gate between them' {
@@ -637,17 +639,36 @@ try {
         Assert-True ($text -match 'Stop-VM[\s\S]*?-Kill') 'Guarded hard power-off action is missing.'
     }
 
-    Invoke-NativeTest 'RDM attach sets the SCSI unit in the device spec, not afterwards' {
-        Assert-True ($text -match '\$disk\.UnitNumber = \$UnitNumber') 'The add spec does not set the unit number.'
-        Assert-True ($text -notmatch 'function Set-HardDiskUnitNumber') 'The unsupported post-attach unit-number edit is back.'
-        $newHardDiskCalls = @(Get-CommandAst -Ast $ast -Name 'New-HardDisk')
-        Assert-Equal $newHardDiskCalls.Count 0 'RDMs are being added with New-HardDisk, which cannot pick the unit.'
+    Invoke-NativeTest 'Mapping follows the estate''s proven sequence, in order' {
+        # Disk first, controller created FROM that disk, unit forced to 0 by an edit spec,
+        # then the rest of the group onto the same controller. Hand-built device specs
+        # replaced this once and vCenter refused them.
+        $mapFunction = @($functionAsts | Where-Object { $_.Name -eq 'New-RdmDiskGroup' })
+        Assert-Equal $mapFunction.Count 1 'New-RdmDiskGroup is missing.'
+        $mapText = $mapFunction[0].Extent.Text
+
+        $steps = @(
+            'New-HardDisk -VM \$currentFirstVM -DeviceName \$deviceNames\[0\]',
+            'New-ScsiController -HardDisk \$firstDisk',
+            '\$unitSpec\.DeviceChange\[0\]\.Operation = ''edit''',
+            '\$unitSpec\.DeviceChange\[0\]\.Device\.UnitNumber = 0',
+            'New-HardDisk .* -Controller \$controller'
+        )
+        $position = 0
+        foreach ($step in $steps) {
+            $match = [regex]::Match($mapText.Substring($position), $step)
+            Assert-True $match.Success "The mapping sequence is missing, or out of order at: $step"
+            $position += $match.Index + 1
+        }
+
+        Assert-True ($mapText -match 'ReconfigVM\(\$copySpec\)') 'The other nodes do not receive the copy spec.'
     }
 
-    Invoke-NativeTest 'Destination controller type comes from the source, not a hardcoded PVSCSI' {
-        Assert-True ($text -notmatch 'New-Object VMware\.Vim\.ParaVirtualSCSIController') 'The controller type is hardcoded to PVSCSI.'
-        Assert-True ($text -match 'New-Object -TypeName \$ControllerTypeName') 'The controller is not built from the source type.'
+    Invoke-NativeTest 'Controller type and bus sharing are mapped from the source' {
+        Assert-True ($text -match '(?m)^function ConvertTo-PowerCliControllerType') 'The controller type mapping is missing.'
+        Assert-True ($text -match '(?m)^function ConvertTo-PowerCliBusSharing') 'The bus sharing mapping is missing.'
         Assert-True ($text -match 'ControllerType = \$controller\.GetType\(\)\.FullName') 'The source controller type is not recorded.'
+        Assert-True ($text -match 'ConvertTo-PowerCliControllerType -ControllerTypeName \$controllerRecord\[0\]\.ControllerType') 'The mapping is not fed from the source controller.'
     }
 
     Invoke-NativeTest 'Optional SDK properties are read without assuming they exist' {
@@ -671,31 +692,33 @@ try {
         }
     }
 
-    Invoke-NativeTest 'Capacity is checked everywhere it still can be' {
+    Invoke-NativeTest 'Verification checks what can be known after the mapping' {
         Assert-True ($text -match 'CapacityToleranceGB') 'No capacity tolerance is defined.'
-        Assert-True ($text -match 'Capacity is \$\(\$actual\[0\]\.CapacityGB\)') 'Post-migration verification does not compare capacity.'
-        Assert-True ($text -match 'but the RDM being moved is') 'The opt-in presentation check does not compare capacity.'
+        Assert-True ($text -match 'the RDMs it replaces were') 'Verification does not compare capacity against the source.'
+        Assert-True ($text -match 'is not the same device on every node') 'Verification does not compare devices across the nodes.'
     }
 
-    Invoke-NativeTest 'Host storage is read only when presentation is being verified' {
-        # Presenting the LUNs is the engineer's prerequisite. Reading every path on every
-        # host to re-confirm it was the slowest thing the script did, on every run.
-        $storageReads = @(Get-CommandAst -Ast $ast -Name 'Get-HostStorageMap')
-        Assert-True ($storageReads.Count -gt 0) 'The host storage read has gone entirely; -VerifyLunPresentation needs it.'
+    Invoke-NativeTest 'Host storage is read once, to resolve LUN IDs at mapping time' {
+        # The LUNs are assumed present. The host is read to answer "which device is LUN
+        # 40", never to check that it is there - and only on the VM's own host.
+        $mapFunction = @($functionAsts | Where-Object { $_.Name -eq 'New-RdmDiskGroup' })
+        Assert-Equal $mapFunction.Count 1 'New-RdmDiskGroup is missing.'
 
-        $verifyFunction = @($functionAsts | Where-Object { $_.Name -eq 'Confirm-LunPresentation' })
-        Assert-Equal $verifyFunction.Count 1 'Confirm-LunPresentation is missing.'
+        foreach ($name in @('Get-EsxCli', 'Get-ScsiLun')) {
+            $calls = @(Get-CommandAst -Ast $ast -Name $name)
+            Assert-True ($calls.Count -gt 0) "$name is not called at all; LUN IDs cannot be resolved."
+            $outside = @(
+                $calls |
+                    Where-Object {
+                        ($_.Extent.StartOffset -lt $mapFunction[0].Extent.StartOffset) -or
+                        ($_.Extent.EndOffset -gt $mapFunction[0].Extent.EndOffset)
+                    } |
+                    ForEach-Object { "line $($_.Extent.StartLineNumber)" }
+            )
+            Assert-Equal $outside.Count 0 "$name is called outside the mapping sequence: $($outside -join ', ')."
+        }
 
-        $outside = @(
-            $storageReads |
-                Where-Object {
-                    ($_.Extent.StartOffset -lt $verifyFunction[0].Extent.StartOffset) -or
-                    ($_.Extent.EndOffset -gt $verifyFunction[0].Extent.EndOffset)
-                } |
-                ForEach-Object { "line $($_.Extent.StartLineNumber)" }
-        )
-        Assert-Equal $outside.Count 0 "Host storage is read outside the opt-in verification: $($outside -join ', ')."
-        Assert-True ($text -match 'PREREQUISITE, not checked by this script') 'The prerequisite is not printed for the engineer.'
+        Assert-True ($text -match 'PREREQUISITE, assumed and not checked') 'The prerequisite is not printed for the engineer.'
     }
 
     Invoke-NativeTest 'RDM discovery matches device types rather than duck-typing a backing' {
@@ -710,7 +733,11 @@ try {
 
     Invoke-NativeTest 'Operator CSV does not require NAA values' {
         Assert-True ($header -notmatch '(?i)naa') 'Operator CSV unexpectedly contains an NAA column.'
-        Assert-True ($text -match 'Resolve-DestinationLun') 'Internal device resolution function is missing.'
+        # The device comes from the LUN ID and the SVM, resolved on the host - never from
+        # the RDM that was detached, whose backing carries a vml identifier that does not
+        # compare with the naa the host reports.
+        Assert-True ($text -match 'TargetIdentifier -like') 'LUN IDs are not resolved against the SVM path list.'
+        Assert-True ($text -match 'ConsoleDeviceName') 'The console device name is not used for the attach.'
     }
 
     Write-Host ''

@@ -83,17 +83,6 @@
     Allow a hard power-off, and only when VMware Tools is not running. Without it a
     powered-on VM whose Tools are unavailable stops the migration.
 
-.PARAMETER VerifyLunPresentation
-    Read the destination hosts' storage and confirm every LUN in the CSV is presented
-    before anything is changed. Off by default: presentation and rescanning are the
-    engineer's prerequisite, and the read costs one storage enumeration per host.
-
-.PARAMETER SkipDeviceCheck
-    Skip even the quick "can the destination host see this device" check. That check is
-    one storage read per destination host and it runs before anything is powered off;
-    skipping it means a device that is not presented is found at the attach instead,
-    with the VMs already down and moved.
-
 .PARAMETER PowerOnAfterMigration
     Power the VMs on at the destination once every migration group has been relocated,
     re-attached and verified - a workload type at a time, groups in CSV order and VMs in
@@ -177,12 +166,6 @@ param(
     [switch]$PowerOnAfterMigration,
 
     [Parameter()]
-    [switch]$VerifyLunPresentation,
-
-    [Parameter()]
-    [switch]$SkipDeviceCheck,
-
-    [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$OutputFolder = (Join-Path (Get-Location) 'SqlRdmClusterMigrationOutput'),
 
@@ -193,7 +176,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.13.0'
+$ScriptVersion = '3.0.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -1148,215 +1131,6 @@ function Get-VMRdmLayout {
     }
 }
 
-function Get-HostStorageMap {
-    <#
-    .SYNOPSIS
-        Reads a host's iSCSI paths and disk devices once, for repeated LUN lookups.
-
-    .DESCRIPTION
-        Resolving a LUN used to run one esxcli path enumeration and one Get-ScsiLun per
-        LUN per host. A three-controller cluster of twelve LUNs across eight hosts is
-        ~200 round trips to answer a question that takes two per host.
-
-    .PARAMETER VMHost
-        The host to read.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        $VMHost
-    )
-
-    $esxcli = Get-EsxCli -VMHost $VMHost -V2
-    $paths = @($esxcli.storage.core.path.list.Invoke())
-    $scsiLuns = @(Get-ScsiLun -VMHost $VMHost -LunType Disk)
-
-    $lunsByCanonicalName = @{}
-    foreach ($scsiLun in $scsiLuns) {
-        $lunsByCanonicalName[([string]$scsiLun.CanonicalName).ToLowerInvariant()] = $scsiLun
-    }
-
-    return [pscustomobject]@{
-        VMHost              = $VMHost
-        Paths               = $paths
-        LunsByCanonicalName = $lunsByCanonicalName
-    }
-}
-
-function Resolve-DestinationLun {
-    <#
-    .SYNOPSIS
-        Resolves an SVM plus LUN ID to exactly one device on one host.
-
-    .DESCRIPTION
-        The operator supplies the SVM and the LUN ID because those are what the storage
-        team hands over. The canonical name is derived here and then verified to be the
-        same device on every eligible host, so a typo cannot quietly become a different
-        LUN on a different node of the same cluster.
-
-    .PARAMETER StorageMap
-        The host storage map from Get-HostStorageMap.
-
-    .PARAMETER Svm
-        SVM name, matched against the path target identifier.
-
-    .PARAMETER LunId
-        The LUN ID as presented by the array.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        $StorageMap,
-
-        [Parameter(Mandatory)]
-        [string]$Svm,
-
-        [Parameter(Mandatory)]
-        [int]$LunId
-    )
-
-    $hostName = $StorageMap.VMHost.Name
-    $paths = @(
-        $StorageMap.Paths |
-            Where-Object {
-                ([int]$_.LUN -eq $LunId) -and ([string]$_.TargetIdentifier -like "*$Svm*")
-            }
-    )
-
-    if ($paths.Count -eq 0) {
-        throw "Host '$hostName' has no path for SVM '$Svm', LUN $LunId."
-    }
-
-    $deviceNames = @(
-        $paths |
-            ForEach-Object { [string]$_.Device } |
-            Where-Object { $_ } |
-            Select-Object -Unique
-    )
-    if ($deviceNames.Count -ne 1) {
-        throw "Host '$hostName' resolves SVM '$Svm', LUN $LunId to $($deviceNames.Count) devices; expected one."
-    }
-
-    $canonicalName = $deviceNames[0].ToLowerInvariant()
-    if (-not $StorageMap.LunsByCanonicalName.ContainsKey($canonicalName)) {
-        throw "Host '$hostName' has a path to '$($deviceNames[0])' but no matching disk device; rescan the HBAs."
-    }
-
-    $scsiLun = $StorageMap.LunsByCanonicalName[$canonicalName]
-
-    return [pscustomobject]@{
-        LunId             = $LunId
-        CanonicalName     = $canonicalName
-        ConsoleDeviceName = [string]$scsiLun.ConsoleDeviceName
-        CapacityGB        = [math]::Round([double]$scsiLun.CapacityGB, 3)
-        PathCount         = $paths.Count
-    }
-}
-
-function Assert-DeviceVisible {
-    <#
-    .SYNOPSIS
-        Confirms the destination hosts can see the devices the RDMs will be re-attached to.
-
-    .DESCRIPTION
-        One Get-ScsiLun per destination host - the hosts actually chosen, not every host
-        in the cluster, and no per-LUN path enumeration. It exists because the alternative
-        is finding out at the attach, which happens after the VMs are powered off, their
-        RDMs detached and the machines relocated: the worst possible moment and the
-        hardest state to unpick.
-
-        This is not the presentation check; -VerifyLunPresentation is. This only asks
-        whether the device the VM already has is visible where the VM is going.
-
-    .PARAMETER DestinationHosts
-        The hosts the VMs will be placed on.
-
-    .PARAMETER Disks
-        The resolved destination disks.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [array]$DestinationHosts,
-
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [array]$Disks
-    )
-
-    foreach ($destinationHost in $DestinationHosts) {
-        $visible = @{}
-        foreach ($scsiLun in @(Get-ScsiLun -VMHost $destinationHost -LunType Disk)) {
-            $visible[([string]$scsiLun.CanonicalName).ToLowerInvariant()] = $true
-        }
-
-        $missing = @($Disks | Where-Object { -not $visible.ContainsKey($_.CanonicalName) })
-        if ($missing.Count -gt 0) {
-            $names = @($missing | ForEach-Object { "LUN $($_.LunId) ($($_.CanonicalName))" }) -join ', '
-            throw "Host '$($destinationHost.Name)' cannot see $names. Present the LUNs to it and rescan the HBAs, then run again."
-        }
-
-        Write-RichoLog "    $($destinationHost.Name): all $($Disks.Count) device(s) visible." -Level INFO
-    }
-}
-
-function Confirm-LunPresentation {
-    <#
-    .SYNOPSIS
-        Reads the destination hosts back and confirms every LUN is presented.
-
-    .DESCRIPTION
-        Only ever run on request. Presenting the LUNs and rescanning is the engineer's
-        prerequisite, and confirming it costs a full storage enumeration per host - the
-        slowest thing this script used to do, on every run, whether anyone doubted the
-        presentation or not.
-
-    .PARAMETER DestinationHosts
-        The eligible destination host records.
-
-    .PARAMETER Svm
-        SVM presenting the LUNs.
-
-    .PARAMETER Disks
-        The resolved destination disks, carrying the LUN IDs and the device identities
-        taken from the source RDMs.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [array]$DestinationHosts,
-
-        [Parameter(Mandatory)]
-        [string]$Svm,
-
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [array]$Disks
-    )
-
-    foreach ($record in $DestinationHosts) {
-        $hostName = $record.VMHost.Name
-        Write-RichoLog "    $hostName : reading storage paths and devices..." -Level INFO
-        $hostStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-        $storageMap = Get-HostStorageMap -VMHost $record.VMHost
-
-        foreach ($disk in $Disks) {
-            $resolved = Resolve-DestinationLun -StorageMap $storageMap -Svm $Svm -LunId $disk.LunId
-            if ($resolved.CanonicalName -ne $disk.CanonicalName) {
-                throw "On '$hostName', SVM '$Svm' LUN $($disk.LunId) is device '$($resolved.CanonicalName)', but the RDM being moved is '$($disk.CanonicalName)'."
-            }
-            if ([math]::Abs($resolved.CapacityGB - $disk.CapacityGB) -gt $script:CapacityToleranceGB) {
-                throw "On '$hostName', LUN $($disk.LunId) is $($resolved.CapacityGB) GB but the RDM being moved is $($disk.CapacityGB) GB."
-            }
-        }
-
-        $hostStopwatch.Stop()
-        Write-RichoLog "      all $($Disks.Count) LUN(s) present and matching ($(Format-Elapsed -Elapsed $hostStopwatch.Elapsed))." -Level INFO
-    }
-}
-
 function Get-EligibleDestinationHosts {
     <#
     .SYNOPSIS
@@ -1371,7 +1145,7 @@ function Get-EligibleDestinationHosts {
         Storage presentation is NOT checked here. Presenting the LUNs to the destination
         hosts and rescanning is the engineer's prerequisite, and reading every path on
         every host to re-confirm it was the slowest thing this script did. What must be
-        presented is printed instead, and -VerifyLunPresentation reads it back on request.
+        presented is stated instead, once, and taken on trust.
 
         The mounts are read from the datastores, not from the hosts. Asking each host what
         it mounts is one round trip per host - a minute of them on a 42-host cluster - and
@@ -1489,110 +1263,6 @@ function Wait-VMReconfigureTask {
     Wait-VMLongTask -Task (Get-Task -Id "Task-$($TaskReference.Value)") -Activity $Description -ReportEverySeconds 10
 }
 
-function Get-PciControllerKey {
-    <#
-    .SYNOPSIS
-        Returns the key of a VM's PCI controller, the parent of its SCSI controllers.
-
-    .DESCRIPTION
-        It is 100 on every VM anyone has seen, but a new SCSI controller has to name a
-        real parent key and reading it costs nothing next to guessing it.
-
-    .PARAMETER DeviceList
-        The VM's Config.Hardware.Device list.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [array]$DeviceList
-    )
-
-    $pci = @($DeviceList | Where-Object { $_ -is [VMware.Vim.VirtualPCIController] })
-    if ($pci.Count -ne 1) {
-        throw "Expected exactly one PCI controller on the VM; found $($pci.Count)."
-    }
-
-    return [int]$pci[0].Key
-}
-
-function New-SharedScsiController {
-    <#
-    .SYNOPSIS
-        Adds a SCSI controller of the source's own type and bus-sharing mode.
-
-    .DESCRIPTION
-        The controller type is not a free choice. A WSFC node built on LSI Logic SAS that
-        comes back as PVSCSI needs a driver it may not have, and the guest sees its shared
-        disks arrive on different hardware - which is exactly the condition SQL FCI is
-        least able to absorb. The type therefore comes from the source device.
-
-        UnitNumber is deliberately left unset so vCenter chooses the PCI slot. Setting it
-        to the SCSI bus number, as this script used to, puts the controller in whichever
-        slot happens to share that number and collides with whatever already holds it.
-
-    .PARAMETER VM
-        The VM to add the controller to.
-
-    .PARAMETER BusNumber
-        SCSI bus number for the new controller.
-
-    .PARAMETER ControllerTypeName
-        Full VMware.Vim type name of the source controller.
-
-    .PARAMETER SharedBus
-        Bus-sharing mode taken from the source controller, whatever it is.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)]
-        $VM,
-
-        [Parameter(Mandatory)]
-        [int]$BusNumber,
-
-        [Parameter(Mandatory)]
-        [string]$ControllerTypeName,
-
-        [Parameter(Mandatory)]
-        [string]$SharedBus
-    )
-
-    if ($ControllerTypeName -notlike 'VMware.Vim.*') {
-        throw "Refusing to create a controller of type '$ControllerTypeName'."
-    }
-
-    $vmView = Get-View -Id $VM.Id -Property Config.Hardware.Device
-    $devices = @($vmView.Config.Hardware.Device)
-
-    $existing = @(
-        $devices |
-            Where-Object { ($_ -is [VMware.Vim.VirtualSCSIController]) -and ([int]$_.BusNumber -eq $BusNumber) }
-    )
-    if ($existing.Count -gt 0) {
-        throw "VM '$($VM.Name)' already has a SCSI controller on bus $BusNumber."
-    }
-
-    $controller = New-Object -TypeName $ControllerTypeName
-    if ($controller -isnot [VMware.Vim.VirtualSCSIController]) {
-        throw "Type '$ControllerTypeName' is not a SCSI controller."
-    }
-
-    $controller.Key = -1000 - $BusNumber
-    $controller.BusNumber = $BusNumber
-    $controller.SharedBus = $SharedBus
-    $controller.ControllerKey = Get-PciControllerKey -DeviceList $devices
-
-    $change = New-Object VMware.Vim.VirtualDeviceConfigSpec
-    $change.Operation = 'add'
-    $change.Device = $controller
-
-    $spec = New-Object VMware.Vim.VirtualMachineConfigSpec
-    $spec.DeviceChange = @($change)
-
-    Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description "Adding SCSI controller $BusNumber to '$($VM.Name)'"
-}
-
 function Remove-SharedScsiController {
     <#
     .SYNOPSIS
@@ -1649,206 +1319,6 @@ function Remove-SharedScsiController {
     $spec.DeviceChange = @($change)
 
     Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description "Removing SCSI controller $BusNumber from '$($VM.Name)'"
-}
-
-function Add-RdmDevice {
-    <#
-    .SYNOPSIS
-        Attaches one physical-mode RDM at an exact SCSI address.
-
-    .DESCRIPTION
-        The device is built as a VirtualDeviceConfigSpec rather than handed to
-        New-HardDisk because New-HardDisk takes the next free unit on the controller and
-        offers no way to ask for a specific one. The old code compensated by editing the
-        unit number afterwards, which vSphere does not support for an attached disk: it
-        either fails the reconfigure or leaves the disk where it was. For a SQL FCI the
-        SCSI address is what the guest matches its shared disks on, so it has to be right
-        the first time.
-
-        When ExistingMappingFile is supplied the mapping file created for the first node
-        is attached rather than a new one created - VMware's documented arrangement for a
-        cluster across boxes.
-
-    .PARAMETER VM
-        The VM to attach to.
-
-    .PARAMETER ControllerBus
-        SCSI bus of the target controller.
-
-    .PARAMETER UnitNumber
-        SCSI unit the disk must occupy.
-
-    .PARAMETER ConsoleDeviceName
-        The /vmfs/devices/disks/... path of the destination LUN.
-
-    .PARAMETER RdmDatastoreName
-        Datastore the new mapping file is created on. Ignored when attaching an existing
-        mapping file.
-
-    .PARAMETER ExistingMappingFile
-        Datastore path of a mapping file to attach instead of creating one.
-
-    .PARAMETER CompatibilityMode
-        Compatibility mode read from the source RDM. Physical, for everything this tool
-        handles, but taken from the device rather than assumed.
-
-    .PARAMETER DiskMode
-        Disk mode read from the source RDM. When the source did not carry one,
-        independent_persistent is used: vCenter rejects the backing outright when the
-        mode is absent.
-
-    .PARAMETER Sharing
-        Disk sharing read from the source RDM - sharingNone or sharingMultiWriter. Left
-        alone when the source did not set it.
-
-    .PARAMETER LunUuid
-        The LUN's UUID as the source RDM recorded it. Part of the reference spec for an
-        RDM add and omitted here until a live run failed on the backing.
-
-    .PARAMETER CapacityInKB
-        The disk's capacity as the source RDM recorded it. Also part of the reference
-        spec, and also omitted here until that failure.
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param(
-        [Parameter(Mandatory)]
-        $VM,
-
-        [Parameter(Mandatory)]
-        [int]$ControllerBus,
-
-        [Parameter(Mandatory)]
-        [int]$UnitNumber,
-
-        [Parameter(Mandatory)]
-        [string]$ConsoleDeviceName,
-
-        [Parameter(Mandatory)]
-        [string]$RdmDatastoreName,
-
-        [Parameter()]
-        [AllowEmptyString()]
-        [string]$ExistingMappingFile,
-
-        [Parameter()]
-        [AllowEmptyString()]
-        [string]$CompatibilityMode = 'physicalMode',
-
-        [Parameter()]
-        [AllowEmptyString()]
-        [string]$DiskMode,
-
-        [Parameter()]
-        [AllowEmptyString()]
-        [string]$Sharing,
-
-        [Parameter()]
-        [AllowEmptyString()]
-        [string]$LunUuid,
-
-        [Parameter()]
-        [long]$CapacityInKB = 0
-    )
-
-    $vmView = Get-View -Id $VM.Id -Property Config.Hardware.Device
-    $controllers = @(
-        $vmView.Config.Hardware.Device |
-            Where-Object { ($_ -is [VMware.Vim.VirtualSCSIController]) -and ([int]$_.BusNumber -eq $ControllerBus) }
-    )
-    if ($controllers.Count -ne 1) {
-        throw "VM '$($VM.Name)' has $($controllers.Count) SCSI controllers on bus $ControllerBus; expected one."
-    }
-    $controllerKey = [int]$controllers[0].Key
-
-    $occupied = @(
-        $vmView.Config.Hardware.Device |
-            Where-Object {
-                ($_ -is [VMware.Vim.VirtualDisk]) -and
-                ([int]$_.ControllerKey -eq $controllerKey) -and
-                ([int]$_.UnitNumber -eq $UnitNumber)
-            }
-    )
-    if ($occupied.Count -gt 0) {
-        throw "SCSI $ControllerBus`:$UnitNumber on '$($VM.Name)' is already occupied."
-    }
-
-    # Everything the device had, put back as it was. The point of a migration is that the
-    # guest finds its disks exactly where, and how, it left them.
-    $backing = New-Object VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo
-    $backing.CompatibilityMode = if ($CompatibilityMode) { $CompatibilityMode } else { 'physicalMode' }
-    $backing.DeviceName = $ConsoleDeviceName
-
-    # SHIPPED AND HIT ON A LIVE RUN: with diskMode left unset, vCenter rejected the add
-    # with "Incompatible device backing specified for device '0'". The source's own mode
-    # is used when it has one; a physical-mode RDM with no mode recorded is
-    # independent-persistent by nature, which is what the client itself sends.
-    $backing.DiskMode = if ($DiskMode) { $DiskMode } else { 'independent_persistent' }
-
-    # The published reference spec for an RDM add - William Lam's rdmManagmement.pl -
-    # carries the LUN's UUID on the backing and a capacity on the device. This script
-    # carried neither, and a live run was refused with "Incompatible device backing
-    # specified for device '0'". Both are set from what the source RDM recorded.
-    if ($LunUuid) { $backing.LunUuid = $LunUuid }
-
-    $disk = New-Object VMware.Vim.VirtualDisk
-    $disk.Key = -100 - $UnitNumber
-    $disk.ControllerKey = $controllerKey
-    $disk.UnitNumber = $UnitNumber
-    $disk.Backing = $backing
-    if ($CapacityInKB -gt 0) { $disk.CapacityInKB = $CapacityInKB }
-    # Same care setting it: a binding without the property cannot be told about sharing,
-    # and a source that never had it does not need to be.
-    if ($Sharing -and ($null -ne $disk.PSObject.Properties['Sharing'])) {
-        $disk.Sharing = $Sharing
-    }
-
-    $change = New-Object VMware.Vim.VirtualDeviceConfigSpec
-    $change.Operation = 'add'
-    if ([string]::IsNullOrWhiteSpace($ExistingMappingFile)) {
-        # An empty datastore path asks vCenter to name the mapping file itself, in the
-        # VM's folder on that datastore.
-        $backing.FileName = "[$RdmDatastoreName]"
-        $change.FileOperation = 'create'
-    }
-    else {
-        $backing.FileName = $ExistingMappingFile
-    }
-    $change.Device = $disk
-
-    $spec = New-Object VMware.Vim.VirtualMachineConfigSpec
-    $spec.DeviceChange = @($change)
-
-    # The whole backing, in the log, before it is sent: when vCenter refuses a device the
-    # message names neither the device nor the file, and this is the difference between a
-    # five-minute diagnosis and an afternoon.
-    $sharingSent = [string](Get-OptionalProperty -InputObject $disk -Name 'Sharing' -Default '')
-    Write-RichoLog "        device: $($backing.DeviceName), mode: $($backing.CompatibilityMode)/$($backing.DiskMode), sharing: '$sharingSent'" -Level INFO
-    Write-RichoLog "        lunUuid: '$($backing.LunUuid)', capacityInKB: $($disk.CapacityInKB), file: '$($backing.FileName)', fileOperation: '$($change.FileOperation)'" -Level INFO
-
-    $attachDescription = "Attaching RDM at SCSI $ControllerBus`:$UnitNumber on '$($VM.Name)' (device $($backing.DeviceName), file '$($backing.FileName)')"
-    Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description $attachDescription
-
-    $afterView = Get-View -Id $VM.Id -Property Config.Hardware.Device
-    $attached = @(
-        $afterView.Config.Hardware.Device |
-            Where-Object {
-                ($_ -is [VMware.Vim.VirtualDisk]) -and
-                ([int]$_.ControllerKey -eq $controllerKey) -and
-                ([int]$_.UnitNumber -eq $UnitNumber)
-            }
-    )
-    if ($attached.Count -ne 1) {
-        throw "Expected one disk at SCSI $ControllerBus`:$UnitNumber on '$($VM.Name)' after the attach; found $($attached.Count)."
-    }
-
-    $attachedCanonical = ([string]$attached[0].Backing.DeviceName -replace '^.*/', '').ToLowerInvariant()
-    $expectedCanonical = ($ConsoleDeviceName -replace '^.*/', '').ToLowerInvariant()
-    if ($attachedCanonical -ne $expectedCanonical) {
-        throw "SCSI $ControllerBus`:$UnitNumber on '$($VM.Name)' resolved to device '$attachedCanonical', expected '$expectedCanonical'."
-    }
-
-    return [string]$attached[0].Backing.FileName
 }
 
 function Wait-VMGuestShutdown {
@@ -2084,81 +1554,258 @@ function Remove-RdmsAndControllers {
     }
 }
 
-function Add-DestinationRdms {
+function ConvertTo-PowerCliControllerType {
     <#
     .SYNOPSIS
-        Recreates a VM's shared-bus controllers and re-attaches its RDMs at the
-        destination.
+        Maps a VMware.Vim controller type to the name New-ScsiController takes.
 
-    .PARAMETER VMItem
-        The planned VM record.
+    .PARAMETER ControllerTypeName
+        Full type name read from the source controller.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$ControllerTypeName
+    )
 
-    .PARAMETER GroupPlan
-        The migration group plan, whose MappingFiles table carries the mapping files
-        created for the first VM when the group shares them.
+    switch -Wildcard ($ControllerTypeName) {
+        '*ParaVirtualSCSIController'      { return 'ParaVirtual' }
+        '*VirtualLsiLogicSASController'   { return 'VirtualLsiLogicSAS' }
+        '*VirtualLsiLogicController'      { return 'VirtualLsiLogic' }
+        '*VirtualBusLogicController'      { return 'VirtualBusLogic' }
+        default                           { return 'ParaVirtual' }
+    }
+}
+
+function ConvertTo-PowerCliBusSharing {
+    <#
+    .SYNOPSIS
+        Maps a SharedBus value to the name New-ScsiController takes.
+
+    .PARAMETER SharedBus
+        Bus sharing read from the source controller.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter()]
+        [AllowEmptyString()]
+        [string]$SharedBus
+    )
+
+    switch ($SharedBus) {
+        'physicalSharing' { return 'Physical' }
+        'virtualSharing'  { return 'Virtual' }
+        'noSharing'       { return 'NoSharing' }
+        default           { return 'Physical' }
+    }
+}
+
+function New-RdmDiskGroup {
+    <#
+    .SYNOPSIS
+        Maps one group of LUNs onto the cluster: a controller, its disks, and the same
+        devices attached to every other node.
+
+    .DESCRIPTION
+        This is the estate's own proven mapping sequence, kept deliberately close to the
+        script it came from, because it works and the hand-built device specs that
+        replaced it did not:
+
+          1. Resolve each LUN ID to a device on the VM's own host - the iSCSI path list
+             filtered by LUN and SVM, then Get-ScsiLun for the console device name. The
+             device identity comes from the LUN ID, never from the RDM that was detached:
+             an RDM's backing carries a vml identifier, and the same LUN is a naa on the
+             host, so the two do not compare.
+          2. Create the first disk of the group with New-HardDisk, then create the
+             controller from that disk. PowerCLI moves the disk onto the new controller.
+          3. Force that first disk to unit 0 with an edit spec.
+          4. Add the rest of the group's disks to the same controller, in CSV order.
+          5. Copy the controller and those disks onto every other VM in the group with a
+             single add spec, so the nodes share one mapping file per LUN.
+
+        Nothing here checks whether the LUNs are presented: they are, by the time this
+        runs, and confirming it was the slowest and least useful thing this script did.
+
+    .PARAMETER FirstVM
+        The VM that owns the mapping files.
+
+    .PARAMETER OtherVMs
+        The remaining VMs in the group.
+
+    .PARAMETER LunIds
+        The group's LUN IDs, in the order they are to be attached.
+
+    .PARAMETER Svm
+        SVM whose paths the LUN IDs are looked up on.
+
+    .PARAMETER RdmDatastore
+        Datastore that holds the mapping files.
+
+    .PARAMETER ControllerType
+        Controller type to create, as New-ScsiController names them.
+
+    .PARAMETER BusSharingMode
+        Bus sharing to create the controller with.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        $VMItem,
+        $FirstVM,
 
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [array]$OtherVMs,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [int[]]$LunIds,
+
+        [Parameter(Mandatory)]
+        [string]$Svm,
+
+        [Parameter(Mandatory)]
+        $RdmDatastore,
+
+        [Parameter()]
+        [string]$ControllerType = 'ParaVirtual',
+
+        [Parameter()]
+        [string]$BusSharingMode = 'Physical'
+    )
+
+    $currentFirstVM = Get-VM -Id $FirstVM.Id
+    $vmHost = $currentFirstVM.VMHost
+    Write-RichoLog "      Resolving $($LunIds.Count) LUN(s) from SVM '$Svm' on $($vmHost.Name)." -Level INFO
+
+    $esxcli = Get-EsxCli -VMHost $vmHost -V2
+    $paths = @($esxcli.storage.core.path.list.Invoke())
+
+    $deviceNames = [System.Collections.Generic.List[string]]::new()
+    $canonicalNames = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($lunId in $LunIds) {
+        $lunPath = @(
+            $paths |
+                Where-Object { ([int]$_.LUN -eq $lunId) -and ([string]$_.TargetIdentifier -like "*$Svm*") } |
+                Select-Object -First 1
+        )
+        if ($lunPath.Count -eq 0) {
+            throw "Host '$($vmHost.Name)' has no path to SVM '$Svm', LUN $lunId. Present it and rescan, then run this group again."
+        }
+
+        $scsiLun = @(Get-ScsiLun -VMHost $vmHost -CanonicalName ([string]$lunPath[0].Device))
+        if ($scsiLun.Count -ne 1) {
+            throw "Host '$($vmHost.Name)' returned $($scsiLun.Count) devices for '$($lunPath[0].Device)'; expected one."
+        }
+
+        $deviceNames.Add([string]$scsiLun[0].ConsoleDeviceName)
+        $canonicalNames.Add([string]$scsiLun[0].CanonicalName)
+        Write-RichoLog "        LUN $lunId -> $($scsiLun[0].CanonicalName) ($($scsiLun[0].ConsoleDeviceName))" -Level INFO
+    }
+
+    # The first disk lands wherever PowerCLI puts it, then the controller is created FROM
+    # it, which moves it across. That order is the part that works.
+    Write-RichoLog "      Creating the first disk and its $ControllerType controller ($BusSharingMode bus sharing)." -Level INFO
+    $firstDisk = New-HardDisk -VM $currentFirstVM -DeviceName $deviceNames[0] -DiskType RawPhysical -Datastore $RdmDatastore
+    $controller = New-ScsiController -HardDisk $firstDisk -BusSharingMode $BusSharingMode -Type $ControllerType
+
+    # Re-read both: the objects above predate the reconfigure that moved the disk.
+    $firstDisk = Get-HardDisk -VM $currentFirstVM -Name $firstDisk.Name
+    $controller = Get-ScsiController -HardDisk $firstDisk
+
+    $unitSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
+    $unitSpec.DeviceChange = New-Object VMware.Vim.VirtualDeviceConfigSpec
+    $unitSpec.DeviceChange[0].Operation = 'edit'
+    $unitSpec.DeviceChange[0].Device = $firstDisk.ExtensionData
+    $unitSpec.DeviceChange[0].Device.UnitNumber = 0
+
+    $unitTask = (Get-View -Id $currentFirstVM.Id).ReconfigVM_Task($unitSpec)
+    Wait-VMReconfigureTask -TaskReference $unitTask -Description "Setting '$($firstDisk.Name)' on '$($currentFirstVM.Name)' to unit 0"
+
+    for ($index = 1; $index -lt $deviceNames.Count; $index++) {
+        $addedDisk = New-HardDisk -VM $currentFirstVM -DeviceName $deviceNames[$index] -DiskType RawPhysical -Datastore $RdmDatastore -Controller $controller
+        Write-RichoLog "        added $($addedDisk.Name) - $($canonicalNames[$index])" -Level INFO
+    }
+
+    if ($OtherVMs.Count -eq 0) { return }
+
+    # Every other node gets the controller and the very same mapping files, in one spec.
+    $rdmDisks = @(
+        Get-HardDisk -VM $currentFirstVM |
+            Where-Object { ($_.DiskType -eq 'RawPhysical') -and ($canonicalNames -contains [string]$_.ScsiCanonicalName) }
+    )
+    if ($rdmDisks.Count -ne $deviceNames.Count) {
+        throw "Expected $($deviceNames.Count) RDM(s) on '$($currentFirstVM.Name)' after mapping; found $($rdmDisks.Count)."
+    }
+
+    $copySpec = New-Object VMware.Vim.VirtualMachineConfigSpec
+    $copySpec.DeviceChange = @()
+
+    $controllerChange = New-Object VMware.Vim.VirtualDeviceConfigSpec
+    $controllerChange.Operation = 'add'
+    $controllerChange.Device = $controller.ExtensionData
+    $copySpec.DeviceChange += $controllerChange
+
+    foreach ($rdmDisk in $rdmDisks) {
+        $diskChange = New-Object VMware.Vim.VirtualDeviceConfigSpec
+        $diskChange.Operation = 'add'
+        $diskChange.Device = $rdmDisk.ExtensionData
+        $copySpec.DeviceChange += $diskChange
+    }
+
+    foreach ($otherVM in $OtherVMs) {
+        $currentOtherVM = Get-VM -Id $otherVM.Id
+        Write-RichoLog "      Applying the same controller and $($rdmDisks.Count) disk(s) to '$($currentOtherVM.Name)'." -Level INFO
+        (Get-View -Id $currentOtherVM.Id).ReconfigVM($copySpec)
+    }
+}
+
+function Add-DestinationRdmGroups {
+    <#
+    .SYNOPSIS
+        Maps every LUN group in a migration group back onto its VMs.
+
+    .DESCRIPTION
+        Runs once per group, after every VM in it has been relocated - the first VM owns
+        the mapping files and the rest attach them, so they all have to be at the
+        destination before any of it starts.
+
+    .PARAMETER GroupPlan
+        The resolved migration group.
+    #>
+    [CmdletBinding()]
+    param(
         [Parameter(Mandatory)]
         $GroupPlan
     )
 
-    $vmName = $VMItem.VM.Name
+    $firstVMItem = @($GroupPlan.VMItems | Sort-Object PowerOnOrder)[0]
+    $otherVMs = @($GroupPlan.VMItems | Sort-Object PowerOnOrder | Select-Object -Skip 1 | ForEach-Object { $_.VM })
 
-    foreach ($bus in @($GroupPlan.Disks | ForEach-Object { $_.ControllerBus } | Select-Object -Unique | Sort-Object)) {
-        $controllerMatches = @($GroupPlan.Controllers | Where-Object { $_.ControllerBus -eq $bus })
-        if ($controllerMatches.Count -ne 1) {
-            throw "No source controller was recorded for SCSI bus $bus in group '$($GroupPlan.Name)'."
+    foreach ($diskGroup in $GroupPlan.DiskGroups) {
+        $controllerRecord = @($GroupPlan.Controllers | Where-Object { $_.ControllerBus -eq $diskGroup.ControllerBus })
+        $controllerType = 'ParaVirtual'
+        $busSharing = 'Physical'
+        if ($controllerRecord.Count -eq 1) {
+            $controllerType = ConvertTo-PowerCliControllerType -ControllerTypeName $controllerRecord[0].ControllerType
+            $busSharing = ConvertTo-PowerCliBusSharing -SharedBus $controllerRecord[0].SharedBus
         }
-        $controllerType = $controllerMatches[0]
-        $addControllerDetail = "Create $($controllerType.ShortType) controller on bus $bus with $($controllerType.SharedBus)."
-        Invoke-PlannedChange $GroupPlan.Name $vmName 'AddController' "SCSI $bus" $addControllerDetail {
-            $newControllerParameters = @{
-                VM                 = Get-VM -Id $VMItem.VM.Id
-                BusNumber          = $bus
-                ControllerTypeName = $controllerType.ControllerType
-                SharedBus          = $controllerType.SharedBus
+
+        $detail = "Map LUN(s) $($diskGroup.LunIds -join ', ') from SVM '$($GroupPlan.Svm)' onto a new $controllerType controller ($busSharing bus sharing) for '$($firstVMItem.VM.Name)', then attach the same disks to $($otherVMs.Count) other VM(s)."
+        Invoke-PlannedChange $GroupPlan.Name $firstVMItem.VM.Name 'MapLunGroup' "group $($diskGroup.ControllerBus)" $detail {
+            $groupParameters = @{
+                FirstVM        = $firstVMItem.VM
+                OtherVMs       = $otherVMs
+                LunIds         = [int[]]$diskGroup.LunIds
+                Svm            = $GroupPlan.Svm
+                RdmDatastore   = $GroupPlan.RdmDatastore
+                ControllerType = $controllerType
+                BusSharingMode = $busSharing
             }
-            New-SharedScsiController @newControllerParameters
-        }
-    }
-
-    foreach ($disk in @($GroupPlan.Disks | Sort-Object ControllerBus, UnitNumber)) {
-        $addressKey = "$($disk.ControllerBus):$($disk.UnitNumber)"
-        $existingMappingFile = ''
-        if (($GroupPlan.MappingMode -eq 'Shared') -and $GroupPlan.MappingFiles.ContainsKey($addressKey)) {
-            $existingMappingFile = [string]$GroupPlan.MappingFiles[$addressKey]
-        }
-
-        $mappingDetail = if ($GroupPlan.MappingMode -eq 'Shared' -and $VMItem.PowerOnOrder -gt 1) {
-            "attaching the mapping file created for '$($GroupPlan.VMItems[0].VM.Name)'"
-        }
-        else {
-            "creating a mapping file on '$($GroupPlan.RdmDatastore.Name)'"
-        }
-        $addRdmDetail = "Attach SVM '$($GroupPlan.Svm)' LUN $($disk.LunId) ($($disk.CapacityGB) GB) at SCSI $addressKey, $mappingDetail."
-
-        Invoke-PlannedChange $GroupPlan.Name $vmName 'AddRdm' "LUN $($disk.LunId)" $addRdmDetail {
-            $addParameters = @{
-                VM                  = Get-VM -Id $VMItem.VM.Id
-                ControllerBus       = $disk.ControllerBus
-                UnitNumber          = $disk.UnitNumber
-                ConsoleDeviceName   = $disk.ConsoleDeviceName
-                RdmDatastoreName    = $GroupPlan.RdmDatastore.Name
-                ExistingMappingFile = $existingMappingFile
-                CompatibilityMode   = $disk.CompatibilityMode
-                DiskMode            = $disk.DiskMode
-                Sharing             = $disk.Sharing
-                LunUuid             = $disk.LunUuid
-                CapacityInKB        = $disk.CapacityInKB
-            }
-            $mappingFile = Add-RdmDevice @addParameters
-            if (-not $GroupPlan.MappingFiles.ContainsKey($addressKey)) {
-                $GroupPlan.MappingFiles[$addressKey] = $mappingFile
-            }
+            New-RdmDiskGroup @groupParameters
         }
     }
 }
@@ -2338,28 +1985,6 @@ function Resolve-MigrationPlan {
             }
         }
 
-        # VMware's documented cluster-across-boxes build gives the group one mapping file
-        # per LUN, created for the first node and attached by the rest. Some estates have
-        # one per VM instead. Whichever this group uses is reproduced, not assumed.
-        $mappingMode = 'PerVm'
-        if ($vmItems.Count -gt 1) {
-            $sharedCount = 0
-            for ($index = 0; $index -lt $referenceRdms.Count; $index++) {
-                $files = @(
-                    $vmItems |
-                        ForEach-Object { @($_.Layout.Rdms | Sort-Object ControllerBus, UnitNumber)[$index].BackingFile } |
-                        Select-Object -Unique
-                )
-                if ($files.Count -eq 1) { $sharedCount++ }
-            }
-            if ($sharedCount -eq $referenceRdms.Count) {
-                $mappingMode = 'Shared'
-            }
-            elseif ($sharedCount -ne 0) {
-                throw "Migration group '$groupName' mixes shared and per-VM RDM mapping files; resolve that by hand before migrating."
-            }
-        }
-
         $controllers = [System.Collections.Generic.List[object]]::new()
         foreach ($bus in @($referenceRdms | ForEach-Object { $_.ControllerBus } | Select-Object -Unique | Sort-Object)) {
             $sample = @($referenceRdms | Where-Object { $_.ControllerBus -eq $bus })[0]
@@ -2371,7 +1996,11 @@ function Resolve-MigrationPlan {
             })
         }
 
-        $resolvedDisks = [System.Collections.Generic.List[object]]::new()
+        # The plan records what the CSV asks for, address by address, and the source
+        # topology it must match. It does NOT resolve devices: the LUN ID is resolved to a
+        # device on the VM's own host at attach time, which is where the estate's proven
+        # mapping sequence does it, and the only place the answer is guaranteed right.
+        $plannedDisks = [System.Collections.Generic.List[object]]::new()
         $diskIndex = 0
         foreach ($diskGroup in $diskGroups) {
             for ($position = 0; $position -lt $diskGroup.LunIds.Count; $position++) {
@@ -2383,72 +2012,33 @@ function Resolve-MigrationPlan {
                     throw "Source topology differs from CSV order at LUN $lunId : the CSV places it at SCSI $($diskGroup.ControllerBus):$unitNumber, the source has SCSI $($reference.ControllerBus):$($reference.UnitNumber)."
                 }
 
-                # The device is the one the VM already has. These are the same LUNs,
-                # re-presented to the destination cluster, so the mapping the source RDM
-                # carries is the mapping to put back - which is why nothing here has to
-                # scan a host to find it, and why the operator never types an NAA.
-                if ([string]::IsNullOrWhiteSpace($reference.DeviceName)) {
-                    throw "The RDM at SCSI $($diskGroup.ControllerBus):$unitNumber on '$($referenceItem.VM.Name)' has no device path to re-attach."
-                }
-
-                $resolvedDisks.Add([pscustomobject]@{
-                    LunId             = $lunId
-                    CanonicalName     = $reference.CanonicalName
-                    ConsoleDeviceName = $reference.DeviceName
-                    CapacityGB        = $reference.CapacityGB
-                    ControllerBus     = $diskGroup.ControllerBus
-                    UnitNumber        = $unitNumber
-                    SourceLabel       = $reference.Label
-                    CompatibilityMode = $reference.CompatibilityMode
-                    DiskMode          = $reference.DiskMode
-                    Sharing           = $reference.Sharing
-                    BusSharing        = $reference.BusSharing
-                    LunUuid           = $reference.LunUuid
-                    CapacityInKB      = $reference.CapacityInKB
+                $plannedDisks.Add([pscustomobject]@{
+                    LunId         = $lunId
+                    ControllerBus = $diskGroup.ControllerBus
+                    UnitNumber    = $unitNumber
+                    CapacityGB    = $reference.CapacityGB
+                    SourceLabel   = $reference.Label
+                    SourceDevice  = $reference.CanonicalName
                 })
                 $diskIndex++
             }
         }
 
-        Write-RichoLog "  Plan resolved: $($resolvedDisks.Count) LUN(s) across $($controllers.Count) controller(s), $mappingMode mapping files." -Level INFO
+        Write-RichoLog "  Plan resolved: $($plannedDisks.Count) LUN(s) across $($diskGroups.Count) group(s)." -Level INFO
 
-        # Presentation is the engineer's prerequisite, so it is stated rather than
-        # checked: these devices, on these hosts, before this group runs.
+        # Presentation is the engineer's prerequisite. It is stated, never checked - the
+        # LUNs are assumed present, and every check of that was slow, and one of them
+        # compared a vml identifier against a naa and stopped a good run.
         $destinationHostNames = @($eligibleHosts | ForEach-Object { $_.VMHost.Name })
         $prerequisite = [System.Collections.Generic.List[string]]::new()
-        $prerequisite.Add("Present these LUNs from SVM '$svm' to $($destinationHostNames -join ', ') and rescan the HBAs before running group '$groupName':")
-        foreach ($disk in $resolvedDisks) {
-            $prerequisite.Add("  LUN $($disk.LunId)  $($disk.CanonicalName)  $($disk.CapacityGB) GB  -> SCSI $($disk.ControllerBus):$($disk.UnitNumber)")
+        $prerequisite.Add("These LUNs from SVM '$svm' must already be presented to $($destinationHostNames -join ', ') and the HBAs rescanned:")
+        foreach ($diskGroup in $diskGroups) {
+            $prerequisite.Add("  group $($diskGroup.ControllerBus): LUN $($diskGroup.LunIds -join ', ')")
         }
 
-        Write-RichoLog '  ---- PREREQUISITE, not checked by this script ----' -Level INFO
+        Write-RichoLog '  ---- PREREQUISITE, assumed and not checked ----' -Level INFO
         foreach ($line in $prerequisite) { Write-RichoLog "  $line" -Level INFO }
-
-        if ($VerifyLunPresentation) {
-            Write-RichoLog '  -VerifyLunPresentation was supplied; reading the destination hosts back.' -Level INFO
-            Confirm-LunPresentation -DestinationHosts $eligibleHosts -Svm $svm -Disks $resolvedDisks.ToArray()
-        }
-        elseif ($SkipDeviceCheck) {
-            Write-RichoLog '  -SkipDeviceCheck was supplied; the devices are not checked at all before the VMs come down.' -Level WARN
-        }
-        else {
-            # Only the hosts these VMs are actually going to, and only "is the device
-            # there" - a second or two, against a failure that lands mid-migration.
-            $placementHosts = @($vmItems | ForEach-Object { $_.DestinationHost } | Sort-Object -Property Name -Unique)
-            Write-RichoLog "  Confirming the $($resolvedDisks.Count) device(s) are visible on $($placementHosts.Count) destination host(s)." -Level INFO
-            Assert-DeviceVisible -DestinationHosts $placementHosts -Disks $resolvedDisks.ToArray()
-        }
-        Write-RichoLog '  -------------------------------------------------' -Level INFO
-
-        $duplicateDevices = @(
-            $resolvedDisks |
-                Group-Object CanonicalName |
-                Where-Object { $_.Count -gt 1 } |
-                ForEach-Object { $_.Name }
-        )
-        if ($duplicateDevices.Count -gt 0) {
-            throw "Two or more CSV LUN IDs resolve to the same device in '$groupName': $($duplicateDevices -join ', ')."
-        }
+        Write-RichoLog '  -----------------------------------------------' -Level INFO
 
         $plans.Add([pscustomobject]@{
             Name                = $groupName
@@ -2463,12 +2053,10 @@ function Resolve-MigrationPlan {
             RdmDatastore        = $rdmDatastore
             RdmDatastoreDerived = $rdmDatastoreDerived
             VMItems             = $vmItems.ToArray()
-            Disks               = $resolvedDisks.ToArray()
+            Disks               = $plannedDisks.ToArray()
+            DiskGroups          = $diskGroups.ToArray()
             Controllers         = $controllers.ToArray()
-            MappingMode         = $mappingMode
-            MappingFiles        = @{}
             Prerequisite        = $prerequisite.ToArray()
-            LunPresentationVerified = [bool]$VerifyLunPresentation
             HostExclusions      = $eligibility.Exclusions
         })
     }
@@ -2506,9 +2094,10 @@ function New-MigrationManifest {
         DestinationDatastoreCluster = $GroupPlan.DatastoreCluster.Name
         RdmDatastore                = $GroupPlan.RdmDatastore.Name
         RdmDatastoreDerived         = $GroupPlan.RdmDatastoreDerived
-        RdmMappingMode              = $GroupPlan.MappingMode
         PresentationPrerequisite    = $GroupPlan.Prerequisite
-        LunPresentationVerified     = $GroupPlan.LunPresentationVerified
+        DiskGroups                  = @($GroupPlan.DiskGroups | ForEach-Object {
+            [ordered]@{ ControllerBus = $_.ControllerBus; LunIds = $_.LunIds }
+        })
         ExcludedHosts               = $GroupPlan.HostExclusions
         Controllers                 = $GroupPlan.Controllers
         VMs = @($GroupPlan.VMItems | ForEach-Object {
@@ -2532,12 +2121,15 @@ function New-MigrationManifest {
 function Confirm-MigrationOutcome {
     <#
     .SYNOPSIS
-        Re-reads each VM after the migration and compares it to the plan.
+        Re-reads each VM after the mapping and checks what it actually got.
 
     .DESCRIPTION
-        Evidence, not decoration. Every disk is checked back against the address, device
-        and capacity it was supposed to land on, so the change record shows the state that
-        was actually reached rather than the state that was intended.
+        Evidence, not decoration. What can be known is checked, and nothing else is
+        pretended: the bus numbers are vCenter's to assign when the controllers are
+        created, so they are reported rather than demanded. What must hold is that every
+        node ended up with the same number of physical RDMs, in the same group shapes the
+        CSV asked for, at contiguous units from zero, and - the one that matters for a
+        cluster - that every node sees the same device at the same address.
 
     .PARAMETER GroupPlan
         The resolved group plan.
@@ -2549,6 +2141,8 @@ function Confirm-MigrationOutcome {
     )
 
     $records = [System.Collections.Generic.List[object]]::new()
+    $expectedTotal = @($GroupPlan.Disks).Count
+    $expectedGroupSizes = @($GroupPlan.DiskGroups | ForEach-Object { @($_.LunIds).Count } | Sort-Object)
 
     foreach ($vmItem in $GroupPlan.VMItems) {
         $currentVM = Get-VM -Id $vmItem.VM.Id
@@ -2560,35 +2154,43 @@ function Confirm-MigrationOutcome {
         $pools = @(Get-ResourcePool -VM $currentVM -ErrorAction SilentlyContinue)
         $poolName = if ($pools.Count -gt 0) { [string]$pools[0].Name } else { '' }
 
-        foreach ($disk in $GroupPlan.Disks) {
-            $actual = @(
-                $layout.Rdms |
-                    Where-Object { ($_.ControllerBus -eq $disk.ControllerBus) -and ($_.UnitNumber -eq $disk.UnitNumber) }
-            )
+        $rdms = @($layout.Rdms | Sort-Object ControllerBus, UnitNumber)
+        $groupSizes = @($rdms | Group-Object ControllerBus | ForEach-Object { $_.Count } | Sort-Object)
 
-            $status = 'Failed'
-            $detail = ''
-            if ($actual.Count -ne 1) {
-                $detail = "Expected one RDM at SCSI $($disk.ControllerBus):$($disk.UnitNumber); found $($actual.Count)."
+        $vmFindings = [System.Collections.Generic.List[string]]::new()
+        if ($rdms.Count -ne $expectedTotal) {
+            $vmFindings.Add("has $($rdms.Count) physical RDM(s); the CSV asks for $expectedTotal")
+        }
+        if (($groupSizes -join ',') -ne ($expectedGroupSizes -join ',')) {
+            $vmFindings.Add("groups its RDMs as $($groupSizes -join '+') across controllers; the CSV asks for $($expectedGroupSizes -join '+')")
+        }
+
+        # Sizes, as a set: the addresses can legitimately land on a different bus number
+        # than the source used, but the disks themselves cannot change size.
+        $actualCapacities = @($rdms | ForEach-Object { [math]::Round($_.CapacityGB, 0) } | Sort-Object)
+        $expectedCapacities = @($GroupPlan.Disks | ForEach-Object { [math]::Round($_.CapacityGB, 0) } | Sort-Object)
+        if (($actualCapacities -join ',') -ne ($expectedCapacities -join ',')) {
+            $vmFindings.Add("carries $($actualCapacities -join ', ') GB; the RDMs it replaces were $($expectedCapacities -join ', ') GB")
+        }
+
+        foreach ($busGroup in @($rdms | Group-Object ControllerBus)) {
+            $units = @($busGroup.Group | ForEach-Object { [int]$_.UnitNumber } | Sort-Object)
+            $expectedUnits = @(Get-ScsiUnitNumberSequence -Count $units.Count)
+            if (($units -join ',') -ne ($expectedUnits -join ',')) {
+                $vmFindings.Add("SCSI $($busGroup.Name) carries units $($units -join ',') rather than $($expectedUnits -join ',')")
             }
-            elseif ($actual[0].CanonicalName -ne $disk.CanonicalName) {
-                $detail = "Device is '$($actual[0].CanonicalName)', expected '$($disk.CanonicalName)'."
+        }
+
+        foreach ($rdm in $rdms) {
+            $status = 'Passed'
+            $detail = "SCSI $($rdm.ControllerBus):$($rdm.UnitNumber) carries $($rdm.CanonicalName) at $($rdm.CapacityGB) GB, $($rdm.CompatibilityMode) on a $($rdm.BusSharing) bus."
+            if ($rdm.CompatibilityMode -ne 'physicalMode') {
+                $status = 'Failed'
+                $detail = "SCSI $($rdm.ControllerBus):$($rdm.UnitNumber) is '$($rdm.CompatibilityMode)', expected physicalMode."
             }
-            elseif ([math]::Abs($actual[0].CapacityGB - $disk.CapacityGB) -gt $script:CapacityToleranceGB) {
-                $detail = "Capacity is $($actual[0].CapacityGB) GB, expected $($disk.CapacityGB) GB."
-            }
-            elseif ($actual[0].BusSharing -ne $disk.BusSharing) {
-                $detail = "Bus sharing is '$($actual[0].BusSharing)', expected '$($disk.BusSharing)' as it was at the source."
-            }
-            elseif ($actual[0].Sharing -ne $disk.Sharing) {
-                $detail = "Disk sharing is '$($actual[0].Sharing)', expected '$($disk.Sharing)' as it was at the source."
-            }
-            elseif ($actual[0].CompatibilityMode -ne $disk.CompatibilityMode) {
-                $detail = "Compatibility mode is '$($actual[0].CompatibilityMode)', expected '$($disk.CompatibilityMode)'."
-            }
-            else {
-                $status = 'Passed'
-                $detail = "SCSI $($disk.ControllerBus):$($disk.UnitNumber) carries LUN $($disk.LunId) at $($actual[0].CapacityGB) GB."
+            elseif ($vmFindings.Count -gt 0) {
+                $status = 'Failed'
+                $detail = "$($currentVM.Name) $($vmFindings -join '; ')."
             }
 
             $records.Add([pscustomobject]@{
@@ -2600,11 +2202,41 @@ function Confirm-MigrationOutcome {
                 VMHost         = [string]$currentVM.VMHost.Name
                 ResourcePool   = $poolName
                 PowerState     = [string]$currentVM.PowerState
-                ScsiAddress    = "$($disk.ControllerBus):$($disk.UnitNumber)"
-                LunId          = $disk.LunId
+                ScsiAddress    = "$($rdm.ControllerBus):$($rdm.UnitNumber)"
+                Device         = $rdm.CanonicalName
+                CapacityGB     = $rdm.CapacityGB
                 Status         = $status
                 Detail         = $detail
             })
+        }
+
+        if ($rdms.Count -eq 0) {
+            $records.Add([pscustomobject]@{
+                ScriptVersion  = $ScriptVersion
+                MigrationGroup = $GroupPlan.Name
+                WorkloadType   = $GroupPlan.WorkloadType
+                Batch          = $GroupPlan.Batch
+                VM             = $currentVM.Name
+                VMHost         = [string]$currentVM.VMHost.Name
+                ResourcePool   = $poolName
+                PowerState     = [string]$currentVM.PowerState
+                ScsiAddress    = ''
+                Device         = ''
+                CapacityGB     = 0
+                Status         = 'Failed'
+                Detail         = "$($currentVM.Name) has no physical RDMs; the CSV asks for $expectedTotal."
+            })
+        }
+    }
+
+    # A cluster whose nodes do not see the same device at the same address is not a
+    # cluster. This catches a copy spec that went astray, or a node that missed a disk.
+    foreach ($addressGroup in @($records | Where-Object { $_.ScsiAddress } | Group-Object ScsiAddress)) {
+        $devices = @($addressGroup.Group | ForEach-Object { $_.Device } | Select-Object -Unique)
+        if ($devices.Count -le 1) { continue }
+        foreach ($record in $addressGroup.Group) {
+            $record.Status = 'Failed'
+            $record.Detail = "SCSI $($addressGroup.Name) is not the same device on every node: $($devices -join ', ')."
         }
     }
 
@@ -2747,7 +2379,7 @@ try {
 
     foreach ($groupPlan in $plans) {
         Write-RichoLog "===== Migration group $($groupPlan.Name) [batch $($groupPlan.Batch), $($groupPlan.WorkloadType)] =====" -Level INFO
-        Write-RichoLog "$($groupPlan.VMItems.Count) VM(s), $($groupPlan.Disks.Count) RDM(s), $($groupPlan.MappingMode) mapping files, $($groupPlan.SourceClusterLabel) -> $($groupPlan.Cluster.Name)/$($groupPlan.ResourcePool.Name), RDM pointers on $($groupPlan.RdmDatastore.Name)." -Level INFO
+        Write-RichoLog "$($groupPlan.VMItems.Count) VM(s), $($groupPlan.Disks.Count) LUN(s) in $($groupPlan.DiskGroups.Count) group(s), $($groupPlan.SourceClusterLabel) -> $($groupPlan.Cluster.Name)/$($groupPlan.ResourcePool.Name), mapping files on $($groupPlan.RdmDatastore.Name)." -Level INFO
 
         $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
         $modeLabel = if ($DryRun) { 'dryrun' } else { 'execution' }
@@ -2761,7 +2393,7 @@ try {
         # Every VM in the group comes down and gives up its shared disks before any of them
         # moves. A half-migrated WSFC with one node still holding the RDMs is the state
         # this ordering exists to prevent.
-        Write-RichoLog "  Phase 1 of 3: powering down $($groupPlan.VMItems.Count) VM(s) and detaching their RDMs." -Level INFO
+        Write-RichoLog "  Phase 1 of 4: powering down $($groupPlan.VMItems.Count) VM(s) and detaching their RDMs." -Level INFO
         $vmIndex = 0
         foreach ($vmItem in $groupPlan.VMItems) {
             $vmIndex++
@@ -2777,12 +2409,12 @@ try {
         }
         Write-Progress -Activity "Group $($groupPlan.Name): shutdown and detach" -Completed
 
-        Write-RichoLog "  Phase 2 of 3: relocating and re-attaching. A cold move of a large VM takes minutes." -Level INFO
+        Write-RichoLog "  Phase 2 of 4: relocating. A cold move of a large VM takes minutes." -Level INFO
         $vmIndex = 0
         foreach ($vmItem in $groupPlan.VMItems) {
             $vmIndex++
             Write-RichoLog "    [$vmIndex/$($groupPlan.VMItems.Count)] $($vmItem.VM.Name) -> $($vmItem.DestinationHost.Name)" -Level INFO
-            Write-Progress -Activity "Group $($groupPlan.Name): relocate and re-attach" -Status $vmItem.VM.Name -PercentComplete ([int](($vmIndex / [math]::Max(1, $groupPlan.VMItems.Count)) * 100))
+            Write-Progress -Activity "Group $($groupPlan.Name): relocate" -Status $vmItem.VM.Name -PercentComplete ([int](($vmIndex / [math]::Max(1, $groupPlan.VMItems.Count)) * 100))
             $relocateDetail = "Cold-relocate '$($vmItem.VM.Name)' to host '$($vmItem.DestinationHost.Name)', datastore cluster '$($groupPlan.DatastoreCluster.Name)' and resource pool '$($groupPlan.ResourcePool.Name)'."
             Invoke-PlannedChange $groupPlan.Name $vmItem.VM.Name 'ColdRelocate' $vmItem.DestinationHost.Name $relocateDetail {
                 # Run the relocate as a task so its percentage can be reported. A cold
@@ -2802,12 +2434,15 @@ try {
                 $poolView = Get-View -Id $groupPlan.ResourcePool.Id
                 $poolView.MoveIntoResourcePool([VMware.Vim.ManagedObjectReference[]]@($currentView.MoRef))
             }
-
-            Add-DestinationRdms -VMItem $vmItem -GroupPlan $groupPlan
         }
-        Write-Progress -Activity "Group $($groupPlan.Name): relocate and re-attach" -Completed
+        Write-Progress -Activity "Group $($groupPlan.Name): relocate" -Completed
 
-        Write-RichoLog "  Phase 3 of 3: verifying." -Level INFO
+        # Every VM has to be at the destination before any mapping starts: the first VM
+        # owns the mapping files and the rest attach the very same ones.
+        Write-RichoLog "  Phase 3 of 4: mapping $($groupPlan.Disks.Count) LUN(s) back, group by group." -Level INFO
+        Add-DestinationRdmGroups -GroupPlan $groupPlan
+
+        Write-RichoLog "  Phase 4 of 4: verifying." -Level INFO
         if ($DryRun) {
             Add-Result $groupPlan.Name '' 'Verify' 'DryRun' 'Post-migration verification runs only in an execution run.'
         }

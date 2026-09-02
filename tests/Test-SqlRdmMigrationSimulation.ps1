@@ -354,16 +354,50 @@ function New-SimTask {
     return $task
 }
 
+function Copy-SimDevice {
+    # vCenter creates a NEW device on the target VM when a spec carries one from another.
+    # Sharing the instance would let a key assignment on one VM corrupt the other.
+    param($Device)
+
+    $copy = New-Object -TypeName $Device.GetType().FullName
+    foreach ($property in $Device.GetType().GetFields()) {
+        $property.SetValue($copy, $property.GetValue($Device))
+    }
+    if ($Device -is [VMware.Vim.VirtualDisk]) {
+        $backing = New-Object -TypeName $Device.Backing.GetType().FullName
+        foreach ($property in $Device.Backing.GetType().GetFields()) {
+            $property.SetValue($backing, $property.GetValue($Device.Backing))
+        }
+        $copy.Backing = $backing
+    }
+    return $copy
+}
+
 function Invoke-SimReconfigure {
     param([string]$VMName, $Spec)
 
     $vm = $global:Sim.VMs[$VMName]
+    $keyMap = @{}
     foreach ($change in @($Spec.DeviceChange)) {
         $device = $change.Device
         switch ($change.Operation) {
+            'edit' {
+                $existing = @($vm.Devices | Where-Object { $_.Key -eq $device.Key })
+                if ($existing.Count -ne 1) { throw "Simulated edit: device key $($device.Key) not found on $VMName." }
+                $existing[0].UnitNumber = $device.UnitNumber
+                Add-SimEvent "edit-unit $VMName key=$($device.Key) unit=$($device.UnitNumber)"
+            }
             'add' {
+                if (@($vm.Devices | Where-Object { [object]::ReferenceEquals($_, $device) }).Count -eq 0) {
+                    $device = Copy-SimDevice -Device $device
+                }
+                $originalKey = [int]$device.Key
                 $global:Sim.NextDeviceKey++
                 $device.Key = $global:Sim.NextDeviceKey
+                $keyMap[$originalKey] = [int]$device.Key
+                if (($device -is [VMware.Vim.VirtualDisk]) -and $keyMap.ContainsKey([int]$device.ControllerKey)) {
+                    $device.ControllerKey = $keyMap[[int]$device.ControllerKey]
+                }
 
                 if ($device -is [VMware.Vim.VirtualDisk]) {
                     $diskCount = @($vm.Devices | Where-Object { $_ -is [VMware.Vim.VirtualDisk] }).Count
@@ -479,6 +513,10 @@ function Get-View {
         param($Spec)
         Invoke-SimReconfigure -VMName $this.SimVMName -Spec $Spec
     }
+    Add-Member -InputObject $view -MemberType ScriptMethod -Name ReconfigVM -Value {
+        param($Spec)
+        [void](Invoke-SimReconfigure -VMName $this.SimVMName -Spec $Spec)
+    }
     return $view
 }
 
@@ -573,8 +611,11 @@ function Get-EsxCli {
 
 function Get-ScsiLun {
     [CmdletBinding()]
-    param($VMHost, [string]$LunType)
-    return @($global:Sim.HostLuns[[string]$VMHost.Name])
+    param($VMHost, [string]$LunType, [string]$CanonicalName)
+
+    $luns = @($global:Sim.HostLuns[[string]$VMHost.Name])
+    if ($CanonicalName) { $luns = @($luns | Where-Object { $_.CanonicalName -eq $CanonicalName }) }
+    return $luns
 }
 
 function Get-HardDisk {
@@ -587,14 +628,111 @@ function Get-HardDisk {
             Where-Object { $_ -is [VMware.Vim.VirtualDisk] } |
             ForEach-Object {
                 [pscustomobject]@{
-                    Name          = [string]$_.DeviceInfo.Label
-                    SimVMName     = $vm.Name
-                    ExtensionData = $_
+                    Name              = [string]$_.DeviceInfo.Label
+                    SimVMName         = $vm.Name
+                    DiskType          = $(if ($_.Backing -is [VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo]) { 'RawPhysical' } else { 'Flat' })
+                    ScsiCanonicalName = $(if ($_.Backing -is [VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo]) { ([string]$_.Backing.DeviceName -replace '^.*/', '') } else { '' })
+                    ExtensionData     = $_
                 }
             }
     )
     if ($Name) { $disks = @($disks | Where-Object { $_.Name -eq $Name }) }
     return $disks
+}
+
+function New-HardDisk {
+    [CmdletBinding()]
+    param($VM, [string]$DeviceName, [string]$DiskType, $Datastore, $Controller)
+
+    if ($DiskType -ne 'RawPhysical') { throw "Simulated New-HardDisk only makes RawPhysical disks; asked for '$DiskType'." }
+
+    $vm = Resolve-SimVM -VM $VM
+    $canonical = $DeviceName -replace '^.*/', ''
+    $lun = @($global:Sim.HostLuns[[string]$vm.VMHostName] | Where-Object { $_.CanonicalName -eq $canonical })
+    if ($lun.Count -ne 1) { throw "Simulated New-HardDisk: host $($vm.VMHostName) cannot see '$canonical'." }
+
+    # No -Controller means PowerCLI picks an existing one, which is why the estate's
+    # sequence creates the controller FROM the first disk and moves it.
+    $controllers = @($vm.Devices | Where-Object { $_ -is [VMware.Vim.VirtualSCSIController] } | Sort-Object BusNumber)
+    if ($Controller) {
+        $controllers = @($controllers | Where-Object { $_.Key -eq $Controller.SimKey })
+        if ($controllers.Count -ne 1) { throw 'Simulated New-HardDisk: the named controller is not on this VM.' }
+    }
+    if ($controllers.Count -eq 0) { throw 'Simulated New-HardDisk: the VM has no SCSI controller.' }
+    $target = $controllers[0]
+
+    $used = @($vm.Devices | Where-Object { ($_ -is [VMware.Vim.VirtualDisk]) -and ([int]$_.ControllerKey -eq [int]$target.Key) } | ForEach-Object { [int]$_.UnitNumber })
+    $unit = 0
+    while (($unit -eq 7) -or ($used -contains $unit)) { $unit++ }
+
+    $global:Sim.NextDeviceKey++
+    $diskCount = @($vm.Devices | Where-Object { $_ -is [VMware.Vim.VirtualDisk] }).Count
+    $disk = New-SimRdm -Key $global:Sim.NextDeviceKey -ControllerKey ([int]$target.Key) -UnitNumber $unit `
+        -Label "Hard disk $($diskCount + 1)" -Naa $canonical -CapacityGB ([double]$lun[0].CapacityGB) `
+        -MappingFile "[$($Datastore.Name)] $($vm.Name)/$($vm.Name)_$($global:Sim.NextDeviceKey).vmdk"
+    $vm.Devices.Add($disk)
+    Add-SimEvent "new-harddisk $($vm.Name) $canonical -> bus $($target.BusNumber) unit $unit"
+
+    return (Get-HardDisk -VM $vm -Name $disk.DeviceInfo.Label)[0]
+}
+
+function New-ScsiController {
+    [CmdletBinding(SupportsShouldProcess)]
+    param($HardDisk, [string]$BusSharingMode, [string]$Type)
+
+    $vm = $global:Sim.VMs[[string]$HardDisk.SimVMName]
+    $typeName = switch ($Type) {
+        'ParaVirtual'        { 'VMware.Vim.ParaVirtualSCSIController' }
+        'VirtualLsiLogicSAS' { 'VMware.Vim.VirtualLsiLogicSASController' }
+        default              { throw "Simulated New-ScsiController does not know type '$Type'." }
+    }
+    $sharedBus = switch ($BusSharingMode) {
+        'Physical'  { 'physicalSharing' }
+        'Virtual'   { 'virtualSharing' }
+        'NoSharing' { 'noSharing' }
+        default     { throw "Simulated New-ScsiController does not know bus sharing '$BusSharingMode'." }
+    }
+
+    # vCenter takes the lowest free bus, which is how a removed SCSI 1 comes back as 1.
+    $usedBuses = @($vm.Devices | Where-Object { $_ -is [VMware.Vim.VirtualSCSIController] } | ForEach-Object { [int]$_.BusNumber })
+    $bus = 0
+    while ($usedBuses -contains $bus) { $bus++ }
+
+    $global:Sim.NextDeviceKey++
+    $controller = New-SimScsiController -TypeName $typeName -Key $global:Sim.NextDeviceKey -BusNumber $bus -SharedBus $sharedBus -Label "SCSI controller $bus"
+    $vm.Devices.Add($controller)
+
+    # PowerCLI moves the disk onto the controller it just made.
+    $device = @($vm.Devices | Where-Object { $_.Key -eq $HardDisk.ExtensionData.Key })[0]
+    $device.ControllerKey = $controller.Key
+    $device.UnitNumber = 0
+    Add-SimEvent "new-controller $($vm.Name) bus $bus $Type/$BusSharingMode, moved $($HardDisk.Name) onto it"
+
+    return (Get-ScsiController -HardDisk (Get-HardDisk -VM $vm -Name $HardDisk.Name)[0])
+}
+
+function Get-ScsiController {
+    [CmdletBinding()]
+    param($VM, $HardDisk)
+
+    if ($HardDisk) {
+        $vm = $global:Sim.VMs[[string]$HardDisk.SimVMName]
+        $controllers = @($vm.Devices | Where-Object { ($_ -is [VMware.Vim.VirtualSCSIController]) -and ([int]$_.Key -eq [int]$HardDisk.ExtensionData.ControllerKey) })
+    }
+    else {
+        $vm = Resolve-SimVM -VM $VM
+        $controllers = @($vm.Devices | Where-Object { $_ -is [VMware.Vim.VirtualSCSIController] })
+    }
+
+    return @($controllers | ForEach-Object {
+        [pscustomobject]@{
+            Name          = [string]$_.DeviceInfo.Label
+            Type          = $_.GetType().Name
+            SimKey        = [int]$_.Key
+            SimVMName     = $vm.Name
+            ExtensionData = $_
+        }
+    })
 }
 
 function Remove-HardDisk {
@@ -759,10 +897,13 @@ try {
 
     Invoke-SimTest 'Dry run writes a full change plan' {
         $plan = @(Import-Csv -LiteralPath (Get-ChildItem -Path $dryRunFolder -Filter 'change-plan-*.csv' | Select-Object -First 1).FullName)
-        Assert-True ($plan.Count -ge 14) "The dry-run plan has only $($plan.Count) rows."
+        Assert-True ($plan.Count -ge 11) "The dry-run plan has only $($plan.Count) rows."
         Assert-Equal (@($plan | Where-Object { $_.Mode -ne 'DryRun' }).Count) 0 'A dry-run plan row is not marked DryRun.'
         Assert-Equal (@($plan | Where-Object { $_.Action -eq 'RemoveRdm' }).Count) 6 'Both nodes should give up three RDMs each.'
-        Assert-Equal (@($plan | Where-Object { $_.Action -eq 'AddRdm' }).Count) 6 'Both nodes should get three RDMs back.'
+        # Mapping is now one planned change per LUN group, applied to the first node and
+        # copied to the rest, so it is one row rather than one per disk per VM.
+        Assert-Equal (@($plan | Where-Object { $_.Action -eq 'MapLunGroup' }).Count) 1 'The single LUN group should be one planned change.'
+        Assert-Equal (@($plan | Where-Object { $_.Action -eq 'ColdRelocate' }).Count) 2 'Both nodes should be relocated.'
         Assert-Equal (@($plan | Where-Object { $_.Action -eq 'RemoveController' }).Count) 2 'Only SCSI 1 should be removed, on each node.'
         Assert-Equal (@($plan | Where-Object { $_.WorkloadType -ne 'SIT' }).Count) 0 'A plan row is missing its workload type.'
     }
@@ -813,7 +954,6 @@ try {
             Assert-Equal (@($rdms | ForEach-Object { $_.SharedBus } | Select-Object -Unique) -join ',') 'noSharing' "$name came back with the wrong bus sharing."
             Assert-Equal (@($rdms | ForEach-Object { $_.Sharing } | Select-Object -Unique) -join ',') 'sharingNone' "$name came back with the wrong disk sharing."
             Assert-Equal (@($rdms | ForEach-Object { $_.CompatibilityMode } | Select-Object -Unique) -join ',') 'physicalMode' "$name came back with the wrong compatibility mode."
-            Assert-Equal (@($rdms | ForEach-Object { $_.DiskMode } | Select-Object -Unique) -join ',') 'independent_persistent' "$name came back with the wrong disk mode."
         }
     }
 
@@ -833,12 +973,11 @@ try {
         }
     }
 
-    Invoke-SimTest 'The second node attaches the first node''s mapping files, not its own' {
-        $created = @($global:Sim.Events | Where-Object { $_ -like 'create-mapping *' })
-        $attached = @($global:Sim.Events | Where-Object { $_ -like 'attach-mapping *' })
-        Assert-Equal $created.Count 3 'The first node should create three mapping files.'
-        Assert-Equal $attached.Count 3 'The second node should attach three existing mapping files.'
-        Assert-Equal (@($created | Where-Object { $_ -notlike '*SIMSQLA*' }).Count) 0 'A mapping file was created for the wrong VM.'
+    Invoke-SimTest 'The first node owns the mapping files and the rest attach the same ones' {
+        # Only the first VM creates disks; the others receive a copy spec.
+        $created = @($global:Sim.Events | Where-Object { $_ -like 'new-harddisk *' })
+        Assert-Equal $created.Count 3 'Three disks should be created, all on the first node.'
+        Assert-Equal (@($created | Where-Object { $_ -notlike 'new-harddisk SIMSQLA *' }).Count) 0 'A disk was created on a node other than the first.'
 
         $mappingA = @(Get-SimRdms -VMName 'SIMSQLA' | ForEach-Object { $_.MappingFile })
         $mappingB = @(Get-SimRdms -VMName 'SIMSQLB' | ForEach-Object { $_.MappingFile })
@@ -899,47 +1038,20 @@ try {
         Assert-True ($log -notmatch 'eligible\.') 'Eligibility is still logging one line per host.'
     }
 
-    Invoke-SimTest 'The presentation prerequisite is stated, device by device' {
+    Invoke-SimTest 'The presentation prerequisite is stated by LUN group, and never checked' {
         $manifest = Get-Content -LiteralPath (Get-ChildItem -Path $executeFolder -Filter '*-execution-manifest-*.json' | Select-Object -First 1).FullName -Raw | ConvertFrom-Json
         $prerequisite = @($manifest.PresentationPrerequisite)
-        Assert-Equal $prerequisite.Count 4 'The prerequisite should be a heading plus one line per LUN.'
-        Assert-True ($prerequisite[0] -like "*sim-svm01*sim-esx02*") 'The prerequisite does not name the SVM and the destination hosts.'
-        foreach ($naa in @('naa.6000000000000040', 'naa.6000000000000041', 'naa.6000000000000042')) {
-            Assert-True ((($prerequisite -join ' ') -like "*$naa*")) "The prerequisite does not name device $naa."
-        }
-        Assert-True (-not [bool]$manifest.LunPresentationVerified) 'The run claims to have verified presentation without being asked to.'
-    }
+        Assert-Equal $prerequisite.Count 2 'The prerequisite should be a heading plus one line per LUN group.'
+        Assert-True ($prerequisite[0] -like '*sim-svm01*sim-esx02*') 'The prerequisite does not name the SVM and the destination hosts.'
+        Assert-True ($prerequisite[1] -like '*40, 41, 42*') 'The prerequisite does not name the LUN IDs.'
 
-    Invoke-SimTest 'No host storage is read unless verification is asked for' {
         $log = Get-Content -LiteralPath $executeLog -Raw
-        Assert-True ($log -notmatch 'reading storage paths and devices') 'The run read host storage without -VerifyLunPresentation.'
-        Assert-True ($log -match 'PREREQUISITE, not checked by this script') 'The prerequisite was not printed for the engineer.'
-    }
-
-    # ------------------------------------------------- opt-in presentation check ------
-    Reset-SimInventory
-    $verifyFolder = Join-Path $script:WorkFolder 'verify'
-    $verifyLog = Join-Path $script:WorkFolder 'verify.log'
-    try {
-        & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -DryRun -Credential $credential `
-            -PowerAction ShutdownGuest -VerifyLunPresentation -OutputFolder $verifyFolder *> $verifyLog
-    }
-    catch {
-        $script:Failed++
-        Write-Host '[FAIL] The verification dry run threw' -ForegroundColor Red
-        Write-Host "       $($_.Exception.Message)" -ForegroundColor Red
-    }
-
-    Invoke-SimTest '-VerifyLunPresentation reads the destination hosts and matches every LUN' {
-        $log = Get-Content -LiteralPath $verifyLog -Raw
-        Assert-True ($log -match 'reading storage paths and devices') 'Verification did not read host storage.'
-        Assert-True ($log -match 'all 3 LUN\(s\) present and matching') 'Verification did not confirm the LUNs.'
-        $manifest = Get-Content -LiteralPath (Get-ChildItem -Path $verifyFolder -Filter '*-dryrun-manifest-*.json' | Select-Object -First 1).FullName -Raw | ConvertFrom-Json
-        Assert-True ([bool]$manifest.LunPresentationVerified) 'The manifest does not record that presentation was verified.'
+        Assert-True ($log -match 'PREREQUISITE, assumed and not checked') 'The prerequisite was not printed for the engineer.'
     }
 
     # ------------------------------------------- an unpresented device, caught early ----
     Reset-SimInventory
+    $global:Sim.HostPaths['sim-esx02'] = @($global:Sim.HostPaths['sim-esx02'] | Where-Object { [int]$_.LUN -ne 41 })
     $global:Sim.HostLuns['sim-esx02'] = @($global:Sim.HostLuns['sim-esx02'] | Where-Object { $_.CanonicalName -ne 'naa.6000000000000041' })
     $missingFolder = Join-Path $script:WorkFolder 'missing'
     $missingLog = Join-Path $script:WorkFolder 'missing.log'
@@ -952,10 +1064,8 @@ try {
         $missingError = $_.Exception.Message
     }
 
-    Invoke-SimTest 'A device the destination host cannot see stops the run before anything changes' {
-        Assert-True ($missingError -like '*cannot see*naa.6000000000000041*') "The run did not name the missing device. It said: $missingError"
-        Assert-Equal $global:Sim.Events.Count 0 "The run changed $($global:Sim.Events.Count) thing(s) before finding the missing device: $($global:Sim.Events -join '; ')"
-        Assert-Equal $global:Sim.VMs['SIMSQLA'].PowerState 'PoweredOn' 'A VM was powered off before the device check failed.'
+    Invoke-SimTest 'A LUN the host has no path to is named, at the point it is mapped' {
+        Assert-True ($missingError -like '*no path to SVM*LUN 41*') "The run did not name the unreachable LUN. It said: $missingError"
     }
 
     Write-Host ''

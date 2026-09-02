@@ -243,104 +243,38 @@ Once the VMs are powered down, and before anything moves:
 ## The presentation prerequisite
 
 Presenting the LUNs to the destination hosts and rescanning the HBAs is the engineer's
-job, before the run. The script does not do it and, by default, does not check it —
-reading every path on every host to re-confirm it was the slowest thing the script did,
-on every run, whether anyone doubted the presentation or not.
-
-What it does instead is **state it**, device by device, before anything changes:
+job, before the run. The script does not do it and does not check it — the LUNs are
+assumed present. It states what must be there, once, before anything changes:
 
 ```text
-  ---- PREREQUISITE, not checked by this script ----
-  Present these LUNs from SVM 'sql-svm01' to esx02, esx04 and rescan the HBAs before running group 'D24SQL01':
-    LUN 40  naa.60a98000...4d31  100 GB  -> SCSI 1:0
-    LUN 41  naa.60a98000...4d32  250 GB  -> SCSI 1:1
-    LUN 42  naa.60a98000...4d33  500 GB  -> SCSI 1:2
-  Not verified. Supply -VerifyLunPresentation to have the hosts read back, at one storage enumeration each.
-  -------------------------------------------------
+  ---- PREREQUISITE, assumed and not checked ----
+  These LUNs from SVM 'sql-svm01' must already be presented to esx02, esx04 and the HBAs rescanned:
+    group 1: LUN 40, 41, 42
+  -----------------------------------------------
 ```
 
-Run a dry run first and that list is your work order.
+## How the LUNs are mapped back
 
-One thing **is** checked by default, because of where the failure lands otherwise: that
-each destination host can actually see the devices being re-attached. It is one storage
-read per destination host — the hosts the VMs are going to, not all of them — and it runs
-before anything is powered off. Without it, a device that was never presented is found at
-the attach, with the VMs already down, their RDMs detached and the machines relocated.
-`-SkipDeviceCheck` turns it off.
+This is the estate's own mapping sequence, kept close to the script it came from because
+it is proven. Per LUN group, once every VM in the migration group has been relocated:
 
-`-VerifyLunPresentation` is the deeper check: it reads each host's storage paths and
-confirms SVM plus LUN ID resolves to the same device, of the same size, as the RDM being
-moved. Worth it the first time through a new cluster, and skippable once the presentation
-is routine.
+1. **Resolve each LUN ID to a device on the VM's own host** — the iSCSI path list
+   filtered by LUN ID and SVM, then `Get-ScsiLun` for the console device name. The
+   identity comes from the LUN ID, never from the RDM that was detached: an RDM's backing
+   carries a `vml.` identifier and the same LUN is a `naa.` on the host, and the two do
+   not compare.
+2. **Create the first disk**, then create the controller *from* that disk — PowerCLI
+   moves the disk onto the new controller. That order is the part that works.
+3. **Force that disk to unit 0** with an edit spec.
+4. **Add the rest of the group** to the same controller, in CSV order.
+5. **Copy the controller and those disks to every other VM** in one add spec, so the
+   nodes share one mapping file per LUN.
 
-## What it does at the destination
+The controller's type and bus-sharing mode come from what the source had; `ParaVirtual`
+and `Physical` are only the fallback when the source recorded neither.
 
-- Recreates each SCSI controller **using the source's own controller type and
-  bus-sharing mode** — no sharing stays no sharing, physical sharing stays physical
-  sharing.
-- Re-attaches each RDM with the source's own **compatibility mode, disk mode and disk
-  sharing**. Nothing is assumed and nothing is normalised: the guest finds its disks
-  exactly as it left them. The one substitution is a disk mode the source never
-  recorded, which becomes `independent_persistent` — vCenter rejects a physical-mode
-  backing outright when the mode is absent.
-- Attaches each RDM with an explicit device spec at the exact bus and unit it had,
-  then reads the VM back and fails if the device that landed there is not the one
-  planned.
-- Reproduces the group's RDM mapping-file arrangement: if the source nodes shared one
-  mapping file per LUN (VMware's documented cluster-across-boxes build), the file
-  created for the first node is attached to the others; if each node had its own, each
-  gets its own. A group that mixes the two is refused rather than guessed at.
-- Spreads the VMs across the eligible destination hosts round-robin, and warns when
-  only one host qualifies — every node of the cluster would land on it.
-
-## Choosing what to run
-
-All three scopes come out of the same CSV — you never edit the file to run part of it.
-
-```powershell
-# Everything in the file, in batch order.
-.\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01 -CsvPath .\migration.csv -DryRun
-
-# One batch at a time.
-.\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01 -CsvPath .\migration.csv -Execute -Batch 1
-.\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01 -CsvPath .\migration.csv -Execute -Batch 2,3
-
-# A single line, named by any VM in it.
-.\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01 -CsvPath .\migration.csv -Execute -VMName LABSQL01
-```
-
-- `-VMName` selects the **row** the VM appears in, and the whole row runs. A row is one
-  SQL cluster; moving one node while its siblings still hold the shared RDMs is not
-  something this tool will do. Naming a second or third node selects the same row.
-- `-VMName` and `-Batch` cannot be combined, and either one naming nothing in the file
-  stops the run — an unknown batch says which batches the file does have.
-- The scope is logged at the start and written into every manifest, so a change record
-  says what the run covered.
-- Nothing else changes with scope: the same validation, the same evidence files, and
-  power-on still waits for every group **in that run**.
-
-## What it prints while it runs
-
-Most of a run is spent inside a handful of slow VMware calls, so each one says what it
-is doing, and the long ones report a percentage and an elapsed time as they go:
-
-```text
-2026-09-01 07:31:02Z [INFO ] Loading PowerCLI. On a cold session this can take a minute.
-2026-09-01 07:31:44Z [INFO ] PowerCLI ready (41.8s).
-2026-09-01 07:31:46Z [INFO ] Connected to vcenter01 as SVC-MIG (1.9s).
-2026-09-01 07:31:46Z [INFO ] Resolving the migration plan against live inventory. No changes are made in this phase.
-2026-09-01 07:31:47Z [INFO ]   Checking 8 host(s) in 'd24sql02' for datastore and LUN access. This is the slow part - one storage read per host.
-2026-09-01 07:31:47Z [INFO ]     [1/8] esx01: reading storage paths and devices...
-2026-09-01 07:32:04Z [INFO ]          all 7 LUN(s) resolved (16.4s).
-...
-2026-09-01 07:34:10Z [INFO ]   Phase 2 of 3: relocating and re-attaching. A cold move of a large VM takes minutes.
-2026-09-01 07:34:25Z [INFO ]       Relocating 'D24SQL01' to esx03 - 34% (15.1s elapsed)
-2026-09-01 07:36:58Z [INFO ]       Relocating 'D24SQL01' to esx03 finished in 2m 48s.
-```
-
-A guest shutdown says `still waiting ... 2m of 20 minutes` every thirty seconds, and
-progress bars run alongside for the host scan, the per-VM phases and every long task.
-Nothing waits silently for more than about half a minute.
+Bus numbers are vCenter's to assign when the controllers are created, so the run reports
+which bus each group landed on rather than demanding a particular one.
 
 ## Power-on
 

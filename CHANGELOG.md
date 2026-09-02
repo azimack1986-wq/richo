@@ -4604,3 +4604,55 @@ of it immediately.
 - The attach now logs the whole spec over two lines — device, modes and sharing, then
   LUN UUID, capacity, mapping file and file operation — so what was sent can be compared
   against what vCenter produces for a hand-built RDM in the same estate.
+
+### [3.0.0] — 2026-09-02
+
+The mapping half of this script is now the estate's own proven sequence rather than a
+reimplementation of it. Three live failures came out of that reimplementation, and the
+last of them showed why it could not work.
+
+#### Fixed
+
+- **The device identity was taken from the wrong place.** The script re-attached using
+  the device path recorded on the RDM it had just detached. An RDM's backing carries a
+  `vml.` identifier; the same LUN is a `naa.` in the host's device list. So the
+  pre-flight check compared a `vml.` against every `naa.` the host reported, found no
+  match, and stopped a run whose LUNs were present all along —
+  `cannot see LUN 0 (vml.0200000000600a0980...)`. The device is now resolved from the LUN
+  ID and the SVM, on the VM's own host, at mapping time, which is where the original
+  script does it and the only place the answer is right.
+
+#### Changed
+
+- **The mapping sequence is restored in full**: resolve the LUN IDs on the host, create
+  the first disk, create the controller *from* that disk so PowerCLI moves it across,
+  force that disk to unit 0 with an edit spec, add the rest of the group to the same
+  controller in CSV order, then copy the controller and disks to every other node in one
+  add spec. The hand-built `VirtualDeviceConfigSpec` that replaced it — and that vCenter
+  twice refused with `Incompatible device backing specified for device '0'` — is gone,
+  along with `Add-RdmDevice`, `New-SharedScsiController` and `Get-PciControllerKey`.
+
+- **Mapping runs once per LUN group, after every VM in the group has been relocated.**
+  The first VM owns the mapping files and the rest attach the same ones, so they all have
+  to be at the destination before any of it starts. The phases are now four: power down
+  and detach, relocate, map, verify.
+
+- **Nothing checks that the LUNs are presented.** `-VerifyLunPresentation`,
+  `-SkipDeviceCheck`, `Assert-DeviceVisible`, `Confirm-LunPresentation`,
+  `Get-HostStorageMap` and `Resolve-DestinationLun` are all removed. The host is read at
+  mapping time to answer "which device is LUN 40", never to confirm it is there.
+
+- **Verification checks what can actually be known.** Bus numbers are vCenter's to assign
+  when a controller is created, so they are reported, not demanded. What must hold: every
+  node has the number of physical RDMs the CSV asks for, grouped the way the CSV groups
+  them, at contiguous units from zero, carrying the same sizes as the RDMs they replace —
+  and, the one that matters for a cluster, every node sees the same device at the same
+  address.
+
+#### Tests
+
+- The simulator now models `New-HardDisk`, `New-ScsiController`, `Get-ScsiController`,
+  edit specs, and the key remapping vCenter does when one spec adds a controller and its
+  disks together — so the proven sequence is exercised end to end rather than described.
+- A test asserts the five steps of that sequence appear in order, so a future
+  reimplementation cannot quietly replace it again.
