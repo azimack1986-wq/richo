@@ -4894,3 +4894,51 @@ last of them showed why it could not work.
   `RecommendHostsForVm`, managed-object-reference resolution — and **reproduces the live
   failure**: a `StoragePod` in `RelocateSpec.Datastore` is refused with the same message
   vCenter used, so this regression fails a test rather than an outage window.
+
+### [3.8.0] — 2026-09-02
+
+#### Fixed
+
+- **SHIPPED AND HIT ON A LIVE RUN: the LUN landed on SCSI 0, and rewrote the boot
+  controller's bus sharing.** The controller was created with `New-ScsiController`, which
+  picks the bus itself. On a VM whose only shared controller had just been detached,
+  PowerCLI picked **bus 0** — so the migration's LUN was attached at `0:0` and SCSI 0 came
+  back as `ParaVirtualSCSIController, bus sharing physicalSharing`. On a production SQL
+  node that is the boot controller.
+
+  **The CSV column is now the bus, and nothing else is:**
+
+  | CSV column | Goes on |
+  | --- | --- |
+  | `group_1_lun_IDs_ordered_space_separated` | SCSI 1 |
+  | `group_2_lun_IDs_ordered_space_separated` | SCSI 2 |
+  | `group_3_lun_IDs_ordered_space_separated` | SCSI 3 |
+
+  `New-ScsiController` is gone. `Add-ScsiControllerOnBus` states the bus in an explicit
+  device spec and recreates the source controller's own type and bus sharing; both it and
+  `New-RdmDiskGroup` refuse any bus outside 1–3. `Set-RdmDiskAddress` then places each
+  disk at the unit the plan named, rather than accepting whatever `New-HardDisk` chose.
+
+  Every `New-HardDisk` call now names that controller. If the controller is added but
+  PowerCLI will not return it, **the run stops with the LUNs unattached** — without a named
+  controller `New-HardDisk` takes the first controller with a free slot, which is SCSI 0,
+  and a moment on the boot bus is a moment too long.
+
+- **`A specified parameter was not correct: spec.host` from Storage DRS.** A relocate
+  placement spec has to name a host. The DRS host recommendation is now asked for first
+  and put in the spec; when DRS names no host, the recommendation is not asked for at all
+  and the pod's emptiest datastore is used, at `INFO` rather than as a warning — Storage
+  DRS balances the pod on its own schedule.
+
+- The datastore fallback read `Accessible`, which is deprecated and warned on every call.
+  It reads `State` where the binding has it, and `Accessible` only where it does not.
+
+#### Changed
+
+- The controller is recreated from the source's **own** type name and `SharedBus` value
+  rather than the PowerCLI equivalents, so it comes back exactly as it was. The
+  `ConvertTo-PowerCli*` mappings are still used for the sentence an operator reads.
+
+- The simulation harness gained a mode where `Get-ScsiController -VM` hides empty
+  controllers, and proves the run stops with SCSI 0 untouched rather than falling back to
+  it; and one where Storage DRS refuses a spec with no host, as the live one did.

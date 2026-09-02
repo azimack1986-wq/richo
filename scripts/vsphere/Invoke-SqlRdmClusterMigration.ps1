@@ -155,7 +155,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '3.7.0'
+$ScriptVersion = '3.8.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -1264,6 +1264,12 @@ function Get-StorageDrsDatastore {
     .PARAMETER ResourcePool
         The destination resource pool, so the recommendation is made for where the VM is
         actually going.
+
+    .PARAMETER HostReference
+        The host DRS chose. Storage DRS refuses a relocate placement spec without one -
+        "A specified parameter was not correct: spec.host" - so when DRS named no host
+        the recommendation is not asked for at all and the pod's emptiest datastore is
+        used instead.
     #>
     [CmdletBinding()]
     param(
@@ -1274,13 +1280,22 @@ function Get-StorageDrsDatastore {
         $VMView,
 
         [Parameter(Mandatory)]
-        $ResourcePool
+        $ResourcePool,
+
+        [Parameter()]
+        $HostReference = $null
     )
 
     $podView = Get-View -Id $DatastoreCluster.Id
     $recommended = $null
 
+    if ($null -eq $HostReference) {
+        Write-RichoLog "      No host to ask Storage DRS with, so placing on the emptiest datastore in '$($DatastoreCluster.Name)'. Storage DRS balances the pod on its own schedule." -Level INFO
+    }
+
     try {
+        if ($null -eq $HostReference) { throw 'no host for the placement spec' }
+
         # The live connection already carries the service instance; Get-View ServiceInstance
         # is the fallback for a binding that does not expose it.
         $storageManagerRef = Get-OptionalProperty -InputObject $connection.ExtensionData.Content -Name 'StorageResourceManager' -Default $null
@@ -1297,6 +1312,7 @@ function Get-StorageDrsDatastore {
         $placementSpec.Vm = $VMView.MoRef
         $placementSpec.PodSelectionSpec = $podSelection
         $placementSpec.ResourcePool = (Get-View -Id $ResourcePool.Id).MoRef
+        $placementSpec.Host = $HostReference
         $placementSpec.Priority = 'defaultPriority'
 
         $placement = $storageManager.RecommendDatastores($placementSpec)
@@ -1318,7 +1334,9 @@ function Get-StorageDrsDatastore {
         }
     }
     catch {
-        Write-RichoLog "      Storage DRS declined to recommend a datastore in '$($DatastoreCluster.Name)': $($_.Exception.Message)" -Level WARN
+        if ($null -ne $HostReference) {
+            Write-RichoLog "      Storage DRS declined to recommend a datastore in '$($DatastoreCluster.Name)': $($_.Exception.Message)" -Level WARN
+        }
     }
 
     if ($recommended) {
@@ -1326,16 +1344,23 @@ function Get-StorageDrsDatastore {
         return $recommended
     }
 
+    # State replaced Accessible, and reading the old one raises a deprecation warning on
+    # a current PowerCLI. Whichever this binding has, without assuming either.
     $fallback = @(
         Get-Datastore -Location $DatastoreCluster |
-            Where-Object { [bool](Get-OptionalProperty -InputObject $_ -Name 'Accessible' -Default $true) } |
+            Where-Object {
+                $state = Get-OptionalProperty -InputObject $_ -Name 'State' -Default $null
+                if ($null -ne $state) { [string]$state -eq 'Available' }
+                else { [bool](Get-OptionalProperty -InputObject $_ -Name 'Accessible' -Default $true) }
+            } |
             Sort-Object -Property FreeSpaceGB -Descending
     )
     if ($fallback.Count -eq 0) {
         throw "Datastore cluster '$($DatastoreCluster.Name)' has no usable datastore for '$($VMView.Name)'."
     }
 
-    Write-RichoLog "      No Storage DRS recommendation; using '$($fallback[0].Name)', the emptiest datastore in '$($DatastoreCluster.Name)'." -Level WARN
+    $fallbackLevel = if ($null -eq $HostReference) { 'INFO' } else { 'WARN' }
+    Write-RichoLog "      Placing on '$($fallback[0].Name)', the emptiest datastore in '$($DatastoreCluster.Name)'." -Level $fallbackLevel
     return $fallback[0]
 }
 
@@ -1429,19 +1454,22 @@ function Move-VMToDestination {
 
     $vmView = Get-View -Id $VMItem.VM.Id
 
-    $datastoreParameters = @{
-        DatastoreCluster = $GroupPlan.DatastoreCluster
-        VMView           = $vmView
-        ResourcePool     = $GroupPlan.ResourcePool
-    }
-    $targetDatastore = Get-StorageDrsDatastore @datastoreParameters
-
+    # The host is asked for first: Storage DRS refuses a relocate placement spec that
+    # does not name one - "A specified parameter was not correct: spec.host".
     $hostParameters = @{
         Cluster      = $GroupPlan.Cluster
         VMView       = $vmView
         ResourcePool = $GroupPlan.ResourcePool
     }
     $targetHostRef = Get-DrsRecommendedHost @hostParameters
+
+    $datastoreParameters = @{
+        DatastoreCluster = $GroupPlan.DatastoreCluster
+        VMView           = $vmView
+        ResourcePool     = $GroupPlan.ResourcePool
+        HostReference    = $targetHostRef
+    }
+    $targetDatastore = Get-StorageDrsDatastore @datastoreParameters
 
     $relocateSpec = New-Object VMware.Vim.VirtualMachineRelocateSpec
     $relocateSpec.Pool = (Get-View -Id $GroupPlan.ResourcePool.Id).MoRef
@@ -1884,6 +1912,162 @@ function ConvertTo-PowerCliBusSharing {
     }
 }
 
+function Add-ScsiControllerOnBus {
+    <#
+    .SYNOPSIS
+        Adds a SCSI controller on one named bus and returns its device key.
+
+    .DESCRIPTION
+        SHIPPED AND HIT ON A LIVE RUN. The controller used to be made with
+        New-ScsiController, which picks the bus itself. On a VM whose only shared
+        controller had just been detached, PowerCLI picked bus 0 - so the migration's LUN
+        landed at 0:0 and the boot controller's bus sharing was rewritten to
+        physicalSharing. SCSI 0 carries the operating system and is never touched by this
+        tool, in either direction.
+
+        The bus is the CSV column and nothing else: group_1 is SCSI 1, group_2 is SCSI 2,
+        group_3 is SCSI 3. It is named in an explicit device spec here so that no cmdlet
+        gets to choose it.
+
+    .PARAMETER VM
+        The VM to add the controller to.
+
+    .PARAMETER BusNumber
+        The bus to create it on. Never 0.
+
+    .PARAMETER ControllerTypeName
+        Full VMware.Vim type name read from the source controller, recreated as-is.
+
+    .PARAMETER SharedBus
+        Bus sharing read from the source controller, recreated as-is.
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param(
+        [Parameter(Mandatory)]
+        $VM,
+
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 3)]
+        [int]$BusNumber,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ControllerTypeName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SharedBus
+    )
+
+    $vmView = Get-View -Id $VM.Id -Property Config.Hardware.Device
+    $existing = @(
+        $vmView.Config.Hardware.Device |
+            Where-Object { ($_ -is [VMware.Vim.VirtualSCSIController]) -and ([int]$_.BusNumber -eq $BusNumber) }
+    )
+
+    if ($existing.Count -gt 1) {
+        throw "VM '$($VM.Name)' has $($existing.Count) SCSI controllers on bus $BusNumber; expected none or one."
+    }
+
+    if ($existing.Count -eq 1) {
+        $occupied = @(
+            $vmView.Config.Hardware.Device |
+                Where-Object { ($_ -is [VMware.Vim.VirtualDisk]) -and ([int]$_.ControllerKey -eq [int]$existing[0].Key) }
+        )
+        if ($occupied.Count -gt 0) {
+            $labels = @($occupied | ForEach-Object { [string]$_.DeviceInfo.Label }) -join ', '
+            throw "SCSI $BusNumber on '$($VM.Name)' already carries $labels. This group's LUNs belong on SCSI $BusNumber; resolve that by hand before running this VM."
+        }
+        Write-RichoLog "      Reusing the empty SCSI $BusNumber controller already on '$($VM.Name)'." -Level INFO
+        return [int]$existing[0].Key
+    }
+
+    $controller = New-Object $ControllerTypeName
+    $controller.BusNumber = $BusNumber
+    $controller.SharedBus = $SharedBus
+    # -100 and below is the documented placeholder range: vCenter assigns the real key.
+    $controller.Key = -101
+
+    $change = New-Object VMware.Vim.VirtualDeviceConfigSpec
+    $change.Operation = 'add'
+    $change.Device = $controller
+
+    $spec = New-Object VMware.Vim.VirtualMachineConfigSpec
+    $spec.DeviceChange = @($change)
+
+    $shortType = ($ControllerTypeName -split '\.')[-1]
+    $description = "Adding SCSI controller $BusNumber ($shortType, bus sharing $SharedBus) to '$($VM.Name)'"
+    Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description $description
+
+    $created = @(
+        (Get-View -Id $VM.Id -Property Config.Hardware.Device).Config.Hardware.Device |
+            Where-Object { ($_ -is [VMware.Vim.VirtualSCSIController]) -and ([int]$_.BusNumber -eq $BusNumber) }
+    )
+    if ($created.Count -ne 1) {
+        throw "SCSI controller $BusNumber was not created on '$($VM.Name)': found $($created.Count) after the reconfigure."
+    }
+
+    return [int]$created[0].Key
+}
+
+function Set-RdmDiskAddress {
+    <#
+    .SYNOPSIS
+        Moves one disk to an exact SCSI address, and does nothing if it is already there.
+
+    .DESCRIPTION
+        A plain device edit: the backing is untouched, only the controller and the unit.
+        A WSFC node cares which unit a LUN is on, and New-HardDisk only ever takes the
+        next free one, so the address is stated rather than accepted.
+
+    .PARAMETER VM
+        The VM the disk is on.
+
+    .PARAMETER HardDisk
+        The disk to place.
+
+    .PARAMETER ControllerKey
+        Device key of the controller it belongs on.
+
+    .PARAMETER UnitNumber
+        The unit it belongs at.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $VM,
+
+        [Parameter(Mandatory)]
+        $HardDisk,
+
+        [Parameter(Mandatory)]
+        [int]$ControllerKey,
+
+        [Parameter(Mandatory)]
+        [int]$UnitNumber
+    )
+
+    $device = $HardDisk.ExtensionData
+    if (([int]$device.ControllerKey -eq $ControllerKey) -and ([int]$device.UnitNumber -eq $UnitNumber)) {
+        return
+    }
+
+    $device.ControllerKey = $ControllerKey
+    $device.UnitNumber = $UnitNumber
+
+    $change = New-Object VMware.Vim.VirtualDeviceConfigSpec
+    $change.Operation = 'edit'
+    $change.Device = $device
+
+    $spec = New-Object VMware.Vim.VirtualMachineConfigSpec
+    $spec.DeviceChange = @($change)
+
+    $vmView = Get-View -Id $VM.Id
+    $description = "Placing '$($HardDisk.Name)' on '$($VM.Name)' at unit $UnitNumber"
+    Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description $description
+}
+
 function New-RdmDiskGroup {
     <#
     .SYNOPSIS
@@ -1900,11 +2084,12 @@ function New-RdmDiskGroup {
              device identity comes from the LUN ID, never from the RDM that was detached:
              an RDM's backing carries a vml identifier, and the same LUN is a naa on the
              host, so the two do not compare.
-          2. Create the first disk of the group with New-HardDisk, then create the
-             controller from that disk. PowerCLI moves the disk onto the new controller.
-          3. Force that first disk to unit 0 with an edit spec.
-          4. Add the rest of the group's disks to the same controller, in CSV order.
-          5. Copy the controller and those disks onto every other VM in the group with a
+          2. Add the controller on the bus the CSV column names - group_1 is SCSI 1,
+             group_2 is SCSI 2, group_3 is SCSI 3 - recreated with the source
+             controller's own type and bus sharing. SCSI 0 is never touched.
+          3. Create each disk of the group with New-HardDisk, which is what makes the
+             mapping file correctly, and place each one at its exact unit.
+          4. Copy the controller and those disks onto every other VM in the group with a
              single add spec, so the nodes share one mapping file per LUN.
 
         Nothing here checks whether the LUNs are presented: they are, by the time this
@@ -1925,11 +2110,17 @@ function New-RdmDiskGroup {
     .PARAMETER RdmDatastore
         Datastore that holds the mapping files.
 
-    .PARAMETER ControllerType
-        Controller type to create, as New-ScsiController names them.
+    .PARAMETER ControllerBus
+        SCSI bus this group belongs on: the CSV column's number, 1 to 3. Never 0.
 
-    .PARAMETER BusSharingMode
-        Bus sharing to create the controller with.
+    .PARAMETER UnitNumbers
+        The unit each LUN goes to, in the same order as LunIds.
+
+    .PARAMETER ControllerTypeName
+        Full VMware.Vim type name of the source controller, recreated as-is.
+
+    .PARAMETER SharedBus
+        Bus sharing of the source controller, recreated as-is.
     #>
     [CmdletBinding()]
     param(
@@ -1950,11 +2141,21 @@ function New-RdmDiskGroup {
         [Parameter(Mandatory)]
         $RdmDatastore,
 
-        [Parameter()]
-        [string]$ControllerType = 'ParaVirtual',
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 3)]
+        [int]$ControllerBus,
 
-        [Parameter()]
-        [string]$BusSharingMode = 'Physical'
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [int[]]$UnitNumbers,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ControllerTypeName,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$SharedBus
     )
 
     $currentFirstVM = Get-VM -Id $FirstVM.Id
@@ -1987,29 +2188,53 @@ function New-RdmDiskGroup {
         Write-RichoLog "        LUN $lunId -> $($scsiLun[0].CanonicalName) ($($scsiLun[0].ConsoleDeviceName))" -Level INFO
     }
 
-    # The first disk lands wherever PowerCLI puts it, then the controller is created FROM
-    # it, which moves it across. That order is the part that works.
-    Write-RichoLog "      Creating the first disk and its $ControllerType controller ($BusSharingMode bus sharing)." -Level INFO
-    $firstDisk = New-HardDisk -VM $currentFirstVM -DeviceName $deviceNames[0] -DiskType RawPhysical -Datastore $RdmDatastore
-    $controller = New-ScsiController -HardDisk $firstDisk -BusSharingMode $BusSharingMode -Type $ControllerType
-
-    # Re-read both: the objects above predate the reconfigure that moved the disk.
-    $firstDisk = Get-HardDisk -VM $currentFirstVM -Name $firstDisk.Name
-    $controller = Get-ScsiController -HardDisk $firstDisk
-
-    $unitSpec = New-Object VMware.Vim.VirtualMachineConfigSpec
-    $unitSpec.DeviceChange = New-Object VMware.Vim.VirtualDeviceConfigSpec
-    $unitSpec.DeviceChange[0].Operation = 'edit'
-    $unitSpec.DeviceChange[0].Device = $firstDisk.ExtensionData
-    $unitSpec.DeviceChange[0].Device.UnitNumber = 0
-
-    $unitTask = (Get-View -Id $currentFirstVM.Id).ReconfigVM_Task($unitSpec)
-    Wait-VMReconfigureTask -TaskReference $unitTask -Description "Setting '$($firstDisk.Name)' on '$($currentFirstVM.Name)' to unit 0"
-
-    for ($index = 1; $index -lt $deviceNames.Count; $index++) {
-        $addedDisk = New-HardDisk -VM $currentFirstVM -DeviceName $deviceNames[$index] -DiskType RawPhysical -Datastore $RdmDatastore -Controller $controller
-        Write-RichoLog "        added $($addedDisk.Name) - $($canonicalNames[$index])" -Level INFO
+    # The bus comes from the CSV column, and nothing gets to choose it but the CSV.
+    $controllerParameters = @{
+        VM                 = $currentFirstVM
+        BusNumber          = $ControllerBus
+        ControllerTypeName = $ControllerTypeName
+        SharedBus          = $SharedBus
     }
+    $controllerKey = Add-ScsiControllerOnBus @controllerParameters
+
+    # Every disk is created ON this controller. New-HardDisk without one takes the first
+    # controller with a free slot, which is SCSI 0 - so if the controller just added
+    # cannot be found, the run stops here rather than putting a LUN on the boot bus even
+    # for a moment.
+    $controllerObject = @(
+        Get-ScsiController -VM (Get-VM -Id $currentFirstVM.Id) |
+            Where-Object { [int]$_.ExtensionData.Key -eq $controllerKey }
+    )
+    if ($controllerObject.Count -ne 1) {
+        throw "SCSI controller $ControllerBus was added to '$($currentFirstVM.Name)' but PowerCLI returned $($controllerObject.Count) matching controllers, so the disks cannot be created on it. Nothing was attached. Attach this group's LUNs to SCSI $ControllerBus by hand, or run it again."
+    }
+
+    for ($index = 0; $index -lt $deviceNames.Count; $index++) {
+        $unitNumber = [int]$UnitNumbers[$index]
+        $currentFirstVM = Get-VM -Id $FirstVM.Id
+
+        $diskParameters = @{
+            VM         = $currentFirstVM
+            DeviceName = $deviceNames[$index]
+            DiskType   = 'RawPhysical'
+            Datastore  = $RdmDatastore
+            Controller = $controllerObject[0]
+        }
+
+        $addedDisk = New-HardDisk @diskParameters
+        $addedDisk = Get-HardDisk -VM (Get-VM -Id $FirstVM.Id) -Name $addedDisk.Name
+
+        $addressParameters = @{
+            VM            = $currentFirstVM
+            HardDisk      = $addedDisk
+            ControllerKey = $controllerKey
+            UnitNumber    = $unitNumber
+        }
+        Set-RdmDiskAddress @addressParameters
+        Write-RichoLog "        $($addedDisk.Name) - $($canonicalNames[$index]) at SCSI $ControllerBus`:$unitNumber" -Level INFO
+    }
+
+    $currentFirstVM = Get-VM -Id $FirstVM.Id
 
     if ($OtherVMs.Count -eq 0) { return }
 
@@ -2025,9 +2250,17 @@ function New-RdmDiskGroup {
     $copySpec = New-Object VMware.Vim.VirtualMachineConfigSpec
     $copySpec.DeviceChange = @()
 
+    $createdController = @(
+        (Get-View -Id $currentFirstVM.Id -Property Config.Hardware.Device).Config.Hardware.Device |
+            Where-Object { ($_ -is [VMware.Vim.VirtualSCSIController]) -and ([int]$_.Key -eq $controllerKey) }
+    )
+    if ($createdController.Count -ne 1) {
+        throw "SCSI controller $ControllerBus is no longer on '$($currentFirstVM.Name)'; the other nodes cannot be given a copy of it."
+    }
+
     $controllerChange = New-Object VMware.Vim.VirtualDeviceConfigSpec
     $controllerChange.Operation = 'add'
-    $controllerChange.Device = $controller.ExtensionData
+    $controllerChange.Device = $createdController[0]
     $copySpec.DeviceChange += $controllerChange
 
     foreach ($rdmDisk in $rdmDisks) {
@@ -2067,24 +2300,30 @@ function Add-DestinationRdmGroups {
     $otherVMs = @($GroupPlan.VMItems | Sort-Object PowerOnOrder | Select-Object -Skip 1 | ForEach-Object { $_.VM })
 
     foreach ($diskGroup in $GroupPlan.DiskGroups) {
+        # The source controller is recreated as it was: its own type, its own bus
+        # sharing. The PowerCLI names are only for the sentence an operator reads.
         $controllerRecord = @($GroupPlan.Controllers | Where-Object { $_.ControllerBus -eq $diskGroup.ControllerBus })
-        $controllerType = 'ParaVirtual'
-        $busSharing = 'Physical'
+        $controllerTypeName = 'VMware.Vim.ParaVirtualSCSIController'
+        $sharedBus = 'physicalSharing'
         if ($controllerRecord.Count -eq 1) {
-            $controllerType = ConvertTo-PowerCliControllerType -ControllerTypeName $controllerRecord[0].ControllerType
-            $busSharing = ConvertTo-PowerCliBusSharing -SharedBus $controllerRecord[0].SharedBus
+            $controllerTypeName = [string]$controllerRecord[0].ControllerType
+            $sharedBus = [string]$controllerRecord[0].SharedBus
         }
+        $controllerType = ConvertTo-PowerCliControllerType -ControllerTypeName $controllerTypeName
+        $busSharing = ConvertTo-PowerCliBusSharing -SharedBus $sharedBus
 
-        $detail = "Map LUN(s) $($diskGroup.LunIds -join ', ') from SVM '$($GroupPlan.Svm)' onto a new $controllerType controller ($busSharing bus sharing) for '$($firstVMItem.VM.Name)', then attach the same disks to $($otherVMs.Count) other VM(s)."
-        Invoke-PlannedChange $GroupPlan.Name $firstVMItem.VM.Name 'MapLunGroup' "group $($diskGroup.ControllerBus)" $detail {
+        $detail = "Map LUN(s) $($diskGroup.LunIds -join ', ') from SVM '$($GroupPlan.Svm)' onto SCSI $($diskGroup.ControllerBus), a new $controllerType controller ($busSharing bus sharing), for '$($firstVMItem.VM.Name)', then attach the same disks to $($otherVMs.Count) other VM(s)."
+        Invoke-PlannedChange $GroupPlan.Name $firstVMItem.VM.Name 'MapLunGroup' "SCSI $($diskGroup.ControllerBus)" $detail {
             $groupParameters = @{
-                FirstVM        = $firstVMItem.VM
-                OtherVMs       = $otherVMs
-                LunIds         = [int[]]$diskGroup.LunIds
-                Svm            = $GroupPlan.Svm
-                RdmDatastore   = $GroupPlan.RdmDatastore
-                ControllerType = $controllerType
-                BusSharingMode = $busSharing
+                FirstVM            = $firstVMItem.VM
+                OtherVMs           = $otherVMs
+                LunIds             = [int[]]$diskGroup.LunIds
+                Svm                = $GroupPlan.Svm
+                RdmDatastore       = $GroupPlan.RdmDatastore
+                ControllerBus      = [int]$diskGroup.ControllerBus
+                UnitNumbers        = [int[]]$diskGroup.UnitNumbers
+                ControllerTypeName = $controllerTypeName
+                SharedBus          = $sharedBus
             }
             New-RdmDiskGroup @groupParameters
         }

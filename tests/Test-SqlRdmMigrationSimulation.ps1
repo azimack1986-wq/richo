@@ -133,6 +133,7 @@ namespace VMware.Vim {
     public class StoragePlacementSpec {
         public string Type;
         public ManagedObjectReference Vm;
+        public ManagedObjectReference Host;
         public ManagedObjectReference ResourcePool;
         public StorageDrsPodSelectionSpec PodSelectionSpec;
         public string Priority;
@@ -284,6 +285,9 @@ function Reset-SimInventory {
     # When set, Stop-VMGuest is accepted and ignored - the guest that takes the request
     # and keeps running, which is exactly what the hard power-off exists for.
     $global:Sim.IgnoreGuestShutdown = $false
+    # When set, Get-ScsiController -VM returns only controllers that carry a disk - the
+    # binding behaviour the mapping has to cope with when it has just added an empty one.
+    $global:Sim.HideEmptyControllers = $false
 
     $naas = @('naa.6000000000000040', 'naa.6000000000000041', 'naa.6000000000000042')
     $global:Sim.VMs['SIMSQLA'] = New-SimVM -Name 'SIMSQLA' -Index 1 -Naas $naas -MappingOwner 'SIMSQLA'
@@ -593,6 +597,11 @@ function Get-View {
         Add-Member -InputObject $view -MemberType ScriptMethod -Name RecommendDatastores -Value {
             param($Spec)
             Add-SimEvent 'recommend-datastores'
+            # SHIPPED AND HIT ON A LIVE RUN: a relocate placement spec with no host in it
+            # is refused, and the message names the field.
+            if ($null -eq $Spec.Host) {
+                throw 'A specified parameter was not correct: spec.host'
+            }
             $pod = @($global:Sim.DatastoreClusters.Values | Where-Object { $_.Id -eq [string]$Spec.PodSelectionSpec.StoragePod.Value })[0]
             $candidates = @(
                 $global:Sim.Datastores.Values |
@@ -855,6 +864,15 @@ function Get-ScsiController {
     else {
         $vm = Resolve-SimVM -VM $VM
         $controllers = @($vm.Devices | Where-Object { $_ -is [VMware.Vim.VirtualSCSIController] })
+        if ($global:Sim.HideEmptyControllers) {
+            $controllers = @(
+                $controllers |
+                    Where-Object {
+                        $controllerKey = [int]$_.Key
+                        @($vm.Devices | Where-Object { ($_ -is [VMware.Vim.VirtualDisk]) -and ([int]$_.ControllerKey -eq $controllerKey) }).Count -gt 0
+                    }
+            )
+        }
     }
 
     return @($controllers | ForEach-Object {
@@ -1235,6 +1253,22 @@ try {
         }
     }
 
+    Invoke-SimTest 'The CSV column picks the bus, and no disk is ever created on SCSI 0' {
+        # SHIPPED AND HIT ON A LIVE RUN: New-ScsiController chose the bus, picked 0, and
+        # the LUN landed at 0:0 with the boot controller rewritten to physicalSharing.
+        foreach ($name in @('SIMSQLA', 'SIMSQLB')) {
+            foreach ($rdm in @(Get-SimRdms -VMName $name)) {
+                Assert-Equal $rdm.Bus 1 "$name has an RDM on SCSI $($rdm.Bus); group 1 belongs on SCSI 1."
+            }
+        }
+
+        # The events are the record of what was actually asked for, disk by disk.
+        $created = @($global:Sim.Events | Where-Object { $_ -like 'new-harddisk *' })
+        Assert-Equal $created.Count 3 "Expected three disks to be created, saw $($created.Count)."
+        $onBusZero = @($created | Where-Object { $_ -like '*-> bus 0 *' })
+        Assert-Equal $onBusZero.Count 0 "A disk was created on SCSI 0: $($onBusZero -join '; ')."
+    }
+
     Invoke-SimTest 'The first node owns the mapping files and the rest attach the same ones' {
         # Only the first VM creates disks; the others receive a copy spec.
         $created = @($global:Sim.Events | Where-Object { $_ -like 'new-harddisk *' })
@@ -1508,6 +1542,41 @@ try {
 
         Assert-Equal (Get-SimRdms -VMName 'SIMSQLB').Count 3 'SIMSQLB did not get its RDMs back.'
         Assert-Equal $global:Sim.VMs['SIMSQLB'].PowerState 'PoweredOn' 'SIMSQLB was not powered back on.'
+    }
+
+    Invoke-SimTest 'A controller it cannot find stops the run rather than falling back to SCSI 0' {
+        # If PowerCLI will not return the empty controller just added, there is nowhere
+        # safe to create the disks: New-HardDisk without one takes SCSI 0. The run stops
+        # with the LUNs unattached instead.
+        Reset-SimInventory
+        $global:Sim.HideEmptyControllers = $true
+        $global:Sim.PromptAnswers.Add('y')
+        $hiddenFolder = Join-Path $script:WorkFolder 'hidden'
+        $hiddenLog = Join-Path $script:WorkFolder 'hidden.log'
+
+        $threw = $false
+        try {
+            & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
+                -OutputFolder $hiddenFolder *> $hiddenLog
+        }
+        catch {
+            $threw = $true
+        }
+
+        Assert-True $threw 'The run carried on without a controller to create the disks on.'
+        $log = Get-Content -LiteralPath $hiddenLog -Raw
+        Assert-True ($log -match 'so the disks cannot be created on it') 'The failure did not say why it stopped.'
+        Assert-True ($log -match 'Nothing was attached') 'The failure did not say what state it left behind.'
+
+        $created = @($global:Sim.Events | Where-Object { $_ -like 'new-harddisk *' })
+        Assert-Equal $created.Count 0 "A disk was created anyway: $($created -join '; ')."
+
+        # The boot bus is exactly as it was.
+        $vm = $global:Sim.VMs['SIMSQLA']
+        $bootController = @($vm.Devices | Where-Object { ($_ -is [VMware.Vim.VirtualSCSIController]) -and ([int]$_.BusNumber -eq 0) })[0]
+        Assert-Equal ([string]$bootController.SharedBus) 'noSharing' 'The boot controller bus sharing was changed.'
+        $onBusZero = @($vm.Devices | Where-Object { ($_ -is [VMware.Vim.VirtualDisk]) -and ([int]$_.ControllerKey -eq [int]$bootController.Key) })
+        Assert-Equal $onBusZero.Count 1 'SCSI 0 gained or lost a disk.'
     }
 
     Write-Host ''

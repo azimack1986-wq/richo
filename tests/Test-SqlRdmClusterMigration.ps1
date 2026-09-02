@@ -596,12 +596,20 @@ try {
         # with "SCSI controller bus 1 is no longer attached" one line after detaching the
         # only RDM on it. It is still the right cmdlet for asking which controller a disk
         # is on, which is all the mapping sequence uses it for.
+        # New-RdmDiskGroup asks it for the object to hand New-HardDisk -Controller, and
+        # copes with an empty answer. Nowhere else may depend on it.
+        $mapping = @($functionAsts | Where-Object { $_.Name -eq 'New-RdmDiskGroup' })[0]
         $byVM = @(
             Get-CommandAst -Ast $ast -Name 'Get-ScsiController' |
                 Where-Object { $_.Extent.Text -notmatch '-HardDisk' } |
+                Where-Object {
+                    ($_.Extent.StartOffset -lt $mapping.Extent.StartOffset) -or
+                    ($_.Extent.EndOffset -gt $mapping.Extent.EndOffset)
+                } |
                 ForEach-Object { "line $($_.Extent.StartLineNumber)" }
         )
         Assert-Equal $byVM.Count 0 "Get-ScsiController is being asked for a VM's controllers: $($byVM -join ', ')."
+        Assert-True (($mapping.Extent.Text -match '\$controllerObject\.Count -ne 1')) 'The mapping does not stop when the controller it just added cannot be found.'
         Assert-True ($text -match '(?m)^function Remove-SharedScsiController') 'The device-spec controller removal is missing.'
         Assert-True ($text -match '\[VMware\.Vim\.VirtualSCSIController\]') 'Controllers are not matched by device type.'
     }
@@ -774,19 +782,19 @@ try {
     }
 
     Invoke-NativeTest 'Mapping follows the estate''s proven sequence, in order' {
-        # Disk first, controller created FROM that disk, unit forced to 0 by an edit spec,
-        # then the rest of the group onto the same controller. Hand-built device specs
-        # replaced this once and vCenter refused them.
+        # LUN IDs resolved on the host, controller added on the bus the CSV names, disks
+        # created with New-HardDisk - which is what writes the mapping file correctly -
+        # and each placed at its exact unit. Then one copy spec for the other nodes.
         $mapFunction = @($functionAsts | Where-Object { $_.Name -eq 'New-RdmDiskGroup' })
         Assert-Equal $mapFunction.Count 1 'New-RdmDiskGroup is missing.'
         $mapText = $mapFunction[0].Extent.Text
 
         $steps = @(
-            'New-HardDisk -VM \$currentFirstVM -DeviceName \$deviceNames\[0\]',
-            'New-ScsiController -HardDisk \$firstDisk',
-            '\$unitSpec\.DeviceChange\[0\]\.Operation = ''edit''',
-            '\$unitSpec\.DeviceChange\[0\]\.Device\.UnitNumber = 0',
-            'New-HardDisk .* -Controller \$controller'
+            'esxcli\.storage\.core\.path\.list\.Invoke\(\)',
+            'Get-ScsiLun -VMHost \$vmHost -CanonicalName',
+            'Add-ScsiControllerOnBus @controllerParameters',
+            'New-HardDisk @diskParameters',
+            'Set-RdmDiskAddress @addressParameters'
         )
         $position = 0
         foreach ($step in $steps) {
@@ -795,14 +803,56 @@ try {
             $position += $match.Index + 1
         }
 
+        Assert-True ($mapText -match 'DiskType   = ''RawPhysical''') 'The disks are not created as physical RDMs.'
         Assert-True ($mapText -match 'ReconfigVM\(\$copySpec\)') 'The other nodes do not receive the copy spec.'
+    }
+
+    Invoke-NativeTest 'The CSV column picks the SCSI bus, and it is never 0' {
+        # SHIPPED AND HIT ON A LIVE RUN: New-ScsiController chose the bus, and on a VM
+        # whose only shared controller had just been detached it chose 0 - the LUN landed
+        # at 0:0 and the boot controller's bus sharing was rewritten to physicalSharing.
+        $newScsi = @(Get-CommandAst -Ast $ast -Name 'New-ScsiController')
+        Assert-Equal $newScsi.Count 0 'New-ScsiController is back; it picks the bus itself.'
+        Assert-True ($text -match '(?m)^function Add-ScsiControllerOnBus') 'Nothing adds a controller on a named bus.'
+        Assert-True ($text -match '(?m)^function Set-RdmDiskAddress') 'Nothing places a disk at an exact unit.'
+
+        # group_1 -> SCSI 1, group_2 -> SCSI 2, group_3 -> SCSI 3.
+        Assert-True ($text -match '\$groupNumber\+\+') 'The group number is not counted off the CSV columns.'
+        Assert-True ($text -match 'ControllerBus = \$groupNumber') 'The bus does not come from the CSV column.'
+
+        foreach ($name in @('Add-ScsiControllerOnBus', 'New-RdmDiskGroup')) {
+            $busFunction = @($functionAsts | Where-Object { $_.Name -eq $name })[0]
+            Assert-True (($busFunction.Extent.Text -match '\[ValidateRange\(1, 3\)\]')) "$name accepts a bus outside 1-3."
+        }
+
+        # Nothing in the mapping may write to bus 0 or to a bus it was not given.
+        $adder = @($functionAsts | Where-Object { $_.Name -eq 'Add-ScsiControllerOnBus' })[0]
+        $adderText = $adder.Extent.Text
+        Assert-True ($adderText -match '\$controller\.BusNumber = \$BusNumber') 'The controller is created on some other bus.'
+        Assert-True ($adderText -match 'already carries') 'A bus that is already occupied is silently taken over.'
+
+        # New-HardDisk without -Controller takes the first controller with a free slot,
+        # which is SCSI 0. Every call has to name the group's controller.
+        $unbound = @(
+            Get-CommandAst -Ast $ast -Name 'New-HardDisk' |
+                Where-Object { $_.Extent.Text -notmatch '@diskParameters' } |
+                ForEach-Object { "line $($_.Extent.StartLineNumber)" }
+        )
+        Assert-Equal $unbound.Count 0 "New-HardDisk is called without a controller: $($unbound -join ', ')."
+        $mapping = @($functionAsts | Where-Object { $_.Name -eq 'New-RdmDiskGroup' })[0]
+        Assert-True (($mapping.Extent.Text -match 'Controller = \$controllerObject\[0\]')) 'The disks are not created on the group''s own controller.'
     }
 
     Invoke-NativeTest 'Controller type and bus sharing are mapped from the source' {
         Assert-True ($text -match '(?m)^function ConvertTo-PowerCliControllerType') 'The controller type mapping is missing.'
         Assert-True ($text -match '(?m)^function ConvertTo-PowerCliBusSharing') 'The bus sharing mapping is missing.'
         Assert-True ($text -match 'ControllerType = \$controller\.GetType\(\)\.FullName') 'The source controller type is not recorded.'
-        Assert-True ($text -match 'ConvertTo-PowerCliControllerType -ControllerTypeName \$controllerRecord\[0\]\.ControllerType') 'The mapping is not fed from the source controller.'
+        Assert-True ($text -match 'ConvertTo-PowerCliControllerType -ControllerTypeName \$controllerTypeName') 'The readable name is not derived from the source controller.'
+        # The controller itself is recreated from the source's own values, not from the
+        # PowerCLI names, so it comes back byte for byte as it was.
+        Assert-True ($text -match '\$controllerTypeName = \[string\]\$controllerRecord\[0\]\.ControllerType') 'The source controller type is not carried into the mapping.'
+        Assert-True ($text -match '\$sharedBus = \[string\]\$controllerRecord\[0\]\.SharedBus') 'The source bus sharing is not carried into the mapping.'
+        Assert-True ($text -match '\$controller\.SharedBus = \$SharedBus') 'The recreated controller does not take the source bus sharing.'
     }
 
     Invoke-NativeTest 'Optional SDK properties are read without assuming they exist' {

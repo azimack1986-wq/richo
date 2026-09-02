@@ -96,9 +96,12 @@ printed as it is made:
 > *before* the relocate, not during it, so the script asks for it and puts a real
 > datastore in the spec.
 
-If Storage DRS declines to answer, the emptiest accessible datastore in the pod is used
-and the log says so. If DRS names no host, none is put in the spec and vCenter places the
-VM within the cluster — which is what a DRS cluster does anyway.
+The host is asked for **first**: Storage DRS refuses a relocate placement spec that does
+not name one (`A specified parameter was not correct: spec.host`). If DRS names no host,
+the storage recommendation is not asked for at all — the emptiest datastore in the pod is
+used, and Storage DRS balances the pod on its own schedule afterwards. No host in the spec
+also means vCenter places the VM within the cluster, which is what a DRS cluster does
+anyway.
 
 ## How the VMs are powered down
 
@@ -303,26 +306,52 @@ assumed present. It states what must be there, once, before anything changes:
 
 ## How the LUNs are mapped back
 
-This is the estate's own mapping sequence, kept close to the script it came from because
-it is proven. Per LUN group, once every VM in the migration group has been relocated:
+The CSV column decides the SCSI bus, and nothing else does:
+
+| CSV column | Goes on |
+| --- | --- |
+| `group_1_lun_IDs_ordered_space_separated` | **SCSI 1**, in column order |
+| `group_2_lun_IDs_ordered_space_separated` | **SCSI 2**, in column order |
+| `group_3_lun_IDs_ordered_space_separated` | **SCSI 3**, in column order |
+
+**SCSI 0 is never touched, in either direction.** It carries the operating system and any
+plain VMDKs: no controller on bus 0 is removed, no LUN is ever attached to it, and its bus
+sharing is never rewritten. A physical RDM found on bus 0 at the source stops the run.
+
+Per LUN group, once every VM in the migration group has been relocated:
 
 1. **Resolve each LUN ID to a device on the VM's own host** — the iSCSI path list
    filtered by LUN ID and SVM, then `Get-ScsiLun` for the console device name. The
    identity comes from the LUN ID, never from the RDM that was detached: an RDM's backing
    carries a `vml.` identifier and the same LUN is a `naa.` on the host, and the two do
    not compare.
-2. **Create the first disk**, then create the controller *from* that disk — PowerCLI
-   moves the disk onto the new controller. That order is the part that works.
-3. **Force that disk to unit 0** with an edit spec.
-4. **Add the rest of the group** to the same controller, in CSV order.
-5. **Copy the controller and those disks to every other VM** in one add spec, so the
+2. **Add the controller on the group's own bus** with an explicit device spec, recreated
+   with the source controller's own type and bus sharing. If a controller is already on
+   that bus and empty it is reused; if it is already carrying disks the run stops.
+3. **Create each disk with `New-HardDisk` on that controller** — that cmdlet is what
+   writes the mapping file correctly — and **place each one at its exact unit**, because
+   `New-HardDisk` only ever takes the next free unit and a WSFC node cares which unit a
+   LUN is on.
+4. **Copy the controller and those disks to every other VM** in one add spec, so the
    nodes share one mapping file per LUN.
 
-The controller's type and bus-sharing mode come from what the source had; `ParaVirtual`
-and `Physical` are only the fallback when the source recorded neither.
+```text
+      Adding SCSI controller 1 (VirtualLsiLogicSASController, bus sharing noSharing) to 'D24SQL01' finished in 2s.
+        Hard disk 2 - naa.600a098038314... at SCSI 1:0
+        Hard disk 3 - naa.600a098038315... at SCSI 1:1
+        Hard disk 4 - naa.600a098038316... at SCSI 1:2
+      Applying the same controller and 3 disk(s) to 'D24SQL02'.
+```
 
-Bus numbers are vCenter's to assign when the controllers are created, so the run reports
-which bus each group landed on rather than demanding a particular one.
+> **Why not `New-ScsiController`?** It picks the bus itself. On a VM whose only shared
+> controller had just been detached it picked **bus 0** — the LUN landed at `0:0` and the
+> boot controller's bus sharing was rewritten to `physicalSharing`. The bus is now stated
+> in the device spec, and both the controller helper and the mapping refuse any bus
+> outside 1–3.
+
+If the controller is added but PowerCLI will not return it, the run **stops** with the
+LUNs unattached rather than falling back — `New-HardDisk` without a named controller takes
+the first controller with a free slot, which is SCSI 0.
 
 ## Power-on
 
