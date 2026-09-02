@@ -209,10 +209,12 @@ still up:
 
 - Destination cluster, resource pool, datastore cluster and RDM datastore each
   resolve to exactly one object, matched case-sensitively.
-- Placement is left to vCenter. The destination handed to `Move-VM` is the **cluster**,
-  so DRS picks a host that can reach the storage — a better answer than this script
-  guessing, and free. Only a cluster with DRS disabled needs a host named, and then it is
-  simply the first connected, powered-on host outside maintenance mode.
+- Placement is left to vCenter, both halves of it: `Move-VM` is handed the destination
+  **cluster** and the destination **datastore cluster**, so DRS picks the host and
+  Storage DRS picks the datastore. Neither is worked out here — vCenter's answer accounts
+  for storage reachability, which is more than this script could establish, and costs
+  nothing to ask for. A destination cluster with DRS disabled stops the run during
+  planning, before anything is touched.
 - No two disks in the group resolve to the same device.
 - The devices to re-attach are the ones the VMs already have — same LUNs, re-presented —
   so nothing has to scan a host to find them and the operator never types an NAA.

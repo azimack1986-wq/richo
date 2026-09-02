@@ -4737,3 +4737,22 @@ last of them showed why it could not work.
 
 - The prerequisite now names the destination **cluster** rather than listing the hosts
   its LUNs must reach, which on a 42-host cluster was a paragraph nobody read.
+
+### [3.4.0] — 2026-09-02
+
+#### Removed
+
+- **The non-DRS placement fallback.** DRS is on everywhere in this estate, so the branch
+  that picked a host by hand was code that would never run and could not be tested against
+  anything real. `Get-VMHost` is no longer called at all.
+
+#### Changed
+
+- **Placement is vCenter's, both halves of it.** `Move-VM` gets the destination cluster
+  and the destination datastore cluster: DRS chooses the host, Storage DRS chooses the
+  datastore. The run says so before it moves anything.
+
+- A destination cluster with DRS disabled now stops the run **during planning**, with a
+  sentence that says why — rather than at the relocate, with the VMs already down and
+  their RDMs detached. The check reads the property defensively, so a PowerCLI binding
+  that does not expose `DrsEnabled` does not stop a run over a property.

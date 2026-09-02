@@ -624,8 +624,13 @@ try {
         Assert-True ($text -match 'still waiting for') 'The guest shutdown wait has no heartbeat.'
 
         Assert-True ($text -match 'Resolving \$\(\$LunIds\.Count\) LUN\(s\)') 'The LUN resolution says nothing before it reads the host.'
-        Assert-True ($text -match '(?m)^function Get-MigrationDestination') 'Placement is not decided in one place.'
+        Assert-True ($text -match '(?m)^function Assert-DrsPlacement') 'The DRS placement assumption is not asserted anywhere.'
         Assert-True ($text -notmatch 'Get-EligibleDestinationHosts') 'The per-host datastore eligibility scan is back.'
+
+        # Placement is vCenter's job, both halves of it. Nothing here should be asking
+        # about hosts at all.
+        $hostCalls = @(Get-CommandAst -Ast $ast -Name 'Get-VMHost')
+        Assert-Equal $hostCalls.Count 0 'Get-VMHost is back; DRS decides where these VMs land.'
     }
 
     Invoke-NativeTest 'There are two modes and one gate between them' {

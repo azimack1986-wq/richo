@@ -1084,14 +1084,15 @@ try {
         $manifest = Get-Content -LiteralPath (Get-ChildItem -Path $executeFolder -Filter '*-execution-manifest-*.json' | Select-Object -First 1).FullName -Raw | ConvertFrom-Json
         Assert-Equal $manifest.RdmDatastore 'simsql02sit_i_rdm' 'The RDM datastore was not derived from the cluster and workload type.'
         Assert-True ([bool]$manifest.RdmDatastoreDerived) 'The manifest does not record that the datastore name was derived.'
-        Assert-True ($manifest.DestinationPlacement -like '*DRS placement*') "Placement was not left to DRS: $($manifest.DestinationPlacement)"
+        Assert-True ($manifest.DestinationPlacement -like '*placed by DRS*') "Placement was not left to DRS: $($manifest.DestinationPlacement)"
 
         # The 25 seconds this used to cost on a 42-host cluster was one question asked of
         # every host, to conclude what a working cluster always concludes.
         $log = Get-Content -LiteralPath $executeLog -Raw
         Assert-True ($log -notmatch 'mount tables of') 'The datastore mount tables are still being read.'
         Assert-True ($log -notmatch 'host\(s\) can take these VMs') 'Host eligibility is still being computed.'
-        Assert-True ($log -match "Destination is cluster 'simsql02'") 'The run does not say where it is placing the VMs.'
+        Assert-True ($log -match "Destination is cluster 'simsql02': DRS places each VM") 'The run does not say where it is placing the VMs.'
+        Assert-True ($log -match 'Storage DRS places its files') 'The run does not say who places the files.'
     }
 
     Invoke-SimTest 'The presentation prerequisite is stated by LUN group, and never checked' {
@@ -1199,6 +1200,25 @@ try {
         }
         $results = @(Import-Csv -LiteralPath (Get-ChildItem -Path $declineFolder -Filter 'results-*.csv' | Select-Object -First 1).FullName)
         Assert-Equal (@($results | Where-Object { ($_.Phase -eq 'PowerOn') -and ($_.Status -eq 'Skipped') }).Count) 1 'The declined power-on was not recorded.'
+    }
+
+    Invoke-SimTest 'A cluster without DRS stops the run during planning' {
+        Reset-SimInventory
+        $global:Sim.Clusters['simsql02'].DrsEnabled = $false
+        $drsFolder = Join-Path $script:WorkFolder 'nodrs'
+        $drsLog = Join-Path $script:WorkFolder 'nodrs.log'
+        $drsError = ''
+        try {
+            & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
+                -PowerAction ShutdownGuest -OutputFolder $drsFolder *> $drsLog
+        }
+        catch {
+            $drsError = $_.Exception.Message
+        }
+
+        Assert-True ($drsError -like '*DRS is disabled on destination cluster*') "The run did not name the DRS problem. It said: $drsError"
+        Assert-Equal $global:Sim.Events.Count 0 'The run changed something before finding DRS was off.'
+        Assert-Equal $global:Sim.VMs['SIMSQLA'].PowerState 'PoweredOn' 'A VM was powered off before planning failed.'
     }
 
     Invoke-SimTest 'A row commented out with # is skipped entirely' {

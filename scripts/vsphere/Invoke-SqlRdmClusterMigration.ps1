@@ -1137,21 +1137,21 @@ function Get-VMRdmLayout {
     }
 }
 
-function Get-MigrationDestination {
+function Assert-DrsPlacement {
     <#
     .SYNOPSIS
-        Decides what to hand Move-VM as the destination.
+        Confirms the destination cluster can place a VM itself.
 
     .DESCRIPTION
-        The cluster, when DRS can place the VM: vCenter then chooses a host that can
-        reach the storage, which is a better answer than this script guessing and costs
-        nothing to ask for.
+        Both halves of placement belong to vCenter here: DRS chooses the host, and Storage
+        DRS chooses the datastore within the destination datastore cluster. That is why
+        this script asks for neither - handing Move-VM a cluster and a datastore cluster
+        gets a host that can reach the storage, which is a better answer than any this
+        script could work out, and costs nothing to ask for.
 
-        Only a cluster without DRS needs a host named, and then it is simply the first
-        connected, powered-on host that is not in maintenance - one call, no per-host
-        reads. What this used to do instead was ask all 42 hosts of a cluster which
-        datastores they mount, twenty-five seconds to conclude that all 42 mount them,
-        which is the only thing a working cluster can conclude.
+        DRS is on everywhere in this estate. This is here so that if it ever is not, the
+        run stops during planning with a sentence that says why, rather than at the
+        relocate, with the VMs already down and their RDMs detached.
 
     .PARAMETER Cluster
         The destination cluster.
@@ -1162,33 +1162,14 @@ function Get-MigrationDestination {
         $Cluster
     )
 
-    $drsEnabled = [bool](Get-OptionalProperty -InputObject $Cluster -Name 'DrsEnabled' -Default $false)
-    if ($drsEnabled) {
-        Write-RichoLog "  Destination is cluster '$($Cluster.Name)'; DRS places each VM on a host that can reach the storage." -Level INFO
-        return [pscustomobject]@{
-            Target = $Cluster
-            Label  = "cluster $($Cluster.Name) (DRS placement)"
-        }
+    # Read defensively: a binding that does not expose DrsEnabled must not stop a run over
+    # a property, and vCenter will refuse the relocate soon enough if DRS really is off.
+    $drsEnabled = Get-OptionalProperty -InputObject $Cluster -Name 'DrsEnabled' -Default $null
+    if ($null -ne $drsEnabled -and -not [bool]$drsEnabled) {
+        throw "DRS is disabled on destination cluster '$($Cluster.Name)'. This script hands vCenter the cluster and lets DRS place each VM; enable DRS, or name a host by hand in the vSphere client after the run."
     }
 
-    $candidates = @(
-        Get-VMHost -Location $Cluster |
-            Where-Object {
-                ($_.ConnectionState -eq 'Connected') -and
-                ($_.PowerState -eq 'PoweredOn') -and
-                (-not $_.ExtensionData.Runtime.InMaintenanceMode)
-            } |
-            Sort-Object Name
-    )
-    if ($candidates.Count -eq 0) {
-        throw "Cluster '$($Cluster.Name)' has DRS disabled and no connected, powered-on host outside maintenance mode to place these VMs on."
-    }
-
-    Write-RichoLog "  DRS is off on '$($Cluster.Name)'; placing on $($candidates[0].Name), the first of $($candidates.Count) available host(s)." -Level WARN
-    return [pscustomobject]@{
-        Target = $candidates[0]
-        Label  = $candidates[0].Name
-    }
+    Write-RichoLog "  Destination is cluster '$($Cluster.Name)': DRS places each VM, and Storage DRS places its files within the destination datastore cluster." -Level INFO
 }
 
 function Wait-VMReconfigureTask {
@@ -1848,7 +1829,7 @@ function Resolve-MigrationPlan {
             })
         }
 
-        $destination = Get-MigrationDestination -Cluster $cluster
+        Assert-DrsPlacement -Cluster $cluster
 
         Write-RichoLog "  Reading the RDM topology of $($vmNames.Count) VM(s)." -Level INFO
         $vmItems = [System.Collections.Generic.List[object]]::new()
@@ -1886,8 +1867,8 @@ function Resolve-MigrationPlan {
                 VM              = $vm
                 Layout          = $layout
                 SourceCluster   = $vmClusterName
-                Destination     = $destination.Target
-                DestinationLabel = $destination.Label
+                Destination     = $cluster
+                DestinationLabel = "cluster $($cluster.Name)"
                 PowerOnOrder    = $placementIndex
             })
         }
@@ -1997,7 +1978,7 @@ function Resolve-MigrationPlan {
             DiskGroups          = $diskGroups.ToArray()
             Controllers         = $controllers.ToArray()
             Prerequisite        = $prerequisite.ToArray()
-            DestinationLabel    = $destination.Label
+            DestinationLabel    = "cluster $($cluster.Name), placed by DRS"
         })
     }
 
