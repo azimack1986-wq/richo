@@ -67,6 +67,39 @@ name defaults to the vCenter FQDN; override it with `-CredentialName`. `-Credent
 still takes a `PSCredential` directly, which is what an unattended run on a jump host
 would normally use.
 
+## How the VMs are placed
+
+Placement is vCenter's, both halves of it, and the script asks for both rather than
+working either out — one call each, no host scanning:
+
+| Question | Who answers | How |
+| --- | --- | --- |
+| Which datastore in the datastore cluster? | Storage DRS | `StorageResourceManager.RecommendDatastores` |
+| Which host in the destination cluster? | DRS | `ClusterComputeResource.RecommendHostsForVm` |
+| Which resource pool? | The CSV | `destination_resource_pool` |
+
+Both answers go into an explicit `VirtualMachineRelocateSpec` and the VM is relocated
+with `RelocateVM_Task`, landing directly in its destination resource pool. Each choice is
+printed as it is made:
+
+```text
+      Storage DRS chose datastore 'd24sql02_sit_ds_04' in 'd24sql02_n_sit_sc5_n_common'.
+      DRS chose host 'd24esx07.example.com' in cluster 'd24sql02'.
+      Relocating 'D24SQL01' to 'd24sql02_sit' on datastore 'd24sql02_sit_ds_04' - 42% (1m 18s elapsed)
+```
+
+> **Why not `Move-VM`?** It was, and vCenter rejected it:
+> `A specified parameter was not correct: RelocateSpec`. `RelocateSpec.datastore` only
+> accepts a **Datastore**; a **StoragePod** — which is what a datastore cluster is — is
+> not valid there, and with a cluster as the destination PowerCLI passes the pod's
+> reference straight through instead of resolving it. Storage DRS placement has to happen
+> *before* the relocate, not during it, so the script asks for it and puts a real
+> datastore in the spec.
+
+If Storage DRS declines to answer, the emptiest accessible datastore in the pod is used
+and the log says so. If DRS names no host, none is put in the spec and vCenter places the
+VM within the cluster — which is what a DRS cluster does anyway.
+
 ## How the VMs are powered down
 
 A VM named in the CSV is being migrated, so it is going down — the only question is how,

@@ -123,6 +123,20 @@ namespace VMware.Vim {
     }
     public class VirtualMachineConfigSpec { public VirtualDeviceConfigSpec[] DeviceChange; }
     public class ManagedObjectReference { public string Type; public string Value; }
+    public class VirtualMachineRelocateSpec {
+        public ManagedObjectReference Pool;
+        public ManagedObjectReference Host;
+        public ManagedObjectReference Datastore;
+    }
+    public enum VirtualMachineMovePriority { lowPriority, highPriority, defaultPriority }
+    public class StorageDrsPodSelectionSpec { public ManagedObjectReference StoragePod; }
+    public class StoragePlacementSpec {
+        public string Type;
+        public ManagedObjectReference Vm;
+        public ManagedObjectReference ResourcePool;
+        public StorageDrsPodSelectionSpec PodSelectionSpec;
+        public string Priority;
+    }
 }
 '@
 }
@@ -251,6 +265,7 @@ function New-SimVM {
         VMHostName           = 'sim-esx01'
         ClusterName          = 'simsql01'
         ResourcePoolName     = 'SIM-SOURCE-RP'
+        DatastoreName        = 'sim-ds-src'
         DatastoreClusterName = 'SIM-SOURCE-DSC'
         ToolsRunningStatus   = 'guestToolsRunning'
         VmxPath              = "[sim-ds-src] $Name/$Name.vmx"
@@ -292,10 +307,11 @@ function Reset-SimInventory {
     # One shared cluster, one mapping directory per workload type - which is the whole
     # reason the workload type exists in the CSV.
     $global:Sim.Datastores = [ordered]@{
-        'sim-ds-01'          = [pscustomobject]@{ Name = 'sim-ds-01'; Id = 'Datastore-datastore-1'; PodName = 'SIM-VM-DSC' }
-        'simsql02sit_i_rdm'  = [pscustomobject]@{ Name = 'simsql02sit_i_rdm'; Id = 'Datastore-datastore-2'; PodName = '' }
-        'simsql02_i_rdm'     = [pscustomobject]@{ Name = 'simsql02_i_rdm'; Id = 'Datastore-datastore-3'; PodName = '' }
-        'simsql02dev_i_rdm'  = [pscustomobject]@{ Name = 'simsql02dev_i_rdm'; Id = 'Datastore-datastore-4'; PodName = '' }
+        'sim-ds-01'          = [pscustomobject]@{ Name = 'sim-ds-01'; Id = 'Datastore-datastore-1'; PodName = 'SIM-VM-DSC'; FreeSpaceGB = 400; Accessible = $true }
+        'sim-ds-02'          = [pscustomobject]@{ Name = 'sim-ds-02'; Id = 'Datastore-datastore-5'; PodName = 'SIM-VM-DSC'; FreeSpaceGB = 900; Accessible = $true }
+        'simsql02sit_i_rdm'  = [pscustomobject]@{ Name = 'simsql02sit_i_rdm'; Id = 'Datastore-datastore-2'; PodName = ''; FreeSpaceGB = 50; Accessible = $true }
+        'simsql02_i_rdm'     = [pscustomobject]@{ Name = 'simsql02_i_rdm'; Id = 'Datastore-datastore-3'; PodName = ''; FreeSpaceGB = 50; Accessible = $true }
+        'simsql02dev_i_rdm'  = [pscustomobject]@{ Name = 'simsql02dev_i_rdm'; Id = 'Datastore-datastore-4'; PodName = ''; FreeSpaceGB = 50; Accessible = $true }
     }
 
     $global:Sim.Hosts = [ordered]@{}
@@ -315,8 +331,8 @@ function Reset-SimInventory {
     # has no paths to the LUNs either - so it is excluded whether or not the run verifies
     # presentation.
     $global:Sim.HostDatastores = @{
-        'sim-esx01' = @('sim-ds-01', 'simsql02sit_i_rdm', 'simsql02_i_rdm', 'simsql02dev_i_rdm')
-        'sim-esx02' = @('sim-ds-01', 'simsql02sit_i_rdm', 'simsql02_i_rdm', 'simsql02dev_i_rdm')
+        'sim-esx01' = @('sim-ds-01', 'sim-ds-02', 'simsql02sit_i_rdm', 'simsql02_i_rdm', 'simsql02dev_i_rdm')
+        'sim-esx02' = @('sim-ds-01', 'sim-ds-02', 'simsql02sit_i_rdm', 'simsql02_i_rdm', 'simsql02dev_i_rdm')
         'sim-esx03' = @('sim-ds-01')
     }
 
@@ -465,9 +481,25 @@ function Invoke-SimReconfigure {
     return ([pscustomobject]@{ Type = 'Task'; Value = $task.Value })
 }
 
+function ConvertTo-SimViewId {
+    # Get-View takes either an id string or a managed object reference, and the real one
+    # resolves both. A reference whose value already carries its type prefix is a sim id
+    # as it stands; anything else is qualified with its type.
+    param($Reference)
+
+    if ($Reference -is [VMware.Vim.ManagedObjectReference]) {
+        if ([string]$Reference.Value -like "$($Reference.Type)-*") { return [string]$Reference.Value }
+        return "$($Reference.Type)-$($Reference.Value)"
+    }
+    return [string]$Reference
+}
+
 function Get-View {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Id, $Property)
+
+    $Id = @($Id | ForEach-Object { ConvertTo-SimViewId -Reference $_ })
+    if ($Id.Count -eq 1) { $Id = $Id[0] }
 
     # A datastore's mount table, the way eligibility reads it now: one query for all of
     # them, each entry naming a host by managed object reference.
@@ -487,7 +519,10 @@ function Get-View {
                             }
                         }
                 )
-                [pscustomobject]@{ Id = $datastoreId; Host = $mounts }
+                $datastoreRef = New-Object VMware.Vim.ManagedObjectReference
+                $datastoreRef.Type = 'Datastore'
+                $datastoreRef.Value = ($datastoreId -replace '^Datastore-', '')
+                [pscustomobject]@{ Id = $datastoreId; Name = $datastore.Name; MoRef = $datastoreRef; Host = $mounts }
             }
         )
     }
@@ -495,14 +530,90 @@ function Get-View {
     $identifier = [string]$Id
 
     if ($identifier -like 'ResourcePool-*') {
-        $view = [pscustomobject]@{ Name = 'pool'; Id = $identifier }
-        Add-Member -InputObject $view -MemberType ScriptMethod -Name MoveIntoResourcePool -Value {
-            param($MoRefs)
-            foreach ($moRef in @($MoRefs)) {
-                $vm = Resolve-SimVM -VM ([string]$moRef.Value)
-                $pool = @($global:Sim.Pools.Values | Where-Object { $_.Id -eq $this.Id })[0]
-                $vm.ResourcePoolName = $pool.Name
-                Add-SimEvent "move-pool $($vm.Name) -> $($pool.Name)"
+        $pool = @($global:Sim.Pools.Values | Where-Object { $_.Id -eq $identifier })[0]
+        $poolRef = New-Object VMware.Vim.ManagedObjectReference
+        $poolRef.Type = 'ResourcePool'
+        $poolRef.Value = $identifier
+        return [pscustomobject]@{ Name = $pool.Name; Id = $identifier; MoRef = $poolRef }
+    }
+
+    if ($identifier -like 'StoragePod-*') {
+        $pod = @($global:Sim.DatastoreClusters.Values | Where-Object { $_.Id -eq $identifier })[0]
+        $podRef = New-Object VMware.Vim.ManagedObjectReference
+        $podRef.Type = 'StoragePod'
+        $podRef.Value = $identifier
+        return [pscustomobject]@{ Name = $pod.Name; Id = $identifier; MoRef = $podRef }
+    }
+
+    if ($identifier -like 'ClusterComputeResource-*') {
+        $cluster = @($global:Sim.Clusters.Values | Where-Object { $_.Id -eq $identifier })[0]
+        $view = [pscustomobject]@{ Name = $cluster.Name; Id = $identifier; SimClusterName = $cluster.Name }
+        # DRS initial placement: every connected host in the cluster is a candidate, and
+        # the one that mounts the most of the estate's storage is rated highest.
+        Add-Member -InputObject $view -MemberType ScriptMethod -Name RecommendHostsForVm -Value {
+            param($VmRef, $PoolRef)
+            Add-SimEvent "recommend-hosts $($this.SimClusterName)"
+            return @(
+                $global:Sim.Hosts.Values |
+                    Where-Object {
+                        ($_.ClusterName -eq $this.SimClusterName) -and
+                        ($_.ConnectionState -eq 'Connected') -and
+                        ($_.PowerState -eq 'PoweredOn')
+                    } |
+                    ForEach-Object {
+                        $hostRef = New-Object VMware.Vim.ManagedObjectReference
+                        $hostRef.Type = 'HostSystem'
+                        $hostRef.Value = [string]$_.Id
+                        [pscustomobject]@{
+                            Host   = $hostRef
+                            Rating = @($global:Sim.HostDatastores[[string]$_.Name]).Count
+                        }
+                    } |
+                    Sort-Object -Property Rating -Descending
+            )
+        }
+        return $view
+    }
+
+    if ($identifier -like 'HostSystem-*') {
+        $simHost = @($global:Sim.Hosts.Values | Where-Object { $_.Id -eq $identifier })[0]
+        return [pscustomobject]@{ Name = $simHost.Name; Id = $identifier }
+    }
+
+    if ($identifier -eq 'ServiceInstance') {
+        return [pscustomobject]@{
+            Content = [pscustomobject]@{ StorageResourceManager = 'StorageResourceManager-srm' }
+        }
+    }
+
+    if ($identifier -like 'StorageResourceManager-*') {
+        $view = [pscustomobject]@{ Id = $identifier }
+        # Storage DRS: the emptiest datastore in the pod, which is what the real thing
+        # tends to answer for an initial placement on a balanced pod.
+        Add-Member -InputObject $view -MemberType ScriptMethod -Name RecommendDatastores -Value {
+            param($Spec)
+            Add-SimEvent 'recommend-datastores'
+            $pod = @($global:Sim.DatastoreClusters.Values | Where-Object { $_.Id -eq [string]$Spec.PodSelectionSpec.StoragePod.Value })[0]
+            $candidates = @(
+                $global:Sim.Datastores.Values |
+                    Where-Object { $_.PodName -eq $pod.Name } |
+                    Sort-Object -Property FreeSpaceGB -Descending
+            )
+            $rating = 100
+            return [pscustomobject]@{
+                Recommendations = @(
+                    $candidates | ForEach-Object {
+                        $destination = New-Object VMware.Vim.ManagedObjectReference
+                        $destination.Type = 'Datastore'
+                        $destination.Value = ([string]$_.Id -replace '^Datastore-', '')
+                        $recommendation = [pscustomobject]@{
+                            Rating = $rating
+                            Action = @([pscustomobject]@{ Destination = $destination })
+                        }
+                        $rating -= 10
+                        $recommendation
+                    }
+                )
             }
         }
         return $view
@@ -515,6 +626,7 @@ function Get-View {
 
     $view = [pscustomobject]@{
         SimVMName = $vm.Name
+        Name      = $vm.Name
         MoRef     = $moRef
         Snapshot  = $null
         Config    = [pscustomobject]@{
@@ -530,6 +642,10 @@ function Get-View {
     Add-Member -InputObject $view -MemberType ScriptMethod -Name ReconfigVM -Value {
         param($Spec)
         [void](Invoke-SimReconfigure -VMName $this.SimVMName -Spec $Spec)
+    }
+    Add-Member -InputObject $view -MemberType ScriptMethod -Name RelocateVM_Task -Value {
+        param($Spec, $Priority)
+        return (Invoke-SimRelocate -VMName $this.SimVMName -Spec $Spec)
     }
     return $view
 }
@@ -584,8 +700,11 @@ function Get-DatastoreCluster {
 
 function Get-Datastore {
     [CmdletBinding()]
-    param([string]$Name, $Location, $VMHost)
+    param([string]$Name, [string]$Id, $Location, $VMHost)
 
+    if ($Id) {
+        return @($global:Sim.Datastores.Values | Where-Object { $_.Id -eq $Id })
+    }
     if ($VMHost) {
         $names = $global:Sim.HostDatastores[[string]$VMHost.Name]
         return @($global:Sim.Datastores.Values | Where-Object { $_.Name -in $names })
@@ -760,39 +879,57 @@ function Remove-HardDisk {
     Add-SimEvent "remove-disk $($vm.Name) $($HardDisk.Name)"
 }
 
-function Move-VM {
-    [CmdletBinding(SupportsShouldProcess)]
-    param($VM, $Destination, $Datastore, [switch]$RunAsync)
+function Invoke-SimRelocate {
+    # RelocateVM_Task: everything the spec asks for, and nothing it does not. A pod
+    # reference in Spec.Datastore is what the real vCenter rejects, so it is rejected
+    # here too - that failure is the reason this path exists at all.
+    param([string]$VMName, $Spec)
 
-    $vm = Resolve-SimVM -VM $VM
+    $vm = $global:Sim.VMs[$VMName]
+
+    # The spec is validated first, exactly as vCenter does: a malformed one is refused
+    # before the VM's own state is looked at.
+    if ([string]$Spec.Datastore.Type -ne 'Datastore') {
+        throw "A specified parameter was not correct: RelocateSpec"
+    }
+    $datastore = @($global:Sim.Datastores.Values | Where-Object { $_.Id -eq "Datastore-$($Spec.Datastore.Value)" })[0]
+    if (-not $datastore) { throw "A specified parameter was not correct: RelocateSpec" }
+
+    $pool = @($global:Sim.Pools.Values | Where-Object { $_.Id -eq [string]$Spec.Pool.Value })[0]
+    if (-not $pool) { throw "A specified parameter was not correct: RelocateSpec" }
+
     if ($vm.PowerState -ne 'PoweredOff') { throw "Simulated cold relocate of '$($vm.Name)' while it is $($vm.PowerState)." }
 
     $rdms = @($vm.Devices | Where-Object { $_.Backing -is [VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo] })
     if ($rdms.Count -gt 0) { throw "Simulated cold relocate of '$($vm.Name)' with $($rdms.Count) RDM(s) still attached." }
 
-    if ($global:Sim.Clusters.Contains([string]$Destination.Name)) {
-        # DRS initial placement: the first host in the cluster that could take it.
-        $placed = @(
+    if ($Spec.Host) {
+        $placedHost = @($global:Sim.Hosts.Values | Where-Object { $_.Id -eq [string]$Spec.Host.Value })[0]
+        if (-not $placedHost) { throw "A specified parameter was not correct: RelocateSpec" }
+    }
+    else {
+        # No host in the spec: DRS places it within the cluster that owns the pool.
+        $placedHost = @(
             $global:Sim.Hosts.Values |
                 Where-Object {
-                    ($_.ClusterName -eq [string]$Destination.Name) -and
+                    ($_.ClusterName -eq $pool.ClusterName) -and
                     ($_.ConnectionState -eq 'Connected') -and
                     ($_.PowerState -eq 'PoweredOn')
                 } |
                 Sort-Object Name
-        )
-        if ($placed.Count -eq 0) { throw "Simulated DRS placement found no host in '$($Destination.Name)'." }
-        $vm.VMHostName = [string]$placed[0].Name
-        $vm.ClusterName = [string]$Destination.Name
+        )[0]
+        if (-not $placedHost) { throw "Simulated DRS placement found no host in '$($pool.ClusterName)'." }
     }
-    else {
-        $vm.VMHostName = [string]$Destination.Name
-        $vm.ClusterName = [string]$global:Sim.Hosts[[string]$Destination.Name].ClusterName
-    }
-    $vm.DatastoreClusterName = [string]$Datastore.Name
+
+    $vm.VMHostName = [string]$placedHost.Name
+    $vm.ClusterName = [string]$pool.ClusterName
+    $vm.ResourcePoolName = [string]$pool.Name
+    $vm.DatastoreName = [string]$datastore.Name
+    $vm.DatastoreClusterName = [string]$datastore.PodName
     Add-SimEvent "relocate $($vm.Name) -> $($vm.VMHostName)"
 
-    return (New-SimTask -Description "relocate $($vm.Name)")
+    $task = New-SimTask -Description "relocate $($vm.Name)"
+    return ([pscustomobject]@{ Type = 'Task'; Value = $task.Value })
 }
 
 function Get-Task {
@@ -843,7 +980,13 @@ function Read-Host {
 function Connect-VIServer {
     [CmdletBinding()]
     param([string]$Server, $Credential)
-    return [pscustomobject]@{ Name = $Server; User = 'SIM\operator' }
+    return [pscustomobject]@{
+        Name          = $Server
+        User          = 'SIM\operator'
+        ExtensionData = [pscustomobject]@{
+            Content = [pscustomobject]@{ StorageResourceManager = 'StorageResourceManager-srm' }
+        }
+    }
 }
 
 function Disconnect-VIServer {
@@ -1022,6 +1165,36 @@ try {
             Assert-Equal $global:Sim.VMs[$name].ResourcePoolName 'SIM-SQL-RP' "$name is in the wrong resource pool."
             Assert-Equal $global:Sim.VMs[$name].DatastoreClusterName 'SIM-VM-DSC' "$name is on the wrong datastore cluster."
         }
+    }
+
+    Invoke-SimTest 'Placement is asked for, and the spec carries a datastore not a pod' {
+        # SHIPPED AND HIT ON A LIVE RUN: the relocate used to hand vCenter a StoragePod
+        # in RelocateSpec.datastore, which only accepts a Datastore, and the whole spec
+        # was rejected with "A specified parameter was not correct: RelocateSpec".
+        $events = @($global:Sim.Events)
+        Assert-True ($events -contains 'recommend-datastores') 'Storage DRS was never asked where the VMs should land.'
+        Assert-True ($events -contains 'recommend-hosts simsql02') 'DRS was never asked which host should run them.'
+        $log = Get-Content -LiteralPath $executeLog -Raw
+        Assert-True ($log -match "DRS chose host 'sim-esx02'") 'The host DRS recommended was not used.'
+
+        foreach ($name in @('SIMSQLA', 'SIMSQLB')) {
+            # sim-ds-02 is the emptiest datastore in the pod, which is what this
+            # simulation's Storage DRS recommends.
+            Assert-Equal $global:Sim.VMs[$name].DatastoreName 'sim-ds-02' "$name did not land on the datastore Storage DRS chose."
+        }
+    }
+
+    Invoke-SimTest 'A pod reference in the relocate spec is rejected, as vCenter rejects it' {
+        # The harness reproduces the live failure, so a regression here fails a test
+        # rather than an outage window.
+        $podSpec = New-Object VMware.Vim.VirtualMachineRelocateSpec
+        $podSpec.Pool = (Get-View -Id $global:Sim.Pools['SIM-SQL-RP'].Id).MoRef
+        $podSpec.Datastore = (Get-View -Id $global:Sim.DatastoreClusters['SIM-VM-DSC'].Id).MoRef
+
+        $message = ''
+        try { Invoke-SimRelocate -VMName 'SIMSQLA' -Spec $podSpec }
+        catch { $message = $_.Exception.Message }
+        Assert-True ($message -match 'A specified parameter was not correct: RelocateSpec') "A datastore cluster was accepted in the relocate spec. Got: $message"
     }
 
     Invoke-SimTest 'Every RDM is back at the SCSI address it came from' {

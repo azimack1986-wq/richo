@@ -656,7 +656,7 @@ try {
     Invoke-NativeTest 'Long operations report progress instead of going quiet' {
         Assert-True ($text -match '(?m)^function Wait-VMLongTask') 'The task progress helper is missing.'
         Assert-True ($text -match 'Write-Progress') 'Nothing drives a progress bar.'
-        Assert-True ($text -match 'RunAsync    = \$true') 'The cold relocate does not run as a task, so its percentage cannot be reported.'
+        Assert-True ($text -match 'RelocateVM_Task') 'The cold relocate does not run as a task, so its percentage cannot be reported.'
         Assert-True ($text -match 'still waiting for') 'The guest shutdown wait has no heartbeat.'
 
         Assert-True ($text -match 'Resolving \$\(\$LunIds\.Count\) LUN\(s\)') 'The LUN resolution says nothing before it reads the host.'
@@ -667,6 +667,44 @@ try {
         # about hosts at all.
         $hostCalls = @(Get-CommandAst -Ast $ast -Name 'Get-VMHost')
         Assert-Equal $hostCalls.Count 0 'Get-VMHost is back; DRS decides where these VMs land.'
+    }
+
+    Invoke-NativeTest 'The relocate hands vCenter a spec it can accept' {
+        # SHIPPED AND HIT ON A LIVE RUN: Move-VM with a cluster destination and a
+        # datastore cluster put a StoragePod reference in RelocateSpec.datastore, which
+        # only accepts a Datastore, and vCenter rejected the spec outright.
+        $moveCalls = @(Get-CommandAst -Ast $ast -Name 'Move-VM')
+        Assert-Equal $moveCalls.Count 0 'Move-VM is back; it cannot be handed a datastore cluster with a cluster destination.'
+        Assert-True ($text -match '(?m)^function Get-StorageDrsDatastore') 'Nothing resolves the datastore cluster to a datastore.'
+        Assert-True ($text -match '(?m)^function Get-DrsRecommendedHost') 'Nothing asks DRS for a host.'
+        Assert-True ($text -match '(?m)^function Move-VMToDestination') 'The relocate has no implementation.'
+
+        $relocate = @($functionAsts | Where-Object { $_.Name -eq 'Move-VMToDestination' })
+        Assert-Equal $relocate.Count 1 'Move-VMToDestination is missing.'
+        $relocateText = $relocate[0].Extent.Text
+        Assert-True ($relocateText -match 'VirtualMachineRelocateSpec') 'The relocate spec is not built explicitly.'
+        Assert-True ($relocateText -match '\$relocateSpec\.Datastore = ') 'The relocate spec names no datastore.'
+        Assert-True ($relocateText -match '\$relocateSpec\.Pool = ') 'The relocate spec names no resource pool.'
+        Assert-True ($relocateText -match 'Get-StorageDrsDatastore') 'The datastore is not the one Storage DRS chose.'
+        Assert-True ($relocateText -match 'RelocateVM_Task') 'The relocate is not run as a task.'
+
+        # The pool comes from the CSV, so the VM lands where it belongs in one step.
+        $poolMoves = @(
+            $ast.FindAll({
+                param($node)
+                $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]
+            }, $true) |
+                Where-Object { "$($_.Member)" -eq 'MoveIntoResourcePool' }
+        )
+        Assert-Equal $poolMoves.Count 0 'The VM is still being moved into its pool as a second step.'
+
+        # Storage DRS is asked for a real datastore, and a pod reference never reaches
+        # the spec.
+        $storage = @($functionAsts | Where-Object { $_.Name -eq 'Get-StorageDrsDatastore' })
+        $storageText = $storage[0].Extent.Text
+        Assert-True ($storageText -match 'RecommendDatastores') 'Storage DRS is never asked.'
+        Assert-True ($storageText -match 'StoragePlacementSpec') 'No placement spec is built.'
+        Assert-True ($storageText -match 'FreeSpaceGB') 'There is no fallback when Storage DRS declines.'
     }
 
     Invoke-NativeTest 'There are two modes and one gate between them' {

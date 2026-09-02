@@ -155,7 +155,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '3.6.0'
+$ScriptVersion = '3.7.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -1208,10 +1208,9 @@ function Assert-DrsPlacement {
 
     .DESCRIPTION
         Both halves of placement belong to vCenter here: DRS chooses the host, and Storage
-        DRS chooses the datastore within the destination datastore cluster. That is why
-        this script asks for neither - handing Move-VM a cluster and a datastore cluster
-        gets a host that can reach the storage, which is a better answer than any this
-        script could work out, and costs nothing to ask for.
+        DRS chooses the datastore within the destination datastore cluster. This script
+        asks them both, one call each, rather than working either out for itself - see
+        Get-DrsRecommendedHost and Get-StorageDrsDatastore.
 
         DRS is on everywhere in this estate. This is here so that if it ever is not, the
         run stops during planning with a sentence that says why, rather than at the
@@ -1234,6 +1233,224 @@ function Assert-DrsPlacement {
     }
 
     Write-RichoLog "  Destination is cluster '$($Cluster.Name)': DRS places each VM, and Storage DRS places its files within the destination datastore cluster." -Level INFO
+}
+
+function Get-StorageDrsDatastore {
+    <#
+    .SYNOPSIS
+        Asks Storage DRS which datastore in a datastore cluster a VM should land on.
+
+    .DESCRIPTION
+        SHIPPED AND HIT ON A LIVE RUN. The relocate used to be
+        'Move-VM -Destination <cluster> -Datastore <datastore cluster>', and vCenter
+        rejected it with "A specified parameter was not correct: RelocateSpec".
+
+        VirtualMachineRelocateSpec.datastore has to be a Datastore. A StoragePod - which
+        is what a datastore cluster is - is not valid there, and with a cluster as the
+        destination PowerCLI passes the pod's reference straight through rather than
+        resolving it. Storage DRS placement has to happen before the relocate, not during
+        it, so it is asked for here and the answer is a real datastore.
+
+        This is still Storage DRS choosing, which is the whole point of the datastore
+        cluster. If it declines to answer, the emptiest datastore in the pod is used and
+        the log says that is what happened.
+
+    .PARAMETER DatastoreCluster
+        The destination datastore cluster.
+
+    .PARAMETER VMView
+        The VM's Get-View object.
+
+    .PARAMETER ResourcePool
+        The destination resource pool, so the recommendation is made for where the VM is
+        actually going.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $DatastoreCluster,
+
+        [Parameter(Mandatory)]
+        $VMView,
+
+        [Parameter(Mandatory)]
+        $ResourcePool
+    )
+
+    $podView = Get-View -Id $DatastoreCluster.Id
+    $recommended = $null
+
+    try {
+        # The live connection already carries the service instance; Get-View ServiceInstance
+        # is the fallback for a binding that does not expose it.
+        $storageManagerRef = Get-OptionalProperty -InputObject $connection.ExtensionData.Content -Name 'StorageResourceManager' -Default $null
+        if ($null -eq $storageManagerRef) {
+            $storageManagerRef = (Get-View ServiceInstance).Content.StorageResourceManager
+        }
+        $storageManager = Get-View -Id $storageManagerRef
+
+        $podSelection = New-Object VMware.Vim.StorageDrsPodSelectionSpec
+        $podSelection.StoragePod = $podView.MoRef
+
+        $placementSpec = New-Object VMware.Vim.StoragePlacementSpec
+        $placementSpec.Type = 'relocate'
+        $placementSpec.Vm = $VMView.MoRef
+        $placementSpec.PodSelectionSpec = $podSelection
+        $placementSpec.ResourcePool = (Get-View -Id $ResourcePool.Id).MoRef
+        $placementSpec.Priority = 'defaultPriority'
+
+        $placement = $storageManager.RecommendDatastores($placementSpec)
+        $recommendations = @(Get-OptionalProperty -InputObject $placement -Name 'Recommendations' -Default @())
+
+        # Highest rating first - vCenter does not guarantee the order.
+        $best = @(
+            $recommendations |
+                Where-Object { @(Get-OptionalProperty -InputObject $_ -Name 'Action' -Default @()).Count -gt 0 } |
+                Sort-Object -Property { [int](Get-OptionalProperty -InputObject $_ -Name 'Rating' -Default 0) } -Descending
+        )
+
+        if ($best.Count -gt 0) {
+            $action = @($best[0].Action)[0]
+            $destinationRef = Get-OptionalProperty -InputObject $action -Name 'Destination' -Default $null
+            if ($destinationRef) {
+                $recommended = Get-Datastore -Id "Datastore-$($destinationRef.Value)"
+            }
+        }
+    }
+    catch {
+        Write-RichoLog "      Storage DRS declined to recommend a datastore in '$($DatastoreCluster.Name)': $($_.Exception.Message)" -Level WARN
+    }
+
+    if ($recommended) {
+        Write-RichoLog "      Storage DRS chose datastore '$($recommended.Name)' in '$($DatastoreCluster.Name)'." -Level INFO
+        return $recommended
+    }
+
+    $fallback = @(
+        Get-Datastore -Location $DatastoreCluster |
+            Where-Object { [bool](Get-OptionalProperty -InputObject $_ -Name 'Accessible' -Default $true) } |
+            Sort-Object -Property FreeSpaceGB -Descending
+    )
+    if ($fallback.Count -eq 0) {
+        throw "Datastore cluster '$($DatastoreCluster.Name)' has no usable datastore for '$($VMView.Name)'."
+    }
+
+    Write-RichoLog "      No Storage DRS recommendation; using '$($fallback[0].Name)', the emptiest datastore in '$($DatastoreCluster.Name)'." -Level WARN
+    return $fallback[0]
+}
+
+function Get-DrsRecommendedHost {
+    <#
+    .SYNOPSIS
+        Asks DRS which host in the destination cluster should run a VM.
+
+    .DESCRIPTION
+        One call, and no host scanning: DRS already knows which of its hosts can take the
+        VM. The answer is optional - a relocate into a resource pool in a DRS cluster with
+        no host named is placed by DRS anyway - so a cluster that declines to answer is
+        not an error, and the caller leaves the host out of the spec.
+
+    .PARAMETER Cluster
+        The destination cluster.
+
+    .PARAMETER VMView
+        The VM's Get-View object.
+
+    .PARAMETER ResourcePool
+        The destination resource pool.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Cluster,
+
+        [Parameter(Mandatory)]
+        $VMView,
+
+        [Parameter(Mandatory)]
+        $ResourcePool
+    )
+
+    try {
+        $clusterView = Get-View -Id $Cluster.Id
+        $poolView = Get-View -Id $ResourcePool.Id
+        $recommendations = @($clusterView.RecommendHostsForVm($VMView.MoRef, $poolView.MoRef))
+        $best = @(
+            $recommendations |
+                Sort-Object -Property { [double](Get-OptionalProperty -InputObject $_ -Name 'Rating' -Default 0) } -Descending
+        )
+        if ($best.Count -gt 0) {
+            $hostRef = Get-OptionalProperty -InputObject $best[0] -Name 'Host' -Default $null
+            if ($hostRef) {
+                $recommendedHost = Get-View -Id $hostRef
+                Write-RichoLog "      DRS chose host '$($recommendedHost.Name)' in cluster '$($Cluster.Name)'." -Level INFO
+                return $hostRef
+            }
+        }
+    }
+    catch {
+        Write-RichoLog "      DRS did not recommend a host in '$($Cluster.Name)': $($_.Exception.Message). Leaving the choice to vCenter." -Level INFO
+    }
+
+    Write-RichoLog "      No host named in the relocate; DRS places '$($VMView.Name)' within '$($Cluster.Name)'." -Level INFO
+    return $null
+}
+
+function Move-VMToDestination {
+    <#
+    .SYNOPSIS
+        Cold-relocates one VM into the destination resource pool and datastore.
+
+    .DESCRIPTION
+        An explicit VirtualMachineRelocateSpec rather than Move-VM, because the spec
+        Move-VM composed for a cluster destination plus a datastore cluster was rejected
+        by vCenter - see Get-StorageDrsDatastore. Everything in the spec is chosen here
+        and logged: the pool comes from the CSV, the datastore from Storage DRS, the host
+        from DRS.
+
+        Relocating straight into the destination resource pool also removes the second
+        step this used to need: Move-VM landed the VM in the cluster's root pool and a
+        MoveIntoResourcePool call afterwards put it where the CSV asked for.
+
+    .PARAMETER VMItem
+        The planned VM record.
+
+    .PARAMETER GroupPlan
+        The migration group being processed.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $VMItem,
+
+        [Parameter(Mandatory)]
+        $GroupPlan
+    )
+
+    $vmView = Get-View -Id $VMItem.VM.Id
+
+    $datastoreParameters = @{
+        DatastoreCluster = $GroupPlan.DatastoreCluster
+        VMView           = $vmView
+        ResourcePool     = $GroupPlan.ResourcePool
+    }
+    $targetDatastore = Get-StorageDrsDatastore @datastoreParameters
+
+    $hostParameters = @{
+        Cluster      = $GroupPlan.Cluster
+        VMView       = $vmView
+        ResourcePool = $GroupPlan.ResourcePool
+    }
+    $targetHostRef = Get-DrsRecommendedHost @hostParameters
+
+    $relocateSpec = New-Object VMware.Vim.VirtualMachineRelocateSpec
+    $relocateSpec.Pool = (Get-View -Id $GroupPlan.ResourcePool.Id).MoRef
+    $relocateSpec.Datastore = (Get-View -Id $targetDatastore.Id).MoRef
+    if ($targetHostRef) { $relocateSpec.Host = $targetHostRef }
+
+    $activity = "Relocating '$($VMItem.VM.Name)' to '$($GroupPlan.ResourcePool.Name)' on datastore '$($targetDatastore.Name)'"
+    $taskReference = $vmView.RelocateVM_Task($relocateSpec, [VMware.Vim.VirtualMachineMovePriority]::defaultPriority)
+    Wait-VMLongTask -Task (Get-Task -Id "Task-$($taskReference.Value)") -Activity $activity
 }
 
 function Wait-VMReconfigureTask {
@@ -2528,22 +2745,7 @@ try {
             Write-Progress -Activity "Group $($groupPlan.Name): relocate" -Status $vmItem.VM.Name -PercentComplete ([int](($vmIndex / [math]::Max(1, $groupPlan.VMItems.Count)) * 100))
             $relocateDetail = "Cold-relocate '$($vmItem.VM.Name)' to $($vmItem.DestinationLabel), datastore cluster '$($groupPlan.DatastoreCluster.Name)' and resource pool '$($groupPlan.ResourcePool.Name)'."
             Invoke-PlannedChange $groupPlan.Name $vmItem.VM.Name 'ColdRelocate' $vmItem.DestinationLabel $relocateDetail {
-                # Run the relocate as a task so its percentage can be reported. A cold
-                # move of a large VM is otherwise several minutes of silence.
-                $moveParameters = @{
-                    VM          = Get-VM -Id $vmItem.VM.Id
-                    Destination = $vmItem.Destination
-                    Datastore   = $groupPlan.DatastoreCluster
-                    RunAsync    = $true
-                    Confirm     = $false
-                }
-                $moveTask = Move-VM @moveParameters
-                Wait-VMLongTask -Task $moveTask -Activity "Relocating '$($vmItem.VM.Name)' to $($vmItem.DestinationLabel)"
-
-                Write-RichoLog "      Moving '$($vmItem.VM.Name)' into resource pool '$($groupPlan.ResourcePool.Name)'." -Level INFO
-                $currentView = Get-View -Id $vmItem.VM.Id
-                $poolView = Get-View -Id $groupPlan.ResourcePool.Id
-                $poolView.MoveIntoResourcePool([VMware.Vim.ManagedObjectReference[]]@($currentView.MoRef))
+                Move-VMToDestination -VMItem $vmItem -GroupPlan $groupPlan
             }
         }
         Write-Progress -Activity "Group $($groupPlan.Name): relocate" -Completed

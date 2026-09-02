@@ -4843,3 +4843,54 @@ last of them showed why it could not work.
   with status `Noticed`, and repeated in the verdict as
   `DRY RUN COMPLETED SUCCESSFULLY - 1 thing(s) flagged.` The run still succeeded — a flag
   is something to read, not a failure.
+
+### [3.7.0] — 2026-09-02
+
+#### Fixed
+
+- **SHIPPED AND HIT ON A LIVE RUN: `A specified parameter was not correct: RelocateSpec`.**
+  The relocate was
+
+  ```powershell
+  Move-VM -Destination $cluster          # ClusterComputeResource
+          -Datastore   $datastoreCluster # StoragePod
+  ```
+
+  and vCenter rejected the whole spec. `VirtualMachineRelocateSpec.datastore` accepts a
+  **Datastore**; a **StoragePod** is not valid there. PowerCLI resolves the pod for you on
+  some paths, but not when `-Destination` is a cluster — it passes the pod's reference
+  straight through. Storage DRS placement has to be resolved *before* the relocate, not
+  during it.
+
+  The VMs were already powered down with their RDMs detached when this hit, so the failure
+  landed at the worst possible point in the run.
+
+#### Changed
+
+- **The relocate builds its own `VirtualMachineRelocateSpec` and calls `RelocateVM_Task`.**
+  Every field in it is chosen here and logged, and both placement questions still go to
+  vCenter — one call each, no host scanning:
+
+  | Question | Who answers | How |
+  | --- | --- | --- |
+  | Which datastore in the datastore cluster? | Storage DRS | `StorageResourceManager.RecommendDatastores` |
+  | Which host in the destination cluster? | DRS | `ClusterComputeResource.RecommendHostsForVm` |
+  | Which resource pool? | The CSV | `destination_resource_pool` |
+
+  ```
+        Storage DRS chose datastore 'd24sql02_sit_ds_04' in 'd24sql02_n_sit_sc5_n_common'.
+        DRS chose host 'd24esx07.example.com' in cluster 'd24sql02'.
+  ```
+
+  Storage DRS declining falls back to the emptiest accessible datastore in the pod, with a
+  warning. DRS declining leaves the host out of the spec, which is how a DRS cluster
+  places a VM anyway.
+
+- **The VM lands in its destination resource pool in one step.** `Move-VM` put it in the
+  cluster's root pool and a second `MoveIntoResourcePool` call moved it afterwards; the
+  spec now names the pool from the CSV directly, and that call is gone.
+
+- The simulation harness gained the relocate API — `RelocateVM_Task`, `RecommendDatastores`,
+  `RecommendHostsForVm`, managed-object-reference resolution — and **reproduces the live
+  failure**: a `StoragePod` in `RelocateSpec.Datastore` is refused with the same message
+  vCenter used, so this regression fails a test rather than an outage window.
