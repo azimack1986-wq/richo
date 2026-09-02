@@ -4656,3 +4656,27 @@ last of them showed why it could not work.
   disks together — so the proven sequence is exercised end to end rather than described.
 - A test asserts the five steps of that sequence appear in order, so a future
   reimplementation cannot quietly replace it again.
+
+### [3.1.0] — 2026-09-02
+
+#### Changed
+
+- **Power-on follows the line item, not the run.** 2.4.0 held every VM down until every
+  group in the run was finished and then brought them up a workload type at a time. A row
+  in the CSV is one SQL cluster, and it comes back up as one: as soon as that row is
+  relocated, mapped on every node and verified, its VMs are powered on in CSV order, and
+  the next row starts. `Invoke-WorkloadPowerOn` becomes `Invoke-GroupPowerOn`. Still only
+  with `-PowerOnAfterMigration`.
+
+#### Added
+
+- **The dry run now covers PROD, SIT and DEV end to end.** The mapping-directory
+  derivation was unit-tested for all three but only ever exercised as SIT in the
+  simulation. A new scenario runs three rows against one shared cluster — the arrangement
+  this estate actually has — and asserts each derives its own directory
+  (`simsql02_i_rdm`, `simsql02sit_i_rdm`, `simsql02dev_i_rdm`), that all three target the
+  same cluster, that they run in batch order, and that the dry run changes nothing.
+
+- Per-disk plan lines in the dry run: every LUN, the SCSI address it is going back to,
+  the disk it replaces and that disk's size. The mapping phase itself is one planned
+  change per LUN group, so without these a dry run said less than it used to.

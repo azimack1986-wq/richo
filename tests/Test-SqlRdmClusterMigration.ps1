@@ -512,9 +512,9 @@ try {
         Assert-Equal $unguarded.Count 0 "Unguarded mutating calls: $($unguarded -join '; ')."
     }
 
-    Invoke-NativeTest 'Power-on happens once, batched by workload type' {
-        $powerOnFunction = @($functionAsts | Where-Object { $_.Name -eq 'Invoke-WorkloadPowerOn' })
-        Assert-Equal $powerOnFunction.Count 1 'Invoke-WorkloadPowerOn is missing.'
+    Invoke-NativeTest 'Power-on happens once per line item, after it is verified' {
+        $powerOnFunction = @($functionAsts | Where-Object { $_.Name -eq 'Invoke-GroupPowerOn' })
+        Assert-Equal $powerOnFunction.Count 1 'Invoke-GroupPowerOn is missing.'
         $startCalls = @(Get-CommandAst -Ast $ast -Name 'Start-VM')
         Assert-True ($startCalls.Count -gt 0) 'Nothing powers a VM on at all.'
         $outside = @(

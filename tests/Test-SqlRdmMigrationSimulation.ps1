@@ -269,6 +269,11 @@ function Reset-SimInventory {
     $global:Sim.VMs['SIMSQLA'] = New-SimVM -Name 'SIMSQLA' -Index 1 -Naas $naas -MappingOwner 'SIMSQLA'
     $global:Sim.VMs['SIMSQLB'] = New-SimVM -Name 'SIMSQLB' -Index 2 -Naas $naas -MappingOwner 'SIMSQLA'
 
+    # One-LUN VMs for the PROD and DEV rows: the same shared cluster, different mapping
+    # directories.
+    $global:Sim.VMs['SIMSQLPRD'] = New-SimVM -Name 'SIMSQLPRD' -Index 3 -Naas @('naa.6000000000000043') -MappingOwner 'SIMSQLPRD'
+    $global:Sim.VMs['SIMSQLDEV'] = New-SimVM -Name 'SIMSQLDEV' -Index 4 -Naas @('naa.6000000000000044') -MappingOwner 'SIMSQLDEV'
+
     $global:Sim.Clusters = [ordered]@{
         'simsql01' = [pscustomobject]@{ Name = 'simsql01'; Id = 'ClusterComputeResource-domain-c1' }
         'simsql02' = [pscustomobject]@{ Name = 'simsql02'; Id = 'ClusterComputeResource-domain-c2' }
@@ -279,9 +284,13 @@ function Reset-SimInventory {
     $global:Sim.DatastoreClusters = [ordered]@{
         'SIM-VM-DSC' = [pscustomobject]@{ Name = 'SIM-VM-DSC'; Id = 'StoragePod-group-p1' }
     }
+    # One shared cluster, one mapping directory per workload type - which is the whole
+    # reason the workload type exists in the CSV.
     $global:Sim.Datastores = [ordered]@{
         'sim-ds-01'          = [pscustomobject]@{ Name = 'sim-ds-01'; Id = 'Datastore-datastore-1'; PodName = 'SIM-VM-DSC' }
         'simsql02sit_i_rdm'  = [pscustomobject]@{ Name = 'simsql02sit_i_rdm'; Id = 'Datastore-datastore-2'; PodName = '' }
+        'simsql02_i_rdm'     = [pscustomobject]@{ Name = 'simsql02_i_rdm'; Id = 'Datastore-datastore-3'; PodName = '' }
+        'simsql02dev_i_rdm'  = [pscustomobject]@{ Name = 'simsql02dev_i_rdm'; Id = 'Datastore-datastore-4'; PodName = '' }
     }
 
     $global:Sim.Hosts = [ordered]@{}
@@ -301,8 +310,8 @@ function Reset-SimInventory {
     # has no paths to the LUNs either - so it is excluded whether or not the run verifies
     # presentation.
     $global:Sim.HostDatastores = @{
-        'sim-esx01' = @('sim-ds-01', 'simsql02sit_i_rdm')
-        'sim-esx02' = @('sim-ds-01', 'simsql02sit_i_rdm')
+        'sim-esx01' = @('sim-ds-01', 'simsql02sit_i_rdm', 'simsql02_i_rdm', 'simsql02dev_i_rdm')
+        'sim-esx02' = @('sim-ds-01', 'simsql02sit_i_rdm', 'simsql02_i_rdm', 'simsql02dev_i_rdm')
         'sim-esx03' = @('sim-ds-01')
     }
 
@@ -1066,6 +1075,57 @@ try {
 
     Invoke-SimTest 'A LUN the host has no path to is named, at the point it is mapped' {
         Assert-True ($missingError -like '*no path to SVM*LUN 41*') "The run did not name the unreachable LUN. It said: $missingError"
+    }
+
+    # ------------------------------------- PROD, SIT and DEV on one shared cluster ----
+    Reset-SimInventory
+    $workloadCsv = Join-Path $script:WorkFolder 'workloads.csv'
+    @(
+        'batch,destination_cluster,workload_type,first_vm,other_vms_space_separated,svm,iSCSI_Data_Store,group_1_lun_IDs_ordered_space_separated,group_2_lun_IDs_ordered_space_separated,group_3_lun_IDs_ordered_space_separated,destination_resource_pool,destination_datastore_cluster',
+        '2,simsql02,PROD,SIMSQLPRD,,sim-svm01,,43,,,SIM-SQL-RP,SIM-VM-DSC',
+        '1,simsql02,SIT,SIMSQLA,SIMSQLB,sim-svm01,,40 41 42,,,SIM-SQL-RP,SIM-VM-DSC',
+        '1,simsql02,DEV,SIMSQLDEV,,sim-svm01,,44,,,SIM-SQL-RP,SIM-VM-DSC'
+    ) | Set-Content -LiteralPath $workloadCsv -Encoding UTF8
+
+    $workloadFolder = Join-Path $script:WorkFolder 'workloads'
+    $workloadLog = Join-Path $script:WorkFolder 'workloads.log'
+    try {
+        & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $workloadCsv -DryRun -Credential $credential `
+            -PowerAction ShutdownGuest -OutputFolder $workloadFolder *> $workloadLog
+    }
+    catch {
+        $script:Failed++
+        Write-Host '[FAIL] The PROD/SIT/DEV dry run threw' -ForegroundColor Red
+        Write-Host "       $($_.Exception.Message)" -ForegroundColor Red
+    }
+
+    Invoke-SimTest 'One shared cluster, three workload types, three mapping directories' {
+        $manifests = @(
+            Get-ChildItem -Path $workloadFolder -Filter '*-dryrun-manifest-*.json' |
+                ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json }
+        )
+        Assert-Equal $manifests.Count 3 'A manifest should be written for each of the three groups.'
+
+        $expected = @{
+            'SIMSQLPRD' = @{ Workload = 'PROD'; Datastore = 'simsql02_i_rdm' }
+            'SIMSQLA'   = @{ Workload = 'SIT';  Datastore = 'simsql02sit_i_rdm' }
+            'SIMSQLDEV' = @{ Workload = 'DEV';  Datastore = 'simsql02dev_i_rdm' }
+        }
+        foreach ($manifest in $manifests) {
+            $want = $expected[[string]$manifest.MigrationGroup]
+            Assert-True ($null -ne $want) "Unexpected migration group '$($manifest.MigrationGroup)'."
+            Assert-Equal $manifest.WorkloadType $want.Workload "Wrong workload type for $($manifest.MigrationGroup)."
+            Assert-Equal $manifest.DestinationCluster 'simsql02' "All three groups target the one shared cluster."
+            Assert-Equal $manifest.RdmDatastore $want.Datastore "$($manifest.MigrationGroup) derived the wrong mapping directory."
+            Assert-True ([bool]$manifest.RdmDatastoreDerived) "$($manifest.MigrationGroup) did not derive its datastore name."
+        }
+    }
+
+    Invoke-SimTest 'The three groups run in batch order, and change nothing on a dry run' {
+        $log = Get-Content -LiteralPath $workloadLog -Raw
+        $order = @([regex]::Matches($log, 'Resolving batch (\d+) (\w+) migration group') | ForEach-Object { "$($_.Groups[1].Value)$($_.Groups[2].Value)" })
+        Assert-Equal ($order -join ',') '1SIT,1DEV,2PROD' "Groups were resolved in the wrong order: $($order -join ',')"
+        Assert-Equal $global:Sim.Events.Count 0 "The dry run changed $($global:Sim.Events.Count) thing(s)."
     }
 
     Write-Host ''

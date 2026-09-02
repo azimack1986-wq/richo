@@ -84,9 +84,9 @@
     powered-on VM whose Tools are unavailable stops the migration.
 
 .PARAMETER PowerOnAfterMigration
-    Power the VMs on at the destination once every migration group has been relocated,
-    re-attached and verified - a workload type at a time, groups in CSV order and VMs in
-    power-on order within each group. Without it the VMs are left powered off.
+    Power each migration group's VMs on as soon as that line item is complete - every VM
+    in the row relocated, every LUN mapped on every node, and the placement verified -
+    in CSV order, first_vm first. Without it the VMs are left powered off.
 
 .PARAMETER OutputFolder
     Where the manifest, plan, results and verification files are written.
@@ -176,7 +176,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '3.0.0'
+$ScriptVersion = '3.1.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -2025,6 +2025,9 @@ function Resolve-MigrationPlan {
         }
 
         Write-RichoLog "  Plan resolved: $($plannedDisks.Count) LUN(s) across $($diskGroups.Count) group(s)." -Level INFO
+        foreach ($plannedDisk in $plannedDisks) {
+            Write-RichoLog "    LUN $($plannedDisk.LunId) -> SCSI $($plannedDisk.ControllerBus):$($plannedDisk.UnitNumber), replacing '$($plannedDisk.SourceLabel)' ($($plannedDisk.CapacityGB) GB, $($plannedDisk.SourceDevice))" -Level INFO
+        }
 
         # Presentation is the engineer's prerequisite. It is stated, never checked - the
         # LUNs are assumed present, and every check of that was slow, and one of them
@@ -2243,45 +2246,34 @@ function Confirm-MigrationOutcome {
     return $records.ToArray()
 }
 
-function Invoke-WorkloadPowerOn {
+function Invoke-GroupPowerOn {
     <#
     .SYNOPSIS
-        Powers the migrated VMs on, a workload type at a time.
+        Powers on the VMs of one migration group, once that group is complete.
 
     .DESCRIPTION
-        Nothing is powered on until every LUN in every group of that workload type is
-        mapped back at the destination and verified. A SQL FCI node that boots while a
-        sibling group is still mid-migration can bring shared disks online against a
-        half-assembled cluster, so the wait is the point.
+        A line item in the CSV is one SQL cluster, and it comes back up as one: every VM
+        in the row relocated, every LUN mapped on every node, and the placement verified,
+        before the first of them is started. A node that boots while a sibling is still
+        being mapped can bring shared disks online against a half-assembled cluster.
 
-        Within a workload type the groups run in CSV order and the VMs in each group in
-        power-on order - first_vm, then the rest as listed. A group that fails throws and
-        the run stops before this is reached, so nothing here powers on after a failure.
+        Order within the group is first_vm, then the rest as the CSV lists them.
 
-    .PARAMETER Plans
-        Every resolved migration group in the run.
+    .PARAMETER GroupPlan
+        The resolved migration group.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [AllowEmptyCollection()]
-        [array]$Plans
+        $GroupPlan
     )
 
-    $workloadTypes = @($Plans | ForEach-Object { $_.WorkloadType } | Select-Object -Unique)
+    Write-RichoLog "  Powering on $($GroupPlan.VMItems.Count) VM(s) of $($GroupPlan.WorkloadType) group '$($GroupPlan.Name)', in CSV order." -Level INFO
 
-    foreach ($workloadType in $workloadTypes) {
-        $groups = @($Plans | Where-Object { $_.WorkloadType -eq $workloadType })
-        $vmCount = @($groups | ForEach-Object { $_.VMItems } | Measure-Object).Count
-        Write-RichoLog "===== Powering on $workloadType workloads: $vmCount VM(s) across $($groups.Count) group(s) =====" -Level INFO
-
-        foreach ($groupPlan in $groups) {
-            foreach ($vmItem in @($groupPlan.VMItems | Sort-Object PowerOnOrder)) {
-                $powerOnDetail = "Power on $workloadType VM '$($vmItem.VM.Name)' in sequence position $($vmItem.PowerOnOrder) of group '$($groupPlan.Name)'."
-                Invoke-PlannedChange $groupPlan.Name $vmItem.VM.Name 'PowerOn' $vmItem.VM.Name $powerOnDetail {
-                    Start-VM -VM (Get-VM -Id $vmItem.VM.Id) -Confirm:$false | Out-Null
-                }
-            }
+    foreach ($vmItem in @($GroupPlan.VMItems | Sort-Object PowerOnOrder)) {
+        $powerOnDetail = "Power on $($GroupPlan.WorkloadType) VM '$($vmItem.VM.Name)' in sequence position $($vmItem.PowerOnOrder) of group '$($GroupPlan.Name)'."
+        Invoke-PlannedChange $GroupPlan.Name $vmItem.VM.Name 'PowerOn' $vmItem.VM.Name $powerOnDetail {
+            Start-VM -VM (Get-VM -Id $vmItem.VM.Id) -Confirm:$false | Out-Null
         }
     }
 }
@@ -2459,6 +2451,14 @@ try {
             Add-Result $groupPlan.Name '' 'Verify' 'Passed' "All $($groupVerification.Count) disk placements match the plan."
         }
 
+        # The line item is complete: relocated, mapped and verified. Now it can boot.
+        if ($PowerOnAfterMigration) {
+            Invoke-GroupPowerOn -GroupPlan $groupPlan
+        }
+        else {
+            Write-RichoLog "  PowerOnAfterMigration was not requested; '$($groupPlan.Name)' has been left powered off." -Level INFO
+        }
+
         $groupStatus = if ($DryRun) { 'DryRunPassed' } else { 'Succeeded' }
         Add-Result $groupPlan.Name '' 'Group' $groupStatus 'Migration group processing completed.'
         Write-RichoLog "Migration group $($groupPlan.Name): $groupStatus." -Level INFO
@@ -2467,15 +2467,6 @@ try {
     $succeeded = @($script:Results | Where-Object { $_.Status -eq 'Succeeded' }).Count
     $planned = @($script:Results | Where-Object { $_.Status -eq 'DryRun' }).Count
     Write-RichoLog "All $($plans.Count) group(s) processed in $(Format-Elapsed -Elapsed $script:RunStopwatch.Elapsed): $succeeded change(s) made, $planned planned." -Level INFO
-
-    # Every group is migrated and verified before anything boots, then the VMs come up a
-    # workload type at a time.
-    if ($PowerOnAfterMigration) {
-        Invoke-WorkloadPowerOn -Plans $plans
-    }
-    else {
-        Write-RichoLog 'PowerOnAfterMigration was not requested; the VMs have been left powered off.' -Level INFO
-    }
 }
 catch {
     # -ErrorAction Continue so the logger's own Write-Error does not become the

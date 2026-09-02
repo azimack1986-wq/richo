@@ -278,14 +278,14 @@ which bus each group landed on rather than demanding a particular one.
 
 ## Power-on
 
-Nothing is powered on until **every** migration group in the run has been relocated,
-re-attached and verified. The VMs then come up a workload type at a time — all `PROD`
-groups, then all `SIT`, then all `DEV`, in the order the types first appear in the
-CSV — with groups in CSV order and, within a group, `first_vm` before the rest.
+A line item in the CSV is one SQL cluster, and it comes back up as one. As soon as a
+group is complete — every VM in the row relocated, every LUN mapped on every node, and
+the placement verified — that group's VMs are powered on, in CSV order, `first_vm`
+first. The next group then starts from the top.
 
-A SQL FCI node that boots while a sibling group is still mid-migration can bring
-shared disks online against a half-assembled cluster, which is what the wait is for. A
-group that fails throws and stops the run before anything is powered on.
+A node that boots while a sibling is still being mapped can bring shared disks online
+against a half-assembled cluster, which is what the wait is for. A group that fails
+throws and stops the run before anything in it is powered on.
 
 Power-on still only happens with `-PowerOnAfterMigration`. Without it the run says so
 and leaves the VMs off for you to start by hand.
