@@ -624,6 +624,8 @@ try {
         Assert-True ($text -match 'still waiting for') 'The guest shutdown wait has no heartbeat.'
 
         Assert-True ($text -match 'Resolving \$\(\$LunIds\.Count\) LUN\(s\)') 'The LUN resolution says nothing before it reads the host.'
+        Assert-True ($text -match '(?m)^function Get-MigrationDestination') 'Placement is not decided in one place.'
+        Assert-True ($text -notmatch 'Get-EligibleDestinationHosts') 'The per-host datastore eligibility scan is back.'
     }
 
     Invoke-NativeTest 'There are two modes and one gate between them' {

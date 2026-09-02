@@ -168,7 +168,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '3.2.0'
+$ScriptVersion = '3.3.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -1137,112 +1137,57 @@ function Get-VMRdmLayout {
     }
 }
 
-function Get-EligibleDestinationHosts {
+function Get-MigrationDestination {
     <#
     .SYNOPSIS
-        Returns the destination hosts that can run the migrated VMs.
+        Decides what to hand Move-VM as the destination.
 
     .DESCRIPTION
-        A host qualifies if it is connected, powered on, out of maintenance mode, and
-        mounts both the destination datastore cluster and the RDM pointer datastore.
-        Hosts that fail are reported with the reason - "no eligible host" on its own tells
-        the operator nothing about which prerequisite is missing.
+        The cluster, when DRS can place the VM: vCenter then chooses a host that can
+        reach the storage, which is a better answer than this script guessing and costs
+        nothing to ask for.
 
-        Storage presentation is NOT checked here. Presenting the LUNs to the destination
-        hosts and rescanning is the engineer's prerequisite, and reading every path on
-        every host to re-confirm it was the slowest thing this script did. What must be
-        presented is stated instead, once, and taken on trust.
-
-        The mounts are read from the datastores, not from the hosts. Asking each host what
-        it mounts is one round trip per host - a minute of them on a 42-host cluster - and
-        answers a question two queries already answer: a datastore knows which hosts have
-        it mounted.
+        Only a cluster without DRS needs a host named, and then it is simply the first
+        connected, powered-on host that is not in maintenance - one call, no per-host
+        reads. What this used to do instead was ask all 42 hosts of a cluster which
+        datastores they mount, twenty-five seconds to conclude that all 42 mount them,
+        which is the only thing a working cluster can conclude.
 
     .PARAMETER Cluster
         The destination cluster.
-
-    .PARAMETER DatastoreCluster
-        Destination datastore cluster for the VM home files.
-
-    .PARAMETER RdmDatastore
-        Datastore that holds the RDM mapping files.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        $Cluster,
-
-        [Parameter(Mandatory)]
-        $DatastoreCluster,
-
-        [Parameter(Mandatory)]
-        $RdmDatastore
+        $Cluster
     )
 
-    $eligible = [System.Collections.Generic.List[object]]::new()
-    $exclusions = [System.Collections.Generic.List[string]]::new()
-    $scanStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
-
-    $candidateHosts = @(Get-VMHost -Location $Cluster)
-    $podDatastores = @(Get-Datastore -Location $DatastoreCluster)
-    Write-RichoLog "  Checking $($candidateHosts.Count) host(s) in '$($Cluster.Name)' against the mount tables of $($podDatastores.Count + 1) datastore(s)." -Level INFO
-
-    # Two reads, whatever the cluster size: a datastore's own mount table names every host
-    # that has it. MoRef values are prefixed with the type so they compare directly with
-    # the Id PowerCLI puts on a VMHost.
-    $podHostIds = @(
-        Get-View -Id @($podDatastores | ForEach-Object { $_.Id }) -Property Host |
-            ForEach-Object { $_.Host } |
-            Where-Object { $_.MountInfo.Mounted -and $_.MountInfo.Accessible } |
-            ForEach-Object { "$($_.Key.Type)-$($_.Key.Value)" } |
-            Select-Object -Unique
-    )
-    $rdmHostIds = @(
-        Get-View -Id $RdmDatastore.Id -Property Host |
-            ForEach-Object { $_.Host } |
-            Where-Object { $_.MountInfo.Mounted -and $_.MountInfo.Accessible } |
-            ForEach-Object { "$($_.Key.Type)-$($_.Key.Value)" } |
-            Select-Object -Unique
-    )
-
-    foreach ($candidateHost in $candidateHosts) {
-        if ($candidateHost.ConnectionState -ne 'Connected') {
-            $exclusions.Add("$($candidateHost.Name): connection state is $($candidateHost.ConnectionState)")
-            continue
+    $drsEnabled = [bool](Get-OptionalProperty -InputObject $Cluster -Name 'DrsEnabled' -Default $false)
+    if ($drsEnabled) {
+        Write-RichoLog "  Destination is cluster '$($Cluster.Name)'; DRS places each VM on a host that can reach the storage." -Level INFO
+        return [pscustomobject]@{
+            Target = $Cluster
+            Label  = "cluster $($Cluster.Name) (DRS placement)"
         }
-        if ($candidateHost.PowerState -ne 'PoweredOn') {
-            $exclusions.Add("$($candidateHost.Name): power state is $($candidateHost.PowerState)")
-            continue
-        }
-        if ($candidateHost.ExtensionData.Runtime.InMaintenanceMode) {
-            $exclusions.Add("$($candidateHost.Name): in maintenance mode")
-            continue
-        }
-        if ([string]$candidateHost.Id -notin $podHostIds) {
-            $exclusions.Add("$($candidateHost.Name): mounts no datastore from '$($DatastoreCluster.Name)'")
-            continue
-        }
-        if ([string]$candidateHost.Id -notin $rdmHostIds) {
-            $exclusions.Add("$($candidateHost.Name): does not mount RDM datastore '$($RdmDatastore.Name)'")
-            continue
-        }
-
-        $eligible.Add([pscustomobject]@{ VMHost = $candidateHost })
     }
 
-    $scanStopwatch.Stop()
-    Write-RichoLog "  $($eligible.Count) of $($candidateHosts.Count) host(s) can take these VMs ($(Format-Elapsed -Elapsed $scanStopwatch.Elapsed)). $($exclusions.Count) excluded." -Level INFO
-
-    # Named, not listed one per line: on a large cluster the exclusions are the noise and
-    # the reason is the signal.
-    foreach ($reason in @($exclusions | ForEach-Object { ($_ -split ': ', 2)[1] } | Select-Object -Unique)) {
-        $affected = @($exclusions | Where-Object { $_ -like "*: $reason" } | ForEach-Object { ($_ -split ': ', 2)[0] })
-        Write-RichoLog "    $($affected.Count) host(s) excluded - $reason : $($affected -join ', ')" -Level WARN
+    $candidates = @(
+        Get-VMHost -Location $Cluster |
+            Where-Object {
+                ($_.ConnectionState -eq 'Connected') -and
+                ($_.PowerState -eq 'PoweredOn') -and
+                (-not $_.ExtensionData.Runtime.InMaintenanceMode)
+            } |
+            Sort-Object Name
+    )
+    if ($candidates.Count -eq 0) {
+        throw "Cluster '$($Cluster.Name)' has DRS disabled and no connected, powered-on host outside maintenance mode to place these VMs on."
     }
 
+    Write-RichoLog "  DRS is off on '$($Cluster.Name)'; placing on $($candidates[0].Name), the first of $($candidates.Count) available host(s)." -Level WARN
     return [pscustomobject]@{
-        Hosts      = $eligible.ToArray()
-        Exclusions = $exclusions.ToArray()
+        Target = $candidates[0]
+        Label  = $candidates[0].Name
     }
 }
 
@@ -1903,20 +1848,7 @@ function Resolve-MigrationPlan {
             })
         }
 
-        $eligibleHostParameters = @{
-            Cluster          = $cluster
-            DatastoreCluster = $datastoreCluster
-            RdmDatastore     = $rdmDatastore
-        }
-        $eligibility = Get-EligibleDestinationHosts @eligibleHostParameters
-        $eligibleHosts = $eligibility.Hosts
-        if ($eligibleHosts.Count -eq 0) {
-            $reasons = if ($eligibility.Exclusions.Count -gt 0) { " Hosts were excluded because - $($eligibility.Exclusions -join '; ')" } else { '' }
-            throw "No eligible destination host in '$groupName' can mount both the destination datastore cluster and the RDM datastore.$reasons"
-        }
-        if (($eligibleHosts.Count -eq 1) -and ($vmNames.Count -gt 1)) {
-            Write-RichoLog "Only one eligible host in '$groupName'; every node of this cluster will land on $($eligibleHosts[0].VMHost.Name). Separate them before the guests are brought back into service." -Level WARN
-        }
+        $destination = Get-MigrationDestination -Cluster $cluster
 
         Write-RichoLog "  Reading the RDM topology of $($vmNames.Count) VM(s)." -Level INFO
         $vmItems = [System.Collections.Generic.List[object]]::new()
@@ -1949,13 +1881,13 @@ function Resolve-MigrationPlan {
                 Write-RichoLog "VM '$vmName' is already in destination cluster '$destinationClusterName'. Check the row before running this live." -Level WARN
             }
 
-            $destinationRecord = $eligibleHosts[$placementIndex % $eligibleHosts.Count]
             $placementIndex++
             $vmItems.Add([pscustomobject]@{
                 VM              = $vm
                 Layout          = $layout
                 SourceCluster   = $vmClusterName
-                DestinationHost = $destinationRecord.VMHost
+                Destination     = $destination.Target
+                DestinationLabel = $destination.Label
                 PowerOnOrder    = $placementIndex
             })
         }
@@ -2038,9 +1970,8 @@ function Resolve-MigrationPlan {
         # Presentation is the engineer's prerequisite. It is stated, never checked - the
         # LUNs are assumed present, and every check of that was slow, and one of them
         # compared a vml identifier against a naa and stopped a good run.
-        $destinationHostNames = @($eligibleHosts | ForEach-Object { $_.VMHost.Name })
         $prerequisite = [System.Collections.Generic.List[string]]::new()
-        $prerequisite.Add("These LUNs from SVM '$svm' must already be presented to $($destinationHostNames -join ', ') and the HBAs rescanned:")
+        $prerequisite.Add("These LUNs from SVM '$svm' must already be presented to the hosts of cluster '$($cluster.Name)' and the HBAs rescanned:")
         foreach ($diskGroup in $diskGroups) {
             $prerequisite.Add("  group $($diskGroup.ControllerBus): LUN $($diskGroup.LunIds -join ', ')")
         }
@@ -2066,7 +1997,7 @@ function Resolve-MigrationPlan {
             DiskGroups          = $diskGroups.ToArray()
             Controllers         = $controllers.ToArray()
             Prerequisite        = $prerequisite.ToArray()
-            HostExclusions      = $eligibility.Exclusions
+            DestinationLabel    = $destination.Label
         })
     }
 
@@ -2107,7 +2038,7 @@ function New-MigrationManifest {
         DiskGroups                  = @($GroupPlan.DiskGroups | ForEach-Object {
             [ordered]@{ ControllerBus = $_.ControllerBus; LunIds = $_.LunIds }
         })
-        ExcludedHosts               = $GroupPlan.HostExclusions
+        DestinationPlacement        = $GroupPlan.DestinationLabel
         Controllers                 = $GroupPlan.Controllers
         VMs = @($GroupPlan.VMItems | ForEach-Object {
             [ordered]@{
@@ -2116,7 +2047,7 @@ function New-MigrationManifest {
                 OriginalPowerState = [string]$_.VM.PowerState
                 SourceCluster      = [string]$_.SourceCluster
                 SourceHost         = [string]$_.VM.VMHost.Name
-                DestinationHost    = [string]$_.DestinationHost.Name
+                Destination        = [string]$_.DestinationLabel
                 PowerOnOrder       = $_.PowerOnOrder
                 ChangeVersion      = [string]$_.Layout.View.Config.ChangeVersion
                 VmxPath            = [string]$_.Layout.View.Config.Files.VmPathName
@@ -2480,21 +2411,21 @@ try {
         $vmIndex = 0
         foreach ($vmItem in $groupPlan.VMItems) {
             $vmIndex++
-            Write-RichoLog "    [$vmIndex/$($groupPlan.VMItems.Count)] $($vmItem.VM.Name) -> $($vmItem.DestinationHost.Name)" -Level INFO
+            Write-RichoLog "    [$vmIndex/$($groupPlan.VMItems.Count)] $($vmItem.VM.Name) -> $($vmItem.DestinationLabel)" -Level INFO
             Write-Progress -Activity "Group $($groupPlan.Name): relocate" -Status $vmItem.VM.Name -PercentComplete ([int](($vmIndex / [math]::Max(1, $groupPlan.VMItems.Count)) * 100))
-            $relocateDetail = "Cold-relocate '$($vmItem.VM.Name)' to host '$($vmItem.DestinationHost.Name)', datastore cluster '$($groupPlan.DatastoreCluster.Name)' and resource pool '$($groupPlan.ResourcePool.Name)'."
-            Invoke-PlannedChange $groupPlan.Name $vmItem.VM.Name 'ColdRelocate' $vmItem.DestinationHost.Name $relocateDetail {
+            $relocateDetail = "Cold-relocate '$($vmItem.VM.Name)' to $($vmItem.DestinationLabel), datastore cluster '$($groupPlan.DatastoreCluster.Name)' and resource pool '$($groupPlan.ResourcePool.Name)'."
+            Invoke-PlannedChange $groupPlan.Name $vmItem.VM.Name 'ColdRelocate' $vmItem.DestinationLabel $relocateDetail {
                 # Run the relocate as a task so its percentage can be reported. A cold
                 # move of a large VM is otherwise several minutes of silence.
                 $moveParameters = @{
                     VM          = Get-VM -Id $vmItem.VM.Id
-                    Destination = $vmItem.DestinationHost
+                    Destination = $vmItem.Destination
                     Datastore   = $groupPlan.DatastoreCluster
                     RunAsync    = $true
                     Confirm     = $false
                 }
                 $moveTask = Move-VM @moveParameters
-                Wait-VMLongTask -Task $moveTask -Activity "Relocating '$($vmItem.VM.Name)' to $($vmItem.DestinationHost.Name)"
+                Wait-VMLongTask -Task $moveTask -Activity "Relocating '$($vmItem.VM.Name)' to $($vmItem.DestinationLabel)"
 
                 Write-RichoLog "      Moving '$($vmItem.VM.Name)' into resource pool '$($groupPlan.ResourcePool.Name)'." -Level INFO
                 $currentView = Get-View -Id $vmItem.VM.Id

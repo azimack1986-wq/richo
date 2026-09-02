@@ -277,8 +277,8 @@ function Reset-SimInventory {
     $global:Sim.VMs['SIMSQLDEV'] = New-SimVM -Name 'SIMSQLDEV' -Index 4 -Naas @('naa.6000000000000044') -MappingOwner 'SIMSQLDEV'
 
     $global:Sim.Clusters = [ordered]@{
-        'simsql01' = [pscustomobject]@{ Name = 'simsql01'; Id = 'ClusterComputeResource-domain-c1' }
-        'simsql02' = [pscustomobject]@{ Name = 'simsql02'; Id = 'ClusterComputeResource-domain-c2' }
+        'simsql01' = [pscustomobject]@{ Name = 'simsql01'; Id = 'ClusterComputeResource-domain-c1'; DrsEnabled = $true }
+        'simsql02' = [pscustomobject]@{ Name = 'simsql02'; Id = 'ClusterComputeResource-domain-c2'; DrsEnabled = $true }
     }
     $global:Sim.Pools = [ordered]@{
         'SIM-SQL-RP' = [pscustomobject]@{ Name = 'SIM-SQL-RP'; Id = 'ResourcePool-resgroup-1'; ClusterName = 'simsql02' }
@@ -767,8 +767,25 @@ function Move-VM {
     $rdms = @($vm.Devices | Where-Object { $_.Backing -is [VMware.Vim.VirtualDiskRawDiskMappingVer1BackingInfo] })
     if ($rdms.Count -gt 0) { throw "Simulated cold relocate of '$($vm.Name)' with $($rdms.Count) RDM(s) still attached." }
 
-    $vm.VMHostName = [string]$Destination.Name
-    $vm.ClusterName = [string]$global:Sim.Hosts[[string]$Destination.Name].ClusterName
+    if ($global:Sim.Clusters.Contains([string]$Destination.Name)) {
+        # DRS initial placement: the first host in the cluster that could take it.
+        $placed = @(
+            $global:Sim.Hosts.Values |
+                Where-Object {
+                    ($_.ClusterName -eq [string]$Destination.Name) -and
+                    ($_.ConnectionState -eq 'Connected') -and
+                    ($_.PowerState -eq 'PoweredOn')
+                } |
+                Sort-Object Name
+        )
+        if ($placed.Count -eq 0) { throw "Simulated DRS placement found no host in '$($Destination.Name)'." }
+        $vm.VMHostName = [string]$placed[0].Name
+        $vm.ClusterName = [string]$Destination.Name
+    }
+    else {
+        $vm.VMHostName = [string]$Destination.Name
+        $vm.ClusterName = [string]$global:Sim.Hosts[[string]$Destination.Name].ClusterName
+    }
     $vm.DatastoreClusterName = [string]$Datastore.Name
     Add-SimEvent "relocate $($vm.Name) -> $($vm.VMHostName)"
 
@@ -1063,26 +1080,25 @@ try {
         Assert-Equal (@($verification | Where-Object { $_.WorkloadType -ne 'SIT' }).Count) 0 'A verification row is missing its workload type.'
     }
 
-    Invoke-SimTest 'The host missing the RDM datastore is excluded, with a reason' {
+    Invoke-SimTest 'The destination is the cluster, and no host is interrogated' {
         $manifest = Get-Content -LiteralPath (Get-ChildItem -Path $executeFolder -Filter '*-execution-manifest-*.json' | Select-Object -First 1).FullName -Raw | ConvertFrom-Json
         Assert-Equal $manifest.RdmDatastore 'simsql02sit_i_rdm' 'The RDM datastore was not derived from the cluster and workload type.'
         Assert-True ([bool]$manifest.RdmDatastoreDerived) 'The manifest does not record that the datastore name was derived.'
-        Assert-True (($manifest.ExcludedHosts -join ' ') -like '*sim-esx03*') 'The host that does not mount the RDM datastore was not reported as excluded.'
-    }
+        Assert-True ($manifest.DestinationPlacement -like '*DRS placement*') "Placement was not left to DRS: $($manifest.DestinationPlacement)"
 
-    Invoke-SimTest 'Host eligibility does not ask every host what it mounts' {
-        # A 42-host cluster made this one round trip per host. The datastore's own mount
-        # table answers it in two.
+        # The 25 seconds this used to cost on a 42-host cluster was one question asked of
+        # every host, to conclude what a working cluster always concludes.
         $log = Get-Content -LiteralPath $executeLog -Raw
-        Assert-True ($log -match 'against the mount tables of') 'Eligibility is not reading the datastore mount tables.'
-        Assert-True ($log -notmatch 'eligible\.') 'Eligibility is still logging one line per host.'
+        Assert-True ($log -notmatch 'mount tables of') 'The datastore mount tables are still being read.'
+        Assert-True ($log -notmatch 'host\(s\) can take these VMs') 'Host eligibility is still being computed.'
+        Assert-True ($log -match "Destination is cluster 'simsql02'") 'The run does not say where it is placing the VMs.'
     }
 
     Invoke-SimTest 'The presentation prerequisite is stated by LUN group, and never checked' {
         $manifest = Get-Content -LiteralPath (Get-ChildItem -Path $executeFolder -Filter '*-execution-manifest-*.json' | Select-Object -First 1).FullName -Raw | ConvertFrom-Json
         $prerequisite = @($manifest.PresentationPrerequisite)
         Assert-Equal $prerequisite.Count 2 'The prerequisite should be a heading plus one line per LUN group.'
-        Assert-True ($prerequisite[0] -like '*sim-svm01*sim-esx02*') 'The prerequisite does not name the SVM and the destination hosts.'
+        Assert-True ($prerequisite[0] -like "*sim-svm01*cluster 'simsql02'*") 'The prerequisite does not name the SVM and the destination cluster.'
         Assert-True ($prerequisite[1] -like '*40, 41, 42*') 'The prerequisite does not name the LUN IDs.'
 
         $log = Get-Content -LiteralPath $executeLog -Raw

@@ -4714,3 +4714,26 @@ last of them showed why it could not work.
   the VMs are migrated, mapped, still off, and the decision recorded. A third run proves a
   hashed row is skipped while its neighbour runs, with a deliberately invalid hashed row
   to prove hashing skips validation too.
+
+### [3.3.0] — 2026-09-02
+
+#### Removed
+
+- **The destination-host eligibility scan.** It asked every host in the destination
+  cluster which datastores it mounts, to work out which of them could take the VMs.
+  On a 42-host cluster that was 25 seconds, every group, every run — to conclude that all
+  42 mount them, which is the only thing a working cluster can conclude. `Get-VMHost`,
+  the datastore mount tables and the whole notion of an eligible host are gone, along with
+  the round-robin placement they fed.
+
+#### Changed
+
+- **`Move-VM` is handed the cluster, and DRS places the VM.** vCenter then chooses a host
+  that can reach the storage, which is a better answer than this script guessing at it
+  from a mount table. A cluster with DRS disabled still needs a host named, so one is:
+  the first connected, powered-on host outside maintenance mode, from a single
+  `Get-VMHost` — no per-host reads either way. The manifest records which of the two
+  happened, and the log says so before anything moves.
+
+- The prerequisite now names the destination **cluster** rather than listing the hosts
+  its LUNs must reach, which on a 42-host cluster was a paragraph nobody read.
