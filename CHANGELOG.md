@@ -4790,3 +4790,56 @@ last of them showed why it could not work.
 
 - `$ScriptVersion` had been left at `3.3.0` while 3.4.0's changes shipped, so results and
   verification CSVs from those runs are stamped a release behind. It reads `3.5.0` now.
+
+### [3.6.0] — 2026-09-02
+
+#### Removed
+
+- **`-PowerAction`, `-ForcePowerOffIfGuestShutdownUnavailable` and
+  `-ShutdownTimeoutMinutes`.** A VM named in the CSV is being migrated, so it is going
+  down — every step after the shutdown needs it off. A switch whose only other setting
+  makes the tool refuse the job it was given is not a safety feature, it is a way to
+  discover at 2am that the run will not start.
+
+#### Changed
+
+- **A VM in the list goes down: politely if it can, hard if it will not.**
+
+  | State of the VM | What happens |
+  | --- | --- |
+  | Already powered off | Nothing. Recorded and skipped. |
+  | VMware Tools running | Graceful guest shutdown, then `-GuestShutdownTimeoutSeconds` (default **30**) to comply. Still running after that → powered off hard. |
+  | VMware Tools not running | Powered off hard immediately. There is nothing to ask. |
+
+  Both hard paths are logged, recorded in the results file, and **confirmed** against
+  vCenter rather than assumed — detaching an RDM from a VM vCenter still believes is
+  running fails several steps later, so the kill is waited on (120 seconds) and a VM
+  that never reaches `PoweredOff` stops the run.
+
+- **`-GuestShutdownTimeoutSeconds`** replaces `-ShutdownTimeoutMinutes`. Seconds, because
+  the grace period is now 30 of them rather than 20 minutes: the wait is no longer the
+  only thing standing between a slow guest and a failed run, so it does not need to be
+  generous.
+
+- **The dry run ends on a verdict, and the command that follows it.** The last block now
+  opens with `DRY RUN COMPLETED SUCCESSFULLY - nothing flagged. Ready to execute.` and
+  closes with this run's own arguments, `-Execute` in place of `-DryRun`, ready to copy:
+
+  ```
+  ================ DRY RUN COMPLETE ================
+  DRY RUN COMPLETED SUCCESSFULLY - nothing flagged. Ready to execute.
+  1 group(s) walked end to end in 41s. 12 change(s) recorded in the plan. Nothing was changed.
+  No VMs were powered on, and none could be: a dry run maps no LUNs, so there is nothing
+  to bring up. That is expected, not a failure.
+  Review the change plan and results CSVs, then run the same command with -Execute:
+    & 'C:\...\Invoke-SqlRdmClusterMigration.ps1' -VCenter 'vcenter01' -CsvPath '...' -Execute
+  ==================================================
+  ```
+
+- **Dry-run blockers became notices.** With the power-action refusals gone there is
+  nothing left for a rehearsal to block on, but there is still something worth reading
+  twice: a node that will be powered off hard because it has no VMware Tools. That is
+  flagged where it is found as `NOTE FOR THE LIVE RUN: …`, recorded in the results CSV
+  with status `Noticed`, and repeated in the verdict as
+  `DRY RUN COMPLETED SUCCESSFULLY - 1 thing(s) flagged.` The run still succeeded — a flag
+  is something to read, not a failure.

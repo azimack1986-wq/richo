@@ -36,25 +36,25 @@ the parameters and the CSV.
 .\scripts\vsphere\Invoke-SqlRdmClusterMigration.ps1 `
     -VCenter vcenter01.example.com `
     -CsvPath .\SqlRdmClusterMigration.csv `
-    -DryRun -PowerAction ShutdownGuest `
-    -OutputFolder .\SqlRdmClusterMigrationOutput
-
-# Live run, leaving the VMs powered off at the destination.
-.\scripts\vsphere\Invoke-SqlRdmClusterMigration.ps1 `
-    -VCenter vcenter01.example.com `
-    -CsvPath .\SqlRdmClusterMigration.csv `
-    -Execute -PowerAction ShutdownGuest -ShutdownTimeoutMinutes 20 `
+    -DryRun `
     -OutputFolder .\SqlRdmClusterMigrationOutput
 
 # Live run. Each row is mapped, printed, and offered for power-on as it completes.
 .\scripts\vsphere\Invoke-SqlRdmClusterMigration.ps1 `
-    -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv `
-    -Execute -PowerAction ShutdownGuest -ShutdownTimeoutMinutes 20
+    -VCenter vcenter01.example.com `
+    -CsvPath .\SqlRdmClusterMigration.csv `
+    -Execute `
+    -OutputFolder .\SqlRdmClusterMigrationOutput
 
-# Live run allowing a hard power-off only where VMware Tools is unavailable.
+# Live run giving each guest a minute to shut itself down before it is powered off hard.
 .\scripts\vsphere\Invoke-SqlRdmClusterMigration.ps1 `
     -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv `
-    -Execute -PowerAction ShutdownGuest -ForcePowerOffIfGuestShutdownUnavailable
+    -Execute -GuestShutdownTimeoutSeconds 60
+
+# One row, by VM name.
+.\scripts\vsphere\Invoke-SqlRdmClusterMigration.ps1 `
+    -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv `
+    -Execute -VMName D24SQL01
 ```
 
 There are two modes and nothing in between. `-DryRun` announces every change and
@@ -67,10 +67,24 @@ name defaults to the vCenter FQDN; override it with `-CredentialName`. `-Credent
 still takes a `PSCredential` directly, which is what an unattended run on a jump host
 would normally use.
 
-> `-ForcePowerOffIfGuestShutdownUnavailable` is deliberately opt-in. Without it, a
-> powered-on VM whose VMware Tools is not running stops the migration. With it, a hard
-> power-off is used **only** in that case — never as a shortcut past a slow guest
-> shutdown. A dry run records the proposed hard power-off and does not perform it.
+## How the VMs are powered down
+
+A VM named in the CSV is being migrated, so it is going down — the only question is how,
+and there is no switch that changes the answer:
+
+| State of the VM | What happens |
+| --- | --- |
+| Already powered off | Nothing. Recorded and skipped. |
+| VMware Tools running | Graceful guest shutdown, then up to `-GuestShutdownTimeoutSeconds` (default **30**) to comply. Still running after that → powered off hard. |
+| VMware Tools not running | Powered off hard immediately. There is nothing to ask. |
+
+Both hard-power-off paths are said out loud in the log, recorded in the results file, and
+confirmed against vCenter rather than assumed — detaching an RDM from a VM vCenter still
+believes is running fails several steps later, so the kill is waited on.
+
+In a dry run, a VM that will be powered off hard because it has no VMware Tools is
+flagged (see below). A slow guest cannot be predicted from a rehearsal, so that one is
+only ever reported live.
 
 ## High-level flow
 
@@ -306,38 +320,41 @@ thing anyone sees before booting a SQL cluster, so it has to be what is actually
 
 ## What a finished dry run looks like
 
-A dry run that reaches the end says so, and says why nothing was started:
+The verdict comes first, because that is the line anyone actually reads. A clean run:
 
 ```text
 ================ DRY RUN COMPLETE ================
+DRY RUN COMPLETED SUCCESSFULLY - nothing flagged. Ready to execute.
 1 group(s) walked end to end in 41s. 12 change(s) recorded in the plan. Nothing was changed.
 No VMs were powered on, and none could be: a dry run maps no LUNs, so there is nothing
 to bring up. That is expected, not a failure.
-Nothing was found that would stop a live run.
-Review the change plan and results CSVs, then re-run with -Execute to make the changes.
+Review the change plan and results CSVs, then run the same command with -Execute:
+  & 'C:\...\Invoke-SqlRdmClusterMigration.ps1' -VCenter 'vcenter01' -CsvPath 'C:\...\rows.csv' -Execute -OutputFolder '.\SqlRdmClusterMigrationOutput'
 ==================================================
 ```
 
-The absent power-on is not a fault. A dry run maps no LUNs, so a VM brought up at the
-end of one would be a SQL node without its disks — there is nothing to show and nothing
-to start. The block exists because a clean rehearsal used to end on whatever line came
-last, and that was often a shutdown blocker written at `[ERROR]`.
+The command on the last line is this run's own arguments with `-Execute` in place of
+`-DryRun`, printed so a UNC path with spaces in it does not have to be retyped at 2am.
 
-Conditions that would legitimately stop a **live** run are collected rather than thrown,
-so one pass reports all of them:
+The absent power-on is not a fault. A dry run maps no LUNs, so a VM brought up at the end
+of one would be a SQL node without its disks — there is nothing to show and nothing to
+start.
+
+Anything a live run will do that is worth reading twice is flagged where it is found and
+repeated in the verdict:
 
 ```text
-      WOULD STOP A LIVE RUN: VM 'D24SQL01' is powered on and -PowerAction is None, so
-      nothing would shut it down. A live run needs -PowerAction ShutdownGuest.
+      NOTE FOR THE LIVE RUN: VM 'D24SQL02' is powered on but VMware Tools is not running,
+      so it will be powered off hard rather than shut down gracefully.
 ...
-2 thing(s) would stop a live run - fix these before running with -Execute:
-  1. VM 'D24SQL01' is powered on and -PowerAction is None, ...
-  2. VM 'D24SQL02' is powered on and -PowerAction is None, ...
+DRY RUN COMPLETED SUCCESSFULLY - 1 thing(s) flagged. Read them before you execute:
+  1. VM 'D24SQL02' is powered on but VMware Tools is not running, ...
 ```
 
-Each one is also a row in `results-<stamp>.csv` with status `Blocked`. An execution run
-still stops dead on exactly these conditions — the difference is only that a rehearsal
-finishes and hands back the whole list.
+Each is also a row in `results-<stamp>.csv` with status `Noticed`. The run still
+succeeded — a flag is something to read, not a failure. A dry run that genuinely cannot
+proceed (a missing VM, a cluster with DRS off, a bad CSV) still stops with an error, as
+it always did.
 
 ## Excluding rows
 
@@ -365,7 +382,7 @@ Written to `-OutputFolder` (default `.\SqlRdmClusterMigrationOutput`):
 | --- | --- |
 | `<group>-<mode>-manifest-<stamp>.json` | Pre-change evidence: workload type, the clusters the VMs came from and the destination, source and destination placement, every source RDM, every resolved destination LUN, whether the RDM datastore name was derived, excluded hosts, mapping mode |
 | `change-plan-<stamp>.csv` | Every change the run intended, in order — identical in a dry run and a live run |
-| `results-<stamp>.csv` | Every change attempted and its outcome, including `Blocked` rows for anything a dry run found that would stop a live run |
+| `results-<stamp>.csv` | Every change attempted and its outcome, including `Noticed` rows for anything a dry run flagged for the live run |
 | `verification-<stamp>.csv` | Post-migration disk-by-disk comparison against the plan (execution runs only) |
 
 Every row carries `$ScriptVersion` and `WorkloadType`, so a change record traces back
@@ -387,8 +404,9 @@ writes its temporary CSVs to the temporary directory and deletes them.
 - `-DryRun` performs VMware reads and writes local evidence files only.
 - The script does not present LUNs on the array and does not rescan ESXi HBAs.
 - RDM removal always uses `-DeletePermanently:$false`.
-- A hard power-off is unavailable unless the explicit force switch is supplied, and
-  then only when VMware Tools is not running.
+- A hard power-off is used only after a guest has been asked and given
+  `-GuestShutdownTimeoutSeconds` to comply, or where there are no VMware Tools to ask
+  through. Either way it is logged, recorded and confirmed against vCenter.
 - Power-on happens only when the operator answers yes to the mapping shown on screen,
   and only after that row has been mapped and verified. Anything but an explicit yes
   leaves the VMs off.

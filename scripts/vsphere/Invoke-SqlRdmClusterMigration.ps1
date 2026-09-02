@@ -19,8 +19,8 @@
          plus every LUN in the CSV.
       2. Reads the source RDM topology from the first VM and proves every other VM in the
          group matches it - same controller bus, unit number, capacity and controller type.
-      3. Shuts the VMs down (guest shutdown; hard power-off only with the explicit opt-in
-         switch), detaches the RDMs and their shared-bus controllers, cold-relocates each
+      3. Shuts the VMs down - gracefully through VMware Tools, then hard if the guest
+         has not gone in time - detaches the RDMs and their shared-bus controllers, cold-relocates each
          VM, then recreates the controllers and re-attaches the RDMs at exactly the same
          SCSI addresses.
       4. Re-reads the resulting topology and writes it out as evidence.
@@ -72,16 +72,10 @@
 .PARAMETER CredentialName
     Logical credential name for the credential helper. Defaults to the vCenter FQDN.
 
-.PARAMETER PowerAction
-    What to do with a VM that is still powered on. 'None' fails the run; 'ShutdownGuest'
-    requests a graceful guest shutdown and waits for it.
-
-.PARAMETER ShutdownTimeoutMinutes
-    How long to wait for a guest shutdown before failing the run.
-
-.PARAMETER ForcePowerOffIfGuestShutdownUnavailable
-    Allow a hard power-off, and only when VMware Tools is not running. Without it a
-    powered-on VM whose Tools are unavailable stops the migration.
+.PARAMETER GuestShutdownTimeoutSeconds
+    How long a guest gets to shut itself down before it is powered off hard. Defaults to
+    30 seconds. A VM named in the CSV is being migrated - the only question is whether it
+    goes down politely, so there is no option here that leaves it running.
 
 .PARAMETER OutputFolder
     Where the manifest, plan, results and verification files are written.
@@ -90,23 +84,23 @@
     Accept an untrusted vCenter certificate for this session only.
 
 .EXAMPLE
-    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -DryRun -PowerAction ShutdownGuest
+    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -DryRun
 
     Validates the CSV against live inventory and writes the plan without changing anything.
 
 .EXAMPLE
-    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -PowerAction ShutdownGuest -ShutdownTimeoutMinutes 20
+    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -GuestShutdownTimeoutSeconds 60
 
     Migrates every row in the CSV. After each row is mapped and verified it prints what
     landed where and asks whether to power that row's VMs on.
 
 .EXAMPLE
-    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -VMName LABSQL01 -PowerAction ShutdownGuest
+    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -VMName LABSQL01
 
     Runs the single CSV row that names LABSQL01 - that VM and the rest of its cluster.
 
 .EXAMPLE
-    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -Batch 1 -PowerAction ShutdownGuest
+    .\Invoke-SqlRdmClusterMigration.ps1 -VCenter vcenter01.example.com -CsvPath .\SqlRdmClusterMigration.csv -Execute -Batch 1
 
     Runs every row marked batch 1, in CSV order.
 #>
@@ -147,15 +141,8 @@ param(
     [string]$CredentialName,
 
     [Parameter()]
-    [ValidateSet('None', 'ShutdownGuest')]
-    [string]$PowerAction = 'None',
-
-    [Parameter()]
-    [ValidateRange(1, 120)]
-    [int]$ShutdownTimeoutMinutes = 20,
-
-    [Parameter()]
-    [switch]$ForcePowerOffIfGuestShutdownUnavailable,
+    [ValidateRange(1, 3600)]
+    [int]$GuestShutdownTimeoutSeconds = 30,
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
@@ -168,7 +155,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '3.5.0'
+$ScriptVersion = '3.6.0'
 $connection = $null
 
 # There are exactly two modes and one gate between them: -DryRun records what would
@@ -190,12 +177,16 @@ $script:Results = [System.Collections.Generic.List[object]]::new()
 # name in the main body replaced this list with an array, which broke every execution run
 # at the point it wrote its evidence.
 $script:VerificationRows = [System.Collections.Generic.List[object]]::new()
-# Conditions that a dry run finds and a live run would stop dead on. A dry run records
-# them and carries on so one pass reports every one of them, rather than ending on the
-# first and looking like a failure of the tool.
-$script:Blockers = [System.Collections.Generic.List[string]]::new()
+# Things a dry run finds that a live run will do and an operator should know about before
+# it does - a hard power-off, above all. Collected here so one pass reports every one of
+# them in the closing summary rather than burying them in the log.
+$script:DryRunNotices = [System.Collections.Generic.List[string]]::new()
 
 # Highest SCSI unit number on a controller. Unit 7 is reserved for the controller itself.
+# How long a VM gets to reach PoweredOff after a hard power-off has been issued. This is
+# vCenter completing a kill, not a guest doing anything, so it is generous and fixed.
+$script:HardPowerOffTimeoutSeconds = 120
+
 $script:MaxScsiUnitNumber = 15
 $script:ReservedScsiUnitNumber = 7
 
@@ -476,25 +467,54 @@ function Add-Result {
     })
 }
 
-function Add-DryRunBlocker {
+function Format-ExecuteCommand {
     <#
     .SYNOPSIS
-        Records something that would stop a live run, and lets the dry run continue.
+        Builds the command line that repeats this run with -Execute.
 
     .DESCRIPTION
-        A dry run exists to find every problem in one pass. Throwing on the first one
-        ends the run and reads as a tool failure, so in dry-run mode the condition is
-        recorded here instead and repeated in the closing summary. The equivalent live
-        run still throws - see the call sites.
+        A dry run that passes is followed by the same run with one word changed, and
+        retyping a UNC path with spaces in it at 2am is how the wrong CSV gets migrated.
+        Printed at the end of a clean dry run so it can be copied.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $invocation = if ($PSCommandPath) { $PSCommandPath } else { 'Invoke-SqlRdmClusterMigration.ps1' }
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $parts.Add("& '$invocation'")
+    $parts.Add("-VCenter '$VCenter'")
+    $parts.Add("-CsvPath '$CsvPath'")
+    $parts.Add('-Execute')
+    if ($VMName) { $parts.Add("-VMName $(($VMName | ForEach-Object { "'$_'" }) -join ', ')") }
+    if ($Batch) { $parts.Add("-Batch $($Batch -join ', ')") }
+    if ($GuestShutdownTimeoutSeconds -ne 30) { $parts.Add("-GuestShutdownTimeoutSeconds $GuestShutdownTimeoutSeconds") }
+    if ($CredentialName) { $parts.Add("-CredentialName '$CredentialName'") }
+    if ($IgnoreInvalidCertificate) { $parts.Add('-IgnoreInvalidCertificate') }
+    $parts.Add("-OutputFolder '$OutputFolder'")
+
+    return ($parts -join ' ')
+}
+
+function Add-DryRunNotice {
+    <#
+    .SYNOPSIS
+        Records something a live run will do that the operator should see beforehand.
+
+    .DESCRIPTION
+        A dry run exists to show what the live run will do, and some of that is worth
+        reading twice - a node that will be powered off hard rather than asked politely,
+        above all. Noticed here as it is found, and repeated in the closing summary so
+        one pass surfaces all of them instead of leaving them scattered through the log.
 
     .PARAMETER MigrationGroup
-        The migration group the blocker belongs to.
+        The migration group the notice belongs to.
 
     .PARAMETER VM
-        The VM the blocker concerns, or an empty string for group-level blockers.
+        The VM the notice concerns, or an empty string for group-level notices.
 
     .PARAMETER Reason
-        What would stop the live run, and what to do about it.
+        What the live run will do, and why.
     #>
     [CmdletBinding()]
     param(
@@ -511,9 +531,9 @@ function Add-DryRunBlocker {
         [string]$Reason
     )
 
-    $script:Blockers.Add($Reason)
-    Write-RichoLog "      WOULD STOP A LIVE RUN: $Reason" -Level WARN
-    Add-Result $MigrationGroup $VM 'Blocker' 'Blocked' $Reason
+    $script:DryRunNotices.Add($Reason)
+    Write-RichoLog "      NOTE FOR THE LIVE RUN: $Reason" -Level WARN
+    Add-Result $MigrationGroup $VM 'Notice' 'Noticed' $Reason
 }
 
 function Invoke-PlannedChange {
@@ -1297,16 +1317,24 @@ function Remove-SharedScsiController {
     Wait-VMReconfigureTask -TaskReference $vmView.ReconfigVM_Task($spec) -Description "Removing SCSI controller $BusNumber from '$($VM.Name)'"
 }
 
-function Wait-VMGuestShutdown {
+function Wait-VMPowerOff {
     <#
     .SYNOPSIS
-        Waits for a VM to reach PoweredOff, or fails the run.
+        Waits for a VM to reach PoweredOff and reports whether it got there.
+
+    .DESCRIPTION
+        Returns $true or $false rather than throwing, because the caller has somewhere to
+        go when a guest does not shut down in time: it powers the VM off hard. The
+        decision belongs at the call site, not here.
 
     .PARAMETER VM
         The VM being shut down.
 
-    .PARAMETER TimeoutMinutes
+    .PARAMETER TimeoutSeconds
         How long to wait before giving up.
+
+    .PARAMETER Reason
+        Short description of what is being waited on, for the progress bar and the log.
     #>
     [CmdletBinding()]
     param(
@@ -1314,38 +1342,46 @@ function Wait-VMGuestShutdown {
         $VM,
 
         [Parameter(Mandatory)]
-        [int]$TimeoutMinutes
+        [int]$TimeoutSeconds,
+
+        [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Reason
     )
 
     $activity = "Waiting for '$($VM.Name)' to power off"
-    $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $lastReport = 0
     $currentVM = Get-VM -Id $VM.Id
 
+    # A 30-second grace period polled every five seconds is six samples; polling a
+    # two-minute wait that often is noise. Scaled, and never longer than the wait.
+    $pollSeconds = [math]::Max(1, [math]::Min(5, [int]($TimeoutSeconds / 5)))
+
     while (($currentVM.PowerState -ne 'PoweredOff') -and ((Get-Date) -lt $deadline)) {
-        Start-Sleep -Seconds 5
+        Start-Sleep -Seconds $pollSeconds
         $currentVM = Get-VM -Id $VM.Id
 
-        $percent = [math]::Min(100, [int](($stopwatch.Elapsed.TotalMinutes / $TimeoutMinutes) * 100))
-        Write-Progress -Activity $activity -Status "$(Format-Elapsed -Elapsed $stopwatch.Elapsed) of $TimeoutMinutes minutes" -PercentComplete $percent
+        $percent = [math]::Min(100, [int](($stopwatch.Elapsed.TotalSeconds / $TimeoutSeconds) * 100))
+        Write-Progress -Activity $activity -Status "$Reason - $([int]$stopwatch.Elapsed.TotalSeconds) of $TimeoutSeconds seconds" -PercentComplete $percent
 
-        # Twenty minutes of an unresponsive guest should not look like twenty minutes of
-        # a hung script.
-        if (($stopwatch.Elapsed.TotalSeconds - $lastReport) -ge 30) {
+        # A slow wait should not look like a hung script.
+        if (($stopwatch.Elapsed.TotalSeconds - $lastReport) -ge 15) {
             $lastReport = $stopwatch.Elapsed.TotalSeconds
-            Write-RichoLog "      still waiting for '$($VM.Name)' to power off - $(Format-Elapsed -Elapsed $stopwatch.Elapsed) of $TimeoutMinutes minutes, state is $($currentVM.PowerState)." -Level INFO
+            Write-RichoLog "      still waiting for '$($VM.Name)' - $([int]$stopwatch.Elapsed.TotalSeconds) of $TimeoutSeconds seconds, state is $($currentVM.PowerState)." -Level INFO
         }
     }
 
     Write-Progress -Activity $activity -Completed
     $stopwatch.Stop()
 
-    if ($currentVM.PowerState -ne 'PoweredOff') {
-        throw "VM '$($VM.Name)' did not power off within $TimeoutMinutes minutes."
+    if ($currentVM.PowerState -eq 'PoweredOff') {
+        Write-RichoLog "      '$($VM.Name)' powered off after $(Format-Elapsed -Elapsed $stopwatch.Elapsed)." -Level INFO
+        return $true
     }
 
-    Write-RichoLog "      '$($VM.Name)' powered off after $(Format-Elapsed -Elapsed $stopwatch.Elapsed)." -Level INFO
+    return $false
 }
 
 function Stop-VMForMigration {
@@ -1354,9 +1390,15 @@ function Stop-VMForMigration {
         Brings one VM to a powered-off state before it is relocated.
 
     .DESCRIPTION
-        The power state is re-read here rather than taken from the plan. Building the plan
-        walks every host's storage and can take minutes, and a VM that was powered off
-        when the plan was built may not be by the time this runs.
+        A VM named in the CSV is being migrated, so it is going down. The only question is
+        how. VMware Tools running means it is asked politely and given
+        -GuestShutdownTimeoutSeconds to comply; still running after that, or no Tools to
+        ask through in the first place, means a hard power-off. There is no mode that
+        leaves it running, because every path after this one needs it off.
+
+        The power state and the Tools status are re-read here rather than taken from the
+        plan. Building the plan walks the inventory and can take minutes, and either can
+        have changed by the time this runs.
 
     .PARAMETER VMItem
         The planned VM record.
@@ -1379,37 +1421,73 @@ function Stop-VMForMigration {
         return
     }
 
-    if ($PowerAction -eq 'None') {
-        $noActionReason = "VM '$($currentVM.Name)' is powered on and -PowerAction is None, so nothing would shut it down. A live run needs -PowerAction ShutdownGuest."
-        if ($DryRun) {
-            Add-DryRunBlocker -MigrationGroup $MigrationGroup -VM $currentVM.Name -Reason $noActionReason
-            return
-        }
-        throw $noActionReason
-    }
-
     $toolsRunning = ([string]$currentVM.ExtensionData.Guest.ToolsRunningStatus -eq 'guestToolsRunning')
-    if ($toolsRunning) {
-        $shutdownDetail = "Request graceful guest shutdown for '$($currentVM.Name)' and wait up to $ShutdownTimeoutMinutes minutes."
-        Invoke-PlannedChange $MigrationGroup $currentVM.Name 'ShutdownGuest' $currentVM.Name $shutdownDetail {
-            Stop-VMGuest -VM (Get-VM -Id $VMItem.VM.Id) -Confirm:$false | Out-Null
-            Wait-VMGuestShutdown -VM $VMItem.VM -TimeoutMinutes $ShutdownTimeoutMinutes
+
+    if (-not $toolsRunning) {
+        # No Tools, nothing to ask. Said out loud either way, and in a dry run it is one
+        # of the notices the closing summary repeats - a SQL node going down hard is the
+        # single most consequential thing this script does.
+        $noToolsReason = "VM '$($currentVM.Name)' is powered on but VMware Tools is not running, so it will be powered off hard rather than shut down gracefully."
+        if ($DryRun) {
+            Add-DryRunNotice -MigrationGroup $MigrationGroup -VM $currentVM.Name -Reason $noToolsReason
+        }
+        else {
+            Write-RichoLog "      $noToolsReason" -Level WARN
+        }
+
+        $forceDetail = "Power off '$($currentVM.Name)' hard: VMware Tools is not running, so it cannot be asked to shut down."
+        Invoke-PlannedChange $MigrationGroup $currentVM.Name 'ForcePowerOff' $currentVM.Name $forceDetail {
+            Stop-VMForMigrationHard -VMItem $VMItem
         }
         return
     }
 
-    if (-not $ForcePowerOffIfGuestShutdownUnavailable) {
-        $noToolsReason = "VM '$($currentVM.Name)' is powered on but VMware Tools is not running, so it cannot be shut down gracefully. A live run needs -ForcePowerOffIfGuestShutdownUnavailable, and only when a hard power-off is explicitly approved."
-        if ($DryRun) {
-            Add-DryRunBlocker -MigrationGroup $MigrationGroup -VM $currentVM.Name -Reason $noToolsReason
+    $shutdownDetail = "Shut '$($currentVM.Name)' down through VMware Tools, and power it off hard if it is still running $GuestShutdownTimeoutSeconds seconds later."
+    Invoke-PlannedChange $MigrationGroup $currentVM.Name 'ShutdownGuest' $currentVM.Name $shutdownDetail {
+        Stop-VMGuest -VM (Get-VM -Id $VMItem.VM.Id) -Confirm:$false | Out-Null
+        $waitParameters = @{
+            VM             = $VMItem.VM
+            TimeoutSeconds = $GuestShutdownTimeoutSeconds
+            Reason         = 'guest shutdown'
+        }
+        if (Wait-VMPowerOff @waitParameters) {
             return
         }
-        throw $noToolsReason
-    }
 
-    $forcePowerOffDetail = "Force power off '$($currentVM.Name)' because VMware Tools is unavailable and the explicit opt-in switch was supplied."
-    Invoke-PlannedChange $MigrationGroup $currentVM.Name 'ForcePowerOff' $currentVM.Name $forcePowerOffDetail {
-        Stop-VM -VM (Get-VM -Id $VMItem.VM.Id) -Kill -Confirm:$false | Out-Null
+        Write-RichoLog "      '$($VMItem.VM.Name)' did not shut down within $GuestShutdownTimeoutSeconds seconds. Powering it off hard." -Level WARN
+        Add-Result $MigrationGroup $VMItem.VM.Name 'ForcePowerOff' 'Succeeded' "Guest shutdown did not complete within $GuestShutdownTimeoutSeconds seconds, so the VM was powered off hard."
+        Stop-VMForMigrationHard -VMItem $VMItem
+    }
+}
+
+function Stop-VMForMigrationHard {
+    <#
+    .SYNOPSIS
+        Powers a VM off hard and waits for vCenter to confirm it.
+
+    .DESCRIPTION
+        The wait is not optional. Detaching an RDM from a VM vCenter still believes is
+        running fails, and it fails several steps later, so the kill is confirmed here
+        rather than assumed.
+
+    .PARAMETER VMItem
+        The planned VM record.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $VMItem
+    )
+
+    Stop-VM -VM (Get-VM -Id $VMItem.VM.Id) -Kill -Confirm:$false | Out-Null
+
+    $waitParameters = @{
+        VM             = $VMItem.VM
+        TimeoutSeconds = $script:HardPowerOffTimeoutSeconds
+        Reason         = 'hard power-off'
+    }
+    if (-not (Wait-VMPowerOff @waitParameters)) {
+        throw "VM '$($VMItem.VM.Name)' has not reached PoweredOff $script:HardPowerOffTimeoutSeconds seconds after a hard power-off was issued."
     }
 }
 
@@ -2522,20 +2600,24 @@ try {
         # thing on screen used to be a shutdown blocker logged as an error, and a clean
         # rehearsal looked like a broken tool.
         Write-RichoLog '================ DRY RUN COMPLETE ================' -Level INFO
-        Write-RichoLog "$($plans.Count) group(s) walked end to end in $(Format-Elapsed -Elapsed $script:RunStopwatch.Elapsed). $planned change(s) recorded in the plan. Nothing was changed." -Level INFO
-        Write-RichoLog 'No VMs were powered on, and none could be: a dry run maps no LUNs, so there is nothing to bring up. That is expected, not a failure.' -Level INFO
-        if ($script:Blockers.Count -gt 0) {
-            Write-RichoLog "$($script:Blockers.Count) thing(s) would stop a live run - fix these before running with -Execute:" -Level WARN
-            $blockerIndex = 0
-            foreach ($blocker in $script:Blockers) {
-                $blockerIndex++
-                Write-RichoLog "  $blockerIndex. $blocker" -Level WARN
+
+        # The verdict first, in one line, because that is the line anyone actually reads.
+        if ($script:DryRunNotices.Count -gt 0) {
+            Write-RichoLog "DRY RUN COMPLETED SUCCESSFULLY - $($script:DryRunNotices.Count) thing(s) flagged. Read them before you execute:" -Level WARN
+            $noticeIndex = 0
+            foreach ($notice in $script:DryRunNotices) {
+                $noticeIndex++
+                Write-RichoLog "  $noticeIndex. $notice" -Level WARN
             }
         }
         else {
-            Write-RichoLog 'Nothing was found that would stop a live run.' -Level INFO
+            Write-RichoLog 'DRY RUN COMPLETED SUCCESSFULLY - nothing flagged. Ready to execute.' -Level INFO
         }
-        Write-RichoLog 'Review the change plan and results CSVs, then re-run with -Execute to make the changes.' -Level INFO
+
+        Write-RichoLog "$($plans.Count) group(s) walked end to end in $(Format-Elapsed -Elapsed $script:RunStopwatch.Elapsed). $planned change(s) recorded in the plan. Nothing was changed." -Level INFO
+        Write-RichoLog 'No VMs were powered on, and none could be: a dry run maps no LUNs, so there is nothing to bring up. That is expected, not a failure.' -Level INFO
+        Write-RichoLog 'Review the change plan and results CSVs, then run the same command with -Execute:' -Level INFO
+        Write-RichoLog "  $(Format-ExecuteCommand)" -Level INFO
         Write-RichoLog '==================================================' -Level INFO
     }
     else {

@@ -266,6 +266,9 @@ function Reset-SimInventory {
     $global:Sim.NextDeviceKey = 5000
     $global:Sim.NextTask = 0
     $global:Sim.Events = [System.Collections.Generic.List[string]]::new()
+    # When set, Stop-VMGuest is accepted and ignored - the guest that takes the request
+    # and keeps running, which is exactly what the hard power-off exists for.
+    $global:Sim.IgnoreGuestShutdown = $false
 
     $naas = @('naa.6000000000000040', 'naa.6000000000000041', 'naa.6000000000000042')
     $global:Sim.VMs['SIMSQLA'] = New-SimVM -Name 'SIMSQLA' -Index 1 -Naas $naas -MappingOwner 'SIMSQLA'
@@ -803,8 +806,9 @@ function Stop-VMGuest {
     [CmdletBinding(SupportsShouldProcess)]
     param($VM)
     $vm = Resolve-SimVM -VM $VM
-    $vm.PowerState = 'PoweredOff'
     Add-SimEvent "guest-shutdown $($vm.Name)"
+    if ($global:Sim.IgnoreGuestShutdown) { return }
+    $vm.PowerState = 'PoweredOff'
 }
 
 function Stop-VM {
@@ -921,7 +925,7 @@ try {
 
     try {
         & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -DryRun -Credential $credential `
-            -PowerAction ShutdownGuest -OutputFolder $dryRunFolder *> $dryRunLog
+            -OutputFolder $dryRunFolder *> $dryRunLog
     }
     catch {
         $script:Failed++
@@ -949,42 +953,46 @@ try {
         Assert-Equal (@($plan | Where-Object { $_.WorkloadType -ne 'SIT' }).Count) 0 'A plan row is missing its workload type.'
     }
 
-    Invoke-SimTest 'A clean dry run says it is complete, and why nothing started' {
+    Invoke-SimTest 'A clean dry run ends on a verdict and the command that follows it' {
         $log = Get-Content -LiteralPath $dryRunLog -Raw
         Assert-True ($log -match 'DRY RUN COMPLETE') 'The dry run did not announce that it completed.'
+        Assert-True ($log -match 'DRY RUN COMPLETED SUCCESSFULLY - nothing flagged\. Ready to execute\.') 'A clean dry run did not give a verdict.'
         Assert-True ($log -match 'Nothing was changed\.') 'The dry run did not say that nothing was changed.'
         Assert-True ($log -match 'none could be: a dry run maps no LUNs') 'The dry run did not explain why nothing was powered on.'
         Assert-True ($log -match 'expected, not a failure') 'The dry run did not say the absent power-on is expected.'
-        Assert-True ($log -match 'Nothing was found that would stop a live run\.') 'A clean dry run reported blockers.'
+        Assert-True ($log -match [regex]::Escape('-CsvPath')) 'The follow-on -Execute command was not printed.'
+        Assert-True ($log -match '-Execute') 'The follow-on command does not say -Execute.'
         Assert-True ($log -notmatch '\[ERROR\]') 'A clean dry run logged an error.'
+        Assert-True ($log -notmatch '\[WARN \]') 'A clean dry run raised a warning.'
     }
 
-    # --------------------------------------------------- dry run that finds a blocker -
+    # ------------------------------------- dry run against a VM with no VMware Tools --
     Reset-SimInventory
-    $blockerFolder = Join-Path $script:WorkFolder 'blocker'
-    $blockerLog = Join-Path $script:WorkFolder 'blocker.log'
-    $blockerThrew = $false
+    $global:Sim.VMs['SIMSQLB'].ToolsRunningStatus = 'guestToolsNotRunning'
+    $noticeFolder = Join-Path $script:WorkFolder 'notice'
+    $noticeLog = Join-Path $script:WorkFolder 'notice.log'
+    $noticeThrew = $false
 
     try {
         & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -DryRun -Credential $credential `
-            -OutputFolder $blockerFolder *> $blockerLog
+            -OutputFolder $noticeFolder *> $noticeLog
     }
     catch {
-        $blockerThrew = $true
+        $noticeThrew = $true
     }
 
-    Invoke-SimTest 'A dry run reports what would stop a live run instead of dying on it' {
-        Assert-True (-not $blockerThrew) 'The dry run threw on a condition a live run would stop on.'
-        $log = Get-Content -LiteralPath $blockerLog -Raw
-        Assert-True ($log -match 'WOULD STOP A LIVE RUN') 'The blocker was not called out where it was found.'
-        Assert-True ($log -match '-PowerAction is None') 'The blocker did not name the missing -PowerAction.'
-        Assert-True ($log -match 'DRY RUN COMPLETE') 'The dry run did not announce that it completed.'
-        Assert-True ($log -match '2 thing\(s\) would stop a live run') 'Both nodes should have been reported as blocked.'
-        Assert-True ($log -notmatch '\[ERROR\]') 'A blocker was reported as a failure of the run.'
-        Assert-Equal $global:Sim.Events.Count 0 'A dry run that found a blocker still changed something.'
+    Invoke-SimTest 'A VM with no VMware Tools is flagged in the dry run, not refused' {
+        Assert-True (-not $noticeThrew) 'The dry run threw over a VM with no VMware Tools.'
+        $log = Get-Content -LiteralPath $noticeLog -Raw
+        Assert-True ($log -match 'NOTE FOR THE LIVE RUN') 'The hard power-off was not called out where it was found.'
+        Assert-True ($log -match "VM 'SIMSQLB' is powered on but VMware Tools is not running") 'The notice did not name the VM.'
+        Assert-True ($log -match 'powered off hard') 'The notice did not say what will happen to it.'
+        Assert-True ($log -match 'DRY RUN COMPLETED SUCCESSFULLY - 1 thing\(s\) flagged') 'The verdict did not carry the flagged item.'
+        Assert-True ($log -notmatch '\[ERROR\]') 'A flagged item was reported as a failure of the run.'
+        Assert-Equal $global:Sim.Events.Count 0 'A dry run that flagged something still changed something.'
 
-        $results = @(Import-Csv -LiteralPath (Get-ChildItem -Path $blockerFolder -Filter 'results-*.csv' | Select-Object -First 1).FullName)
-        Assert-Equal (@($results | Where-Object { $_.Status -eq 'Blocked' }).Count) 2 'The blockers were not recorded in the results.'
+        $results = @(Import-Csv -LiteralPath (Get-ChildItem -Path $noticeFolder -Filter 'results-*.csv' | Select-Object -First 1).FullName)
+        Assert-Equal (@($results | Where-Object { $_.Status -eq 'Noticed' }).Count) 1 'The notice was not recorded in the results.'
         Assert-Equal (@($results | Where-Object { $_.Phase -eq 'Fatal' }).Count) 0 'The dry run recorded a fatal row.'
     }
 
@@ -996,7 +1004,7 @@ try {
 
     try {
         & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
-            -PowerAction ShutdownGuest -OutputFolder $executeFolder *> $executeLog
+            -OutputFolder $executeFolder *> $executeLog
     }
     catch {
         # Recorded rather than rethrown: the assertions below then report what state the
@@ -1154,7 +1162,7 @@ try {
     $missingError = ''
     try {
         & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
-            -PowerAction ShutdownGuest -OutputFolder $missingFolder *> $missingLog
+            -OutputFolder $missingFolder *> $missingLog
     }
     catch {
         $missingError = $_.Exception.Message
@@ -1178,7 +1186,7 @@ try {
     $workloadLog = Join-Path $script:WorkFolder 'workloads.log'
     try {
         & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $workloadCsv -DryRun -Credential $credential `
-            -PowerAction ShutdownGuest -OutputFolder $workloadFolder *> $workloadLog
+            -OutputFolder $workloadFolder *> $workloadLog
     }
     catch {
         $script:Failed++
@@ -1222,7 +1230,7 @@ try {
     $declineLog = Join-Path $script:WorkFolder 'decline.log'
     try {
         & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
-            -PowerAction ShutdownGuest -OutputFolder $declineFolder *> $declineLog
+            -OutputFolder $declineFolder *> $declineLog
     }
     catch {
         $script:Failed++
@@ -1249,7 +1257,7 @@ try {
         $drsError = ''
         try {
             & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
-                -PowerAction ShutdownGuest -OutputFolder $drsFolder *> $drsLog
+                -OutputFolder $drsFolder *> $drsLog
         }
         catch {
             $drsError = $_.Exception.Message
@@ -1273,12 +1281,60 @@ try {
         $hashedFolder = Join-Path $script:WorkFolder 'hashed'
         $hashedLog = Join-Path $script:WorkFolder 'hashed.log'
         & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $hashedCsv -DryRun -Credential $credential `
-            -PowerAction ShutdownGuest -OutputFolder $hashedFolder *> $hashedLog
+            -OutputFolder $hashedFolder *> $hashedLog
 
         $log = Get-Content -LiteralPath $hashedLog -Raw
         Assert-True ($log -match '2 of 3 CSV row\(s\) are commented out') 'The commented rows were not reported.'
         Assert-True ($log -match "Resolving batch 1 SIT migration group 'SIMSQLA'") 'The live row did not run.'
         Assert-True ($log -notmatch 'SIMSQLPRD') 'A commented-out row was processed.'
+    }
+
+    # ------------------------------------------------ power-down policy, live run -----
+    Invoke-SimTest 'A guest that ignores the request is powered off hard, then migrated' {
+        Reset-SimInventory
+        $global:Sim.IgnoreGuestShutdown = $true
+        $global:Sim.PromptAnswers.Add('y')
+        $stubbornFolder = Join-Path $script:WorkFolder 'stubborn'
+        $stubbornLog = Join-Path $script:WorkFolder 'stubborn.log'
+
+        & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
+            -GuestShutdownTimeoutSeconds 1 -OutputFolder $stubbornFolder *> $stubbornLog
+
+        $log = Get-Content -LiteralPath $stubbornLog -Raw
+        Assert-True ($log -match 'did not shut down within 1 seconds\. Powering it off hard\.') 'The guest was never given up on.'
+
+        # Asked first, killed second, on both nodes - and only after being asked.
+        $events = @($global:Sim.Events)
+        foreach ($node in @('SIMSQLA', 'SIMSQLB')) {
+            $askIndex = $events.IndexOf("guest-shutdown $node")
+            $killIndex = $events.IndexOf("force-off $node")
+            Assert-True ($askIndex -ge 0) "$node was never asked to shut down."
+            Assert-True ($killIndex -gt $askIndex) "$node was killed without being asked first."
+        }
+
+        Assert-Equal $global:Sim.VMs['SIMSQLA'].ClusterName 'simsql02' 'SIMSQLA did not reach the destination.'
+        Assert-Equal (Get-SimRdms -VMName 'SIMSQLA').Count 3 'SIMSQLA did not get its RDMs back.'
+        Assert-Equal $global:Sim.VMs['SIMSQLA'].PowerState 'PoweredOn' 'SIMSQLA was not powered back on.'
+    }
+
+    Invoke-SimTest 'A VM with no VMware Tools is powered off hard without being asked' {
+        Reset-SimInventory
+        $global:Sim.VMs['SIMSQLB'].ToolsRunningStatus = 'guestToolsNotRunning'
+        $global:Sim.PromptAnswers.Add('y')
+        $noToolsFolder = Join-Path $script:WorkFolder 'notools'
+        $noToolsLog = Join-Path $script:WorkFolder 'notools.log'
+
+        & $ScriptPath -VCenter 'sim-vcenter' -CsvPath $csvPath -Execute -Credential $credential `
+            -OutputFolder $noToolsFolder *> $noToolsLog
+
+        $events = @($global:Sim.Events)
+        Assert-True ($events -contains 'force-off SIMSQLB') 'SIMSQLB was not powered off hard.'
+        Assert-True (-not ($events -contains 'guest-shutdown SIMSQLB')) 'SIMSQLB was asked to shut down through Tools it does not have.'
+        Assert-True ($events -contains 'guest-shutdown SIMSQLA') 'SIMSQLA was not asked politely.'
+        Assert-True (-not ($events -contains 'force-off SIMSQLA')) 'SIMSQLA was killed despite shutting down cleanly.'
+
+        Assert-Equal (Get-SimRdms -VMName 'SIMSQLB').Count 3 'SIMSQLB did not get its RDMs back.'
+        Assert-Equal $global:Sim.VMs['SIMSQLB'].PowerState 'PoweredOn' 'SIMSQLB was not powered back on.'
     }
 
     Write-Host ''

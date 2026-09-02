@@ -497,6 +497,31 @@ try {
         )
         Assert-True ($plannedBlocks.Count -gt 0) 'No planned-change operation blocks were found at all.'
 
+        # Helpers that exist only to be the body of a planned change. Their own extents
+        # count as guarded, and every call to one has to sit inside a planned block -
+        # checked below, so this does not become a hole in the gate.
+        $plannedHelpers = @('Stop-VMForMigrationHard')
+        $guardedRegions = [System.Collections.Generic.List[object]]::new()
+        foreach ($block in $plannedBlocks) { $guardedRegions.Add($block) }
+        foreach ($helperName in $plannedHelpers) {
+            $helper = @($functionAsts | Where-Object { $_.Name -eq $helperName })
+            Assert-Equal $helper.Count 1 "$helperName is missing."
+            $guardedRegions.Add($helper[0])
+
+            $helperCalls = @(Get-CommandAst -Ast $ast -Name $helperName)
+            Assert-True ($helperCalls.Count -gt 0) "$helperName is defined but never called."
+            foreach ($helperCall in $helperCalls) {
+                $enclosing = @(
+                    $plannedBlocks |
+                        Where-Object {
+                            ($helperCall.Extent.StartOffset -ge $_.Extent.StartOffset) -and
+                            ($helperCall.Extent.EndOffset -le $_.Extent.EndOffset)
+                        }
+                )
+                Assert-True ($enclosing.Count -gt 0) "$helperName is called outside a planned change at line $($helperCall.Extent.StartLineNumber)."
+            }
+        }
+
         $mutating = @(
             'Remove-HardDisk',
             'Remove-SharedScsiController',
@@ -512,7 +537,7 @@ try {
                 Where-Object {
                     $call = $_
                     $inside = @(
-                        $plannedBlocks |
+                        $guardedRegions |
                             Where-Object {
                                 ($call.Extent.StartOffset -ge $_.Extent.StartOffset) -and
                                 ($call.Extent.EndOffset -le $_.Extent.EndOffset)
@@ -538,21 +563,15 @@ try {
         Assert-True (($askIndex -gt $showIndex)) 'The operator is asked before the mapping is shown.'
     }
 
-    Invoke-NativeTest 'A dry run finishes and says so, rather than dying on a blocker' {
-        Assert-True ($text -match '(?m)^function Add-DryRunBlocker') 'Blockers have nowhere to go.'
+    Invoke-NativeTest 'A dry run ends with a verdict, and the command that follows it' {
+        Assert-True ($text -match '(?m)^function Add-DryRunNotice') 'Notices have nowhere to go.'
+        Assert-True ($text -match '(?m)^function Format-ExecuteCommand') 'The follow-on command is never built.'
         Assert-True ($text -match 'DRY RUN COMPLETE') 'A finished dry run never says it finished.'
+        Assert-True ($text -match 'DRY RUN COMPLETED SUCCESSFULLY - nothing flagged\. Ready to execute\.') 'A clean dry run never gives a verdict.'
+        Assert-True ($text -match 'thing\(s\) flagged\. Read them before you execute') 'Flagged items are not called out.'
         Assert-True ($text -match 'none could be: a dry run maps no LUNs') 'A dry run never explains why nothing was powered on.'
         Assert-True ($text -match 'expected, not a failure') 'A dry run never says the absent power-on is expected.'
-
-        # Every condition Stop-VMForMigration would throw on has to be a recorded blocker
-        # in dry-run mode, so one pass reports all of them instead of ending on the first.
-        $stopFunction = @($functionAsts | Where-Object { $_.Name -eq 'Stop-VMForMigration' })
-        Assert-Equal $stopFunction.Count 1 'Stop-VMForMigration is missing.'
-        $stopText = $stopFunction[0].Extent.Text
-        $throwCount = ([regex]::Matches($stopText, '(?m)^\s*throw ')).Count
-        $blockerCount = ([regex]::Matches($stopText, 'Add-DryRunBlocker')).Count
-        Assert-True ($throwCount -gt 0) 'Stop-VMForMigration no longer stops a live run at all.'
-        Assert-Equal $blockerCount $throwCount 'A live-run stop condition is not recorded as a dry-run blocker.'
+        Assert-True ($text -notmatch 'Add-DryRunBlocker') 'The old blocker mechanism is still here.'
     }
 
     Invoke-NativeTest 'Power-on happens once per line item, after it is verified' {
@@ -683,10 +702,37 @@ try {
         Assert-True ($text -match 'DeletePermanently:\$false') 'Safe RDM removal flag was not found.'
     }
 
-    Invoke-NativeTest 'Hard power-off requires explicit opt-in guard' {
-        Assert-True ($text -match '\$ForcePowerOffIfGuestShutdownUnavailable') 'Opt-in switch is missing.'
-        Assert-True ($text -match 'if \(-not \$ForcePowerOffIfGuestShutdownUnavailable\)') 'Opt-in guard is missing.'
-        Assert-True ($text -match 'Stop-VM[\s\S]*?-Kill') 'Guarded hard power-off action is missing.'
+    Invoke-NativeTest 'A VM in the list goes down: politely if it can, hard if it will not' {
+        Assert-True ($text -notmatch 'PowerAction') 'The power-action switch is back.'
+        Assert-True ($text -notmatch 'ForcePowerOffIfGuestShutdownUnavailable') 'The hard power-off opt-in is back.'
+        Assert-True ($text -notmatch 'ShutdownTimeoutMinutes') 'The old minute-based timeout is still here.'
+        Assert-True ($text -match '\[int\]\$GuestShutdownTimeoutSeconds = 30') 'The guest gets something other than 30 seconds by default.'
+
+        $stopFunction = @($functionAsts | Where-Object { $_.Name -eq 'Stop-VMForMigration' })
+        Assert-Equal $stopFunction.Count 1 'Stop-VMForMigration is missing.'
+        $stopText = $stopFunction[0].Extent.Text
+
+        # No Tools is a hard power-off, not a stop.
+        Assert-True ($stopText -match 'if \(-not \$toolsRunning\)') 'The no-Tools case is not handled first.'
+        Assert-True ($stopText -notmatch '(?m)^\s*throw ') 'A powered-on VM can still stop the run instead of going down.'
+        Assert-True ($stopText -match 'Add-DryRunNotice') 'A hard power-off is not flagged in a dry run.'
+
+        # Tools running means ask, wait, then kill - in that order.
+        $askIndex = $stopText.IndexOf('Stop-VMGuest')
+        $waitIndex = $stopText.IndexOf('Wait-VMPowerOff')
+        $killIndex = $stopText.LastIndexOf('Stop-VMForMigrationHard')
+        Assert-True ($askIndex -ge 0) 'Nothing ever asks the guest to shut down.'
+        Assert-True (($waitIndex -gt $askIndex)) 'The wait does not follow the request.'
+        Assert-True (($killIndex -gt $waitIndex)) 'The hard power-off does not follow the wait.'
+
+        # The kill is confirmed, not assumed: an RDM will not detach from a VM vCenter
+        # still believes is running.
+        $hardFunction = @($functionAsts | Where-Object { $_.Name -eq 'Stop-VMForMigrationHard' })
+        Assert-Equal $hardFunction.Count 1 'Stop-VMForMigrationHard is missing.'
+        $hardText = $hardFunction[0].Extent.Text
+        Assert-True ($hardText -match 'Stop-VM .*-Kill') 'The hard power-off does not kill the VM.'
+        Assert-True ($hardText -match 'Wait-VMPowerOff') 'The hard power-off is not confirmed.'
+        Assert-True ($hardText -match '(?m)^\s*throw ') 'A VM that never powers off does not stop the run.'
     }
 
     Invoke-NativeTest 'Mapping follows the estate''s proven sequence, in order' {
