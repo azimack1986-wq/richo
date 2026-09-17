@@ -10,6 +10,48 @@ versioning is [semantic](https://semver.org/) per script.
 
 ---
 
+## Export-VDPortgroupQos.ps1
+
+### [1.0.0] — 2026-09-17
+
+#### Added
+
+- **New script: every distributed port group in an SSO domain, with its QoS / CoS
+  settings, to CSV.** Connects to one vCenter, follows Enhanced Linked Mode to the
+  rest of the SSO domain, walks every VDS and writes one row per traffic filtering
+  and marking rule — the CoS (802.1p) and DSCP values of the rule's Tag action, its
+  direction, qualifiers and other actions — or one row for a port group that has
+  none, so every port group appears. Each row also carries the deprecated
+  per-port-group 802.1p QoS tag, Network I/O Control state and the port group's
+  network resource pool (with the pool's priority tag on NIOC version 2), ingress
+  and egress traffic shaping, and the effective VLAN. `-IncludePortOverrides` adds
+  a row per port whose traffic filter or QoS tag overrides its port group, with
+  what the port connects to. Read-only, and self-contained: no `Richo.Common`, no
+  `environments.json`, only PowerCLI on the host. Only the vCenter sessions it
+  opened are closed at the end.
+- `tests/Test-VDPortgroupQosRows.ps1` — the rendering helpers against stub API
+  objects under strict mode: property access, inherited-policy resolution, VLAN,
+  shaping, qualifier and action rendering, tag extraction, the fixed CSV column
+  set, and the rows for a port group with and without rules and for a port that
+  inherits or overrides them. 90 assertions.
+- Added to the `tests/Test-ScriptLint.ps1` targets.
+
+#### Notes
+
+- **Not yet run against a live vCenter.** Verified on PowerShell 7.4.6 only: the
+  test suite and `Test-ScriptLint.ps1` pass, and the whole script ran end to end
+  against stub PowerCLI cmdlets (linked-mode connect with a duplicate session, a
+  session open before the run left connected, datacenter found by folder walk,
+  NIOC v2 and v3 pools, per-rule rows, port overrides, a failing port fetch, a
+  refused connection, an empty inventory). PSScriptAnalyzer was not run, and
+  Windows PowerShell 5.1 was not exercised. The first live run should be against a
+  lab vCenter with `-Verbose`. The API properties it reads
+  (`VMwareDVSPortSetting.QosTag`, `DVPortgroupConfigInfo.Uplink`,
+  `DvsUpdateTagNetworkRuleAction.QosTag` / `DscpTag`) are read defensively: one
+  the API does not return is an empty cell, not a failure.
+
+---
+
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
 ### [23.32.0] — 2026-08-21

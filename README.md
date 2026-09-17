@@ -153,3 +153,4 @@ They are independent, so any one can be run on its own:
 | `Test-IntersightDeployState.ps1` | Which `ConfigState` values mean a deploy is needed |
 | `Test-IntersightFailureKind.ps1` | Auth failure vs. a response the client cannot parse |
 | `Test-ModuleEnumerationCache.ps1` | Module enumeration happens once, not per lookup |
+| `Test-VDPortgroupQosRows.ps1` | The VDS port group QoS / CoS export: rule, tag, VLAN and shaping rendering, inherited policies, CSV row shape |
