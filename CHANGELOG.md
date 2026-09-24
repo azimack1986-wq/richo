@@ -12,6 +12,68 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Export-VDPortgroupQos.ps1
 
+### [1.1.0] — 2026-09-24
+
+#### Added
+
+- **Change actions, with a dry run.** `-Action SetTag`, `ClearTag` and `RemoveRule`
+  edit the marking (Tag) rules of the port groups matched by `-SwitchName` and
+  `-PortGroupName`, on the rules matched by `-RuleName`: set the CoS and/or DSCP
+  value (`-CosTag`, `-DscpTag`), remove one or both values (`-ClearCos`,
+  `-ClearDscp`), or delete the rule. Only rules with a Tag action are ever
+  touched; Allow and Drop rules, port-level overrides and the switch default port
+  configuration are left alone. A rule that clearing would leave with no value is
+  skipped and pointed at `RemoveRule` rather than sent to vCenter as an empty Tag
+  action. `RemoveRule` requires an explicit `-RuleName`.
+- **The script now supports `-WhatIf` and `-Confirm`** (`ConfirmImpact = High`).
+  `-WhatIf` changes nothing and still writes the CSV, with `Outcome = Planned` and
+  the before and after values on every rule that would change: that CSV is the
+  dry-run report. Without `-WhatIf` each port group change asks for confirmation;
+  `-Confirm:$false` runs unattended.
+- **Value or fault on every row.** Three new columns, `Action`, `Outcome` and
+  `Detail`. Outcome is `Read`, `ReadFailed`, `Planned`, `Changed`, `Skipped` or
+  `Failed`; Detail carries the change (`CoS=4 DSCP=34 -> CoS=5 DSCP=34`), the skip
+  reason, or the error message. A port group that cannot be read no longer aborts
+  the run: it produces a `ReadFailed` row and the run continues.
+- **One write per port group, checked against drift.** Each change re-reads the
+  port group, edits that fresh copy, and sends only the filter policy through
+  `ReconfigureDVPortgroup` with the port group's current `configVersion`, so a
+  port group changed by someone else between read and write is rejected by
+  vCenter rather than overwritten. A rule that disappeared between read and write
+  is refused before anything is sent. After a successful change the port group is
+  read back and the row shows what vCenter now holds; a failed change is reported
+  against the values read before it, with vCenter's message.
+- Parameter validation before connecting: a change value with `-Action Audit`, a
+  `SetTag` without a value or with CoS outside 0-7 or DSCP outside 0-63, a
+  `ClearTag` without `-ClearCos`/`-ClearDscp`, or a `RemoveRule` without
+  `-RuleName` fails immediately with the reason.
+- `tests/Test-VDPortgroupQosRows.ps1` now covers the plan (set, clear, remove, name
+  filter, the empty-tag skip, the already-set skip, Drop rules never targeted),
+  outcomes on rows, and the apply function against stub API objects (config
+  version carried, policy and filter config marked as the port group's own, the
+  right rule edited, the removed rule gone, a missing rule refused with nothing
+  sent). 138 assertions.
+
+#### Fixed
+
+- Help said the legacy per-port-group QoS tag was deprecated since vSphere 6.0.
+  The vSphere API reference says API 5.0.
+
+#### Notes
+
+- Verified on PowerShell 7.4.6: the test suite and `Test-ScriptLint.ps1` pass,
+  and every change path ran end to end against stub PowerCLI cmdlets (dry run
+  with no reconfigure call, set, clear, remove, a reconfigure rejected by the
+  stub with the port group left as read, each validation error). **Not yet run
+  against a live vCenter**, and this release writes to one: the first live run
+  must be `-WhatIf`, then a single port group with `-PortGroupName`, before any
+  wider change. The reconfigure spec (existing filter policy sent back with
+  `inherited = false`, matching the API reference's update rules) is the standard
+  pattern but has not been exercised against a real vCenter here. PSScriptAnalyzer
+  was not run, and Windows PowerShell 5.1 was not exercised.
+
+## Export-VDPortgroupQos.ps1
+
 ### [1.0.0] — 2026-09-17
 
 #### Added

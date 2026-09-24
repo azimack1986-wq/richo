@@ -61,7 +61,7 @@ $expectedColumns = @(
     'NetworkResourcePool', 'NrpPriorityTag', 'LegacyQosTag',
     'TrafficFilterOverrideAllowed', 'TrafficFilteringEnabled', 'RuleCount',
     'RuleSequence', 'RuleName', 'RuleDirection', 'RuleQualifiers', 'RuleActions', 'CosTag', 'DscpTag',
-    'IngressShaping', 'EgressShaping', 'ScriptVersion', 'CollectedUtc'
+    'IngressShaping', 'EgressShaping', 'Action', 'Outcome', 'Detail', 'ScriptVersion', 'CollectedUtc'
 )
 
 $context = @{
@@ -270,6 +270,128 @@ Assert-Equal 'port override rule'  'Port only' $rows[0].RuleName
 Assert-Equal 'port override CoS'   7 $rows[0].CosTag
 Assert-Equal 'port override filtering state' $false $rows[0].TrafficFilteringEnabled
 Assert-Equal 'port still inherits the VLAN'  'VLAN 300' $rows[0].Vlan
+
+Write-Host "`n=== Name matching and tag text ===" -ForegroundColor Cyan
+Assert-Equal 'wildcard match'            $true  (Test-NameMatch -Name 'PG-vMotion-A' -Pattern @('PG-vMotion*'))
+Assert-Equal 'any of several patterns'   $true  (Test-NameMatch -Name 'PG-App' -Pattern @('PG-vMotion*', 'PG-App'))
+Assert-Equal 'no match'                  $false (Test-NameMatch -Name 'PG-App' -Pattern @('PG-vMotion*'))
+Assert-Equal 'both values'  'CoS=5 DSCP=46' (Format-TagValue -Cos 5 -Dscp 46)
+Assert-Equal 'CoS only'     'CoS=0'         (Format-TagValue -Cos 0 -Dscp $null)
+Assert-Equal 'no value'     'none'          (Format-TagValue -Cos $null -Dscp $null)
+
+Write-Host "`n=== Change plan: SetTag ===" -ForegroundColor Cyan
+function ConvertTo-PlanRuleset {
+    # Three rules: a marking rule with both values, a Drop rule, a marking rule with CoS only.
+    $r = @(
+        (ConvertTo-ApiStub 'DvsTrafficRule' @{ Key = 'r1'; Sequence = 10; Description = 'Mark vMotion'; Direction = 'both'; Qualifier = @(); Action = (ConvertTo-ApiStub 'DvsUpdateTagNetworkRuleAction' @{ QosTag = 4; DscpTag = 34 }) }),
+        (ConvertTo-ApiStub 'DvsTrafficRule' @{ Key = 'r2'; Sequence = 20; Description = 'Drop telnet'; Direction = 'both'; Qualifier = @(); Action = (ConvertTo-ApiStub 'DvsDropNetworkRuleAction') }),
+        (ConvertTo-ApiStub 'DvsTrafficRule' @{ Key = 'r3'; Sequence = 30; Description = 'Mark mgmt'; Direction = 'both'; Qualifier = @(); Action = (ConvertTo-ApiStub 'DvsUpdateTagNetworkRuleAction' @{ QosTag = 5; DscpTag = $null }) })
+    )
+    return (ConvertTo-ApiStub 'DvsTrafficRuleset' @{ Enabled = $true; Rules = $r })
+}
+$plan = Get-PortgroupTagPlan -Ruleset (ConvertTo-PlanRuleset) -Action SetTag -CosTag 5
+$byId = @{}
+foreach ($c in $plan.Changes) { $byId[$c.Id] = $c }
+Assert-Equal 'one change planned'                 1 $plan.PlannedCount
+Assert-Equal 'vMotion rule planned'               'Planned' $byId['r1'].Outcome
+Assert-Equal 'vMotion detail before -> after'     'CoS=4 DSCP=34 -> CoS=5 DSCP=34' $byId['r1'].Detail
+Assert-Equal 'only CoS is set'                    $true $byId['r1'].SetCos
+Assert-Equal 'DSCP is not touched'                $false $byId['r1'].SetDscp
+Assert-Equal 'Drop rule skipped'                  'Skipped' $byId['r2'].Outcome
+Assert-Equal 'Drop rule reason names the action'  $true ($byId['r2'].Detail -like 'rule action is Drop, not Tag*')
+Assert-Equal 'already-set rule skipped'           'Skipped' $byId['r3'].Outcome
+Assert-Equal 'already-set reason'                 'already CoS=5' $byId['r3'].Detail
+Assert-Equal 'summary names the change'           $true ($plan.Summary -like "SetTag: 'Mark vMotion' CoS=4 DSCP=34 -> CoS=5 DSCP=34")
+Assert-Equal 'nothing removed'                    0 $plan.RemovedIds.Count
+$plan = Get-PortgroupTagPlan -Ruleset (ConvertTo-PlanRuleset) -Action SetTag -CosTag 5 -DscpTag 46 -RuleName 'Mark m*'
+$byId = @{}
+foreach ($c in $plan.Changes) { $byId[$c.Id] = $c }
+Assert-Equal 'name filter leaves vMotion as Read'  'Read' $byId['r1'].Outcome
+Assert-Equal 'mgmt gains DSCP'                     'CoS=5 -> CoS=5 DSCP=46' $byId['r3'].Detail
+Assert-Equal 'null ruleset plans nothing'          0 (Get-PortgroupTagPlan -Ruleset $null -Action SetTag -CosTag 1).Changes.Count
+
+Write-Host "`n=== Change plan: ClearTag and RemoveRule ===" -ForegroundColor Cyan
+$plan = Get-PortgroupTagPlan -Ruleset (ConvertTo-PlanRuleset) -Action ClearTag -ClearCos $true
+$byId = @{}
+foreach ($c in $plan.Changes) { $byId[$c.Id] = $c }
+Assert-Equal 'vMotion keeps DSCP'                  'CoS=4 DSCP=34 -> DSCP=34' $byId['r1'].Detail
+Assert-Null  'cleared CoS is null'                 $byId['r1'].NewCos
+Assert-Equal 'mgmt would be left empty: skipped'   'Skipped' $byId['r3'].Outcome
+Assert-Equal 'skip reason points at RemoveRule'    $true ($byId['r3'].Detail -like '*use -Action RemoveRule')
+$plan = Get-PortgroupTagPlan -Ruleset (ConvertTo-PlanRuleset) -Action ClearTag -ClearDscp $true -RuleName 'Mark mgmt'
+Assert-Equal 'nothing to clear is skipped'         'Skipped' (@($plan.Changes | Where-Object { $_.Id -eq 'r3' })[0].Outcome)
+$plan = Get-PortgroupTagPlan -Ruleset (ConvertTo-PlanRuleset) -Action RemoveRule -RuleName '*'
+$byId = @{}
+foreach ($c in $plan.Changes) { $byId[$c.Id] = $c }
+Assert-Equal 'both marking rules removed'          2 $plan.PlannedCount
+Assert-Equal 'removed ids'                         'r1,r3' ($plan.RemovedIds -join ',')
+Assert-Equal 'Drop rule never removed'             'Skipped' $byId['r2'].Outcome
+Assert-Equal 'remove flag set'                     $true $byId['r1'].Remove
+Assert-Equal 'remove detail carries old values'    "remove rule 'Mark vMotion' (CoS=4 DSCP=34)" $byId['r1'].Detail
+
+Write-Host "`n=== Outcomes on rows ===" -ForegroundColor Cyan
+$ruleSetting = ConvertTo-ApiStub 'VMwareDVSPortSetting' @{
+    FilterPolicy = (ConvertTo-ApiStub 'DvsFilterPolicy' @{ Inherited = $false; FilterConfig = @(
+        (ConvertTo-ApiStub 'DvsTrafficFilterConfig' @{ TrafficRuleset = (ConvertTo-PlanRuleset) })) })
+}
+$outcomes = @{ r1 = @{ Outcome = 'Changed'; Detail = 'CoS=4 -> 5' }; r2 = @{ Outcome = 'Skipped'; Detail = 'not Tag' } }
+$rows = @(Get-PortSettingQosRow -Context ($context + @{ Action = 'SetTag' }) -SettingChain @($ruleSetting) -RuleOutcome $outcomes)
+Assert-Equal 'outcome per rule'        'Changed,Skipped,Read' (@($rows | ForEach-Object { $_.Outcome }) -join ',')
+Assert-Equal 'detail per rule'         'CoS=4 -> 5,not Tag,' (@($rows | ForEach-Object { $_.Detail }) -join ',')
+Assert-Equal 'action stamped'          'SetTag' $rows[0].Action
+$rows = @(Get-PortSettingQosRow -Context $context -SettingChain @($ruleSetting) -RuleOutcome $outcomes -OnlyRuleId @('r3'))
+Assert-Equal 'OnlyRuleId filters'      1 $rows.Count
+Assert-Equal 'filtered rule'           'Mark mgmt' $rows[0].RuleName
+Assert-Equal 'no matching id: no rows' 0 @(Get-PortSettingQosRow -Context $context -SettingChain @($ruleSetting) -OnlyRuleId @('nope')).Count
+$rows = @(Get-PortSettingQosRow -Context ($context + @{ Outcome = 'ReadFailed'; Detail = 'boom' }) -SettingChain @($plainSetting))
+Assert-Equal 'context outcome wins on the no-rule row' 'ReadFailed' $rows[0].Outcome
+Assert-Equal 'default outcome is Read'  'Read' (@(Get-PortSettingQosRow -Context $context -SettingChain @($plainSetting)))[0].Outcome
+
+Write-Host "`n=== Applying a plan (the only write) ===" -ForegroundColor Cyan
+$vimTypesAreReal = [bool]('VMware.Vim.DVPortgroupConfigSpec' -as [type])
+if ($vimTypesAreReal) {
+    Write-Host '  SKIP  real VMware.Vim types are loaded in this session; the apply test uses stubs' -ForegroundColor Yellow
+}
+else {
+    Add-Type -TypeDefinition @'
+namespace VMware.Vim {
+    public class VMwareDVSPortSetting { public object FilterPolicy; }
+    public class DVPortgroupConfigSpec { public string ConfigVersion; public object DefaultPortConfig; }
+}
+'@
+    $script:sentSpec = $null
+    $view = ConvertTo-ApiStub 'DistributedVirtualPortgroup' @{
+        MoRef  = [pscustomobject]@{ Type = 'DistributedVirtualPortgroup'; Value = 'dvportgroup-1' }
+        Config = (ConvertTo-ApiStub 'DVPortgroupConfigInfo' @{ ConfigVersion = '7'; DefaultPortConfig = $ruleSetting })
+    }
+    $view | Add-Member -MemberType ScriptMethod -Name ReconfigureDVPortgroup -Value { param($spec) $script:sentSpec = $spec } -Force
+    function Get-View { param($Id, $Server, $Property) $view }
+
+    $plan = Get-PortgroupTagPlan -Ruleset (Get-TrafficRuleset $ruleSetting.FilterPolicy) -Action SetTag -CosTag 6 -RuleName 'Mark vMotion'
+    Invoke-PortgroupTagPlan -PortgroupView $view -Server 'vc' -Plan $plan
+    Assert-Equal 'spec sent'                           $true ($null -ne $script:sentSpec)
+    Assert-Equal 'config version carried'              '7' $script:sentSpec.ConfigVersion
+    Assert-Equal 'port setting type'                   'VMwareDVSPortSetting' $script:sentSpec.DefaultPortConfig.GetType().Name
+    Assert-Equal 'policy marked as the port group own' $false $script:sentSpec.DefaultPortConfig.FilterPolicy.Inherited
+    Assert-Equal 'filter config marked own'            $false $script:sentSpec.DefaultPortConfig.FilterPolicy.FilterConfig[0].Inherited
+    $sentRules = @($script:sentSpec.DefaultPortConfig.FilterPolicy.FilterConfig[0].TrafficRuleset.Rules)
+    Assert-Equal 'CoS updated on the rule'             6 (@($sentRules | Where-Object { $_.Key -eq 'r1' })[0].Action.QosTag)
+    Assert-Equal 'DSCP untouched'                      34 (@($sentRules | Where-Object { $_.Key -eq 'r1' })[0].Action.DscpTag)
+    Assert-Equal 'other rules untouched'               5 (@($sentRules | Where-Object { $_.Key -eq 'r3' })[0].Action.QosTag)
+
+    $script:sentSpec = $null
+    $plan = Get-PortgroupTagPlan -Ruleset (Get-TrafficRuleset $ruleSetting.FilterPolicy) -Action RemoveRule -RuleName 'Mark mgmt'
+    Invoke-PortgroupTagPlan -PortgroupView $view -Server 'vc' -Plan $plan
+    $sentRules = @($script:sentSpec.DefaultPortConfig.FilterPolicy.FilterConfig[0].TrafficRuleset.Rules)
+    Assert-Equal 'removed rule gone'                   'r1,r2' (@($sentRules | ForEach-Object { $_.Key }) -join ',')
+
+    $script:sentSpec = $null
+    $plan = Get-PortgroupTagPlan -Ruleset (ConvertTo-PlanRuleset) -Action SetTag -CosTag 1 -RuleName 'Mark mgmt'
+    $threw = ''
+    try { Invoke-PortgroupTagPlan -PortgroupView $view -Server 'vc' -Plan $plan } catch { $threw = $_.Exception.Message }
+    Assert-Equal 'rule missing on re-read throws'      $true ($threw -like "rule 'Mark mgmt' no longer exists*")
+    Assert-Null  'nothing sent when a rule is missing' $script:sentSpec
+}
 
 Write-Host "`n=== Merge-Hashtable ===" -ForegroundColor Cyan
 $merged = Merge-Hashtable -Table @(@{ a = 1; b = 1 }, $null, @{ b = 2 })

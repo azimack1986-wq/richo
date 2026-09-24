@@ -1,9 +1,11 @@
 <#
 .SYNOPSIS
-    Exports every distributed port group in a vCenter SSO domain with its QoS / CoS settings to CSV.
+    Audits, and optionally changes, the QoS / CoS marking on every distributed port group in a vCenter SSO domain.
 
 .DESCRIPTION
-    Read-only inventory of traffic marking on vSphere Distributed Switches (VDS).
+    Inventory of traffic marking on vSphere Distributed Switches (VDS), with optional bulk changes to
+    the marking rules, always written to a CSV that records the value read or the fault hit for
+    every port group.
 
     Connects to one vCenter, follows Enhanced Linked Mode to every other vCenter in the same SSO
     domain (unless -NoLinked), and walks every VDS on each of them. Every distributed port group,
@@ -11,30 +13,54 @@
 
       - Traffic filtering and marking rules. One row per rule, carrying the CoS (802.1p, 0-7)
         and DSCP (0-63) values its Tag action applies, plus the rule's direction, qualifiers
-        and other actions (Allow, Drop, ...). This is where QoS / CoS is configured on
-        vSphere 6.0 and later.
-      - The port group's legacy 802.1p QoS tag (VMwareDVSPortSetting.qosTag). Deprecated since
-        vSphere 6.0 but still present on older switch versions.
+        and other actions (Allow, Drop, ...). This is where QoS / CoS is configured.
+      - The port group's legacy 802.1p QoS tag (VMwareDVSPortSetting.qosTag), deprecated as of
+        vSphere API 5.0 but still present on older switch versions.
       - Network I/O Control: whether it is enabled on the switch, which version, the network
         resource pool the port group is assigned to and, on NIOC version 2, that pool's
         802.1p priority tag.
-      - Ingress and egress traffic shaping.
-      - The effective VLAN configuration, for context.
+      - Ingress and egress traffic shaping, and the effective VLAN, for context.
       - Whether individual ports may override the port group's traffic filter and, with
         -IncludePortOverrides, the ports that actually do.
+      - Action, Outcome and Detail: what was attempted on the row and how it ended. Outcome is
+        one of Read, ReadFailed, Planned, Changed, Skipped or Failed; Detail carries the value
+        change (for example "CoS 4 -> 5") or the error message.
 
-    A port group with no traffic rules still produces one row, so the CSV lists every port group
-    in the domain. Filter on CosTag or DscpTag for the ones that mark traffic, and on Scope for
-    port-level overrides.
+    A port group with no traffic rules still produces one row, and a port group that could not
+    be read produces a ReadFailed row with the error, so the CSV lists every port group in the
+    domain whatever happened to it.
+
+    CHANGE ACTIONS. -Action selects what to do to the marking (Tag) rules of the port groups
+    matched by -SwitchName and -PortGroupName, on rules whose description matches -RuleName:
+
+      Audit       Read only (default).
+      SetTag      Set the CoS (-CosTag) and/or DSCP (-DscpTag) value of the rule's Tag action.
+      ClearTag    Remove the CoS (-ClearCos) and/or DSCP (-ClearDscp) value from the Tag action.
+                  A rule whose Tag action would be left with no value at all is skipped and
+                  reported; remove the rule instead.
+      RemoveRule  Delete the rule. -RuleName is required for this action.
+
+    Only rules with a Tag action are ever changed: Allow and Drop rules are left alone, as are
+    port-level overrides (those are reported, never edited) and the switch default port
+    configuration. Each port group is reconfigured once, through ReconfigureDVPortgroup with
+    the port group's current config version, so a port group changed by someone else between
+    the read and the write fails safely instead of being overwritten. After a successful
+    change the port group is read back from vCenter and the CSV row shows what vCenter now
+    reports; a failed change is reported against the values read before it.
+
+    -WhatIf performs no change on any vCenter but still writes the CSV, with Outcome = Planned
+    on every rule that would have been changed: that CSV is the dry-run report. Without
+    -WhatIf every port group change asks for confirmation (ConfirmImpact is High); pass
+    -Confirm:$false for an unattended run.
 
     Self-contained: no repo module and no config file. VMware PowerCLI must already be installed
     on the host. The VMware.VimAutomation.Core and VMware.VimAutomation.Vds modules are loaded
     only if they are not already in the session, so a pinned bundle is left alone, and nothing
     is ever installed.
 
-    Changes nothing on any vCenter. If the session's PowerCLI DefaultVIServerMode is not
-    Multiple it is set to Multiple for this session only, because linked-mode connections need
-    it. Only the vCenter sessions this script opened are closed at the end.
+    If the session's PowerCLI DefaultVIServerMode is not Multiple it is set to Multiple for this
+    session only, because linked-mode connections need it. Only the vCenter sessions this script
+    opened are closed at the end.
 
 .PARAMETER Server
     vCenter to connect to. With Enhanced Linked Mode, every other vCenter in its SSO domain is
@@ -49,24 +75,70 @@
 
 .PARAMETER OutputPath
     Path of the CSV to write. Defaults to .\output\VDPortgroupQos-<UTC timestamp>.csv under the
-    current directory. Missing directories are created.
+    current directory. Missing directories are created. Written on -WhatIf as well.
 
 .PARAMETER IncludePortOverrides
     Also fetch every port on every VDS and add a row (Scope = Port) for each port whose traffic
     filter or legacy QoS tag overrides its port group. This is one extra call per switch that
-    returns every port, so it is slower on large switches. Off by default.
+    returns every port, so it is slower on large switches. Off by default. Port rows are read
+    only; change actions never touch them.
 
 .PARAMETER PassThru
     Also emit the rows to the pipeline after the CSV is written.
 
+.PARAMETER Action
+    Audit (default), SetTag, ClearTag or RemoveRule. See DESCRIPTION.
+
+.PARAMETER SwitchName
+    Wildcard pattern(s) for the distributed switches whose port groups a change action may
+    touch. Defaults to every switch. Audit rows are still produced for the rest.
+
+.PARAMETER PortGroupName
+    Wildcard pattern(s) for the port groups a change action may touch. Defaults to every port
+    group on the matched switches.
+
+.PARAMETER RuleName
+    Wildcard pattern(s) matched against the rule description (the name shown in the vSphere
+    Client). Defaults to every rule for SetTag and ClearTag. Required for RemoveRule; pass '*'
+    deliberately to remove every marking rule on the matched port groups.
+
+.PARAMETER CosTag
+    SetTag: the CoS (802.1p) value to set, 0 to 7. Per the vSphere API a value of 0 makes the
+    rule clear the CoS tag on matching packets.
+
+.PARAMETER DscpTag
+    SetTag: the DSCP value to set, 0 to 63. A value of 0 makes the rule clear the DSCP tag on
+    matching packets.
+
+.PARAMETER ClearCos
+    ClearTag: remove the CoS value from the Tag action, so the rule no longer marks CoS.
+
+.PARAMETER ClearDscp
+    ClearTag: remove the DSCP value from the Tag action, so the rule no longer marks DSCP.
+
 .EXAMPLE
     .\Export-VDPortgroupQos.ps1 -Server vcenter01.example.com
 
-    Connects to vcenter01 and every vCenter linked to it, and writes
+    Read-only audit of vcenter01 and every vCenter linked to it, written to
     .\output\VDPortgroupQos-<timestamp>.csv.
 
 .EXAMPLE
-    .\Export-VDPortgroupQos.ps1 -Server vcenter01.example.com -Credential (Get-Credential) -OutputPath C:\Temp\pg-qos.csv -IncludePortOverrides
+    .\Export-VDPortgroupQos.ps1 -Server vcenter01.example.com -Action SetTag -PortGroupName 'PG-vMotion*' -RuleName 'Mark vMotion' -CosTag 4 -DscpTag 34 -WhatIf
+
+    Dry run: reports every port group, and marks the rows of the rules that would change as
+    Planned with the before and after values. Nothing is changed on vCenter.
+
+.EXAMPLE
+    .\Export-VDPortgroupQos.ps1 -Server vcenter01.example.com -Action ClearTag -PortGroupName 'PG-App*' -ClearCos -Confirm:$false
+
+    Removes the CoS value from every marking rule on the PG-App* port groups without prompting.
+    Rules that also mark DSCP keep marking DSCP.
+
+.EXAMPLE
+    .\Export-VDPortgroupQos.ps1 -Server vcenter01.example.com -Action RemoveRule -SwitchName dvs-legacy -RuleName 'Mark *' -OutputPath C:\Temp\remove-marking.csv
+
+    Deletes the marking rules named "Mark ..." from every port group on dvs-legacy, asking for
+    confirmation per port group, and records the outcome of each in the CSV.
 
 .EXAMPLE
     .\Export-VDPortgroupQos.ps1 -Server vcenter01.example.com -PassThru |
@@ -85,7 +157,7 @@
     Set-PowerCLIConfiguration -InvalidCertificateAction Warn -Scope Session
 #>
 #Requires -Version 5.1
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
     [Parameter(Mandatory, Position = 0)]
     [ValidateNotNullOrEmpty()]
@@ -99,13 +171,30 @@ param(
 
     [switch]$IncludePortOverrides,
 
-    [switch]$PassThru
+    [switch]$PassThru,
+
+    [ValidateSet('Audit', 'SetTag', 'ClearTag', 'RemoveRule')]
+    [string]$Action = 'Audit',
+
+    [string[]]$SwitchName = @('*'),
+
+    [string[]]$PortGroupName = @('*'),
+
+    [string[]]$RuleName,
+
+    [Nullable[int]]$CosTag,
+
+    [Nullable[int]]$DscpTag,
+
+    [switch]$ClearCos,
+
+    [switch]$ClearDscp
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 
 # ---- Helpers ----------------------------------------------------------------
 
@@ -531,7 +620,7 @@ function ConvertTo-QosRow {
         'NetworkResourcePool', 'NrpPriorityTag', 'LegacyQosTag',
         'TrafficFilterOverrideAllowed', 'TrafficFilteringEnabled', 'RuleCount',
         'RuleSequence', 'RuleName', 'RuleDirection', 'RuleQualifiers', 'RuleActions', 'CosTag', 'DscpTag',
-        'IngressShaping', 'EgressShaping', 'ScriptVersion', 'CollectedUtc'
+        'IngressShaping', 'EgressShaping', 'Action', 'Outcome', 'Detail', 'ScriptVersion', 'CollectedUtc'
     )
     $unknown = @($Values.Keys | Where-Object { $columns -notcontains $_ })
     if ($unknown.Count -gt 0) {
@@ -556,15 +645,28 @@ function Get-PortSettingQosRow {
         Port settings nearest first: the port's own setting (if any), its port group's default port
         configuration, then the switch default port configuration. Inherited policies are resolved
         along it, so a port row shows the VLAN and shaping it actually runs with.
+
+    .PARAMETER RuleOutcome
+        Outcome and Detail per rule identity (see Get-RuleIdentity), for rules a change action
+        touched. Rules not in the table, and the no-rule row, get Outcome = Read.
+
+    .PARAMETER OnlyRuleId
+        When given, only the rules with these identities produce rows, and a port group with no
+        matching rule produces nothing. Used to report rules that a change removed.
     #>
     param(
         [Parameter(Mandatory)]
         [hashtable]$Context,
 
-        [object[]]$SettingChain
+        [object[]]$SettingChain,
+
+        [hashtable]$RuleOutcome = @{},
+
+        [string[]]$OnlyRuleId
     )
 
     $base = Merge-Hashtable -Table @($Context)
+    if (-not $base.ContainsKey('Outcome')) { $base['Outcome'] = 'Read' }
     $base['Vlan'] = Format-VlanSetting (Resolve-EffectivePolicy -Name 'Vlan' -SettingChain $SettingChain)
     $legacyTag = Get-PolicyValue (Resolve-EffectivePolicy -Name 'QosTag' -SettingChain $SettingChain)
     $base['LegacyQosTag'] = if (($null -ne $legacyTag) -and ([int]$legacyTag -ge 0)) { [int]$legacyTag } else { $null }
@@ -575,6 +677,10 @@ function Get-PortSettingQosRow {
     $base['TrafficFilteringEnabled'] = Get-PropertyValue $ruleset 'Enabled'
     $rules = @(Get-PropertyArray $ruleset 'Rules' | Sort-Object -Property { Get-PropertyValue $_ 'Sequence' })
     $base['RuleCount'] = $rules.Count
+    if ($null -ne $OnlyRuleId) {
+        $rules = @($rules | Where-Object { $OnlyRuleId -contains (Get-RuleIdentity $_) })
+        if ($rules.Count -eq 0) { return }
+    }
 
     if ($rules.Count -eq 0) {
         return (ConvertTo-QosRow -Values $base)
@@ -582,6 +688,11 @@ function Get-PortSettingQosRow {
 
     foreach ($rule in $rules) {
         $values = Merge-Hashtable -Table @($base)
+        $ruleId = Get-RuleIdentity $rule
+        if ($RuleOutcome.ContainsKey($ruleId)) {
+            $values['Outcome'] = $RuleOutcome[$ruleId]['Outcome']
+            $values['Detail'] = $RuleOutcome[$ruleId]['Detail']
+        }
         $values['RuleSequence'] = Get-PropertyValue $rule 'Sequence'
         $values['RuleName'] = Get-PropertyValue $rule 'Description'
         $values['RuleDirection'] = [string](Get-PropertyValue $rule 'Direction')
@@ -593,6 +704,234 @@ function Get-PortSettingQosRow {
         $values['DscpTag'] = $action.DscpTag
         ConvertTo-QosRow -Values $values
     }
+}
+
+function Get-RuleIdentity {
+    # Stable identity of a traffic rule across reads: its API key, or sequence plus description
+    # when the key is missing. Used to line up plan, outcome and re-read.
+    param(
+        [Parameter(Position = 0)]
+        $Rule
+    )
+
+    $key = [string](Get-PropertyValue $Rule 'Key')
+    if ($key) { return $key }
+    return ('seq:{0}:{1}' -f (Get-PropertyValue $Rule 'Sequence'), (Get-PropertyValue $Rule 'Description'))
+}
+
+function Test-NameMatch {
+    # True when the name matches any of the wildcard patterns.
+    param(
+        [string]$Name,
+
+        [string[]]$Pattern
+    )
+
+    foreach ($p in $Pattern) {
+        if ($Name -like $p) { return $true }
+    }
+    return $false
+}
+
+function Format-TagValue {
+    # "CoS=5 DSCP=46", "CoS=5", or "none" for a Tag action's current values.
+    param(
+        $Cos,
+
+        $Dscp
+    )
+
+    $parts = @()
+    if ($null -ne $Cos) { $parts += "CoS=$Cos" }
+    if ($null -ne $Dscp) { $parts += "DSCP=$Dscp" }
+    if ($parts.Count -eq 0) { return 'none' }
+    return ($parts -join ' ')
+}
+
+function Get-PortgroupTagPlan {
+    <#
+    .SYNOPSIS
+        Works out what a change action would do to the marking rules of one port group, without
+        touching anything.
+
+    .DESCRIPTION
+        Every rule in the ruleset gets a record: Outcome Read (not targeted), Skipped (targeted but
+        nothing to do, with the reason) or Planned (with the new values, or Remove). Only rules
+        whose action is DvsUpdateTagNetworkRuleAction can be Planned. The Summary is the text shown
+        at the confirmation prompt and by -WhatIf.
+
+    .PARAMETER Ruleset
+        The port group's own DvsTrafficRuleset, or $null when it has none of its own.
+    #>
+    param(
+        $Ruleset,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('SetTag', 'ClearTag', 'RemoveRule')]
+        [string]$Action,
+
+        [string[]]$RuleName = @('*'),
+
+        [Nullable[int]]$CosTag,
+
+        [Nullable[int]]$DscpTag,
+
+        [bool]$ClearCos,
+
+        [bool]$ClearDscp
+    )
+
+    $changes = New-Object System.Collections.Generic.List[object]
+    $summary = New-Object System.Collections.Generic.List[string]
+    foreach ($rule in @(Get-PropertyArray $Ruleset 'Rules')) {
+        $name = [string](Get-PropertyValue $rule 'Description')
+        $record = [pscustomobject]@{
+            Id      = Get-RuleIdentity $rule
+            Rule    = $rule
+            Name    = $name
+            Outcome = 'Read'
+            Detail  = $null
+            Remove  = $false
+            SetCos  = $false
+            SetDscp = $false
+            NewCos  = $null
+            NewDscp = $null
+        }
+        $changes.Add($record)
+        if (-not (Test-NameMatch -Name $name -Pattern $RuleName)) { continue }
+
+        $ruleAction = Get-PropertyValue $rule 'Action'
+        if ((Get-TypeName $ruleAction) -ne 'DvsUpdateTagNetworkRuleAction') {
+            $record.Outcome = 'Skipped'
+            $record.Detail = "rule action is $((Format-RuleAction $ruleAction).Summary), not Tag; only marking rules are changed"
+            continue
+        }
+        $cos = Get-PropertyValue $ruleAction 'QosTag'
+        if (($null -ne $cos) -and ([int]$cos -lt 0)) { $cos = $null }
+        $dscp = Get-PropertyValue $ruleAction 'DscpTag'
+        if (($null -ne $dscp) -and ([int]$dscp -lt 0)) { $dscp = $null }
+        $before = Format-TagValue -Cos $cos -Dscp $dscp
+
+        switch ($Action) {
+            'RemoveRule' {
+                $record.Outcome = 'Planned'
+                $record.Remove = $true
+                $record.Detail = "remove rule '$name' ($before)"
+                $summary.Add("remove '$name' ($before)")
+            }
+            'SetTag' {
+                $newCos = if ($null -ne $CosTag) { [int]$CosTag } else { $cos }
+                $newDscp = if ($null -ne $DscpTag) { [int]$DscpTag } else { $dscp }
+                $after = Format-TagValue -Cos $newCos -Dscp $newDscp
+                if ($after -eq $before) {
+                    $record.Outcome = 'Skipped'
+                    $record.Detail = "already $before"
+                }
+                else {
+                    $record.Outcome = 'Planned'
+                    $record.SetCos = ($null -ne $CosTag)
+                    $record.SetDscp = ($null -ne $DscpTag)
+                    $record.NewCos = $newCos
+                    $record.NewDscp = $newDscp
+                    $record.Detail = "$before -> $after"
+                    $summary.Add("'$name' $before -> $after")
+                }
+            }
+            'ClearTag' {
+                $newCos = if ($ClearCos) { $null } else { $cos }
+                $newDscp = if ($ClearDscp) { $null } else { $dscp }
+                $after = Format-TagValue -Cos $newCos -Dscp $newDscp
+                if ($after -eq $before) {
+                    $record.Outcome = 'Skipped'
+                    $record.Detail = "nothing to clear, already $before"
+                }
+                elseif (($null -eq $newCos) -and ($null -eq $newDscp)) {
+                    $record.Outcome = 'Skipped'
+                    $record.Detail = "clearing would leave the Tag action with no value ($before); use -Action RemoveRule"
+                }
+                else {
+                    $record.Outcome = 'Planned'
+                    $record.SetCos = [bool]$ClearCos
+                    $record.SetDscp = [bool]$ClearDscp
+                    $record.NewCos = $newCos
+                    $record.NewDscp = $newDscp
+                    $record.Detail = "$before -> $after"
+                    $summary.Add("'$name' $before -> $after")
+                }
+            }
+        }
+    }
+
+    $planned = @($changes.ToArray() | Where-Object { $_.Outcome -eq 'Planned' })
+    return [pscustomobject]@{
+        Changes      = $changes.ToArray()
+        PlannedCount = $planned.Count
+        RemovedIds   = @($planned | Where-Object { $_.Remove } | ForEach-Object { $_.Id })
+        Summary      = ('{0}: {1}' -f $Action, ($summary -join '; '))
+    }
+}
+
+function Invoke-PortgroupTagPlan {
+    <#
+    .SYNOPSIS
+        Applies a plan from Get-PortgroupTagPlan to one port group. THE ONLY WRITE IN THIS SCRIPT.
+
+    .DESCRIPTION
+        Must be called inside $PSCmdlet.ShouldProcess. Re-reads the port group first, so the edit is
+        made on a fresh copy of its configuration (the audit copy is left untouched for reporting)
+        with the current config version, then finds each planned rule by identity, sets or clears
+        its tag values or drops it, marks the filter policy as the port group's own, and sends the
+        filter policy back through ReconfigureDVPortgroup. Nothing else in the port group is sent.
+        Throws with vCenter's own message when the reconfigure is rejected.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        $PortgroupView,
+
+        [Parameter(Mandatory)]
+        $Server,
+
+        [Parameter(Mandatory)]
+        $Plan
+    )
+
+    $fresh = Get-View -Id $PortgroupView.MoRef -Server $Server -Property Config
+    $config = Get-PropertyValue $fresh 'Config'
+    $policy = Get-PropertyValue (Get-PropertyValue $config 'DefaultPortConfig') 'FilterPolicy'
+    $ruleset = Get-TrafficRuleset $policy
+    if ($null -eq $ruleset) { throw 'the port group no longer has a traffic ruleset of its own; it was changed since it was read' }
+
+    $byId = @{}
+    foreach ($rule in @(Get-PropertyArray $ruleset 'Rules')) { $byId[(Get-RuleIdentity $rule)] = $rule }
+
+    $removedIds = @()
+    foreach ($change in @($Plan.Changes | Where-Object { $_.Outcome -eq 'Planned' })) {
+        if (-not $byId.ContainsKey($change.Id)) {
+            throw "rule '$($change.Name)' no longer exists on the port group; it was changed since it was read"
+        }
+        if ($change.Remove) {
+            $removedIds += $change.Id
+            continue
+        }
+        $ruleAction = Get-PropertyValue $byId[$change.Id] 'Action'
+        if ($change.SetCos) { $ruleAction.QosTag = $change.NewCos }
+        if ($change.SetDscp) { $ruleAction.DscpTag = $change.NewDscp }
+    }
+    if ($removedIds.Count -gt 0) {
+        $ruleset.Rules = @(Get-PropertyArray $ruleset 'Rules' | Where-Object { $removedIds -notcontains (Get-RuleIdentity $_) })
+    }
+
+    # Sent back as the port group's own policy: per the API, only entries with inherited = false
+    # are applied, and the array replaces the port group's filter settings.
+    $policy.Inherited = $false
+    foreach ($filterConfig in @(Get-PropertyArray $policy 'FilterConfig')) { $filterConfig.Inherited = $false }
+
+    $portSetting = New-Object -TypeName 'VMware.Vim.VMwareDVSPortSetting'
+    $portSetting.FilterPolicy = $policy
+    $spec = New-Object -TypeName 'VMware.Vim.DVPortgroupConfigSpec'
+    $spec.ConfigVersion = [string](Get-PropertyValue $config 'ConfigVersion')
+    $spec.DefaultPortConfig = $portSetting
+    $fresh.ReconfigureDVPortgroup($spec)
 }
 
 function Resolve-DatacenterName {
@@ -754,6 +1093,38 @@ $progressActivity = 'Reading distributed port groups'
 try {
     Write-Log "Export-VDPortgroupQos $ScriptVersion starting on $([Environment]::MachineName)."
 
+    # ---- Validate the change request before touching anything ---------------
+    $changeParameterGiven = ($null -ne $CosTag) -or ($null -ne $DscpTag) -or $ClearCos -or $ClearDscp -or ($null -ne $RuleName)
+    switch ($Action) {
+        'Audit' {
+            if ($changeParameterGiven) { throw '-CosTag, -DscpTag, -ClearCos, -ClearDscp and -RuleName only apply with -Action SetTag, ClearTag or RemoveRule.' }
+        }
+        'SetTag' {
+            if (($null -eq $CosTag) -and ($null -eq $DscpTag)) { throw '-Action SetTag needs -CosTag and/or -DscpTag.' }
+            if (($null -ne $CosTag) -and (($CosTag -lt 0) -or ($CosTag -gt 7))) { throw "-CosTag must be 0 to 7 (802.1p), not $CosTag." }
+            if (($null -ne $DscpTag) -and (($DscpTag -lt 0) -or ($DscpTag -gt 63))) { throw "-DscpTag must be 0 to 63, not $DscpTag." }
+            if ($ClearCos -or $ClearDscp) { throw '-ClearCos and -ClearDscp apply to -Action ClearTag, not SetTag.' }
+        }
+        'ClearTag' {
+            if (-not ($ClearCos -or $ClearDscp)) { throw '-Action ClearTag needs -ClearCos and/or -ClearDscp.' }
+            if (($null -ne $CosTag) -or ($null -ne $DscpTag)) { throw '-CosTag and -DscpTag apply to -Action SetTag, not ClearTag.' }
+        }
+        'RemoveRule' {
+            if ($null -eq $RuleName) { throw "-Action RemoveRule needs -RuleName; pass -RuleName '*' to remove every marking rule on the matched port groups." }
+            if (($null -ne $CosTag) -or ($null -ne $DscpTag) -or $ClearCos -or $ClearDscp) { throw '-CosTag, -DscpTag, -ClearCos and -ClearDscp do not apply to -Action RemoveRule.' }
+        }
+    }
+    if ($null -eq $RuleName) { $RuleName = @('*') }
+    if ($Action -ne 'Audit') {
+        $valueText = switch ($Action) {
+            'SetTag' { (Format-TagValue -Cos $CosTag -Dscp $DscpTag) }
+            'ClearTag' { ('clear ' + (@(@('CoS')[0..0] | Where-Object { $ClearCos }) + @(@('DSCP')[0..0] | Where-Object { $ClearDscp }) -join ' and ')) }
+            default { 'delete' }
+        }
+        Write-Log ("Action {0} ({1}) on switches '{2}', port groups '{3}', rules '{4}'." -f $Action, $valueText, ($SwitchName -join "', '"), ($PortGroupName -join "', '"), ($RuleName -join "', '"))
+        if ($WhatIfPreference) { Write-Log '-WhatIf: nothing will be changed on any vCenter; the CSV is the plan.' -Level WARN }
+    }
+
     try {
         Import-RequiredModules
     }
@@ -775,7 +1146,7 @@ try {
             $mode = [string](Get-PropertyValue (Get-PowerCLIConfiguration -Scope Session) 'DefaultVIServerMode')
             if ($mode -ne 'Multiple') {
                 Write-Log "PowerCLI DefaultVIServerMode is '$mode'. Setting it to Multiple for this session so the linked vCenters can be connected together." -Level WARN
-                Set-PowerCLIConfiguration -DefaultVIServerMode Multiple -Scope Session -Confirm:$false | Out-Null
+                Set-PowerCLIConfiguration -DefaultVIServerMode Multiple -Scope Session -Confirm:$false -WhatIf:$false | Out-Null
             }
         }
         catch {
@@ -799,6 +1170,10 @@ try {
     $datacenterCache = @{}
     $switchCount = 0
     $portgroupCount = 0
+    $readFailedCount = 0
+    $plannedRuleCount = 0
+    $changedPortgroupCount = 0
+    $failedPortgroupCount = 0
 
     foreach ($vc in $targets) {
         Write-Log ('vCenter {0} (version {1} build {2}).' -f $vc.Name, (Get-PropertyValue $vc 'Version'), (Get-PropertyValue $vc 'Build'))
@@ -840,6 +1215,7 @@ try {
                 VDSVersion    = [string](Get-PropertyValue $vds 'Version')
                 NiocEnabled   = $niocEnabled
                 NiocVersion   = $niocVersion
+                Action        = $Action
                 ScriptVersion = $ScriptVersion
                 CollectedUtc  = $collectedUtc
             }
@@ -851,52 +1227,134 @@ try {
             $portgroupByKey = @{}
             foreach ($pg in $portgroups) {
                 $portgroupCount++
-                $pgView = Get-PropertyValue $pg 'ExtensionData'
-                $pgConfig = Get-PropertyValue $pgView 'Config'
-                $pgSetting = Get-PropertyValue $pgConfig 'DefaultPortConfig'
-                $pgKey = [string](Get-PropertyValue $pgView 'Key')
+                $pgName = [string]$pg.Name
+                try {
+                    $pgView = Get-PropertyValue $pg 'ExtensionData'
+                    $pgConfig = Get-PropertyValue $pgView 'Config'
+                    $pgSetting = Get-PropertyValue $pgConfig 'DefaultPortConfig'
+                    $pgKey = [string](Get-PropertyValue $pgView 'Key')
 
-                $binding = Get-PropertyValue $pg 'PortBinding'
-                if ($null -eq $binding) { $binding = Get-PropertyValue $pgConfig 'Type' }
-                $isUplink = Get-PropertyValue $pgConfig 'Uplink'
-                if ($null -eq $isUplink) { $isUplink = Get-PropertyValue $pg 'IsUplink' }
+                    $binding = Get-PropertyValue $pg 'PortBinding'
+                    if ($null -eq $binding) { $binding = Get-PropertyValue $pgConfig 'Type' }
+                    $isUplink = Get-PropertyValue $pgConfig 'Uplink'
+                    if ($null -eq $isUplink) { $isUplink = Get-PropertyValue $pg 'IsUplink' }
 
-                # Resource pool: NIOC v3 assigns by VmVnicNetworkResourcePoolKey on the port group,
-                # NIOC v2 by NetworkResourcePoolKey in the port setting ("-1" = none). Only v2 pools
-                # carry an 802.1p priority tag.
-                $poolName = $null
-                $poolTag = $null
-                $v3Key = [string](Get-PropertyValue $pgConfig 'VmVnicNetworkResourcePoolKey')
-                if ($v3Key) {
-                    $poolName = if ($poolsV3.ContainsKey($v3Key)) { [string](Get-PropertyValue $poolsV3[$v3Key] 'Name') } else { $v3Key }
-                }
-                $v2Key = [string](Get-PolicyValue (Get-PropertyValue $pgSetting 'NetworkResourcePoolKey'))
-                if ($v2Key -and ($v2Key -ne '-1')) {
-                    if ($poolsV2.ContainsKey($v2Key)) {
-                        $poolName = [string](Get-PropertyValue $poolsV2[$v2Key] 'Name')
-                        $poolTag = Get-PropertyValue (Get-PropertyValue $poolsV2[$v2Key] 'AllocationInfo') 'PriorityTag'
-                        if (($null -ne $poolTag) -and ([int]$poolTag -lt 0)) { $poolTag = $null }
+                    # Resource pool: NIOC v3 assigns by VmVnicNetworkResourcePoolKey on the port group,
+                    # NIOC v2 by NetworkResourcePoolKey in the port setting ("-1" = none). Only v2 pools
+                    # carry an 802.1p priority tag.
+                    $poolName = $null
+                    $poolTag = $null
+                    $v3Key = [string](Get-PropertyValue $pgConfig 'VmVnicNetworkResourcePoolKey')
+                    if ($v3Key) {
+                        $poolName = if ($poolsV3.ContainsKey($v3Key)) { [string](Get-PropertyValue $poolsV3[$v3Key] 'Name') } else { $v3Key }
+                    }
+                    $v2Key = [string](Get-PolicyValue (Get-PropertyValue $pgSetting 'NetworkResourcePoolKey'))
+                    if ($v2Key -and ($v2Key -ne '-1')) {
+                        if ($poolsV2.ContainsKey($v2Key)) {
+                            $poolName = [string](Get-PropertyValue $poolsV2[$v2Key] 'Name')
+                            $poolTag = Get-PropertyValue (Get-PropertyValue $poolsV2[$v2Key] 'AllocationInfo') 'PriorityTag'
+                            if (($null -ne $poolTag) -and ([int]$poolTag -lt 0)) { $poolTag = $null }
+                        }
+                        else {
+                            $poolName = $v2Key
+                        }
+                    }
+
+                    $pgContext = @{
+                        PortGroup                    = $pgName
+                        PortGroupKey                 = $pgKey
+                        IsUplink                     = $isUplink
+                        PortBinding                  = [string]$binding
+                        TrafficFilterOverrideAllowed = Get-PropertyValue (Get-PropertyValue $pgConfig 'Policy') 'TrafficFilterOverrideAllowed'
+                        NetworkResourcePool          = $poolName
+                        NrpPriorityTag               = $poolTag
+                    }
+                    $portgroupByKey[$pgKey] = @{ Context = $pgContext; Setting = $pgSetting }
+
+                    $scopeContext = @{ Scope = 'PortGroup' }
+                    $context = Merge-Hashtable -Table @($switchContext, $pgContext, $scopeContext)
+                    $chain = @($pgSetting, $switchDefaultSetting)
+
+                    $targeted = ($Action -ne 'Audit') -and (Test-NameMatch -Name $vds.Name -Pattern $SwitchName) -and (Test-NameMatch -Name $pgName -Pattern $PortGroupName)
+                    if (-not $targeted) {
+                        foreach ($row in @(Get-PortSettingQosRow -Context $context -SettingChain $chain)) { $rows.Add($row) }
+                        continue
+                    }
+
+                    # ---- Change ----------------------------------------------------------
+                    # Only the port group's OWN filter policy is edited. An inherited policy has no
+                    # rules of its own to change, so the port group is reported and left alone.
+                    $ownPolicy = Get-PropertyValue $pgSetting 'FilterPolicy'
+                    $ownRuleset = $null
+                    if (($null -ne $ownPolicy) -and ((Get-PropertyValue $ownPolicy 'Inherited') -ne $true)) {
+                        $ownRuleset = Get-TrafficRuleset $ownPolicy
+                    }
+                    $plan = Get-PortgroupTagPlan -Ruleset $ownRuleset -Action $Action -RuleName $RuleName -CosTag $CosTag -DscpTag $DscpTag -ClearCos $ClearCos -ClearDscp $ClearDscp
+                    $outcomes = @{}
+                    foreach ($change in $plan.Changes) {
+                        $outcomes[$change.Id] = @{ Outcome = $change.Outcome; Detail = $change.Detail }
+                    }
+                    $plannedChanges = @($plan.Changes | Where-Object { $_.Outcome -eq 'Planned' })
+
+                    if ($plannedChanges.Count -eq 0) {
+                        if ($plan.Changes.Count -eq 0) {
+                            $context['Outcome'] = 'Skipped'
+                            $context['Detail'] = 'no marking rules of its own on this port group'
+                        }
+                        foreach ($row in @(Get-PortSettingQosRow -Context $context -SettingChain $chain -RuleOutcome $outcomes)) { $rows.Add($row) }
+                        continue
+                    }
+
+                    $plannedRuleCount += $plannedChanges.Count
+                    $target = '{0} / {1} / {2}' -f $vc.Name, $vds.Name, $pgName
+                    if ($PSCmdlet.ShouldProcess($target, $plan.Summary)) {
+                        try {
+                            Invoke-PortgroupTagPlan -PortgroupView $pgView -Server $vc -Plan $plan
+                            foreach ($change in $plannedChanges) { $outcomes[$change.Id]['Outcome'] = 'Changed' }
+
+                            # Report what vCenter holds now, not what was sent.
+                            $afterView = Get-View -Id $pgView.MoRef -Server $vc -Property Config
+                            $afterSetting = Get-PropertyValue (Get-PropertyValue $afterView 'Config') 'DefaultPortConfig'
+                            foreach ($row in @(Get-PortSettingQosRow -Context $context -SettingChain @($afterSetting, $switchDefaultSetting) -RuleOutcome $outcomes)) { $rows.Add($row) }
+                            if ($plan.RemovedIds.Count -gt 0) {
+                                foreach ($row in @(Get-PortSettingQosRow -Context $context -SettingChain $chain -RuleOutcome $outcomes -OnlyRuleId $plan.RemovedIds)) {
+                                    # The rule is gone: the row records the removal, not the old values.
+                                    $row.RuleQualifiers = $null
+                                    $row.RuleActions = $null
+                                    $row.CosTag = $null
+                                    $row.DscpTag = $null
+                                    $rows.Add($row)
+                                }
+                            }
+                            $changedPortgroupCount++
+                            Write-Log "  ${target}: changed. $($plan.Summary)"
+                        }
+                        catch {
+                            $message = $_.Exception.Message
+                            foreach ($change in $plannedChanges) {
+                                $outcomes[$change.Id] = @{ Outcome = 'Failed'; Detail = "$($change.Detail): $message" }
+                            }
+                            foreach ($row in @(Get-PortSettingQosRow -Context $context -SettingChain $chain -RuleOutcome $outcomes)) { $rows.Add($row) }
+                            $failedPortgroupCount++
+                            Write-Log "  ${target}: change failed, port group left as read. $message" -Level ERROR
+                        }
                     }
                     else {
-                        $poolName = $v2Key
+                        # -WhatIf keeps Outcome = Planned; a "no" at the confirmation prompt is a skip.
+                        if (-not $WhatIfPreference) {
+                            foreach ($change in $plannedChanges) {
+                                $outcomes[$change.Id] = @{ Outcome = 'Skipped'; Detail = "declined at the confirmation prompt: $($change.Detail)" }
+                            }
+                        }
+                        foreach ($row in @(Get-PortSettingQosRow -Context $context -SettingChain $chain -RuleOutcome $outcomes)) { $rows.Add($row) }
                     }
                 }
-
-                $pgContext = @{
-                    PortGroup                    = [string]$pg.Name
-                    PortGroupKey                 = $pgKey
-                    IsUplink                     = $isUplink
-                    PortBinding                  = [string]$binding
-                    TrafficFilterOverrideAllowed = Get-PropertyValue (Get-PropertyValue $pgConfig 'Policy') 'TrafficFilterOverrideAllowed'
-                    NetworkResourcePool          = $poolName
-                    NrpPriorityTag               = $poolTag
-                }
-                $portgroupByKey[$pgKey] = @{ Context = $pgContext; Setting = $pgSetting }
-
-                $scopeContext = @{ Scope = 'PortGroup' }
-                $context = Merge-Hashtable -Table @($switchContext, $pgContext, $scopeContext)
-                foreach ($row in @(Get-PortSettingQosRow -Context $context -SettingChain @($pgSetting, $switchDefaultSetting))) {
-                    $rows.Add($row)
+                catch {
+                    $message = $_.Exception.Message
+                    $readFailedCount++
+                    Write-Log "  $($vds.Name) / ${pgName}: could not be read. $message" -Level WARN
+                    $failContext = @{ PortGroup = $pgName; Scope = 'PortGroup'; Outcome = 'ReadFailed'; Detail = $message }
+                    $rows.Add((ConvertTo-QosRow -Values (Merge-Hashtable -Table @($switchContext, $failContext))))
                 }
             }
 
@@ -921,6 +1379,12 @@ try {
     $ruleRows = @($sorted | Where-Object { $null -ne $_.RuleSequence })
     $taggedRows = @($sorted | Where-Object { ($null -ne $_.CosTag) -or ($null -ne $_.DscpTag) })
     Write-Log ('Read {0} vCenter(s), {1} switch(es), {2} port group(s): {3} row(s), {4} traffic rule(s), {5} of them tagging CoS or DSCP.' -f $targets.Count, $switchCount, $portgroupCount, $sorted.Count, $ruleRows.Count, $taggedRows.Count)
+    if ($readFailedCount -gt 0) { Write-Log "$readFailedCount port group(s) could not be read; see the ReadFailed rows." -Level WARN }
+    if ($Action -ne 'Audit') {
+        $verb = if ($WhatIfPreference) { 'would change' } else { 'changed' }
+        Write-Log ('{0}: {1} rule change(s) planned; {2} port group(s) {3}, {4} failed. Outcome per rule is in the CSV.' -f $Action, $plannedRuleCount, $changedPortgroupCount, $verb, $failedPortgroupCount)
+        if ($failedPortgroupCount -gt 0) { Write-Log "$failedPortgroupCount port group change(s) failed; see the Failed rows." -Level ERROR }
+    }
 
     if ($sorted.Count -eq 0) {
         Write-Log 'Nothing to write: no distributed port groups were found.' -Level WARN
@@ -932,9 +1396,10 @@ try {
         }
         $outputDirectory = Split-Path -Path $OutputPath -Parent
         if ($outputDirectory -and (-not (Test-Path -LiteralPath $outputDirectory))) {
-            New-Item -Path $outputDirectory -ItemType Directory -Force | Out-Null
+            New-Item -Path $outputDirectory -ItemType Directory -Force -WhatIf:$false | Out-Null
         }
-        $sorted | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8
+        # Written on -WhatIf too: the dry-run report is the point of a dry run.
+        $sorted | Export-Csv -Path $OutputPath -NoTypeInformation -Encoding UTF8 -WhatIf:$false
         Write-Log "Wrote $($sorted.Count) row(s) to $OutputPath."
     }
 
@@ -953,7 +1418,7 @@ finally {
         if ($preExisting.ContainsKey($name) -or $disconnected.ContainsKey($name)) { continue }
         $disconnected[$name] = $true
         try {
-            Disconnect-VIServer -Server $session -Confirm:$false -ErrorAction Stop
+            Disconnect-VIServer -Server $session -Confirm:$false -WhatIf:$false -ErrorAction Stop
             Write-Log "Disconnected from $name." -Level DEBUG
         }
         catch {
