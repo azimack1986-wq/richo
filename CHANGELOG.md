@@ -4099,3 +4099,35 @@ authentication removed, for operators who apply their own
 - Everything else — CDP/LLDP detection, CSV name matching, UCS Manager, batching,
   host profile compliance, cluster health, the Step 27 menu — is byte-identical
   to the main controller and verified so by the parity test.
+
+---
+
+## Export-VdsVlanReport.ps1
+
+### [1.0.0] — 2026-10-07
+
+#### Added
+
+- **First release.** Read-only report of vDS port group VLAN settings across a
+  vCenter, written to one CSV with a row per finding:
+  - `DuplicateVlan` — the same VLAN ID on more than one port group of the same vDS,
+    or anywhere in the vCenter with `-DuplicateScope vCenter`. One row per port
+    group, with `SharedWith` naming the others and `VmCount` showing which one is
+    actually in use.
+  - `NoVlan` — VLAN type None.
+  - `TrunkRangeOverlap` — a trunk whose ranges name the same VLAN twice.
+- PVLAN port groups are checked on the ID they put on the wire, and named with
+  their type and primary from the vDS PVLAN map.
+- Trunk port groups are left out of the duplicate check unless `-IncludeTrunk` is
+  given, so a 0-4094 guest-tagging trunk does not duplicate every VLAN. Uplink and
+  NSX-backed port groups are always skipped, and counted in the log.
+- Every row carries `ScriptVersion` and `CollectedUtc`. A run that finds nothing
+  still writes a header-only CSV as evidence.
+
+#### Tests
+
+- `tests/Test-VdsVlanReport.ps1` — 78 assertions: each VLAN spec type, trunk range
+  overlap, the findings in both scopes with and without trunks, and the whole script
+  end to end against stubbed `Connect-VIServer`/`Get-View`/`Disconnect-VIServer`,
+  covering uplink and NSX skipping, VM counts, column order, the header-only CSV, and
+  disconnecting after a failure.
