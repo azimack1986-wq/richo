@@ -131,7 +131,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.1.1'
 
 Import-Module (Join-Path $PSScriptRoot '..\..\modules\Richo.Common\Richo.Common.psd1') -Force
 
@@ -405,7 +405,8 @@ function Format-NsxError {
     if ($detail.Length -gt 500) { $detail = $detail.Substring(0, 500) + '...' }
 
     if ($Status -eq 401 -or $Status -eq 403) {
-        $message += '. Check the account and that its NSX role can read this object'
+        $action = switch ($Method) { 'DELETE' { 'delete' } 'POST' { 'use' } default { 'read' } }
+        $message += ". Check the account and that its NSX role can $action this object"
     }
     return "$message. $detail"
 }

@@ -12,6 +12,14 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Get-NsxUnusedObject.ps1
 
+### [1.1.1] — 2026-10-09
+
+#### Fixed
+
+- A refused request now names the action that was refused ("can delete", "can use")
+  instead of always saying "can read". The audit itself only reads; the wording matters
+  where this request code is reused for deletions.
+
 ### [1.1.0] — 2026-10-09
 
 #### Fixed
