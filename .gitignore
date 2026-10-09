@@ -27,6 +27,7 @@ logs/
 *.transcript
 reports/
 *.csv.bak
+NSX-Unused-Objects-*.csv
 
 # ---------------------------------------------------------------------------
 # PowerShell

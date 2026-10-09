@@ -10,6 +10,60 @@ versioning is [semantic](https://semver.org/) per script.
 
 ---
 
+## Get-NsxUnusedObject.ps1
+
+### [1.0.0] — 2026-10-09
+
+#### Added
+
+- **Read-only audit of NSX 4.2 segments and Tier-1 gateways that look unused**,
+  reviewed against the NSX 4.2 API Guide and brought into the repo from a
+  standalone script. Writes a CSV of candidates; changes nothing in NSX.
+
+#### Fixed (relative to the script it replaces)
+
+- **It did not parse.** The Tier-1 result row had a broken string
+  (`AdminState = "  = ""`), so the script could not start at all.
+- **Every list call would have thrown on its last page.** The API Guide is explicit
+  that the final page carries no `cursor` property, and under
+  `Set-StrictMode -Version Latest` reading `$response.cursor` on it is a terminating
+  error. The same applied to every optional field NSX omits when empty —
+  `connectivity_path` on isolated segments, `vlan_ids` on overlay ones. All
+  optional properties are now read through a helper that returns `$null`.
+- **The error handler could throw on the errors it existed for.** A DNS, TCP or
+  TLS failure has no `Response` property, which StrictMode turned into a second,
+  misleading error. Status is now read defensively on 5.1 and 7.
+- **`-SkipCertificateCheck` refused to run on Windows PowerShell 5.1**, and 5.1 was
+  never given TLS 1.2. Both are now handled for 5.1 and put back afterwards.
+
+#### Changed
+
+- **"Unused" is decided on more evidence, to cut false positives.** A segment is
+  not reported if a Tier-0 or Tier-1 interface (uplink or service interface) is
+  attached to it, or if it has an edge bridge or an L2VPN extension. A Tier-1 is
+  not reported if it has fixed segments, a load balancer service, or an IPSec or
+  L2 VPN service. A check whose endpoint answers 404 is named in `Notes` rather
+  than treated as "none found".
+- **Multi-tenancy projects are audited.** Project objects live under
+  `/orgs/default/projects/<id>/infra` and never appear in `/infra` list calls.
+- **Session authentication by default.** `/api/session/create` plus the
+  `X-XSRF-TOKEN` header, as the API Guide describes, so the password crosses the
+  wire once and the script still works where Basic authentication is disabled
+  for hardening (Broadcom KB 447337). `-UseBasicAuth` is the fallback. A rejected
+  sign-in is never retried, to stay clear of account lockout.
+- **Rate limits respected.** Client-side throttle (default 50 requests/second
+  against NSX's 100 per client), and HTTP 429/503 retried with exponential backoff.
+- **Port checks ask for one port, not a thousand.** A segment's ports are read with
+  `page_size=1` and stop at the first hit.
+- **Ownership is surfaced.** `CreatedBy`, `Protection`, `LastModifiedUtc` and `Tags`
+  columns, with a note on objects owned by a principal identity (NCP, Tanzu,
+  Aria Automation, VCF).
+- **House style.** Logs through `Write-RichoLog`, credentials through
+  `Get-RichoCredential`, `$ScriptVersion` on every CSV row, and an empty result
+  writes a header-only CSV instead of a header plus a blank row.
+
+---
+
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
 ### [23.32.0] — 2026-08-21
