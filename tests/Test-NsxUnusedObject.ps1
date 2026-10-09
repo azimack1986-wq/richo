@@ -36,7 +36,8 @@ if ($errors) {
 $wanted = @(
     'Get-NsxProperty', 'ConvertTo-NsxManagerHost', 'ConvertTo-NsxApiPath', 'Get-NsxHttpStatus',
     'Get-NsxPagedResult', 'Resolve-NsxSegmentUsage', 'Resolve-NsxTier1Usage', 'Get-NsxOwnershipNote',
-    'Get-NsxDisplayName', 'ConvertTo-NsxAuditRow', 'Get-NsxResponseHeader'
+    'Get-NsxDisplayName', 'ConvertTo-NsxAuditRow', 'Get-NsxResponseHeader', 'Get-NsxUnavailableReason',
+    'Get-NsxUnavailableNote'
 )
 $definitions = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
         Where-Object { $wanted -contains $_.Name })
@@ -46,20 +47,26 @@ foreach ($definition in $definitions) { Invoke-Expression $definition.Extent.Tex
 
 # ---- Stubs -----------------------------------------------------------------------------------
 $ScriptVersion = 'test'
-$script:Nsx = @{ BaseUri = 'https://nsx.test' }
-function Write-RichoLog { param([string]$Message, [string]$Level = 'INFO') }
+$script:Nsx = @{ BaseUri = 'https://nsx.test'; LastUnavailable = $null }
+$script:UnsupportedLogged = @{}
+$script:logged = New-Object System.Collections.Generic.List[string]
+function Write-RichoLog { param([string]$Message, [string]$Level = 'INFO') $script:logged.Add("$Level $Message") }
 
-# Canned responses by request path. 'NOTFOUND' answers like an HTTP 404.
+# Canned responses by request path. 'NOTFOUND' answers like an HTTP 404, 'UNSUPPORTED' like
+# NSX's HTTP 400 / 524223 inside a project.
 $script:responses = @{}
 $script:requests = New-Object System.Collections.Generic.List[string]
 function Invoke-NsxRequest {
-    param([string]$Path, [string]$Method = 'GET', [switch]$AllowNotFound, [switch]$NoReauthenticate)
+    param([string]$Path, [string]$Method = 'GET', [switch]$AllowUnavailable, [switch]$NoReauthenticate)
     $script:requests.Add($Path)
     if (-not $script:responses.ContainsKey($Path)) { throw "unexpected request: $Path" }
     $canned = $script:responses[$Path]
-    if ($canned -eq 'NOTFOUND') {
-        if ($AllowNotFound) { return $null }
-        throw "HTTP 404 for $Path"
+    if ($canned -eq 'NOTFOUND' -or $canned -eq 'UNSUPPORTED') {
+        if ($AllowUnavailable) {
+            $script:Nsx.LastUnavailable = if ($canned -eq 'NOTFOUND') { 'NotFound' } else { 'NotSupportedInProject' }
+            return $null
+        }
+        throw "HTTP error for $Path"
     }
     return ($canned | ConvertFrom-Json)
 }
@@ -107,8 +114,8 @@ Initialize-Stub @{ '/noresults?page_size=1000' = '{"result_count":0}' }
 Assert-Equal 'missing results property is empty'   0       (Get-NsxPagedResult -Path '/noresults').Count
 
 Initialize-Stub @{ '/gone?page_size=1000' = 'NOTFOUND' }
-Assert-Equal '404 with -AllowNotFound is $null'    $true   ($null -eq (Get-NsxPagedResult -Path '/gone' -AllowNotFound))
-Assert-Throws '404 without -AllowNotFound throws' { Get-NsxPagedResult -Path '/gone' }
+Assert-Equal '404 with -AllowUnavailable is $null'    $true   ($null -eq (Get-NsxPagedResult -Path '/gone' -AllowUnavailable))
+Assert-Throws '404 without -AllowUnavailable throws' { Get-NsxPagedResult -Path '/gone' }
 
 Initialize-Stub @{
     '/loop?page_size=1000' = '{"results":[{"id":"a"}],"cursor":"same"}'
@@ -127,6 +134,38 @@ Initialize-Stub @{
     '/sparse?page_size=1&cursor=next' = '{"results":[{"id":"late"}]}'
 }
 Assert-Equal 'an empty page with a cursor is not the end' 1 (Get-NsxPagedResult -Path '/sparse' -PageSize 1 -FirstItemOnly).Count
+
+Initialize-Stub @{ '/orgs/default/projects/p1/infra/lb-services?page_size=1000' = 'UNSUPPORTED' }
+Assert-Equal 'not supported in a project is $null'  $true   ($null -eq (Get-NsxPagedResult -Path '/orgs/default/projects/p1/infra/lb-services' -AllowUnavailable))
+Assert-Equal 'and says why'                          'NotSupportedInProject' $script:Nsx.LastUnavailable
+
+# ---- Unavailable APIs ------------------------------------------------------------------------
+Write-Host "`n=== 'Not available here' is told apart from a real failure ===" -ForegroundColor Cyan
+function New-HttpErrorRecord {
+    param([string]$Body)
+    $record = [System.Management.Automation.ErrorRecord]::new([InvalidOperationException]::new('HTTP error'), 'http', 'InvalidOperation', $null)
+    if ($Body) { $record.ErrorDetails = [System.Management.Automation.ErrorDetails]::new($Body) }
+    return $record
+}
+$projectError = New-HttpErrorRecord '{"httpStatus":"BAD_REQUEST","error_code":524223,"module_name":"policy","error_message":"This API is not supported in the context of a Project."}'
+Assert-Equal 'the reported NSX 4.2 project error'     'NotSupportedInProject' (Get-NsxUnavailableReason -ErrorRecord $projectError -Status 400)
+$byText = New-HttpErrorRecord '{"error_message":"This API is not supported in the context of a Project."}'
+Assert-Equal 'recognised by message without a code'   'NotSupportedInProject' (Get-NsxUnavailableReason -ErrorRecord $byText -Status 400)
+Assert-Equal '404 is not found'                       'NotFound'              (Get-NsxUnavailableReason -ErrorRecord (New-HttpErrorRecord '') -Status 404)
+$otherBadRequest = New-HttpErrorRecord '{"error_code":500012,"error_message":"Invalid page_size"}'
+Assert-Equal 'any other 400 is a real failure'        $true  ($null -eq (Get-NsxUnavailableReason -ErrorRecord $otherBadRequest -Status 400))
+Assert-Equal 'a 400 with a non-JSON body is a failure' $true ($null -eq (Get-NsxUnavailableReason -ErrorRecord (New-HttpErrorRecord '<html>proxy</html>') -Status 400))
+Assert-Equal '500 is a real failure'                  $true  ($null -eq (Get-NsxUnavailableReason -ErrorRecord $projectError -Status 500))
+Assert-Equal 'no status is a real failure'            $true  ($null -eq (Get-NsxUnavailableReason -ErrorRecord $projectError -Status $null))
+
+Write-Host "`n=== Unavailable checks become notes only when they could have found something ===" -ForegroundColor Cyan
+Assert-Equal '404 is noted on the row'                'lb-services not checked (HTTP 404)' (Get-NsxUnavailableNote -Check 'lb-services' -Reason 'NotFound' -Space 'default')
+$script:logged.Clear()
+Assert-Equal 'unsupported in a project is not noted'  $true  ($null -eq (Get-NsxUnavailableNote -Check 'lb-services' -Reason 'NotSupportedInProject' -Space 'project:p1'))
+$null = Get-NsxUnavailableNote -Check 'lb-services' -Reason 'NotSupportedInProject' -Space 'project:p1'
+Assert-Equal '...and logged once per space and check' 1 $script:logged.Count
+$null = Get-NsxUnavailableNote -Check 'lb-services' -Reason 'NotSupportedInProject' -Space 'project:p2'
+Assert-Equal '...again for another project'           2 $script:logged.Count
 
 # ---- Optional fields -------------------------------------------------------------------------
 Write-Host "`n=== Optional fields that NSX omits read as `$null under StrictMode ===" -ForegroundColor Cyan

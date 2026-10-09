@@ -12,6 +12,29 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Get-NsxUnusedObject.ps1
 
+### [1.1.0] — 2026-10-09
+
+#### Fixed
+
+- **An NSX 4.2 manager with multi-tenancy projects failed the whole audit.** Inside a
+  project NSX answers some APIs with HTTP 400, `error_code 524223`, "This API is not
+  supported in the context of a Project" — reported first for
+  `/orgs/default/projects/<id>/infra/lb-services`. Only 404 was treated as "not
+  available", so this ended the run. That answer now means the feature cannot exist in
+  the project: the check counts as none and is logged once per project, instead of
+  failing or adding a "not checked" note to every row. A real 404 is still noted.
+
+#### Changed
+
+- **A project that cannot be read is left out whole, with a warning, instead of failing
+  the run.** Its segments and Tier-1 gateways are read before any of them is used, so a
+  half-read project cannot make anything look unused. A failure in the default space
+  still stops the run, as does a rejected sign-in.
+- Tier-1 service interfaces are now read tolerantly too, with the same 404 /
+  not-supported handling as the other per-gateway checks.
+- `Invoke-NsxRequest -AllowNotFound` is now `-AllowUnavailable`, and records why in
+  `$script:Nsx.LastUnavailable`.
+
 ### [1.0.0] — 2026-10-09
 
 #### Added

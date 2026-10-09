@@ -22,10 +22,16 @@
       - no load balancer service is attached to it;
       - it has no IPSec VPN or L2 VPN service.
     A check that could not be run (the endpoint returned 404) is named in the
-    Notes column rather than silently treated as "none found".
+    Notes column rather than silently treated as "none found". Inside a
+    multi-tenancy project NSX answers some of these APIs with HTTP 400, error
+    524223, "not supported in the context of a Project" - load balancer
+    services, for one. That feature cannot exist in the project, so the check
+    counts as none and is logged once, not noted on every row.
 
     Multi-tenancy projects (NSX 4.1 and later) are audited alongside the
-    default space. VPC subnets and Federation global objects are not.
+    default space. A project whose segments or Tier-1 gateways cannot be read
+    is left out whole, with a warning, rather than failing the run. VPC subnets
+    and Federation global objects are not audited.
 
     One CSV row per reported object. For a Tier-1 row, ConnectivityPath is the
     Tier-0 it uplinks to (tier0_path). ScriptVersion is stamped on every row.
@@ -125,7 +131,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 
 Import-Module (Join-Path $PSScriptRoot '..\..\modules\Richo.Common\Richo.Common.psd1') -Force
 
@@ -141,7 +147,13 @@ $script:Nsx = @{
     MaxRequestsPerSecond = 50
     RecentRequests = New-Object 'System.Collections.Generic.Queue[datetime]'
     RequestCount = 0
+    LastStatus = $null
+    LastUnavailable = $null
+    AuthFailed = $false
 }
+
+# Checks NSX does not support inside a project, already logged once per space.
+$script:UnsupportedLogged = @{}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -261,6 +273,84 @@ function Get-NsxHttpStatus {
     if ($null -eq $responseProperty -or $null -eq $responseProperty.Value) { return $null }
     try { return [int]$responseProperty.Value.StatusCode }
     catch { return $null }
+}
+
+function Get-NsxUnavailableReason {
+    <#
+    .SYNOPSIS
+        Tells "this API is not available here" apart from a real failure.
+
+    .DESCRIPTION
+        Two answers mean there is nothing of that kind to check, not that the audit failed:
+
+          - HTTP 404: the endpoint, or its parent object, does not exist.
+          - HTTP 400 with error_code 524223, "This API is not supported in the context of a
+            Project". NSX 4.2 answers this inside a multi-tenancy project for features a project
+            cannot use - load balancer services, for one. Nothing of that kind can exist there.
+
+        Returns 'NotFound', 'NotSupportedInProject', or $null for any other failure.
+
+    .PARAMETER ErrorRecord
+        The caught error.
+
+    .PARAMETER Status
+        Its HTTP status, if there was one.
+
+    .EXAMPLE
+        Get-NsxUnavailableReason -ErrorRecord $_ -Status 400
+    #>
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [AllowNull()]$Status
+    )
+
+    if ($Status -eq 404) { return 'NotFound' }
+    if ($Status -ne 400) { return $null }
+
+    $body = $null
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        try { $body = $ErrorRecord.ErrorDetails.Message | ConvertFrom-Json -ErrorAction Stop }
+        catch { $body = $null }
+    }
+    $code = [string](Get-NsxProperty $body 'error_code')
+    $message = [string](Get-NsxProperty $body 'error_message')
+    if ($code -eq '524223' -or $message -match 'not supported in the context of a Project') { return 'NotSupportedInProject' }
+    return $null
+}
+
+function Get-NsxUnavailableNote {
+    <#
+    .SYNOPSIS
+        Turns an unavailable check into a Notes entry, or into nothing when it cannot apply.
+
+    .DESCRIPTION
+        NotFound means the check could not run, so the reader must be told. NotSupportedInProject
+        means NSX does not allow that feature in the project at all, so there is nothing to find;
+        that is logged once per space and check instead of noted on every row.
+
+    .PARAMETER Check
+        What could not be read, e.g. 'lb-services'.
+
+    .PARAMETER Reason
+        'NotFound' or 'NotSupportedInProject'.
+
+    .PARAMETER Space
+        The space the check ran in.
+
+    .EXAMPLE
+        Get-NsxUnavailableNote -Check 'lb-services' -Reason NotFound -Space default
+    #>
+    param([string]$Check, [string]$Reason, [string]$Space)
+
+    if ($Reason -eq 'NotSupportedInProject') {
+        $key = "$Space|$Check"
+        if (-not $script:UnsupportedLogged.ContainsKey($key)) {
+            $script:UnsupportedLogged[$key] = $true
+            Write-RichoLog "${Space}: NSX does not support $Check in a project, so there are none to find." -Level INFO
+        }
+        return $null
+    }
+    return "$Check not checked (HTTP 404)"
 }
 
 function Format-NsxError {
@@ -477,6 +567,7 @@ function Connect-NsxApi {
     catch {
         $status = Get-NsxHttpStatus -ErrorRecord $_
         if ($status -eq 401 -or $status -eq 403) {
+            $script:Nsx.AuthFailed = $true
             throw (("NSX rejected the sign-in for '{0}' (HTTP {1}). Check the password, and give LDAP or VIDM " +
                     "accounts as user@domain. Not retried - NSX locks an account out after repeated failures.") -f
                 $credential.UserName, $status)
@@ -533,8 +624,10 @@ function Invoke-NsxRequest {
     .PARAMETER Method
         GET (default) or POST.
 
-    .PARAMETER AllowNotFound
-        Return $null on HTTP 404 instead of throwing.
+    .PARAMETER AllowUnavailable
+        Return $null instead of throwing when the API is not available here: HTTP 404, or not
+        supported in a project (see Get-NsxUnavailableReason). $script:Nsx.LastUnavailable says
+        which.
 
     .PARAMETER NoReauthenticate
         Do not sign in again on a 403.
@@ -550,7 +643,7 @@ function Invoke-NsxRequest {
         [ValidateSet('GET', 'POST')]
         [string]$Method = 'GET',
 
-        [switch]$AllowNotFound,
+        [switch]$AllowUnavailable,
 
         [switch]$NoReauthenticate
     )
@@ -591,8 +684,15 @@ function Invoke-NsxRequest {
         }
         catch {
             $status = Get-NsxHttpStatus -ErrorRecord $_
+            $script:Nsx.LastStatus = $status
 
-            if ($status -eq 404 -and $AllowNotFound) { return $null }
+            if ($AllowUnavailable) {
+                $unavailable = Get-NsxUnavailableReason -ErrorRecord $_ -Status $status
+                if ($unavailable) {
+                    $script:Nsx.LastUnavailable = $unavailable
+                    return $null
+                }
+            }
 
             if (($status -eq 429 -or $status -eq 503) -and $attempt -lt $maxAttempts) {
                 $delay = [int][Math]::Pow(2, $attempt - 1)
@@ -624,8 +724,8 @@ function Get-NsxPagedResult {
         unchanged with the same query (NSX 4.2 API Guide, "API Pagination").
 
         Returns ONE array object, never enumerated, so an empty collection
-        (empty array) and an endpoint that does not exist ($null, only with
-        -AllowNotFound) stay distinguishable. Assign the result; do not wrap the
+        (empty array) and an API that is not available here ($null, only with
+        -AllowUnavailable) stay distinguishable. Assign the result; do not wrap the
         call in @().
 
     .PARAMETER Path
@@ -638,8 +738,8 @@ function Get-NsxPagedResult {
         Stop as soon as one item is found. For "is there anything here?"
         checks, so a busy segment does not page through every port.
 
-    .PARAMETER AllowNotFound
-        Return $null when the endpoint answers 404.
+    .PARAMETER AllowUnavailable
+        Return $null when the API is not available here (see Invoke-NsxRequest).
 
     .EXAMPLE
         $segments = Get-NsxPagedResult -Path '/policy/api/v1/infra/segments'
@@ -654,7 +754,7 @@ function Get-NsxPagedResult {
 
         [switch]$FirstItemOnly,
 
-        [switch]$AllowNotFound
+        [switch]$AllowUnavailable
     )
 
     $items = New-Object System.Collections.Generic.List[object]
@@ -664,7 +764,7 @@ function Get-NsxPagedResult {
     $seenCursors = @{}
 
     while ($true) {
-        $response = Invoke-NsxRequest -Path $requestPath -AllowNotFound:$AllowNotFound
+        $response = Invoke-NsxRequest -Path $requestPath -AllowUnavailable:$AllowUnavailable
         if ($null -eq $response) { return $null }
 
         foreach ($item in @(Get-NsxProperty $response 'results')) {
@@ -703,7 +803,7 @@ function Get-NsxSpace {
     $spaces.Add([pscustomobject]@{ Name = 'default'; InfraPath = '/infra'; Complete = $true })
 
     try {
-        $projects = Get-NsxPagedResult -Path '/policy/api/v1/orgs/default/projects' -AllowNotFound
+        $projects = Get-NsxPagedResult -Path '/policy/api/v1/orgs/default/projects' -AllowUnavailable
     }
     catch {
         Write-RichoLog "Could not list multi-tenancy projects, so only the default space is audited. $($_.Exception.Message)" -Level WARN
@@ -752,15 +852,23 @@ function Get-NsxGatewayInterface {
     .PARAMETER Gateway
         The Tier-0 or Tier-1 object.
 
+    .PARAMETER AllowUnavailable
+        Return $null if the locale services or interfaces API is not available here.
+
     .EXAMPLE
         $interfaces = Get-NsxGatewayInterface -Gateway $tier1
     #>
-    param([Parameter(Mandatory)]$Gateway)
+    param(
+        [Parameter(Mandatory)]$Gateway,
+        [switch]$AllowUnavailable
+    )
 
     $interfaces = New-Object System.Collections.Generic.List[object]
-    $localeServices = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath $Gateway.path -Suffix '/locale-services')
+    $localeServices = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath $Gateway.path -Suffix '/locale-services') -AllowUnavailable:$AllowUnavailable
+    if ($null -eq $localeServices) { return $null }
     foreach ($localeService in $localeServices) {
-        $found = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath $localeService.path -Suffix '/interfaces')
+        $found = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath $localeService.path -Suffix '/interfaces') -AllowUnavailable:$AllowUnavailable
+        if ($null -eq $found) { return $null }
         foreach ($interface in $found) { $interfaces.Add($interface) }
     }
     return , $interfaces.ToArray()
@@ -988,7 +1096,7 @@ try {
     Write-RichoLog 'Connected; the Policy API is readable.' -Level INFO
 
     try {
-        $version = Invoke-NsxRequest -Path '/api/v1/node/version' -AllowNotFound -NoReauthenticate
+        $version = Invoke-NsxRequest -Path '/api/v1/node/version' -AllowUnavailable -NoReauthenticate
         $productVersion = [string](Get-NsxProperty $version 'product_version')
         if ($productVersion) {
             Write-RichoLog "NSX version $productVersion." -Level INFO
@@ -1010,24 +1118,37 @@ try {
     $tier1s = New-Object System.Collections.Generic.List[object]
     $tier1Space = @{}                # path -> space name
     $loadBalancersByTier1 = @{}      # Tier-1 path -> count
-    $lbUnavailableSpaces = @{}       # space name -> $true when the LB list endpoint 404s
+    $lbUnavailableSpaces = @{}       # space name -> note, when the LB list could not be read
 
     foreach ($space in $spaces) {
-        $segments = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath "$($space.InfraPath)/segments")
+        # Read the whole space before using any of it. A project that cannot be read is left out
+        # entirely, so a half-read project cannot make anything look unused; the default space
+        # has no such fallback.
+        try {
+            $segments = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath "$($space.InfraPath)/segments")
+            $spaceTier1s = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath "$($space.InfraPath)/tier-1s")
+            $loadBalancers = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath "$($space.InfraPath)/lb-services") -AllowUnavailable
+            $lbReason = $script:Nsx.LastUnavailable
+        }
+        catch {
+            if ($space.Name -eq 'default' -or $script:Nsx.AuthFailed -or $_.Exception -is [System.OperationCanceledException]) { throw }
+            Write-RichoLog "Project '$($space.Name)' could not be read and is left out of the report. $($_.Exception.Message)" -Level WARN
+            $space.Complete = $false
+            continue
+        }
+
         foreach ($segment in $segments) {
             $segmentsByPath[[string]$segment.path] = $segment
             $segmentSpace[[string]$segment.path] = $space.Name
         }
-
-        $spaceTier1s = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath "$($space.InfraPath)/tier-1s")
         foreach ($tier1 in $spaceTier1s) {
             $tier1s.Add($tier1)
             $tier1Space[[string]$tier1.path] = $space.Name
         }
 
-        $loadBalancers = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath "$($space.InfraPath)/lb-services") -AllowNotFound
         if ($null -eq $loadBalancers) {
-            $lbUnavailableSpaces[$space.Name] = $true
+            $lbNote = Get-NsxUnavailableNote -Check 'lb-services' -Reason $lbReason -Space $space.Name
+            if ($lbNote) { $lbUnavailableSpaces[$space.Name] = $lbNote }
         }
         else {
             foreach ($loadBalancer in $loadBalancers) {
@@ -1061,7 +1182,12 @@ try {
 
         $unchecked = New-Object System.Collections.Generic.List[string]
 
-        $interfaces = Get-NsxGatewayInterface -Gateway $tier1
+        $interfaces = Get-NsxGatewayInterface -Gateway $tier1 -AllowUnavailable
+        if ($null -eq $interfaces) {
+            $note = Get-NsxUnavailableNote -Check 'service interfaces' -Reason $script:Nsx.LastUnavailable -Space $tier1Space[[string]$tier1.path]
+            if ($note) { $unchecked.Add($note) }
+            $interfaces = @()
+        }
         foreach ($interface in $interfaces) {
             $segmentPath = [string](Get-NsxProperty $interface 'segment_path')
             if ($segmentPath) { $interfacesBySegment[$segmentPath] = 1 + [int]$interfacesBySegment[$segmentPath] }
@@ -1069,9 +1195,10 @@ try {
 
         # Fixed segments live under the Tier-1, not under /infra/segments.
         $fixedSegmentPaths = @()
-        $fixedSegments = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath $tier1.path -Suffix '/segments') -AllowNotFound
+        $fixedSegments = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath $tier1.path -Suffix '/segments') -AllowUnavailable
         if ($null -eq $fixedSegments) {
-            $unchecked.Add('fixed segments not checked (HTTP 404)')
+            $note = Get-NsxUnavailableNote -Check 'fixed segments' -Reason $script:Nsx.LastUnavailable -Space $tier1Space[[string]$tier1.path]
+            if ($note) { $unchecked.Add($note) }
         }
         else {
             foreach ($segment in $fixedSegments) {
@@ -1083,13 +1210,16 @@ try {
 
         $vpnCount = 0
         foreach ($kind in @('ipsec-vpn-services', 'l2vpn-services')) {
-            $services = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath $tier1.path -Suffix "/$kind") -AllowNotFound -FirstItemOnly
-            if ($null -eq $services) { $unchecked.Add("$kind not checked (HTTP 404)") }
+            $services = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath $tier1.path -Suffix "/$kind") -AllowUnavailable -FirstItemOnly
+            if ($null -eq $services) {
+                $note = Get-NsxUnavailableNote -Check $kind -Reason $script:Nsx.LastUnavailable -Space $tier1Space[[string]$tier1.path]
+                if ($note) { $unchecked.Add($note) }
+            }
             else { $vpnCount += $services.Count }
         }
 
         if ($lbUnavailableSpaces.ContainsKey($tier1Space[[string]$tier1.path])) {
-            $unchecked.Add('lb-services not checked (HTTP 404)')
+            $unchecked.Add($lbUnavailableSpaces[$tier1Space[[string]$tier1.path]])
         }
 
         $tier1Facts[[string]$tier1.path] = [pscustomobject]@{
@@ -1115,9 +1245,10 @@ try {
         Write-Progress -Activity 'Checking segments' -Status "$segmentName ($segmentIndex of $($segmentPaths.Count))" -PercentComplete ([int](100 * $segmentIndex / $segmentPaths.Count))
 
         # page_size=1: only "any port at all?" matters, and a busy segment's port list is large.
-        $ports = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath $segmentPath -Suffix '/ports') -PageSize 1 -FirstItemOnly -AllowNotFound
+        $ports = Get-NsxPagedResult -Path (ConvertTo-NsxApiPath -PolicyPath $segmentPath -Suffix '/ports') -PageSize 1 -FirstItemOnly -AllowUnavailable
         if ($null -eq $ports) {
-            Write-RichoLog "Skipped segment '$segmentName' ($segmentPath): its ports could not be read (HTTP 404). It may have just been deleted." -Level WARN
+            $why = if ($script:Nsx.LastUnavailable -eq 'NotFound') { 'HTTP 404 - it may have just been deleted' } else { 'not supported in a project' }
+            Write-RichoLog "Skipped segment '$segmentName' ($segmentPath): its ports could not be read ($why)." -Level WARN
             $segmentsSkipped++
             continue
         }
@@ -1209,7 +1340,7 @@ try {
         Write-RichoLog "$segmentsSkipped segment(s) could not be checked and are not in the report." -Level WARN
     }
     if (@($spaces | Where-Object { -not $_.Complete }).Count -gt 0) {
-        Write-RichoLog 'Multi-tenancy projects were NOT audited - see the warning above.' -Level WARN
+        Write-RichoLog 'One or more multi-tenancy projects were NOT audited - see the warnings above.' -Level WARN
     }
     Write-RichoLog "Potentially unused: $segmentCount segment(s), $tier1Count Tier-1 gateway(s)." -Level INFO
     Write-RichoLog "CSV: $OutputPath" -Level INFO
