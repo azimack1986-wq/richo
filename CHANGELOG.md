@@ -10,6 +10,78 @@ versioning is [semantic](https://semver.org/) per script.
 
 ---
 
+## Get-UcsVlanAudit.ps1
+
+### [8.0.0] — 2026-10-12
+
+Replaces `UCSM-vCenter-Live-Monthly-VLAN-Audit-v7.5`. Still read-only; same sheets and
+classifications. [docs/ucs-vlan-cleanup.md](docs/ucs-vlan-cleanup.md) has the full review of v7.5.
+
+#### Fixed — could have produced a wrong cleanup candidate
+
+- VLAN names are resolved **per fabric**. The same name can mean different IDs on A and B; v7.5
+  took the first match from either.
+- VLANs used **directly on a service profile vNIC** (bare metal) are protected. Service profiles
+  are matched to ESXi hosts by vNIC MAC, and every VLAN on an associated profile that matches no
+  scanned host is protected — no longer dependent on the manual physical list.
+- A **guest-tagging (4095)** port group in use protects every VLAN; trunk and PVLAN port groups in
+  use protect their ranges.
+- **VM templates** count as usage (`Get-VM` left them out).
+- **VLAN group** members, the **in-band management** VLAN, and native VLANs on service profile
+  vNICs and the LAN Cloud are protected.
+- **Appliance-cloud VLANs** are no longer treated as LAN Cloud VLANs.
+
+#### Fixed — made every run preliminary
+
+- CDP `SystemName` and **LLDP** are read, not just CDP `DevId`.
+- `FI-A PD84000001SS028`, a format v7.5's own comment listed, now matches.
+- Collection failures only count when they are on the domain's own clusters.
+- A distributed port group shared with another cluster, or a DR VLAN missing from the LAN Cloud,
+  is reported but no longer makes the candidates preliminary.
+
+#### Changed
+
+- **Several vCenters per run.** A domain spanning vCenters can now be validated.
+- Clusters are derived from the hosts matched to the domain rather than typed in.
+- Every vCenter read is a single `Get-View -ViewType` call; one login per vCenter; Excel sheets
+  are written in one call each.
+- New sheets: `Warnings`, `Template Memberships`, `Service Profile Mapping`, `Range Port Groups`.
+- `candidates.json` is always written, for `Remove-UcsUnusedVlan.ps1`.
+- House style: `Set-StrictMode`, `Write-RichoLog` (menus are prompts; answers are logged),
+  `Get-RichoCredential`, `-Transcript`, output under `output/`.
+
+#### Tests
+
+- `tests/Test-UcsVlanAudit.ps1` — 137 assertions; `tests/Test-UcsVlanEndToEnd.ps1` — 19.
+
+---
+
+## Remove-UcsUnusedVlan.ps1
+
+### [1.0.0] — 2026-10-12
+
+#### Added
+
+- Removes approved VLANs from **vNIC templates, then the LAN Cloud**. Refuses a preliminary,
+  warned or stale (> 3 days) audit, and any VLAN the audit did not list as a candidate.
+- Re-checks the live domain first: definitions and memberships unchanged since the audit, not
+  native or in-band, templates used only by audited profiles with no pending acknowledgement, and
+  no VLAN name that could also mean an unapproved VLAN. A blocked membership holds back the VLAN
+  on every template.
+- Waits for updating templates to reach their service profiles, and deletes a LAN Cloud VLAN only
+  when nothing references it. Stops before the LAN Cloud stage if a pending reboot
+  acknowledgement appears; never acknowledges.
+- `-WhatIf` dry run; each removal confirmed unless `-Confirm:$false`; `-Stage Templates|LanCloud`
+  to split across windows. Writes `plan.csv`, `snapshot.json`, `rollback.ps1`, `results.csv`.
+
+#### Tests
+
+- `tests/Test-UcsVlanRemoval.ps1` — 94 assertions, including byte-for-byte parity of the helpers
+  shared with the audit; `tests/Test-UcsVlanEndToEnd.ps1` runs both scripts' real entry points.
+- `tests/Test-ScriptLint.ps1` now covers both scripts.
+
+---
+
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
 ### [23.32.0] — 2026-08-21

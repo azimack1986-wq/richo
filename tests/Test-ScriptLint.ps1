@@ -34,6 +34,8 @@ $targets = @(
     Join-Path $repoRoot 'scripts/firmware/Invoke-AutoDeployFirmwareBatchControl.ps1'
     Join-Path $repoRoot 'scripts/firmware/Invoke-AutoDeployFirmwareBatchPreAuth.ps1'
     Join-Path $repoRoot 'scripts/intersight/Test-IntersightApiKey.ps1'
+    Join-Path $repoRoot 'scripts/ucs/Get-UcsVlanAudit.ps1'
+    Join-Path $repoRoot 'scripts/ucs/Remove-UcsUnusedVlan.ps1'
     Join-Path $repoRoot 'tools/Save-RichoModuleBundle.ps1'
 )
 

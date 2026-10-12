@@ -127,8 +127,9 @@ Invoke-ScriptAnalyzer -Path . -Recurse -Settings ./PSScriptAnalyzerSettings.psd1
 Invoke-Pester -Path ./tests
 ```
 
-The firmware controller also ships standalone suites that need no Pester and no
-vendor modules, so they run anywhere including a locked-down jump host:
+The firmware controller and the UCS VLAN scripts also ship standalone suites
+that need no Pester and no vendor modules, so they run anywhere including a
+locked-down jump host:
 
 ```powershell
 Get-ChildItem ./tests/Test-*.ps1 | ForEach-Object { pwsh -File $_.FullName }
@@ -153,3 +154,6 @@ They are independent, so any one can be run on its own:
 | `Test-IntersightDeployState.ps1` | Which `ConfigState` values mean a deploy is needed |
 | `Test-IntersightFailureKind.ps1` | Auth failure vs. a response the client cannot parse |
 | `Test-ModuleEnumerationCache.ps1` | Module enumeration happens once, not per lookup |
+| `Test-UcsVlanAudit.ps1` | VLAN audit: name resolution per fabric, MAC matching, every protection rule, the manifest |
+| `Test-UcsVlanRemoval.ps1` | VLAN removal: what is refused, live re-checks, order, stops, `-WhatIf` |
+| `Test-UcsVlanEndToEnd.ps1` | Both VLAN scripts run as an operator would, against stub vendor modules |
