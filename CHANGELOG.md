@@ -4099,3 +4099,60 @@ authentication removed, for operators who apply their own
 - Everything else — CDP/LLDP detection, CSV name matching, UCS Manager, batching,
   host profile compliance, cluster health, the Step 27 menu — is byte-identical
   to the main controller and verified so by the parity test.
+
+---
+
+## Test-VMDatastorePlacement.ps1
+
+### [1.0.0] — 2026-10-12
+
+#### Added
+
+- **Reports VMs that live on the wrong PROD, SIT or DEV datastore**, per vSphere
+  cluster. Read-only: nothing in vCenter is changed. Only misplaced VMs are shown; a
+  VM in the right place is not reported.
+
+  The environment a VM belongs to comes from its DNS name first, matched label by
+  label so `dpe` never matches inside `dpesit`:
+
+  | DNS labels | Environment |
+  | --- | --- |
+  | `dpe`, `protected` | PROD |
+  | `dpesit`, `protectedsit` | SIT |
+  | `dpedev`, `protecteddev` | DEV |
+
+  With no DNS name, or one carrying none of those labels, the VM name (then the
+  guest hostname) is read against `siepdXXxxL`: `p` PROD, `t` SIT, `d` DEV.
+
+  A datastore's environment comes from `PROD`, `SIT` or `DEV` in its name as a word
+  of its own, so `SITE2_PROD_01` is PROD and not ambiguous. The home folder and every
+  virtual disk count; a mounted ISO and swap do not.
+
+- **A GUI** — sign in with a domain account, pick a cluster or all clusters,
+  Discover, Export CSV. Misplaced VMs, the classification of every datastore, and a
+  log are on separate tabs.
+
+- **An editable rules grid.** Hostname letters, DNS labels and datastore keywords are
+  all editable per environment. Adding `b` to DEV and clicking *Re-apply rules*
+  re-evaluates the last discovery instantly; *Discover* reads vCenter again. A letter
+  the grid does not know is reported as *Unmapped hostname letter*, so a new one is
+  found rather than missed. Rules that contradict each other — one letter in two
+  environments — are refused rather than resolved.
+
+- **`-NoGui`** for headless runs: writes the CSV and outputs the rows. Every row is
+  stamped with `$ScriptVersion`.
+
+- Templates, vCLS and other ESX Agent Manager VMs, and SRM placeholder VMs are
+  skipped and counted.
+
+- Single file. It does not depend on `Richo.Common`, so it can be copied to a jump
+  host on its own; when the module is loaded, logging goes through `Write-RichoLog`.
+
+#### Tests
+
+- `tests/Test-VMDatastorePlacement.ps1` — 125 assertions: DNS label matching, the
+  hostname fallback, letter remapping, datastore keyword boundaries, multi-datastore
+  VMs, the skip rules, rule validation, CSV round trip, and a headless run end to end
+  against stubbed PowerCLI. Mutating the label matching, the keyword boundary or the
+  unmapped-letter rule each turns it red.
+- `tests/Test-ScriptLint.ps1` now covers this script too.
