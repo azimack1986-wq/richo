@@ -168,7 +168,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.0.1'
 
 $script:GuiLogSink = $null
 $script:Gui = $null
@@ -1675,11 +1675,14 @@ function Invoke-GuiDiscovery {
     # Rules are validated before vCenter is read, so a typo costs nothing.
     [void](ConvertTo-PlacementRuleSet -Definition @(Get-GuiRuleDefinition) -HostnamePattern $script:Gui.Pattern.Text.Trim())
 
-    $targets = if ($selected -eq '(All clusters)') {
-        @($script:GuiState.ClusterViews.Keys | Sort-Object | ForEach-Object { $script:GuiState.ClusterViews[$_] })
+    # Assigned inside each branch, not as "$targets = if ...": assigning an if statement unrolls
+    # its output, so one selected cluster arrived as a bare object and Windows PowerShell 5.1
+    # under StrictMode threw "The property 'Count' cannot be found on this object".
+    if ($selected -eq '(All clusters)') {
+        $targets = @($script:GuiState.ClusterViews.Keys | Sort-Object | ForEach-Object { $script:GuiState.ClusterViews[$_] })
     }
     else {
-        @($script:GuiState.ClusterViews[$selected])
+        $targets = @($script:GuiState.ClusterViews[$selected])
     }
 
     $inventory = New-Object System.Collections.Generic.List[object]

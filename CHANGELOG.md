@@ -4104,6 +4104,31 @@ authentication removed, for operators who apply their own
 
 ## Test-VMDatastorePlacement.ps1
 
+### [1.0.1] — 2026-10-12
+
+#### Fixed
+
+- **Discover failed on Windows PowerShell 5.1 with "The property 'Count' cannot be
+  found on this object"** as soon as one cluster was picked. The clusters to read
+  were chosen with `$targets = if (...) { @(...) } else { @($one) }`, and assigning
+  an `if` statement unrolls its output, so a single cluster arrived as a bare object.
+  PowerShell 7 answers `.Count` on a bare object even under StrictMode, which is why
+  the tests passed; 5.1 throws. `$targets` is now assigned inside each branch.
+
+  Nothing had been read from vCenter at that point: the failure was on the progress
+  text, before the first cluster was discovered.
+
+#### Tests
+
+- `tests/Test-ScriptLint.ps1` rule 9 — `.Count` or `.Length` on a variable assigned
+  from a statement (`if`, `switch`, `foreach`, `try`...). Fails on the 1.0.0 line
+  and passes on every linted script now.
+- `tests/Test-VMDatastorePlacement.ps1` — 160 assertions, 35 new: the GUI's own
+  connect, discover (one cluster and all), re-apply, bad-rules and disconnect
+  handlers, driven through stand-in controls. Windows Forms itself still cannot load
+  in the test, and the run is PowerShell 7, so 5.1's stricter `.Count` is covered by
+  the lint rule rather than by execution.
+
 ### [1.0.0] — 2026-10-12
 
 #### Added

@@ -25,7 +25,9 @@ if ($errors) { throw "parse errors in $scriptPath" }
 $wanted = @('Write-PlacementLog', 'Split-RuleValue', 'ConvertTo-PlacementRuleSet', 'Get-DatastoreEnvironment',
             'Get-DnsEnvironment', 'Get-HostnameEnvironment', 'Resolve-VMExpectedEnvironment', 'Get-PlacementReportColumn',
             'Test-VMPlacement', 'Invoke-PlacementEvaluation', 'Format-PlacementSummary', 'Export-PlacementReport',
-            'Get-ViewProperty', 'Get-DatastoreNameFromPath', 'ConvertTo-PlacementVMRecord', 'ConvertTo-PlacementDataTable')
+            'Get-ViewProperty', 'Get-DatastoreNameFromPath', 'ConvertTo-PlacementVMRecord', 'ConvertTo-PlacementDataTable',
+            'Connect-PlacementVCenter', 'Disconnect-PlacementVCenter', 'Get-PlacementClusterList', 'Get-ClusterPlacementInventory',
+            'Invoke-GuiAction', 'Get-GuiRuleDefinition', 'Invoke-GuiConnect', 'Invoke-GuiDisconnect', 'Invoke-GuiDiscovery', 'Invoke-GuiEvaluation')
 $funcs = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $wanted -contains $_.Name })
 foreach ($f in $funcs) { Invoke-Expression $f.Extent.Text }
@@ -356,11 +358,13 @@ $stub = @{
         )
     }
     Calls = New-Object System.Collections.Generic.List[string]
+    ViewCalls = 0
 }
 function Connect-VIServer { param($Server, $Credential) $stub.Calls.Add("connect $Server"); [pscustomobject]@{ Name = $Server; Version = '8.0.3'; Build = '1'; User = 'DPE\tester' } }
 function Disconnect-VIServer { param($Server, [switch]$Confirm) $stub.Calls.Add("disconnect $($Server.Name)") }
 function Get-View {
     param($Server, $ViewType, $Id, $SearchRoot, $Property)
+    $stub.ViewCalls = $stub.ViewCalls + 1
     if ($ViewType -eq 'ClusterComputeResource') { return $stub.Clusters }
     if ($ViewType -eq 'VirtualMachine') { return $stub.VMs[$SearchRoot.Value] }
     if ($null -ne $Id) {
@@ -394,6 +398,112 @@ $message = try { & $scriptPath -NoGui -Server 'vc.example' -Credential $cred -Cl
 Assert-True "an unknown cluster names the clusters that do exist" ($message -match 'CL-DEV-01, CL-PROD-01')
 Assert-True "  and still disconnects" ($stub.Calls.ToArray() -contains 'disconnect vc.example')
 Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------------------------------
+Write-Host "`n=== GUI flow - connect, discover, re-apply, disconnect - with stand-in controls ===" -ForegroundColor Cyan
+# Windows Forms cannot load here, so the controls the GUI functions read and write are stood in by
+# plain objects with the same members, and the three functions that touch Windows Forms types
+# directly (busy cursor, message box) are stubbed. Everything else is the script's own code. This
+# is the path that failed live in 1.0.0: one cluster picked, Discover clicked.
+function Enter-GuiBusyState { param([string]$Text = 'Working...') $script:GuiState.Busy = $true; $busyTexts.Add($Text) }
+function Exit-GuiBusyState { $script:GuiState.Busy = $false }
+function Show-GuiMessage { param([string]$Text, [string]$Icon = 'Information') $messages.Add("${Icon}: $Text") }
+$busyTexts = New-Object System.Collections.Generic.List[string]
+$messages = New-Object System.Collections.Generic.List[string]
+
+function New-StubRulesRow([string]$Environment, [string]$Letters, [string]$DnsLabels, [string]$Keywords) {
+    [pscustomobject]@{ IsNewRow = $false; Cells = @{
+            Environment = [pscustomobject]@{ Value = $Environment }; Letters = [pscustomobject]@{ Value = $Letters }
+            DnsLabels = [pscustomobject]@{ Value = $DnsLabels }; DatastoreKeywords = [pscustomobject]@{ Value = $Keywords } } }
+}
+$rulesRows = @(
+    (New-StubRulesRow 'PROD' 'p' 'dpe, protected' 'PROD')
+    (New-StubRulesRow 'SIT' 't' 'dpesit, protectedsit' 'SIT')
+    (New-StubRulesRow 'DEV' 'd' 'dpedev, protecteddev' 'DEV')
+)
+$clusterList = [pscustomobject]@{ Items = (New-Object System.Collections.ArrayList); SelectedIndex = -1; Enabled = $true }
+$clusterList | Add-Member -MemberType ScriptProperty -Name SelectedItem -Value { if ($this.SelectedIndex -ge 0 -and $this.SelectedIndex -lt $this.Items.Count) { $this.Items[$this.SelectedIndex] } }
+$password = [pscustomobject]@{ Text = 'secret'; TextLength = 6 }
+$password | Add-Member -MemberType ScriptMethod -Name Clear -Value { $this.Text = ''; $this.TextLength = 0 }
+$rulesGrid = [pscustomobject]@{ Rows = $rulesRows }
+$rulesGrid | Add-Member -MemberType ScriptMethod -Name EndEdit -Value { $true }
+
+$script:Gui = @{
+    Server = [pscustomobject]@{ Text = ' vc.example ' }
+    User = [pscustomobject]@{ Text = 'DPE\tester' }
+    Password = $password
+    ClusterList = $clusterList
+    ConnectionLabel = [pscustomobject]@{ Text = '' }
+    Status = [pscustomobject]@{ Text = '' }
+    Pattern = [pscustomobject]@{ Text = $defaultPattern }
+    NfsOnly = [pscustomobject]@{ Checked = $false }
+    FlagUnclassified = [pscustomobject]@{ Checked = $false }
+    ShowUndetermined = [pscustomobject]@{ Checked = $true }
+    ResultsGrid = [pscustomobject]@{ DataSource = $null }
+    DatastoreGrid = [pscustomobject]@{ DataSource = $null }
+    ResultsTab = [pscustomobject]@{ Text = '' }
+    DatastoreTab = [pscustomobject]@{ Text = '' }
+    RulesGrid = $rulesGrid
+}
+$script:GuiState = @{ Connection = $null; Inventory = $null; Result = $null; Scope = ''; Busy = $false; ClusterViews = @{}; SuppliedCredential = $null; ScriptVersion = 'gui-test' }
+
+$stub.Calls.Clear()
+Invoke-GuiAction { Invoke-GuiConnect } 6>$null
+Assert-True "connect: no error shown" ($messages.Count -eq 0) ($messages.ToArray() -join ' | ')
+Assert-True "connect: signs in to the trimmed server name" ($stub.Calls.ToArray() -contains 'connect vc.example')
+Assert-True "connect: password box cleared" ($password.TextLength -eq 0 -and $password.Text -eq '')
+Assert-True "connect: cluster list is All plus each cluster, sorted" (($clusterList.Items.ToArray() -join ',') -eq '(All clusters),CL-DEV-01,CL-PROD-01')
+Assert-True "connect: first real cluster preselected" ($clusterList.SelectedItem -eq 'CL-DEV-01')
+Assert-True "connect: label names the account and cluster count" ($script:Gui.ConnectionLabel.Text -match 'DPE\\tester - 2 cluster')
+
+# The 1.0.0 failure: ONE cluster selected, then Discover.
+$clusterList.SelectedIndex = 2
+$busyTexts.Clear(); $messages.Clear()
+Invoke-GuiAction { Invoke-GuiDiscovery } 6>$null
+Assert-True "discover one cluster: no error shown" ($messages.Count -eq 0) ($messages.ToArray() -join ' | ')
+Assert-True "discover one cluster: progress reads 1 of 1" ($busyTexts.ToArray() -contains 'Discovering CL-PROD-01 (1 of 1)...') ($busyTexts.ToArray() -join ' | ')
+Assert-True "discover one cluster: only that cluster's misplaced VM" ((@($script:GuiState.Result.Findings | ForEach-Object { $_.VMName }) -join ',') -eq 'siepd85csd02')
+Assert-True "discover one cluster: grid holds the row, tab shows the count" ($script:Gui.ResultsGrid.DataSource.Rows.Count -eq 1 -and $script:Gui.ResultsTab.Text -eq 'Misplaced VMs (1)')
+Assert-True "discover one cluster: datastores tab filled" ($script:Gui.DatastoreGrid.DataSource.Rows.Count -eq 2 -and $script:Gui.DatastoreTab.Text -eq 'Datastores (2)')
+Assert-True "discover one cluster: status bar summarises" ($script:Gui.Status.Text -match '^CL-PROD-01: 1 cluster\(s\), 2 VMs: 1 correct, 1 reported')
+Assert-True "discover one cluster: rows stamped with the version" (@($script:GuiState.Result.Findings | Where-Object { $_.ScriptVersion -ne 'gui-test' }).Count -eq 0)
+
+$clusterList.SelectedIndex = 0
+$busyTexts.Clear(); $messages.Clear()
+Invoke-GuiAction { Invoke-GuiDiscovery } 6>$null
+Assert-True "discover all: no error shown" ($messages.Count -eq 0) ($messages.ToArray() -join ' | ')
+Assert-True "discover all: progress reads 1 of 2, 2 of 2" ((@($busyTexts.ToArray() | Where-Object { $_ -like 'Discovering*' }) -join ' | ') -eq 'Discovering CL-DEV-01 (1 of 2)... | Discovering CL-PROD-01 (2 of 2)...')
+Assert-True "discover all: both clusters' misplaced VMs" ($script:GuiState.Result.Findings.Count -eq 2)
+
+# Re-apply after editing the grid: letter p moved to DEV. No vCenter read.
+$viewCallsBefore = $stub.ViewCalls
+$rulesRows[0].Cells.Letters.Value = ''
+$rulesRows[2].Cells.Letters.Value = 'd, p'
+$messages.Clear()
+Invoke-GuiAction { Invoke-GuiEvaluation } 6>$null
+Assert-True "re-apply: no error shown" ($messages.Count -eq 0) ($messages.ToArray() -join ' | ')
+Assert-True "re-apply: p on a DEV datastore is now correct" ((@($script:GuiState.Result.Findings | ForEach-Object { $_.VMName }) -join ',') -eq 'siepd85csd02')
+Assert-True "re-apply: vCenter was not read again" ($stub.ViewCalls -eq $viewCallsBefore)
+
+# A contradictory grid is refused with a message, and the last good result stays on screen.
+$rulesRows[0].Cells.Letters.Value = 'p'
+$messages.Clear()
+Invoke-GuiAction { Invoke-GuiEvaluation } 6>$null 3>$null
+Assert-True "re-apply bad rules: refused with a message" ($messages.Count -eq 1 -and $messages[0] -match "'p' is mapped to both PROD and DEV")
+Assert-True "re-apply bad rules: status says it failed" ($script:Gui.Status.Text -eq 'Failed - see the Log tab.')
+Assert-True "re-apply bad rules: last result kept" ($script:GuiState.Result.Findings.Count -eq 1)
+$rulesRows[2].Cells.Letters.Value = 'd'
+
+$script:GuiState.Busy = $true
+$ran = $false
+Invoke-GuiAction { $script:ran = $true }
+Assert-True "a click while busy does not start a second run" (-not $ran)
+$script:GuiState.Busy = $false
+
+$stub.Calls.Clear()
+Invoke-GuiAction { Invoke-GuiDisconnect } 6>$null
+Assert-True "disconnect: signs out and empties the cluster list" (($stub.Calls.ToArray() -join ',') -eq 'disconnect vc.example' -and $clusterList.Items.Count -eq 0 -and $null -eq $script:GuiState.Connection)
+Assert-True "disconnect: results stay exportable" ($null -ne $script:GuiState.Result)
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

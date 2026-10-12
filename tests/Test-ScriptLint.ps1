@@ -314,6 +314,44 @@ foreach ($path in $targets) {
             }
     )
     Assert-NoFindings "every helper it calls is defined in this script" $foreignCalls
+
+    # --- 9. .Count on a variable assigned from a statement -------------------------------------
+    # SHIPPED AND HIT ON A LIVE RUN. Test-VMDatastorePlacement 1.0.0 picked its clusters with
+    #
+    #     $targets = if ($all) { @(...) } else { @($one) }
+    #
+    # and read $targets.Count. Assigning a statement (if, switch, foreach, try...) collects its
+    # OUTPUT, and output unrolls - so the @() around one cluster was undone and $targets held a
+    # bare object. PowerShell 7 answers .Count on a bare object even under StrictMode; Windows
+    # PowerShell 5.1 throws "The property 'Count' cannot be found on this object". The tests ran
+    # on 7, the jump host runs 5.1, and the GUI died on its first Discover.
+    #
+    # Assign inside each branch instead, or wrap the whole statement: $x = @(if (...) { ... }).
+    $unrollingStatements = @('IfStatementAst', 'SwitchStatementAst', 'ForEachStatementAst', 'ForStatementAst',
+        'WhileStatementAst', 'DoWhileStatementAst', 'DoUntilStatementAst', 'TryStatementAst')
+    $countOnUnrolled = @(
+        $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.MemberExpressionAst] }, $true) |
+            Where-Object {
+                $_.Member -is [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                @('Count', 'Length') -contains $_.Member.Value -and
+                $_.Expression -is [System.Management.Automation.Language.VariableExpressionAst]
+            } |
+            ForEach-Object {
+                $access = $_
+                $name = $access.Expression.VariablePath.UserPath.ToLower()
+                $scope = Get-EnclosingScope -Node $access -Functions $allFunctions -Root $ast
+                $source = @($scope.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+                    Where-Object {
+                        $target = $_.Left -as [System.Management.Automation.Language.VariableExpressionAst]
+                        $null -ne $target -and $target.VariablePath.UserPath.ToLower() -eq $name -and
+                        $unrollingStatements -contains $_.Right.GetType().Name
+                    })
+                if ($source.Count -gt 0) {
+                    "line $($access.Extent.StartLineNumber): `$$($access.Expression.VariablePath.UserPath).$($access.Member.Value), but it is assigned from a statement on line $($source[0].Extent.StartLineNumber) - one item arrives as a bare object and 5.1 StrictMode throws"
+                }
+            }
+    )
+    Assert-NoFindings "no .Count on a variable assigned from a statement" $countOnUnrolled
 }
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
