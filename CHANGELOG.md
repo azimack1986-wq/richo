@@ -4104,6 +4104,36 @@ authentication removed, for operators who apply their own
 
 ## Test-VMDatastorePlacement.ps1
 
+### [1.5.0] — 2026-10-13
+
+#### Added
+
+- **A banner across the top of the window: the tool's name, and where you are.**
+  - **Title:** *VM Datastore Placement*, with the version and what it does.
+  - **Location line:** vCenter, datacenter of the selected cluster, cluster, site,
+    and signed-in account, e.g. `vCenter: siepd85vcs01…  |  Datacenter: DC-85  |
+    Cluster: CL-PROD-01  |  Site: 85  |  Signed in as: DPE\you`. With *(All
+    clusters)* it lists every datacenter and the cluster count.
+  - **Results line:** which cluster the grids came from and when. It warns when that
+    is *not* the cluster selected below, so results from one cluster can't be taken
+    for another's.
+
+  The banner refreshes on connect, disconnect, discovery, re-apply and as soon as
+  another cluster is picked. It is amber under `-WhatIf`, with *PREVIEW ONLY*. The
+  site is read from a `siepdXX` vCenter or cluster name and left out when neither has
+  one.
+- **Each cluster carries its datacenter.** Clusters are listed per datacenter (one
+  extra call per datacenter), so nested host folders are covered. Headless runs log
+  the vCenter and datacenters too.
+- **The migration confirmation names the vCenter** in its title and its question.
+
+#### Tests
+
+- `tests/Test-VMDatastorePlacement.ps1` — 369 assertions. The stubbed vCenter has two
+  datacenters. Mutation-checked: dropping the "not the cluster selected" warning, the
+  refresh on selection, the right datacenter per cluster, and the vCenter in the
+  confirmation each turn it red.
+
 ### [1.4.0] — 2026-10-13
 
 #### Added

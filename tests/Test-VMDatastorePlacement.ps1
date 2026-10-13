@@ -36,6 +36,7 @@ $wanted = @('Write-PlacementLog', 'Split-RuleValue', 'ConvertTo-PlacementRuleSet
             'Get-ViewProperty', 'Get-DatastoreNameFromPath', 'Format-PlacementNameList', 'ConvertTo-PlacementVMRecord', 'ConvertTo-PlacementDataTable',
             'Connect-PlacementVCenter', 'Disconnect-PlacementVCenter', 'Get-PlacementClusterList', 'Get-ClusterPlacementInventory',
             'Get-PlacementStorageInfo', 'Get-PlacementTaskState', 'Invoke-PlacementMigration',
+            'Get-PlacementSite', 'Format-PlacementLocation', 'Show-GuiLocation',
             'Invoke-GuiAction', 'Get-GuiRuleDefinition', 'Invoke-GuiConnect', 'Invoke-GuiDisconnect', 'Invoke-GuiDiscovery',
             'Invoke-GuiEvaluation', 'Get-GuiActiveTable', 'Show-GuiMigrationProgress', 'Invoke-GuiMigration')
 $funcs = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
@@ -557,6 +558,10 @@ function New-DatastoreView { param($Ref, $Name, $Type = 'NFS', $Pod = '', [doubl
 function New-World {
     $refs = { param([string[]]$Values) @($Values | ForEach-Object { New-Ref 'Datastore' $_ }) }
     @{
+        Datacenters = @(
+            [pscustomobject]@{ Name = 'DC-85'; MoRef = (New-Ref 'Datacenter' 'datacenter-1'); ClusterRefs = @('domain-c1') }
+            [pscustomobject]@{ Name = 'DC-86'; MoRef = (New-Ref 'Datacenter' 'datacenter-2'); ClusterRefs = @('domain-c2') }
+        )
         Clusters = @(
             [pscustomobject]@{ Name = 'CL-PROD-01'; MoRef = (New-Ref 'ClusterComputeResource' 'domain-c1'); Datastore = (& $refs 'ds-1', 'ds-2', 'ds-4', 'ds-5', 'ds-6', 'ds-7'); Host = @((New-Ref 'HostSystem' 'host-1')) }
             [pscustomobject]@{ Name = 'CL-DEV-01'; MoRef = (New-Ref 'ClusterComputeResource' 'domain-c2'); Datastore = (& $refs 'ds-2', 'ds-3'); Host = @((New-Ref 'HostSystem' 'host-2')) }
@@ -623,7 +628,12 @@ function Disconnect-VIServer { param($Server, [switch]$Confirm, [switch]$WhatIf)
 function Get-View {
     param($Server, $ViewType, $Id, $SearchRoot, $Property)
     $world.ViewCalls = $world.ViewCalls + 1
-    if ($ViewType -eq 'ClusterComputeResource') { return $world.Clusters }
+    if ($ViewType -eq 'Datacenter') { return $world.Datacenters }
+    if ($ViewType -eq 'ClusterComputeResource') {
+        if ($null -eq $SearchRoot) { throw 'stub Get-View: clusters are listed per datacenter' }
+        $dc = @($world.Datacenters | Where-Object { $_.MoRef.Value -eq $SearchRoot.Value })[0]
+        return @($world.Clusters | Where-Object { $dc.ClusterRefs -contains $_.MoRef.Value })
+    }
     if ($ViewType -eq 'VirtualMachine') { return $world.VMs[$SearchRoot.Value] }
     if ($null -ne $Id) {
         $all = @($world.Clusters) + @($world.Datastores) + @($world.Pods) + @($world.Hosts)
@@ -723,6 +733,17 @@ Assert-True "stop: the running move finishes" ($out[0].Result -eq 'Migrated')
 Assert-True "stop: nothing new starts" ($world.Moves.Count -eq 1 -and (@($out[1..3] | ForEach-Object { $_.Result }) -join ',') -eq 'Not started,Not started,Not started')
 
 # ---------------------------------------------------------------------------------------------
+Write-Host "`n=== Where you are: the banner's location line ===" -ForegroundColor Cyan
+Assert-True "site from a siepdXX vCenter name" ((Get-PlacementSite -Name 'siepd85vcs01.dpe.protected.mil.au', 'CL-PROD-01') -eq '85')
+Assert-True "site from the cluster when the vCenter name has none" ((Get-PlacementSite -Name 'vcenter01.corp', 'SIEPD12-CL01') -eq '12')
+Assert-True "no site when neither name has one" ((Get-PlacementSite -Name 'vcenter01', '', 'CL-PROD-01') -eq '')
+Assert-True "not connected: says so, and what the line will show" ((Format-PlacementLocation) -match '^Not connected - sign in below')
+$line = Format-PlacementLocation -VCenter 'siepd85vcs01' -User 'DPE\me' -Datacenter 'DC-85', 'DC-86' -Cluster 'CL-PROD-01' -ClusterDatacenter 'DC-85' -ClusterCount 4 -Site '85'
+Assert-True "one cluster: vCenter, its datacenter, cluster, site, account" ($line -eq 'vCenter: siepd85vcs01   |   Datacenter: DC-85   |   Cluster: CL-PROD-01   |   Site: 85   |   Signed in as: DPE\me') $line
+$line = Format-PlacementLocation -VCenter 'vc01' -Datacenter 'DC-85', 'DC-86' -Cluster '(All clusters)' -ClusterCount 4
+Assert-True "all clusters: every datacenter, and how many clusters" ($line -eq 'vCenter: vc01   |   Datacenter: DC-85, DC-86   |   Cluster: all 4') $line
+
+# ---------------------------------------------------------------------------------------------
 Write-Host "`n=== Argument checks before any connection ===" -ForegroundColor Cyan
 function Get-RunError { param([hashtable]$Arguments)
     try { & $scriptPath @Arguments 6>$null 2>$null 3>$null; '' } catch { $_.Exception.Message }
@@ -758,6 +779,8 @@ Assert-True "suggested: none for the PROD VMs on a host with no PROD datastore -
 $unscopedCsv = @(Import-Csv -Path (Join-Path $tmp 'run_NotOnProdSitDev.csv'))
 Assert-True "the Not on PROD/SIT/DEV CSV holds the VM on NFS_MISC_01" ($unscopedCsv.Count -eq 1 -and $unscopedCsv[0].VMName -eq 'siepd85csp08')
 Assert-True "connected once and disconnected once" (($world.Calls.ToArray() -join ',') -eq 'connect vc.example,disconnect vc.example') "got $($world.Calls.ToArray() -join ',')"
+$logged = @(& $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv 6>&1 | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
+Assert-True "headless logs where it is: vCenter and datacenters" (@($logged | Where-Object { $_ -match 'Location: vCenter vc\.example, datacenter\(s\) DC-85, DC-86\.' }).Count -eq 1)
 Assert-True "nothing was moved" ($world.Moves.Count -eq 0)
 
 $world = New-World
@@ -835,7 +858,7 @@ function Show-MigrationDialog {
     }
     [pscustomobject]@{ Mode = $script:dialogMode; Targets = $picked; MaxConcurrent = 2; MinFreeSpacePercent = 10 }
 }
-function Confirm-GuiMigration { param($Plan, $MaxConcurrent) $script:confirmAsked++; $script:confirmAnswer }
+function Confirm-GuiMigration { param($Plan, $MaxConcurrent, $VCenter) $script:confirmAsked++; $script:confirmVCenter = $VCenter; $script:confirmAnswer }
 $busyTexts = New-Object System.Collections.Generic.List[string]
 $messages = New-Object System.Collections.Generic.List[string]
 
@@ -864,6 +887,8 @@ $script:Gui = @{
     Password = $password
     ClusterList = $clusterList
     ConnectionLabel = [pscustomobject]@{ Text = '' }
+    Location = [pscustomobject]@{ Text = '' }
+    OnScreen = [pscustomobject]@{ Text = '' }
     Status = [pscustomobject]@{ Text = '' }
     Pattern = [pscustomobject]@{ Text = $defaultPattern }
     FlagUnclassified = [pscustomobject]@{ Checked = $false }
@@ -883,6 +908,8 @@ $script:GuiState = @{ Connection = $null; Inventory = $null; Result = $null; Mig
     ClusterViews = @{}; SuppliedCredential = $null; ScriptVersion = 'gui-test'; ExcludeTypes = @('VMFS'); MaxConcurrent = 2; MinFreePercent = 10 }
 
 $world = New-World
+Show-GuiLocation
+Assert-True "banner before sign-in: not connected" ($script:Gui.Location.Text -match '^Not connected' -and $script:Gui.OnScreen.Text -match '^No results on screen yet')
 Invoke-GuiAction { Invoke-GuiConnect } 6>$null
 Assert-True "connect: no error shown" ($messages.Count -eq 0) ($messages.ToArray() -join ' | ')
 Assert-True "connect: signs in to the trimmed server name" ($world.Calls.ToArray() -contains 'connect vc.example')
@@ -890,6 +917,8 @@ Assert-True "connect: password box cleared" ($password.TextLength -eq 0 -and $pa
 Assert-True "connect: cluster list is All plus each cluster, sorted" (($clusterList.Items.ToArray() -join ',') -eq '(All clusters),CL-DEV-01,CL-PROD-01')
 Assert-True "connect: first real cluster preselected" ($clusterList.SelectedItem -eq 'CL-DEV-01')
 Assert-True "connect: label names the account and cluster count" ($script:Gui.ConnectionLabel.Text -match 'DPE\\tester - 2 cluster')
+Assert-True "connect: banner shows the vCenter, the selected cluster's datacenter, the cluster and the account" ($script:Gui.Location.Text -eq 'vCenter: vc.example   |   Datacenter: DC-86   |   Cluster: CL-DEV-01   |   Signed in as: DPE\tester') $script:Gui.Location.Text
+Assert-True "connect: each cluster knows its datacenter" ($script:GuiState.ClusterViews['CL-PROD-01'].Datacenter -eq 'DC-85' -and $script:GuiState.ClusterViews['CL-DEV-01'].Datacenter -eq 'DC-86')
 
 # The 1.0.0 failure: ONE cluster selected, then Discover.
 $clusterList.SelectedIndex = 2
@@ -900,6 +929,12 @@ Assert-True "discover one cluster: progress reads 1 of 1" ($busyTexts.ToArray() 
 Assert-True "discover one cluster: misplaced tab" ((Get-Names $script:GuiState.Result.Findings) -eq 'siepd85csd02,siepd85csp07' -and $resultsTab.Text -eq 'Misplaced VMs (2)')
 Assert-True "discover one cluster: Not on PROD/SIT/DEV tab" ((Get-Names $script:GuiState.Result.Unscoped) -eq 'siepd85csp08' -and $unscopedTab.Text -eq 'Not on PROD/SIT/DEV (1)' -and $script:Gui.UnscopedGrid.DataSource.Rows.Count -eq 1)
 Assert-True "discover one cluster: grids carry the hidden VMId" ($script:Gui.ResultsGrid.DataSource.Columns.Contains('VMId') -and $script:GuiState.FindingById.ContainsKey('vm-2') -and $script:GuiState.FindingById.ContainsKey('vm-8'))
+Assert-True "discover one cluster: banner says which cluster the results are from" ($script:Gui.Location.Text -match 'Datacenter: DC-85   \|   Cluster: CL-PROD-01' -and $script:Gui.OnScreen.Text -match '^Results on screen: CL-PROD-01, discovered \d\d:\d\d:\d\d$') "$($script:Gui.Location.Text) / $($script:Gui.OnScreen.Text)"
+$clusterList.SelectedIndex = 1
+Show-GuiLocation
+Assert-True "picking another cluster: the banner warns the results are not from it" ($script:Gui.Location.Text -match 'Cluster: CL-DEV-01' -and $script:Gui.OnScreen.Text -match 'NOT the cluster selected below\. Click Discover to read CL-DEV-01\.') $script:Gui.OnScreen.Text
+$clusterList.SelectedIndex = 2
+Show-GuiLocation
 Assert-True "discover one cluster: datastores tab leaves VMFS out" ($script:Gui.DatastoreGrid.DataSource.Rows.Count -eq 5 -and @($script:Gui.DatastoreGrid.DataSource.Rows | Where-Object { $_['Datastore'] -eq 'LOCAL_ESX01' }).Count -eq 0)
 Assert-True "discover one cluster: status bar summarises - the stale-marked VM counted as a full VM" ($script:Gui.Status.Text -match '^CL-PROD-01: 1 cluster\(s\), 6 full VMs: 3 correct, 2 misplaced') $script:Gui.Status.Text
 Assert-True "discover one cluster: the placeholder and the VMFS-only VM are counted as not shown" ($script:Gui.Status.Text -match '1 SRM placeholder\(s\), 0 with no disks, 1 only on VMFS datastores') $script:Gui.Status.Text
@@ -909,6 +944,7 @@ $busyTexts.Clear(); $messages.Clear()
 Invoke-GuiAction { Invoke-GuiDiscovery } 6>$null
 Assert-True "discover all: no error shown" ($messages.Count -eq 0) ($messages.ToArray() -join ' | ')
 Assert-True "discover all: progress reads 1 of 2, 2 of 2" ((@($busyTexts.ToArray() | Where-Object { $_ -like 'Discovering*' }) -join ' | ') -eq 'Discovering CL-DEV-01 (1 of 2)... | Discovering CL-PROD-01 (2 of 2)...')
+Assert-True "discover all: banner lists both datacenters" ($script:Gui.Location.Text -match 'Datacenter: DC-85, DC-86   \|   Cluster: all 2' -and $script:Gui.OnScreen.Text -match '^Results on screen: \(All clusters\)') $script:Gui.Location.Text
 Assert-True "discover all: both clusters' misplaced VMs, the -P one included" ((Get-Names $script:GuiState.Result.Findings) -eq 'siepd85csd02,siepd85csp03,siepd85csp07,SQLCLUSTER01-P')
 
 # Re-apply after editing the grid: letter p moved to DEV. No vCenter read.
@@ -989,6 +1025,7 @@ $viewCallsBefore = $world.ViewCalls
 $messages.Clear()
 Invoke-GuiAction { Invoke-GuiMigration } 6>$null
 Assert-True "migrate selected: only the selected VM moves, to DEV" (($world.Moves.ToArray() -join ',') -eq 'vm-2->ds-2')
+Assert-True "migrate selected: the confirmation named the vCenter" ($script:confirmVCenter -eq 'vc.example')
 Assert-True "migrate selected: result Migrated" ((@($script:GuiState.Migrations | ForEach-Object { "$($_.VMName)=$($_.Result)" }) -join ',') -eq 'siepd85csd02=Migrated')
 Assert-True "migrate selected: the cluster is re-discovered and the VM is gone from the list" ($world.ViewCalls -gt $viewCallsBefore -and (Get-Names $script:GuiState.Result.Findings) -eq 'siepd85csp03,siepd85csp07,SQLCLUSTER01-P')
 Assert-True "migrate selected: not left in a migrating state" (-not $script:GuiState.Migrating)
@@ -1026,6 +1063,7 @@ $world.Calls.Clear()
 Invoke-GuiAction { Invoke-GuiDisconnect } 6>$null
 Assert-True "disconnect: signs out and empties the cluster list" (($world.Calls.ToArray() -join ',') -eq 'disconnect vc.example' -and $clusterList.Items.Count -eq 0 -and $null -eq $script:GuiState.Connection)
 Assert-True "disconnect: results stay exportable" ($null -ne $script:GuiState.Result)
+Assert-True "disconnect: banner says not connected" ($script:Gui.Location.Text -match '^Not connected')
 $messages.Clear()
 Invoke-GuiAction { Invoke-GuiMigration -All } 6>$null 3>$null
 Assert-True "disconnected: migration refused" ($messages.Count -eq 1 -and $messages[0] -match 'Connect to vCenter first')
@@ -1043,6 +1081,14 @@ Assert-True "idle clears UseWaitCursor and puts the pointer back at once" ($exit
 $grids = @([regex]::Matches($guiFunctions['Show-PlacementGui'], '\$script:Gui\.(\w+Grid) = ') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
 $missing = @($grids | Where-Object { $exitText -notmatch "'$_'" })
 Assert-True "idle resets the cursor of every grid the window creates ($($grids -join ', '))" ($grids.Count -ge 5 -and $missing.Count -eq 0) "missing: $($missing -join ', ')"
+Write-Host "`n=== The banner is in the window and kept current ===" -ForegroundColor Cyan
+$guiText = $guiFunctions['Show-PlacementGui']
+Assert-True "the window has a banner naming the tool, as its first row" ($guiText -match "'VM Datastore Placement'" -and $guiText -match '\$layout\.Controls\.Add\(\$banner, 0, 0\)')
+Assert-True "the banner turns amber under -WhatIf and says preview only" ($guiText -match 'if \(\$script:WhatIfRun\) \{\s+\$banner\.BackColor' -and $guiText -match 'PREVIEW ONLY')
+Assert-True "the banner refreshes when the cluster selection changes" ($guiText -match 'ClusterList\.Add_SelectedIndexChanged\(\{ Show-GuiLocation \}\)')
+foreach ($name in @('Invoke-GuiConnect', 'Invoke-GuiDisconnect', 'Invoke-GuiEvaluation')) {
+    Assert-True "$name refreshes the banner" ($guiFunctions[$name] -match 'Show-GuiLocation')
+}
 Assert-True "nothing else in the script sets a wait cursor" (@([regex]::Matches((Get-Content -Path $scriptPath -Raw), 'Cursors\]::WaitCursor')).Count -eq 0)
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })

@@ -88,6 +88,12 @@
     A VM protected by SRM with array-based replication leaves its replicated datastore when it is
     moved. Check its protection group afterwards.
 
+    WHERE YOU ARE. A banner across the top of the window names the tool and shows the vCenter you
+    are signed in to, the datacenter and cluster selected, the site (read from a siepdXX name of the
+    vCenter or cluster) and the account - and which cluster the results on screen came from, warning
+    when that is not the one selected. It turns amber when the script was started with -WhatIf.
+    The migration confirmation names the vCenter too.
+
     Requirements: VMware PowerCLI (VMware.VimAutomation.Core). Migration needs the vCenter privileges
     to relocate VMs. The GUI needs Windows and an STA console - powershell.exe or pwsh launched
     normally. VS Code's integrated console can run MTA; use -NoGui there, or a normal console window.
@@ -261,7 +267,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.4.0'
+$ScriptVersion = '1.5.0'
 
 $script:GuiLogSink = $null
 $script:Gui = $null
@@ -2159,7 +2165,11 @@ function Disconnect-PlacementVCenter {
 function Get-PlacementClusterList {
     <#
     .SYNOPSIS
-        Lists the clusters in the connected vCenter, by name.
+        Lists the clusters in the connected vCenter, by name, each with the datacenter it is in.
+
+    .DESCRIPTION
+        One call for the datacenters, then one per datacenter for the clusters under it - so
+        clusters in nested host folders are found too. Returns Name, MoRef and Datacenter.
 
     .PARAMETER Server
         Connection from Connect-PlacementVCenter.
@@ -2173,7 +2183,13 @@ function Get-PlacementClusterList {
         [object]$Server
     )
 
-    @(Get-View -Server $Server -ViewType ClusterComputeResource -Property 'Name') | Sort-Object -Property Name
+    $clusters = New-Object System.Collections.Generic.List[object]
+    foreach ($datacenter in @(Get-View -Server $Server -ViewType Datacenter -Property 'Name')) {
+        foreach ($cluster in @(Get-View -Server $Server -ViewType ClusterComputeResource -SearchRoot $datacenter.MoRef -Property 'Name')) {
+            $clusters.Add([pscustomobject]@{ Name = [string]$cluster.Name; MoRef = $cluster.MoRef; Datacenter = [string]$datacenter.Name })
+        }
+    }
+    $clusters.ToArray() | Sort-Object -Property Name
 }
 
 function Get-ClusterPlacementInventory {
@@ -2631,6 +2647,158 @@ function Invoke-PlacementMigration {
 # GUI
 # =============================================================================================
 
+function Get-PlacementSite {
+    <#
+    .SYNOPSIS
+        The site number from the first name that follows the siepdXX naming standard.
+
+    .PARAMETER Name
+        Names to try, in order - e.g. the vCenter, then the cluster.
+
+    .EXAMPLE
+        Get-PlacementSite -Name 'siepd85vcs01.dpe.protected.mil.au', 'CL-PROD-01'
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]]$Name
+    )
+
+    foreach ($candidate in $Name) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        $short = ($candidate.Trim() -split '\.')[0]
+        if ($short -match '(?i)^siepd(?<site>\d{2})') { return $Matches['site'] }
+    }
+    ''
+}
+
+function Format-PlacementLocation {
+    <#
+    .SYNOPSIS
+        The "where am I" line for the banner: vCenter, datacenter, cluster, site, account.
+
+    .PARAMETER VCenter
+        vCenter signed in to; empty when not connected.
+
+    .PARAMETER User
+        Account signed in as.
+
+    .PARAMETER Datacenter
+        Every datacenter in the vCenter.
+
+    .PARAMETER Cluster
+        Cluster selected, or '(All clusters)'.
+
+    .PARAMETER ClusterDatacenter
+        Datacenter of the selected cluster.
+
+    .PARAMETER ClusterCount
+        Clusters in the vCenter.
+
+    .PARAMETER Site
+        Site number, when known.
+
+    .EXAMPLE
+        Format-PlacementLocation -VCenter vc01 -User 'DPE\me' -Cluster CL01 -ClusterDatacenter DC-85
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string]$VCenter = '',
+
+        [AllowEmptyString()]
+        [string]$User = '',
+
+        [AllowEmptyCollection()]
+        [string[]]$Datacenter = @(),
+
+        [AllowEmptyString()]
+        [string]$Cluster = '',
+
+        [AllowEmptyString()]
+        [string]$ClusterDatacenter = '',
+
+        [int]$ClusterCount = 0,
+
+        [AllowEmptyString()]
+        [string]$Site = ''
+    )
+
+    if (-not $VCenter) {
+        return 'Not connected - sign in below. This line then shows the vCenter, datacenter, cluster and site you are working on.'
+    }
+    $parts = New-Object System.Collections.Generic.List[string]
+    $parts.Add("vCenter: $VCenter")
+    $datacenters = @($Datacenter | Where-Object { $_ })
+    if ($Cluster -eq '(All clusters)') {
+        if ($datacenters.Count -gt 0) { $parts.Add("Datacenter: $($datacenters -join ', ')") }
+        $parts.Add("Cluster: all $ClusterCount")
+    }
+    elseif ($Cluster) {
+        if ($ClusterDatacenter) { $parts.Add("Datacenter: $ClusterDatacenter") }
+        $parts.Add("Cluster: $Cluster")
+    }
+    elseif ($datacenters.Count -gt 0) {
+        $parts.Add("Datacenter: $($datacenters -join ', ')")
+    }
+    if ($Site) { $parts.Add("Site: $Site") }
+    if ($User) { $parts.Add("Signed in as: $User") }
+    $parts.ToArray() -join '   |   '
+}
+
+function Show-GuiLocation {
+    <#
+    .SYNOPSIS
+        Refreshes the banner: where you are, and which cluster the results on screen came from.
+
+    .DESCRIPTION
+        Never throws - it runs from the cluster list's selection change as well as after connect,
+        disconnect and discovery, and a banner must not be what breaks the window.
+
+    .EXAMPLE
+        Show-GuiLocation
+    #>
+    [CmdletBinding()]
+    param()
+
+    try {
+        $connection = $script:GuiState.Connection
+        $vCenter = ''
+        $user = ''
+        if ($null -ne $connection) {
+            $vCenter = [string]$connection.Name
+            $user = [string]$connection.User
+        }
+        $selected = [string]$script:Gui.ClusterList.SelectedItem
+        $views = @($script:GuiState.ClusterViews.Values)
+        $datacenters = @($views | ForEach-Object { [string]$_.Datacenter } | Where-Object { $_ } | Sort-Object -Unique)
+        $clusterDatacenter = ''
+        if ($selected -and $script:GuiState.ClusterViews.ContainsKey($selected)) { $clusterDatacenter = [string]$script:GuiState.ClusterViews[$selected].Datacenter }
+        $site = ''
+        if ($null -ne $connection) { $site = Get-PlacementSite -Name @($vCenter, $selected) }
+        $script:Gui.Location.Text = Format-PlacementLocation -VCenter $vCenter -User $user -Datacenter $datacenters -Cluster $selected -ClusterDatacenter $clusterDatacenter -ClusterCount $views.Count -Site $site
+
+        $inventory = @($script:GuiState.Inventory | Where-Object { $null -ne $_ })
+        if ($inventory.Count -eq 0) {
+            $script:Gui.OnScreen.Text = 'No results on screen yet - pick a cluster and click Discover.'
+        }
+        else {
+            $scope = [string]$script:GuiState.Scope
+            $when = @($inventory | ForEach-Object { [datetime]$_.DiscoveredAt } | Sort-Object)[-1].ToString('HH:mm:ss')
+            $text = "Results on screen: $scope, discovered $when"
+            if ($selected -and $selected -ne $scope) { $text += "  -  NOT the cluster selected below. Click Discover to read $selected." }
+            $script:Gui.OnScreen.Text = $text
+        }
+    }
+    catch {
+        Write-Verbose "Banner not refreshed: $($_.Exception.Message)"
+    }
+}
+
 function ConvertTo-PlacementDataTable {
     <#
     .SYNOPSIS
@@ -2912,7 +3080,9 @@ function Invoke-GuiConnect {
 
     $script:Gui.ConnectionLabel.Text = "Connected to $($script:GuiState.Connection.Name) as $($script:GuiState.Connection.User) - $($clusterViews.Count) cluster(s)"
     $script:Gui.Status.Text = 'Pick a cluster and click Discover.'
-    Write-PlacementLog "$($clusterViews.Count) cluster(s) found." -Level INFO
+    $datacenterNames = @($clusterViews | ForEach-Object { $_.Datacenter } | Where-Object { $_ } | Sort-Object -Unique)
+    Write-PlacementLog "$($clusterViews.Count) cluster(s) found in datacenter(s) $($datacenterNames -join ', ')." -Level INFO
+    Show-GuiLocation
 }
 
 function Invoke-GuiDisconnect {
@@ -2933,6 +3103,7 @@ function Invoke-GuiDisconnect {
     $script:Gui.ClusterList.Items.Clear()
     $script:Gui.ConnectionLabel.Text = 'Not connected'
     $script:Gui.Status.Text = 'Disconnected. Results stay on screen and can still be exported.'
+    Show-GuiLocation
 }
 
 function Invoke-GuiDiscovery {
@@ -3016,6 +3187,7 @@ function Invoke-GuiEvaluation {
     $summary = Format-PlacementSummary -Summary $result.Summary
     $script:Gui.Status.Text = "$($script:GuiState.Scope): $summary"
     Write-PlacementLog $summary -Level INFO
+    Show-GuiLocation
 }
 
 function Get-GuiActiveTable {
@@ -3115,6 +3287,9 @@ function Confirm-GuiMigration {
     .PARAMETER MaxConcurrent
         Moves running at once, shown in the question.
 
+    .PARAMETER VCenter
+        The vCenter the moves will run on, named in the question.
+
     .EXAMPLE
         if (Confirm-GuiMigration -Plan $plan -MaxConcurrent 2) { ... }
     #>
@@ -3125,7 +3300,9 @@ function Confirm-GuiMigration {
         [AllowEmptyCollection()]
         [object[]]$Plan,
 
-        [int]$MaxConcurrent = 2
+        [int]$MaxConcurrent = 2,
+
+        [string]$VCenter = ''
     )
 
     $moves = @($Plan | Where-Object { $_.Action -eq 'Migrate' })
@@ -3136,11 +3313,11 @@ function Confirm-GuiMigration {
         } | ForEach-Object { "  $($_.Name): $($_.Count) VM(s)" })
     $skipped = @($Plan | Where-Object { $_.Action -ne 'Migrate' }).Count
     $fallbackMoves = @($moves | Where-Object { $_.Fallback }).Count
-    $text = "Storage vMotion $($moves.Count) VM(s) now?`n`n$($lines -join "`n")`n`n"
+    $text = "Storage vMotion $($moves.Count) VM(s) now, on vCenter $($VCenter)?`n`n$($lines -join "`n")`n`n"
     if ($fallbackMoves -gt 0) { $text += "$fallbackMoves VM(s) go to a datastore not named for their environment - none is available - so they will still be listed afterwards.`n" }
     if ($skipped -gt 0) { $text += "$skipped VM(s) will be skipped - the Migrations tab will say why.`n" }
     $text += "Up to $MaxConcurrent run at once. Powered-on VMs stay running. This changes vCenter."
-    $answer = [System.Windows.Forms.MessageBox]::Show($script:Gui.Form, $text, 'Confirm storage vMotion', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+    $answer = [System.Windows.Forms.MessageBox]::Show($script:Gui.Form, $text, "Confirm storage vMotion - $VCenter", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
     $answer -eq [System.Windows.Forms.DialogResult]::Yes
 }
 
@@ -3471,7 +3648,7 @@ function Invoke-GuiMigration {
     $plan = @(Get-PlacementMigrationPlan -Finding $chosen -TargetByEnvironment $selection.Targets -Suggestion $suggestions -MinFreeSpacePercent $selection.MinFreeSpacePercent)
     $moves = @($plan | Where-Object { $_.Action -eq 'Migrate' })
     $preview = ($selection.Mode -ne 'Migrate') -or $script:WhatIfRun
-    if (-not $preview -and $moves.Count -gt 0 -and -not (Confirm-GuiMigration -Plan $plan -MaxConcurrent $selection.MaxConcurrent)) {
+    if (-not $preview -and $moves.Count -gt 0 -and -not (Confirm-GuiMigration -Plan $plan -MaxConcurrent $selection.MaxConcurrent -VCenter ([string]$script:GuiState.Connection.Name))) {
         Write-PlacementLog 'Migration cancelled at the confirmation.' -Level INFO
         return
     }
@@ -3663,6 +3840,38 @@ function Show-PlacementGui {
         $box
     }
 
+    # ---- Banner: what this is, and where you are ---------------------------------------------
+    $banner = New-Object System.Windows.Forms.FlowLayoutPanel
+    $banner.FlowDirection = [System.Windows.Forms.FlowDirection]::TopDown
+    $banner.WrapContents = $false
+    $banner.AutoSize = $true
+    $banner.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $banner.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $banner.Margin = New-Object System.Windows.Forms.Padding(0, 0, 0, 6)
+    $banner.Padding = New-Object System.Windows.Forms.Padding(10, 6, 10, 6)
+    $banner.BackColor = [System.Drawing.Color]::FromArgb(28, 52, 92)
+    $subtitleText = "Finds VMs on the wrong PROD / SIT / DEV datastore, and moves them  -  version $ScriptVersion"
+    if ($script:WhatIfRun) {
+        $banner.BackColor = [System.Drawing.Color]::FromArgb(150, 90, 0)
+        $subtitleText += '  -  PREVIEW ONLY (-WhatIf): nothing in vCenter can be changed'
+    }
+    $newBannerLabel = {
+        param([string]$Text, [System.Drawing.Font]$Font, [System.Drawing.Color]$Colour)
+        $label = New-Object System.Windows.Forms.Label
+        $label.Text = $Text
+        $label.Font = $Font
+        $label.ForeColor = $Colour
+        $label.AutoSize = $true
+        $label.Margin = New-Object System.Windows.Forms.Padding(0, 1, 0, 1)
+        $label
+    }
+    $bannerTitle = & $newBannerLabel 'VM Datastore Placement' (New-Object System.Drawing.Font('Segoe UI', 15, [System.Drawing.FontStyle]::Bold)) ([System.Drawing.Color]::White)
+    $bannerSubtitle = & $newBannerLabel $subtitleText $font ([System.Drawing.Color]::Gainsboro)
+    $script:Gui.Location = & $newBannerLabel '' (New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)) ([System.Drawing.Color]::White)
+    $script:Gui.OnScreen = & $newBannerLabel '' $font ([System.Drawing.Color]::Gainsboro)
+    $banner.Controls.AddRange(@($bannerTitle, $bannerSubtitle, $script:Gui.Location, $script:Gui.OnScreen))
+    $tips.SetToolTip($script:Gui.Location, 'Where you are. Site is read from a siepdXX vCenter or cluster name.')
+
     # ---- Row 0: sign in --------------------------------------------------------------------
     $row0 = & $newRow
     $script:Gui.Server = & $newTextBox 240 $InitialServer
@@ -3835,18 +4044,19 @@ function Show-PlacementGui {
     $tabs.TabPages.AddRange(@($script:Gui.ResultsTab, $script:Gui.UnscopedTab, $script:Gui.DatastoreTab, $script:Gui.MigrationTab, $logTab))
 
     # ---- Assemble --------------------------------------------------------------------------
-    $layout.RowCount = 6
-    foreach ($style in @('AutoSize', 'AutoSize', 'AutoSize', 'AutoSize')) {
+    $layout.RowCount = 7
+    foreach ($style in @('AutoSize', 'AutoSize', 'AutoSize', 'AutoSize', 'AutoSize')) {
         [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::$style)))
     }
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, $rulesHeight)))
     [void]$layout.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
-    $layout.Controls.Add($row0, 0, 0)
-    $layout.Controls.Add($row1, 0, 1)
-    $layout.Controls.Add($row2, 0, 2)
-    $layout.Controls.Add($rulesLabel, 0, 3)
-    $layout.Controls.Add($rulesGrid, 0, 4)
-    $layout.Controls.Add($tabs, 0, 5)
+    $layout.Controls.Add($banner, 0, 0)
+    $layout.Controls.Add($row0, 0, 1)
+    $layout.Controls.Add($row1, 0, 2)
+    $layout.Controls.Add($row2, 0, 3)
+    $layout.Controls.Add($rulesLabel, 0, 4)
+    $layout.Controls.Add($rulesGrid, 0, 5)
+    $layout.Controls.Add($tabs, 0, 6)
 
     $statusStrip = New-Object System.Windows.Forms.StatusStrip
     $script:Gui.Status = New-Object System.Windows.Forms.ToolStripStatusLabel
@@ -3886,6 +4096,8 @@ function Show-PlacementGui {
                 Invoke-GuiAction { Invoke-GuiConnect }
             }
         })
+    # Picking another cluster changes where you are; the banner says so before anything is read.
+    $script:Gui.ClusterList.Add_SelectedIndexChanged({ Show-GuiLocation })
     foreach ($checkbox in @($script:Gui.ShowUndetermined, $script:Gui.FlagUnclassified)) {
         $checkbox.Add_CheckedChanged({
                 if ($null -ne $script:GuiState.Inventory -and -not $script:GuiState.Busy) {
@@ -3909,6 +4121,7 @@ function Show-PlacementGui {
     }
 
     Exit-GuiBusyState
+    Show-GuiLocation
     try {
         $whatIfNote = ''
         if ($script:WhatIfRun) { $whatIfNote = ' Started with -WhatIf: migrations are previews only.' }
@@ -3958,6 +4171,7 @@ try {
         $connection = Connect-PlacementVCenter -Server $Server -Credential $Credential
         try {
             $clusterViews = @(Get-PlacementClusterList -Server $connection)
+            Write-PlacementLog "Location: vCenter $($connection.Name), datacenter(s) $(@($clusterViews | ForEach-Object { $_.Datacenter } | Where-Object { $_ } | Sort-Object -Unique) -join ', ')." -Level INFO
             if ($Cluster) {
                 $wanted = $Cluster
                 $clusterViews = @($clusterViews | Where-Object { $name = [string]$_.Name; @($wanted | Where-Object { $name -like $_ }).Count -gt 0 })
