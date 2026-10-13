@@ -153,4 +153,4 @@ They are independent, so any one can be run on its own:
 | `Test-IntersightDeployState.ps1` | Which `ConfigState` values mean a deploy is needed |
 | `Test-IntersightFailureKind.ps1` | Auth failure vs. a response the client cannot parse |
 | `Test-ModuleEnumerationCache.ps1` | Module enumeration happens once, not per lookup |
-| `Test-VMDatastorePlacement.ps1` | VM datastore placement: DNS/hostname rules, datastore keywords, CSV, headless run |
+| `Test-VMDatastorePlacement.ps1` | VM datastore placement: rules, SHARED/VMFS handling, migration targets, plan and engine, headless and GUI flows |

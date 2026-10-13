@@ -4104,6 +4104,89 @@ authentication removed, for operators who apply their own
 
 ## Test-VMDatastorePlacement.ps1
 
+### [1.2.0] — 2026-10-13
+
+#### Added
+
+- **Storage vMotion of the VMs it finds — one, several, or every VM on a tab.** This
+  is the script's first change to vCenter, so it carries `SupportsShouldProcess`
+  (`ConfirmImpact = 'High'`) and every move goes through `ShouldProcess`: `-WhatIf`
+  previews and calls nothing, and a run started with `-WhatIf` can only preview, the
+  GUI included.
+
+  For each environment among the chosen VMs you pick one target:
+
+  - a **datastore cluster** whose every member is that environment (Storage DRS
+    picks the member), or
+  - a **single NFS datastore** named for it that is not in a datastore cluster.
+
+  Only targets mounted on the host the VM runs on are offered, and only those that
+  are accessible and not in maintenance mode. Free space and datastore clusters are
+  read fresh when the dialog opens. A VM is skipped, with the reason recorded:
+
+  - its environment is unknown, so there is nowhere correct to move it
+  - no target was picked for its environment
+  - the target isn't mounted on the VM's host
+  - it is already on the target
+  - the move would leave the target below `-MinFreeSpacePercent` (default 10%),
+    counting the moves planned before it
+
+  Nothing is preselected. Migrate asks a final Yes/No that defaults to No; Preview
+  runs the same plan with `-WhatIf`. At most `-MaxConcurrentMigrations` run at once
+  (default 2, at most 4). **Stop** starts nothing new and lets running moves finish.
+  Each task is polled, a failure carries vCenter's own message, and a task that can
+  no longer be read becomes *Unknown* rather than a guess. Clusters whose VMs moved
+  are discovered again, so the lists show where things are now.
+
+  Headless: `-MigrateTo @{ PROD = '<datastore cluster or NFS datastore>'; ... }`,
+  optionally narrowed with `-MigrateVM`, prompts per VM unless `-Confirm:$false`. A
+  target that is not eligible for its environment is refused with the eligible list.
+  Results go to `<report>_Migration.csv`.
+
+- **Not on PROD/SIT/DEV tab** (and `<report>_NotOnProdSitDev.csv`): VMs none of whose
+  datastores carries a keyword. Same columns as the Misplaced tab, and migratable
+  when their environment is known. These VMs used to be counted and dropped.
+- **SizeGB** column (committed storage), and **Export CSV** now saves whichever tab is
+  on show: Misplaced VMs, Not on PROD/SIT/DEV, Datastores or Migrations.
+
+#### Changed
+
+- **PROD datastores are named SHARED.** `-ProdDatastoreKeywords` defaults to `SHARED`
+  instead of `PROD`, still matched as a word of its own, so `NFS_SHARED_01` and
+  `SIEPD85SHARED01` are PROD and `SHAREDSTORE01` is not. Add `PROD` back in the rules
+  grid if some PROD datastores still use it.
+- **VMFS datastores are not discovered** (`-ExcludeDatastoreType`, default `VMFS`).
+  They are not listed or classified, a VM's disks on them are ignored, a VM only on
+  them is skipped and counted, and they are never a migration target. This replaces
+  `-NfsOnly` and its checkbox.
+- `-FlagUnclassifiedDatastores` now only covers a VM that uses a PROD/SIT/DEV
+  datastore *and* another one (*Partly outside PROD/SIT/DEV*). A VM on none of them
+  is always on the new tab.
+- Connection status moved to the status bar to make room for the migration buttons.
+
+#### Tests
+
+- `tests/Test-VMDatastorePlacement.ps1` — 265 assertions, rewritten around a stubbed
+  vCenter. It has two clusters and two hosts with their own mounts, SHARED/DEV/
+  unkeyworded/VMFS datastores, and a datastore cluster with NFS and NFS 4.1 members.
+  A successful Storage vMotion task really moves the VM's files in the stub, so
+  re-discovery after a migration is checked, not assumed.
+
+  Covered: target eligibility, every skip reason, cumulative free space, the engine's
+  throttle, the WhatIf no-op, start and task failures, lost tasks and Stop, headless
+  `-MigrateTo` (preview, live, filtered, refused), and the GUI's migrate handlers.
+  Breaking any of ten safety rules turns it red: ShouldProcess bypassed, host-mount
+  check removed, a mixed-environment datastore cluster allowed, VMFS discovered, the
+  throttle off by one, the space check removed, `-WhatIf` not forcing preview, the
+  confirmation skipped, a non-NFS single target allowed, an environment mismatch
+  allowed.
+
+#### Not verified
+
+- The window, the migration dialog and the confirmation box are not run here
+  (Windows Forms does not load on the Linux test host), and nothing has run on
+  Windows PowerShell 5.1 or against a real vCenter.
+
 ### [1.0.1] — 2026-10-12
 
 #### Fixed
