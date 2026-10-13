@@ -64,13 +64,23 @@
     mark behind after a failback (Broadcom KB 412345) - so it is shown, its Reason says so, and the
     log lists it.
 
+    SUGGESTED DESTINATION. Every VM on either list whose environment is known gets one, in the
+    SuggestedDestination column and CSV: of the targets for its environment mounted on the host it
+    runs on, a datastore cluster first, then the one with most free space - that still keeps
+    -MinFreeSpacePercent free after taking the VM, counting the VMs suggested to it before. Where
+    there is none, the column says why.
+
     MIGRATION. From either VM tab, Migrate selected or Migrate all in tab. For each environment among
-    the chosen VMs you pick one target:
+    the chosen VMs the dialog offers, preselected, each VM's own suggested destination - or one
+    target for all of them:
       - a datastore cluster, when every datastore in it is that environment (Storage DRS then picks
         the member), or
       - a single NFS datastore named for that environment, not part of a datastore cluster.
-    Only targets mounted on the host the VM runs on are offered or used. A VM is skipped - with the
-    reason on the Migrations tab - when its environment is unknown, no target was picked for it, the
+    When NO such target is mounted where the chosen VMs run, every available NFS datastore on their
+    cluster is offered instead, labelled with its own classification and not preselected. None of
+    them is named for the VMs' environment, so a VM moved there is still listed afterwards; the
+    confirmation says so. Only targets mounted on the host the VM runs on are offered or used.
+    A VM is skipped - with the reason on the Migrations tab - when its environment is unknown, no target was picked for it, the
     target is not mounted on its host, it is already there, or the move would leave the target with
     less than -MinFreeSpacePercent free. Up to -MaxConcurrentMigrations run at once (default 2, at
     most 4). Stop finishes the running ones and starts nothing new. Moved clusters are re-discovered.
@@ -156,10 +166,11 @@
     Do not report VMs whose environment cannot be worked out from DNS name or hostname.
 
 .PARAMETER MigrateTo
-    -NoGui only. Environment -> target name, e.g. @{ PROD = 'DSC_SHARED_01'; DEV = 'NFS_DEV_02' }.
-    Each name must be an eligible datastore cluster or NFS datastore for that environment; the error
-    lists the eligible ones when it is not. VMs from both VM lists whose environment has a target are
-    migrated. Prompts per VM unless -Confirm:$false; -WhatIf previews.
+    -NoGui only. Environment -> target, e.g. @{ PROD = 'Suggested'; DEV = 'NFS_DEV_02' }.
+    'Suggested' moves each VM to its own suggested destination. A name must be an eligible datastore
+    cluster or NFS datastore for that environment - or, when the clusters have no eligible target for
+    it at all, any available NFS datastore on them. The error lists what is allowed. VMs from both
+    VM lists whose environment has a target are migrated. Prompts per VM unless -Confirm:$false; -WhatIf previews.
 
 .PARAMETER MigrateVM
     -NoGui only, with -MigrateTo. VM names to migrate; wildcards allowed. Default all.
@@ -190,6 +201,11 @@
 
     Headless migration preview: what would move where, and what would be skipped and why. Run again
     without -WhatIf to migrate, confirming each VM (or -Confirm:$false for none).
+
+.EXAMPLE
+    .\Test-VMDatastorePlacement.ps1 -NoGui -Server vcenter01.dpe.protected.mil.au -MigrateTo @{ PROD = 'Suggested'; DEV = 'Suggested' } -WhatIf
+
+    Preview moving every misplaced VM to its own suggested destination.
 
 .NOTES
     Version is in $ScriptVersion below and is stamped onto every CSV row.
@@ -245,7 +261,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.4.0'
 
 $script:GuiLogSink = $null
 $script:Gui = $null
@@ -830,7 +846,7 @@ function Get-PlacementReportColumn {
     param()
 
     'Status', 'Cluster', 'VMName', 'DnsName', 'ExpectedEnvironment', 'DeterminedBy', 'HostnameLetter',
-    'DatastoreEnvironment', 'WrongDatastores', 'AllDatastores', 'SizeGB', 'Reason', 'PowerState',
+    'DatastoreEnvironment', 'WrongDatastores', 'SuggestedDestination', 'AllDatastores', 'SizeGB', 'Reason', 'PowerState',
     'ToolsStatus', 'EsxiHost', 'vCenter', 'DiscoveredAt', 'ScriptVersion'
 }
 
@@ -887,8 +903,9 @@ function Test-VMPlacement {
 
         An unmapped hostname letter is always reported - it is the signal to add the letter.
 
-        The row also carries, for migration and not for the CSV: VMId, VMRef, CommittedBytes and
-        DatastoreNames.
+        The row also carries, for migration and not for the CSV: VMId, VMRef, CommittedBytes,
+        DatastoreNames and SuggestedTarget. SuggestedDestination and SuggestedTarget are filled in by
+        Invoke-PlacementEvaluation, which sees the cluster's storage.
 
     .PARAMETER Record
         One VM from Get-ClusterPlacementInventory.
@@ -987,6 +1004,7 @@ function Test-VMPlacement {
         HostnameLetter = $nameLetter
         DatastoreEnvironment = (@($scoped | ForEach-Object { $_.Environment } | Select-Object -Unique) -join ', ')
         WrongDatastores = (@($wrong | ForEach-Object { "$($_.Name) ($($_.Label))" }) -join '; ')
+        SuggestedDestination = ''
         AllDatastores = (@($classified | ForEach-Object { "$($_.Name) ($($_.Label))" }) -join '; ')
         SizeGB = [Math]::Round($committed / 1GB, 1)
         Reason = $reason
@@ -1000,6 +1018,7 @@ function Test-VMPlacement {
         VMRef = $Record.VMRef
         CommittedBytes = $committed
         DatastoreNames = @($classified | ForEach-Object { $_.Name })
+        SuggestedTarget = $null
     }
     [pscustomobject]@{ Outcome = $outcome; Finding = $finding }
 }
@@ -1025,6 +1044,9 @@ function Invoke-PlacementEvaluation {
     .PARAMETER HideUndetermined
         Do not report VMs whose environment cannot be decided.
 
+    .PARAMETER MinFreeSpacePercent
+        Free space a suggested destination must keep after taking the VM.
+
     .PARAMETER ScriptVersion
         Stamped onto every report row.
 
@@ -1043,6 +1065,9 @@ function Invoke-PlacementEvaluation {
         [switch]$FlagUnclassifiedDatastores,
 
         [switch]$HideUndetermined,
+
+        [ValidateRange(0, 50)]
+        [int]$MinFreeSpacePercent = 10,
 
         [string]$ScriptVersion = ''
     )
@@ -1065,6 +1090,7 @@ function Invoke-PlacementEvaluation {
             if ($type -and -not $excludedTypes.Contains([string]$type)) { $excludedTypes.Add([string]$type) }
         }
         $vmsPerDatastore = @{}
+        $clusterRows = New-Object System.Collections.Generic.List[object]
 
         foreach ($vm in @($cluster.VMs)) {
             if ($null -eq $vm) { continue }
@@ -1078,8 +1104,21 @@ function Invoke-PlacementEvaluation {
             switch ($outcome.Outcome) {
                 'Correct' { $correct++ }
                 'Hidden' { $hidden++ }
-                'Unscoped' { $unscoped.Add($outcome.Finding) }
-                'Reported' { $findings.Add($outcome.Finding) }
+                'Unscoped' { $unscoped.Add($outcome.Finding); $clusterRows.Add($outcome.Finding) }
+                'Reported' { $findings.Add($outcome.Finding); $clusterRows.Add($outcome.Finding) }
+            }
+        }
+
+        # Suggestions need the cluster's storage: free space, datastore clusters, host mounts.
+        $storage = Get-ViewProperty $cluster 'Storage'
+        if ($null -ne $storage -and $clusterRows.Count -gt 0) {
+            $suggestions = Get-PlacementSuggestion -Finding $clusterRows.ToArray() -StorageInfo @($storage) -RuleSet $RuleSet -MinFreeSpacePercent $MinFreeSpacePercent
+            foreach ($row in $clusterRows) {
+                $key = [string]$row.VMId
+                if (-not $key) { $key = "name:$($row.VMName)" }
+                if (-not $suggestions.ContainsKey($key)) { continue }
+                $row.SuggestedDestination = $suggestions[$key].Text
+                $row.SuggestedTarget = $suggestions[$key].Target
             }
         }
 
@@ -1289,7 +1328,12 @@ function Format-PlacementTarget {
         [object]$Target
     )
 
-    '{0}  {1}  -  {2} free of {3}  -  {4}' -f $Target.Kind, $Target.Name, (Format-PlacementSize $Target.FreeBytes), (Format-PlacementSize $Target.CapacityBytes), (@($Target.Clusters) -join ', ')
+    $line = '{0}  {1}  -  {2} free of {3}  -  {4}' -f $Target.Kind, $Target.Name, (Format-PlacementSize $Target.FreeBytes), (Format-PlacementSize $Target.CapacityBytes), (@($Target.Clusters) -join ', ')
+    if ([bool](Get-ViewProperty $Target 'Fallback')) {
+        $line = '{0}  {1}  [{2}]  -  {3} free of {4}  -  {5}' -f $Target.Kind, $Target.Name, $Target.Label, (Format-PlacementSize $Target.FreeBytes), (Format-PlacementSize $Target.CapacityBytes), (@($Target.Clusters) -join ', ')
+        if ($Target.Pod) { $line += "  (in datastore cluster $($Target.Pod))" }
+    }
+    $line
 }
 
 function Get-PlacementTargetChoice {
@@ -1403,16 +1447,210 @@ function Get-PlacementTargetChoice {
     @($targets.Values) | Sort-Object -Property @{ Expression = { if ($_.Kind -eq 'Datastore cluster') { 0 } else { 1 } } }, Name
 }
 
+function Get-PlacementSuggestion {
+    <#
+    .SYNOPSIS
+        Picks a destination for each VM: the best target for its environment mounted where it runs.
+
+    .DESCRIPTION
+        For each VM with a known environment, of the targets Get-PlacementTargetChoice offers for it
+        that are mounted on its host (on its cluster, when the host is not known) and that it is not
+        already wholly on:
+          1. only those that keep MinFreeSpacePercent free after taking it, counting the VMs
+             suggested to the same target before it (VMs are taken in name order)
+          2. a datastore cluster before a single datastore - Storage DRS balances inside it
+          3. then the most free space left
+        Returns a hashtable keyed by VMId (or "name:<VMName>" when there is none) of
+        { Target; Text; Why }. Target is $null when there is no suggestion, and Why says why.
+
+        Pure: reads nothing from vCenter.
+
+    .PARAMETER Finding
+        Rows from either VM list.
+
+    .PARAMETER StorageInfo
+        Output of Get-PlacementStorageInfo for the VMs' clusters.
+
+    .PARAMETER RuleSet
+        Output of ConvertTo-PlacementRuleSet.
+
+    .PARAMETER MinFreeSpacePercent
+        Free space, as a percentage of capacity, a target must keep.
+
+    .EXAMPLE
+        $suggestions = Get-PlacementSuggestion -Finding $findings -StorageInfo $storage -RuleSet $ruleSet
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Finding,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$StorageInfo,
+
+        [Parameter(Mandatory)]
+        [object]$RuleSet,
+
+        [ValidateRange(0, 50)]
+        [int]$MinFreeSpacePercent = 10
+    )
+
+    $choices = @{}
+    $planned = @{}
+    $result = @{}
+    foreach ($item in @($Finding | Sort-Object -Property VMName)) {
+        $key = [string]$item.VMId
+        if (-not $key) { $key = "name:$($item.VMName)" }
+        $environment = [string]$item.ExpectedEnvironment
+        $esxi = [string]$item.EsxiHost
+        $where = "on $esxi"
+        if (-not $esxi) { $where = "on cluster $($item.Cluster)" }
+
+        $why = ''
+        $best = $null
+        if (-not $environment) {
+            $why = 'its environment is not known'
+        }
+        else {
+            if (-not $choices.ContainsKey($environment)) {
+                $choices[$environment] = @(Get-PlacementTargetChoice -StorageInfo $StorageInfo -RuleSet $RuleSet -Environment $environment)
+            }
+            $currentNames = @($item.DatastoreNames)
+            $usable = @($choices[$environment] | Where-Object {
+                    $candidate = $_
+                    if ($esxi) { $visible = @($candidate.Hosts) -contains $esxi }
+                    else { $visible = @($candidate.Clusters) -contains [string]$item.Cluster }
+                    $alreadyThere = $candidate.Kind -eq 'Datastore' -and $currentNames.Count -gt 0 -and @($currentNames | Where-Object { $_ -ne $candidate.Name }).Count -eq 0
+                    $visible -and -not $alreadyThere
+                })
+            if ($usable.Count -eq 0) {
+                $why = "no $environment datastore cluster or NFS datastore is mounted $where. Migrate it on its own to choose from every NFS datastore there"
+            }
+            else {
+                $size = [double]$item.CommittedBytes
+                $ranked = @($usable | ForEach-Object {
+                        $target = $_
+                        $targetKey = "$($target.Kind)|$($target.RefValue)"
+                        $floor = [double]$target.CapacityBytes * $MinFreeSpacePercent / 100
+                        $left = [double]$target.FreeBytes - [double]$planned[$targetKey] - $size
+                        [pscustomobject]@{ Target = $target; Key = $targetKey; Spare = $left - $floor; IsPod = ($target.Kind -eq 'Datastore cluster') }
+                    } | Where-Object { $_.Spare -ge 0 } |
+                    Sort-Object -Property @{ Expression = { $_.IsPod }; Descending = $true }, @{ Expression = { $_.Spare }; Descending = $true }, @{ Expression = { $_.Target.Name } })
+                if ($ranked.Count -eq 0) {
+                    $why = "no $environment target mounted $where has room for it while keeping $MinFreeSpacePercent% free"
+                }
+                else {
+                    $best = $ranked[0].Target
+                    $planned[$ranked[0].Key] = [double]$planned[$ranked[0].Key] + $size
+                }
+            }
+        }
+
+        if ($null -ne $best) {
+            $result[$key] = [pscustomobject]@{ Target = $best; Text = "$($best.Name) ($($best.Kind.ToLowerInvariant()))"; Why = '' }
+        }
+        else {
+            $result[$key] = [pscustomobject]@{ Target = $null; Text = "None - $why."; Why = $why }
+        }
+    }
+    $result
+}
+
+function Get-PlacementFallbackChoice {
+    <#
+    .SYNOPSIS
+        Every available NFS datastore on the clusters - offered only when an environment has no
+        eligible target at all.
+
+    .DESCRIPTION
+        NFS or NFS 4.1, accessible, not in maintenance mode, mounted on at least one of the
+        cluster's hosts - whatever its name says, members of datastore clusters included. Each
+        carries Fallback = $true, its own classification (Environment, Label) and its datastore
+        cluster (Pod), so the dialog, the plan and the confirmation can all say plainly that it is
+        not named for the VMs' environment. Datastores with no keyword come first, then by name.
+
+        Pure: reads nothing from vCenter.
+
+    .PARAMETER StorageInfo
+        Output of Get-PlacementStorageInfo.
+
+    .PARAMETER RuleSet
+        Output of ConvertTo-PlacementRuleSet.
+
+    .EXAMPLE
+        Get-PlacementFallbackChoice -StorageInfo $storage -RuleSet $ruleSet
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$StorageInfo,
+
+        [Parameter(Mandatory)]
+        [object]$RuleSet
+    )
+
+    $targets = New-Object System.Collections.Specialized.OrderedDictionary
+    foreach ($info in $StorageInfo) {
+        # A datastore's own parent says which datastore cluster it is in.
+        $podName = @{}
+        foreach ($pod in @($info.Pods)) { $podName[[string]$pod.RefValue] = [string]$pod.Name }
+        foreach ($datastore in @($info.Datastores)) {
+            if (@('NFS', 'NFS41') -notcontains ([string]$datastore.Type).ToUpperInvariant()) { continue }
+            if (-not $datastore.Accessible -or @('', 'normal') -notcontains [string]$datastore.MaintenanceMode) { continue }
+            $hosts = @(Get-PlacementHostSeeing -HostDatastores $info.HostDatastores -RefValue @([string]$datastore.RefValue))
+            if ($hosts.Count -eq 0) { continue }
+            $key = [string]$datastore.RefValue
+            if ($targets.Contains($key)) {
+                $existing = $targets[$key]
+                $existing.Clusters = @($existing.Clusters) + [string]$info.Cluster
+                $existing.Hosts = @($existing.Hosts) + $hosts
+                continue
+            }
+            $class = Get-DatastoreEnvironment -Name $datastore.Name -RuleSet $RuleSet
+            $pod = ''
+            if ($datastore.PodRefValue -and $podName.ContainsKey([string]$datastore.PodRefValue)) { $pod = $podName[[string]$datastore.PodRefValue] }
+            $targets[$key] = [pscustomobject]@{
+                Kind = 'Datastore'
+                Name = [string]$datastore.Name
+                Ref = $datastore.Ref
+                RefValue = $key
+                Environment = $class.Environment
+                Label = $class.Label
+                FreeBytes = [double]$datastore.FreeBytes
+                CapacityBytes = [double]$datastore.CapacityBytes
+                Clusters = @([string]$info.Cluster)
+                Hosts = $hosts
+                Pod = $pod
+                Fallback = $true
+            }
+        }
+    }
+
+    @($targets.Values) | Sort-Object -Property @{ Expression = { if ($_.Environment) { 1 } else { 0 } } }, Name
+}
+
 function Get-PlacementMigrationPlan {
     <#
     .SYNOPSIS
         Decides, per VM, whether it will be moved and where - or why not.
 
     .DESCRIPTION
-        Every VM given gets one row: Action 'Migrate' or 'Skip', with Reason in a sentence. Skipped:
+        Every VM given gets one row: Action 'Migrate' or 'Skip', with Reason in a sentence.
+
+        A target per environment is either one target for all of its VMs, or 'Suggested': each VM
+        to its own entry in Suggestion. A fallback target (Fallback = $true - an NFS datastore not
+        named for the environment, offered only when it has no eligible target) is allowed through
+        the environment check, and its Reason says the VM will still be listed afterwards.
+
+        Skipped:
           - environment not known (fix the rules first - there is nowhere correct to move it)
-          - no target picked for its environment
-          - target is a different environment (defence in depth - the dialog only offers matches)
+          - no target picked for its environment, or no suggested destination for it
+          - target is a different environment and not a fallback (defence in depth - the dialog
+            only offers matches)
           - target not mounted on the host the VM runs on
           - already wholly on the target datastore
           - the move would leave the target with less than MinFreeSpacePercent free, counting the
@@ -1425,7 +1663,11 @@ function Get-PlacementMigrationPlan {
         Rows from either VM list.
 
     .PARAMETER TargetByEnvironment
-        Environment -> target from Get-PlacementTargetChoice.
+        Environment -> a target from Get-PlacementTargetChoice or Get-PlacementFallbackChoice, or
+        the string 'Suggested'.
+
+    .PARAMETER Suggestion
+        Output of Get-PlacementSuggestion, used for environments set to 'Suggested'.
 
     .PARAMETER MinFreeSpacePercent
         Free space, as a percentage of capacity, each target must keep.
@@ -1441,6 +1683,8 @@ function Get-PlacementMigrationPlan {
 
         [hashtable]$TargetByEnvironment = @{},
 
+        [hashtable]$Suggestion = @{},
+
         [ValidateRange(0, 50)]
         [int]$MinFreeSpacePercent = 10
     )
@@ -1449,8 +1693,23 @@ function Get-PlacementMigrationPlan {
     $seen = @{}
     foreach ($item in $Finding) {
         $environment = [string]$item.ExpectedEnvironment
-        $target = $null
-        if ($environment -and $TargetByEnvironment.ContainsKey($environment)) { $target = $TargetByEnvironment[$environment] }
+        $choice = $null
+        if ($environment -and $TargetByEnvironment.ContainsKey($environment)) { $choice = $TargetByEnvironment[$environment] }
+        $target = $choice
+        $noSuggestion = ''
+        if ($choice -is [string]) {
+            $target = $null
+            if ($choice -eq 'Suggested') {
+                $suggestionKey = [string]$item.VMId
+                if (-not $suggestionKey) { $suggestionKey = "name:$($item.VMName)" }
+                $suggested = $null
+                if ($Suggestion.ContainsKey($suggestionKey)) { $suggested = $Suggestion[$suggestionKey] }
+                if ($null -ne $suggested -and $null -ne $suggested.Target) { $target = $suggested.Target }
+                elseif ($null -ne $suggested) { $noSuggestion = [string]$suggested.Why }
+                else { $noSuggestion = 'none was worked out for it' }
+            }
+        }
+        $isFallback = $null -ne $target -and [bool](Get-ViewProperty $target 'Fallback')
 
         $row = [pscustomobject]@{
             Action = 'Skip'
@@ -1467,6 +1726,7 @@ function Get-PlacementMigrationPlan {
             Target = ''
             TargetKind = ''
             TargetRef = $null
+            Fallback = $isFallback
         }
         if ($null -ne $target) {
             $row.Target = [string]$target.Name
@@ -1485,10 +1745,13 @@ function Get-PlacementMigrationPlan {
         if ($environment -eq '') {
             $row.Reason = "Environment not known ($($item.Status)) - there is nowhere correct to move it. Fix the rules, re-apply, then migrate."
         }
+        elseif ($null -eq $target -and $noSuggestion) {
+            $row.Reason = "No suggested destination: $noSuggestion."
+        }
         elseif ($null -eq $target) {
             $row.Reason = "No $environment target was picked."
         }
-        elseif ($target.Environment -ne $environment) {
+        elseif (-not $isFallback -and $target.Environment -ne $environment) {
             $row.Reason = "Target $($target.Name) is $($target.Environment); the VM belongs on $environment."
         }
         elseif ($row.EsxiHost -and @($target.Hosts) -notcontains $row.EsxiHost) {
@@ -1511,6 +1774,9 @@ function Get-PlacementMigrationPlan {
                 $planned[$key] = [double]$planned[$key] + $row.SizeBytes
                 $row.Action = 'Migrate'
                 $row.Reason = "Move $(Format-PlacementSize $row.SizeBytes) to $($target.Kind.ToLowerInvariant()) $($target.Name)."
+                if ($isFallback) {
+                    $row.Reason += " It is NOT a $environment datastore ($($target.Label)) - none is available here - so the VM will still be listed afterwards."
+                }
             }
         }
         $row
@@ -1916,8 +2182,10 @@ function Get-ClusterPlacementInventory {
         Reads one cluster from vCenter: its datastores and, for each VM, its DNS name and datastores.
 
     .DESCRIPTION
-        Four property-collector calls per cluster - cluster, datastores, hosts, VMs - each asking
-        only for the properties used, rather than a round trip per VM. Read-only.
+        A handful of property-collector calls per cluster - cluster, datastores, hosts, datastore
+        clusters, VMs - each asking only for the properties used, rather than a round trip per VM.
+        Read-only. The storage read is kept on the result (Storage) for the suggested
+        destinations.
 
         Datastores of an excluded type (VMFS by default) are dropped here: not listed, not counted
         for any VM.
@@ -1947,41 +2215,31 @@ function Get-ClusterPlacementInventory {
 
     $discoveredAt = Get-Date
     $excludedTypes = @($ExcludeDatastoreType | Where-Object { $_ } | ForEach-Object { $_.ToUpperInvariant() })
-    $clusterInfo = Get-View -Server $Server -Id $ClusterView.MoRef -Property 'Name', 'Datastore', 'Host'
-    Write-PlacementLog "Reading cluster $($clusterInfo.Name)..." -Level INFO
+    Write-PlacementLog "Reading cluster $($ClusterView.Name)..." -Level INFO
 
+    # One storage read serves both the placement check and the suggested destinations.
+    $storage = @(Get-PlacementStorageInfo -Server $Server -ClusterView @($ClusterView) -ExcludeDatastoreType $ExcludeDatastoreType)[0]
     $datastoreByRef = @{}
     $datastoreByName = @{}
+    foreach ($datastore in @($storage.Datastores)) {
+        $info = [pscustomobject]@{ Name = [string]$datastore.Name; Type = [string]$datastore.Type }
+        $datastoreByRef[[string]$datastore.RefValue] = $info
+        $datastoreByName[$info.Name] = $info
+    }
     $excludedByRef = @{}
     $excludedByName = @{}
-    $datastoreRefs = @($clusterInfo.Datastore | Where-Object { $null -ne $_ })
-    if ($datastoreRefs.Count -gt 0) {
-        foreach ($view in @(Get-View -Server $Server -Id $datastoreRefs -Property 'Name', 'Summary.Type')) {
-            $info = [pscustomobject]@{ Name = [string]$view.Name; Type = [string](Get-ViewProperty $view 'Summary.Type') }
-            if ($excludedTypes -contains $info.Type.ToUpperInvariant()) {
-                $excludedByRef[[string]$view.MoRef.Value] = $info.Name
-                $excludedByName[$info.Name] = $info.Type
-                continue
-            }
-            $datastoreByRef[[string]$view.MoRef.Value] = $info
-            $datastoreByName[$info.Name] = $info
-        }
+    foreach ($datastore in @($storage.Excluded)) {
+        $excludedByRef[[string]$datastore.RefValue] = [string]$datastore.Name
+        $excludedByName[[string]$datastore.Name] = [string]$datastore.Type
     }
-
-    $hostByRef = @{}
-    $hostRefs = @($clusterInfo.Host | Where-Object { $null -ne $_ })
-    if ($hostRefs.Count -gt 0) {
-        foreach ($view in @(Get-View -Server $Server -Id $hostRefs -Property 'Name')) {
-            $hostByRef[[string]$view.MoRef.Value] = [string]$view.Name
-        }
-    }
+    $hostByRef = $storage.HostNameByRef
 
     $vmProperties = @(
         'Name', 'Config.Template', 'Config.ManagedBy', 'Config.Files.VmPathName', 'Config.Hardware.Device',
         'Guest.HostName', 'Guest.ToolsRunningStatus', 'Runtime.PowerState', 'Runtime.Host', 'Datastore',
         'Summary.Storage.Committed'
     )
-    $vmViews = @(Get-View -Server $Server -ViewType VirtualMachine -SearchRoot $clusterInfo.MoRef -Property $vmProperties)
+    $vmViews = @(Get-View -Server $Server -ViewType VirtualMachine -SearchRoot $ClusterView.MoRef -Property $vmProperties)
 
     $records = New-Object System.Collections.Generic.List[object]
     $skipped = @{ Template = 0; Agent = 0; Placeholder = 0; NoDisks = 0; Excluded = 0 }
@@ -1994,7 +2252,7 @@ function Get-ClusterPlacementInventory {
         if ($seen.ContainsKey($id)) { continue }
         $seen[$id] = $true
 
-        $converted = ConvertTo-PlacementVMRecord -View $view -DatastoreByRef $datastoreByRef -DatastoreByName $datastoreByName -ExcludedByRef $excludedByRef -ExcludedByName $excludedByName -HostByRef $hostByRef -Cluster $clusterInfo.Name -VCenter ([string]$Server.Name) -DiscoveredAt $discoveredAt
+        $converted = ConvertTo-PlacementVMRecord -View $view -DatastoreByRef $datastoreByRef -DatastoreByName $datastoreByName -ExcludedByRef $excludedByRef -ExcludedByName $excludedByName -HostByRef $hostByRef -Cluster $storage.Cluster -VCenter ([string]$Server.Name) -DiscoveredAt $discoveredAt
         if ($converted.Skip) {
             $skipped[$converted.Skip] = $skipped[$converted.Skip] + 1
             if ($converted.Skip -eq 'Placeholder') { $placeholderNames.Add([string]$view.Name) }
@@ -2005,19 +2263,19 @@ function Get-ClusterPlacementInventory {
         $records.Add($converted.Record)
     }
 
-    Write-PlacementLog ("Cluster {0}: {1} full VMs, {2} datastores ({3} {4} not discovered); not shown: {5} template(s), {6} vCLS/agent VM(s), {7} SRM placeholder(s), {8} VM(s) with no disks, {9} VM(s) only on {4}." -f $clusterInfo.Name, $records.Count, $datastoreByName.Count, $excludedByName.Count, ($excludedTypes -join '/'), $skipped.Template, $skipped.Agent, $skipped.Placeholder, $skipped.NoDisks, $skipped.Excluded) -Level INFO
+    Write-PlacementLog ("Cluster {0}: {1} full VMs, {2} datastores ({3} {4} not discovered); not shown: {5} template(s), {6} vCLS/agent VM(s), {7} SRM placeholder(s), {8} VM(s) with no disks, {9} VM(s) only on {4}." -f $storage.Cluster, $records.Count, $datastoreByName.Count, $excludedByName.Count, ($excludedTypes -join '/'), $skipped.Template, $skipped.Agent, $skipped.Placeholder, $skipped.NoDisks, $skipped.Excluded) -Level INFO
     if ($placeholderNames.Count -gt 0) {
-        Write-PlacementLog "Cluster $($clusterInfo.Name): SRM placeholders not shown: $(Format-PlacementNameList -Name $placeholderNames.ToArray())" -Level INFO
+        Write-PlacementLog "Cluster $($storage.Cluster): SRM placeholders not shown: $(Format-PlacementNameList -Name $placeholderNames.ToArray())" -Level INFO
     }
     if ($noDiskNames.Count -gt 0) {
-        Write-PlacementLog "Cluster $($clusterInfo.Name): VMs with no disks not shown: $(Format-PlacementNameList -Name $noDiskNames.ToArray())" -Level INFO
+        Write-PlacementLog "Cluster $($storage.Cluster): VMs with no disks not shown: $(Format-PlacementNameList -Name $noDiskNames.ToArray())" -Level INFO
     }
     if ($flaggedNames.Count -gt 0) {
-        Write-PlacementLog "Cluster $($clusterInfo.Name): $($flaggedNames.Count) VM(s) carry the SRM placeholder mark but have disks, so are shown as full VMs - most likely a mark left by a failback (Broadcom KB 412345): $(Format-PlacementNameList -Name $flaggedNames.ToArray())" -Level WARN
+        Write-PlacementLog "Cluster $($storage.Cluster): $($flaggedNames.Count) VM(s) carry the SRM placeholder mark but have disks, so are shown as full VMs - most likely a mark left by a failback (Broadcom KB 412345): $(Format-PlacementNameList -Name $flaggedNames.ToArray())" -Level WARN
     }
 
     [pscustomobject]@{
-        Cluster = [string]$clusterInfo.Name
+        Cluster = [string]$storage.Cluster
         vCenter = [string]$Server.Name
         DiscoveredAt = $discoveredAt
         Datastores = @($datastoreByName.Values | Sort-Object -Property Name)
@@ -2028,6 +2286,7 @@ function Get-ClusterPlacementInventory {
         SkippedPlaceholders = $skipped.Placeholder
         SkippedNoDisks = $skipped.NoDisks
         SkippedExcluded = $skipped.Excluded
+        Storage = $storage
     }
 }
 
@@ -2038,9 +2297,9 @@ function Get-PlacementStorageInfo {
         clusters, and which host mounts which datastore. Read-only.
 
     .DESCRIPTION
-        Read when the migration dialog opens, not at discovery, so the free space the plan checks
-        is current. Excluded datastore types are dropped, which also makes any datastore cluster
-        with such a member ineligible.
+        Read at discovery, for the suggested destinations, and again when the migration dialog
+        opens, so the free space the plan checks is current. Excluded datastore types are listed
+        apart (Excluded), which also makes any datastore cluster with such a member ineligible.
 
     .PARAMETER Server
         Connection from Connect-PlacementVCenter.
@@ -2072,12 +2331,16 @@ function Get-PlacementStorageInfo {
         $clusterInfo = Get-View -Server $Server -Id $view.MoRef -Property 'Name', 'Datastore', 'Host'
 
         $datastores = New-Object System.Collections.Generic.List[object]
+        $excluded = New-Object System.Collections.Generic.List[object]
         $podRefs = @{}
         $datastoreRefs = @($clusterInfo.Datastore | Where-Object { $null -ne $_ })
         if ($datastoreRefs.Count -gt 0) {
             foreach ($datastore in @(Get-View -Server $Server -Id $datastoreRefs -Property 'Name', 'Parent', 'Summary.Type', 'Summary.FreeSpace', 'Summary.Capacity', 'Summary.Accessible', 'Summary.MaintenanceMode')) {
                 $type = [string](Get-ViewProperty $datastore 'Summary.Type')
-                if ($excludedTypes -contains $type.ToUpperInvariant()) { continue }
+                if ($excludedTypes -contains $type.ToUpperInvariant()) {
+                    $excluded.Add([pscustomobject]@{ RefValue = [string]$datastore.MoRef.Value; Name = [string]$datastore.Name; Type = $type })
+                    continue
+                }
                 $podRef = ''
                 if ([string](Get-ViewProperty $datastore 'Parent.Type') -eq 'StoragePod') {
                     $podRef = [string](Get-ViewProperty $datastore 'Parent.Value')
@@ -2098,10 +2361,12 @@ function Get-PlacementStorageInfo {
         }
 
         $hostDatastores = @{}
+        $hostNameByRef = @{}
         $hostRefs = @($clusterInfo.Host | Where-Object { $null -ne $_ })
         if ($hostRefs.Count -gt 0) {
             foreach ($hostView in @(Get-View -Server $Server -Id $hostRefs -Property 'Name', 'Datastore')) {
                 $hostDatastores[[string]$hostView.Name] = @($hostView.Datastore | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_.Value })
+                $hostNameByRef[[string]$hostView.MoRef.Value] = [string]$hostView.Name
             }
         }
 
@@ -2124,6 +2389,8 @@ function Get-PlacementStorageInfo {
             Datastores = $datastores.ToArray()
             Pods = $pods.ToArray()
             HostDatastores = $hostDatastores
+            HostNameByRef = $hostNameByRef
+            Excluded = $excluded.ToArray()
         }
     }
 }
@@ -2291,7 +2558,8 @@ function Invoke-PlacementMigration {
                 $task = Move-VM -VM $vm -Datastore $target -RunAsync -Confirm:$false -ErrorAction Stop
                 $row.Result = 'Running'
                 $row.Started = & $stamp
-                $row.Detail = ''
+                # A move to a datastore not named for the VM's environment keeps saying so.
+                if (-not [bool](Get-ViewProperty $item 'Fallback')) { $row.Detail = '' }
                 $running[[string]$task.Id] = [pscustomobject]@{ Row = $row; Misses = 0 }
                 Write-PlacementLog "Storage vMotion started: $($item.VMName) -> $($item.TargetKind.ToLowerInvariant()) $($item.Target) (task $($task.Id))." -Level INFO
             }
@@ -2497,7 +2765,9 @@ function Enter-GuiBusyState {
         $control.Enabled = $false
     }
     $script:Gui.Stop.Enabled = [bool]$script:GuiState.Migrating -and -not $script:GuiState.StopRequested
-    $script:Gui.Form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+    # UseWaitCursor rather than Form.Cursor: every child control follows it, and it is undone
+    # cleanly. See Exit-GuiBusyState for why the grids are also reset by name.
+    $script:Gui.Form.UseWaitCursor = $true
     $script:Gui.Status.Text = $Text
     [System.Windows.Forms.Application]::DoEvents()
 }
@@ -2527,7 +2797,17 @@ function Exit-GuiBusyState {
     $script:Gui.MigrateSelected.Enabled = $connected -and $evaluated
     $script:Gui.MigrateAll.Enabled = $connected -and $evaluated
     $script:Gui.Stop.Enabled = $false
-    $script:Gui.Form.Cursor = [System.Windows.Forms.Cursors]::Default
+
+    # The spinning cursor must not outlive the work. A DataGridView keeps the cursor it had when
+    # the pointer crossed a column divider and puts it back afterwards, so a wait cursor picked up
+    # mid-discovery could stay on a grid once the form was back to normal. Each grid's own cursor
+    # is cleared, and Cursor.Current is set so the pointer changes now, not on the next move.
+    $script:Gui.Form.UseWaitCursor = $false
+    foreach ($name in @('ResultsGrid', 'UnscopedGrid', 'DatastoreGrid', 'MigrationGrid', 'RulesGrid', 'Tabs')) {
+        if ($script:Gui.ContainsKey($name) -and $null -ne $script:Gui[$name]) { $script:Gui[$name].ResetCursor() }
+    }
+    $script:Gui.Form.ResetCursor()
+    [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::Default
 }
 
 function Wait-GuiInterval {
@@ -2714,6 +2994,7 @@ function Invoke-GuiEvaluation {
     $result = Invoke-PlacementEvaluation -Inventory $script:GuiState.Inventory -RuleSet $ruleSet `
         -FlagUnclassifiedDatastores:($script:Gui.FlagUnclassified.Checked) `
         -HideUndetermined:(-not $script:Gui.ShowUndetermined.Checked) `
+        -MinFreeSpacePercent $script:GuiState.MinFreePercent `
         -ScriptVersion $script:GuiState.ScriptVersion
     $script:GuiState.Result = $result
 
@@ -2848,9 +3129,15 @@ function Confirm-GuiMigration {
     )
 
     $moves = @($Plan | Where-Object { $_.Action -eq 'Migrate' })
-    $lines = @($moves | Group-Object -Property { "$($_.ExpectedEnvironment) -> $($_.TargetKind.ToLowerInvariant()) $($_.Target)" } | ForEach-Object { "  $($_.Name): $($_.Count) VM(s)" })
+    $lines = @($moves | Group-Object -Property {
+            $marker = ''
+            if ($_.Fallback) { $marker = " (NOT a $($_.ExpectedEnvironment) datastore)" }
+            "$($_.ExpectedEnvironment) -> $($_.TargetKind.ToLowerInvariant()) $($_.Target)$marker"
+        } | ForEach-Object { "  $($_.Name): $($_.Count) VM(s)" })
     $skipped = @($Plan | Where-Object { $_.Action -ne 'Migrate' }).Count
+    $fallbackMoves = @($moves | Where-Object { $_.Fallback }).Count
     $text = "Storage vMotion $($moves.Count) VM(s) now?`n`n$($lines -join "`n")`n`n"
+    if ($fallbackMoves -gt 0) { $text += "$fallbackMoves VM(s) go to a datastore not named for their environment - none is available - so they will still be listed afterwards.`n" }
     if ($skipped -gt 0) { $text += "$skipped VM(s) will be skipped - the Migrations tab will say why.`n" }
     $text += "Up to $MaxConcurrent run at once. Powered-on VMs stay running. This changes vCenter."
     $answer = [System.Windows.Forms.MessageBox]::Show($script:Gui.Form, $text, 'Confirm storage vMotion', [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
@@ -2863,9 +3150,13 @@ function Show-MigrationDialog {
         Asks where each environment's VMs should go, how many at once, and how much space to keep.
 
     .DESCRIPTION
-        Returns Mode ('Preview' or 'Migrate'), Targets (environment -> target), MaxConcurrent and
-        MinFreeSpacePercent - or $null when cancelled. Nothing is preselected: every target is an
-        explicit choice.
+        Returns Mode ('Preview' or 'Migrate'), Targets (environment -> target, or 'Suggested'),
+        MaxConcurrent and MinFreeSpacePercent - or $null when cancelled.
+
+        Per environment: when it has eligible targets, "Suggested destination for each VM" is
+        preselected (if any VM has one), followed by the eligible targets. When it has none, every
+        available NFS datastore (Fallback) is listed with its own classification and nothing is
+        preselected - with a note that none is named for the environment.
 
     .PARAMETER Environment
         The environments of the chosen VMs, in rule order.
@@ -2875,6 +3166,13 @@ function Show-MigrationDialog {
 
     .PARAMETER Count
         Environment -> number of chosen VMs.
+
+    .PARAMETER Suggested
+        Environment -> summary of the VMs' suggested destinations, '' when none has one.
+
+    .PARAMETER Fallback
+        Environment -> targets from Get-PlacementFallbackChoice, for environments with no eligible
+        target.
 
     .PARAMETER Unknown
         Chosen VMs with no known environment (they will be skipped).
@@ -2902,6 +3200,10 @@ function Show-MigrationDialog {
 
         [Parameter(Mandatory)]
         [hashtable]$Count,
+
+        [hashtable]$Suggested = @{},
+
+        [hashtable]$Fallback = @{},
 
         [int]$Unknown = 0,
 
@@ -2944,13 +3246,22 @@ function Show-MigrationDialog {
         }
         & $addNote ("Moves each VM's home folder and every disk to the target you pick. Powered-on VMs stay running. " +
             'Offered per environment: datastore clusters whose every datastore is that environment (Storage DRS picks the member), ' +
-            'and single NFS datastores named for it - mounted on the clusters involved. Nothing is preselected.') ([System.Drawing.SystemColors]::ControlText)
+            'and single NFS datastores named for it - mounted on the clusters involved. Where a VM has a suggested destination, that is preselected; you can pick one target for all instead.') ([System.Drawing.SystemColors]::ControlText)
         & $addNote 'A VM protected by SRM with array-based replication leaves its replicated datastore - check its protection group afterwards.' ([System.Drawing.Color]::DarkGoldenrod)
         if ($Unknown -gt 0) { & $addNote "$Unknown chosen VM(s) have no known environment and will be skipped." ([System.Drawing.Color]::DimGray) }
         if ($WhatIfOnly) { & $addNote 'The script was started with -WhatIf, so this can only preview.' ([System.Drawing.Color]::Firebrick) }
 
         $combos = @{}
+        $optionsByName = @{}
         foreach ($name in $Environment) {
+            $eligible = @($Choice[$name])
+            $fallbackTargets = @()
+            if ($eligible.Count -eq 0 -and $Fallback.ContainsKey($name)) { $fallbackTargets = @($Fallback[$name]) }
+            if ($eligible.Count -eq 0 -and $fallbackTargets.Count -gt 0) {
+                & $addNote ("No $name datastore cluster or NFS datastore is mounted where these VMs run, so every available NFS datastore on their cluster is listed instead. " +
+                    "None is named for $name - a VM moved there will still be listed afterwards. Nothing is preselected.") ([System.Drawing.Color]::Firebrick)
+            }
+
             $label = New-Object System.Windows.Forms.Label
             $label.Text = "$name - $($Count[$name]) VM(s)"
             $label.AutoSize = $true
@@ -2958,14 +3269,37 @@ function Show-MigrationDialog {
             $combo = New-Object System.Windows.Forms.ComboBox
             $combo.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
             $combo.Width = 620
-            $options = @($Choice[$name])
-            if ($options.Count -eq 0) { [void]$combo.Items.Add("(no eligible $name target on these clusters - these VMs will be skipped)") }
-            else { [void]$combo.Items.Add('(do not migrate)') }
-            foreach ($target in $options) { [void]$combo.Items.Add((Format-PlacementTarget -Target $target)) }
-            $combo.SelectedIndex = 0
+            $options = New-Object System.Collections.Generic.List[object]
+            $preselect = 0
+            if ($eligible.Count -gt 0) {
+                [void]$combo.Items.Add('(do not migrate)')
+                $summary = ''
+                if ($Suggested.ContainsKey($name)) { $summary = [string]$Suggested[$name] }
+                if ($summary) {
+                    [void]$combo.Items.Add("Suggested destination for each VM:  $summary")
+                    $options.Add('Suggested')
+                    $preselect = 1
+                }
+                foreach ($target in $eligible) {
+                    [void]$combo.Items.Add((Format-PlacementTarget -Target $target))
+                    $options.Add($target)
+                }
+            }
+            elseif ($fallbackTargets.Count -gt 0) {
+                [void]$combo.Items.Add('(do not migrate)')
+                foreach ($target in $fallbackTargets) {
+                    [void]$combo.Items.Add((Format-PlacementTarget -Target $target))
+                    $options.Add($target)
+                }
+            }
+            else {
+                [void]$combo.Items.Add("(no $name target and no NFS datastore available - these VMs will be skipped)")
+            }
+            $combo.SelectedIndex = $preselect
             $layout.Controls.Add($label)
             $layout.Controls.Add($combo)
             $combos[$name] = $combo
+            $optionsByName[$name] = $options.ToArray()
         }
 
         $concurrency = New-Object System.Windows.Forms.NumericUpDown
@@ -3020,9 +3354,9 @@ function Show-MigrationDialog {
 
         $targets = @{}
         foreach ($name in $Environment) {
-            $options = @($Choice[$name])
+            $options = @($optionsByName[$name])
             $index = $combos[$name].SelectedIndex
-            if ($options.Count -gt 0 -and $index -gt 0) { $targets[$name] = $options[$index - 1] }
+            if ($index -gt 0 -and $index -le $options.Count) { $targets[$name] = $options[$index - 1] }
         }
         [pscustomobject]@{
             Mode = [string]$dialog.Tag
@@ -3043,8 +3377,10 @@ function Invoke-GuiMigration {
         final confirmation.
 
     .DESCRIPTION
-        Free space and datastore clusters are read fresh from vCenter first. A Preview runs the same
-        plan with -WhatIf. After a live run, the clusters whose VMs moved are discovered again, so
+        Free space and datastore clusters are read fresh from vCenter first, and the suggested
+        destinations worked out again from them. When an environment has no eligible target, every
+        available NFS datastore on the clusters is offered instead. A Preview runs the same plan
+        with -WhatIf. After a live run, the clusters whose VMs moved are discovered again, so
         the VM tabs show where things are now.
 
     .PARAMETER All
@@ -3094,21 +3430,45 @@ function Invoke-GuiMigration {
     $clusterNames = @($chosen | ForEach-Object { $_.Cluster } | Select-Object -Unique)
     $clusterViews = @($clusterNames | Where-Object { $script:GuiState.ClusterViews.ContainsKey($_) } | ForEach-Object { $script:GuiState.ClusterViews[$_] })
     $storage = @(Get-PlacementStorageInfo -Server $script:GuiState.Connection -ClusterView $clusterViews -ExcludeDatastoreType $script:GuiState.ExcludeTypes)
+    $suggestions = Get-PlacementSuggestion -Finding $chosen -StorageInfo $storage -RuleSet $ruleSet -MinFreeSpacePercent $script:GuiState.MinFreePercent
     $choices = @{}
     $counts = @{}
+    $suggested = @{}
+    $fallbacks = @{}
+    $allFallback = $null
     foreach ($name in $environments) {
         $choices[$name] = @(Get-PlacementTargetChoice -StorageInfo $storage -RuleSet $ruleSet -Environment $name)
-        $counts[$name] = @($chosen | Where-Object { $_.ExpectedEnvironment -eq $name }).Count
+        $ofEnvironment = @($chosen | Where-Object { $_.ExpectedEnvironment -eq $name })
+        $counts[$name] = $ofEnvironment.Count
+
+        $targetNames = @($ofEnvironment | ForEach-Object {
+                $key = [string]$_.VMId
+                if (-not $key) { $key = "name:$($_.VMName)" }
+                if ($suggestions.ContainsKey($key) -and $null -ne $suggestions[$key].Target) { $suggestions[$key].Target.Name }
+            })
+        $parts = @($targetNames | Group-Object | Sort-Object -Property Name | ForEach-Object { "$($_.Name) for $($_.Count)" })
+        $summary = ''
+        if ($parts.Count -gt 0) {
+            $summary = $parts -join ', '
+            $without = $ofEnvironment.Count - $targetNames.Count
+            if ($without -gt 0) { $summary += "; $without with none (skipped)" }
+        }
+        $suggested[$name] = $summary
+
+        if ($choices[$name].Count -eq 0) {
+            if ($null -eq $allFallback) { $allFallback = @(Get-PlacementFallbackChoice -StorageInfo $storage -RuleSet $ruleSet) }
+            $fallbacks[$name] = $allFallback
+        }
     }
     $unknown = @($chosen | Where-Object { -not $_.ExpectedEnvironment }).Count
     Exit-GuiBusyState
 
-    $selection = Show-MigrationDialog -Environment $environments -Choice $choices -Count $counts -Unknown $unknown -MaxConcurrent $script:GuiState.MaxConcurrent -MinFreeSpacePercent $script:GuiState.MinFreePercent -WhatIfOnly $script:WhatIfRun
+    $selection = Show-MigrationDialog -Environment $environments -Choice $choices -Count $counts -Suggested $suggested -Fallback $fallbacks -Unknown $unknown -MaxConcurrent $script:GuiState.MaxConcurrent -MinFreeSpacePercent $script:GuiState.MinFreePercent -WhatIfOnly $script:WhatIfRun
     if ($null -eq $selection) { return }
     $script:GuiState.MaxConcurrent = $selection.MaxConcurrent
     $script:GuiState.MinFreePercent = $selection.MinFreeSpacePercent
 
-    $plan = @(Get-PlacementMigrationPlan -Finding $chosen -TargetByEnvironment $selection.Targets -MinFreeSpacePercent $selection.MinFreeSpacePercent)
+    $plan = @(Get-PlacementMigrationPlan -Finding $chosen -TargetByEnvironment $selection.Targets -Suggestion $suggestions -MinFreeSpacePercent $selection.MinFreeSpacePercent)
     $moves = @($plan | Where-Object { $_.Action -eq 'Migrate' })
     $preview = ($selection.Mode -ne 'Migrate') -or $script:WhatIfRun
     if (-not $preview -and $moves.Count -gt 0 -and -not (Confirm-GuiMigration -Plan $plan -MaxConcurrent $selection.MaxConcurrent)) {
@@ -3612,7 +3972,7 @@ try {
                 $inventory.Add((Get-ClusterPlacementInventory -Server $connection -ClusterView $clusterView -ExcludeDatastoreType $ExcludeDatastoreType))
             }
 
-            $result = Invoke-PlacementEvaluation -Inventory $inventory.ToArray() -RuleSet $ruleSet -FlagUnclassifiedDatastores:$FlagUnclassifiedDatastores -HideUndetermined:$HideUndetermined -ScriptVersion $ScriptVersion
+            $result = Invoke-PlacementEvaluation -Inventory $inventory.ToArray() -RuleSet $ruleSet -FlagUnclassifiedDatastores:$FlagUnclassifiedDatastores -HideUndetermined:$HideUndetermined -MinFreeSpacePercent $MinFreeSpacePercent -ScriptVersion $ScriptVersion
             Write-PlacementLog (Format-PlacementSummary -Summary $result.Summary) -Level INFO
 
             if ([string]::IsNullOrWhiteSpace($OutputPath)) {
@@ -3633,12 +3993,27 @@ try {
                 foreach ($key in @($MigrateTo.Keys)) {
                     $environment = ([string]$key).ToUpperInvariant()
                     $wantedName = [string]$MigrateTo[$key]
+                    if ($wantedName -eq 'Suggested') {
+                        $targetByEnvironment[$environment] = 'Suggested'
+                        Write-PlacementLog "$environment target: each VM's suggested destination." -Level INFO
+                        continue
+                    }
                     $eligible = @(Get-PlacementTargetChoice -StorageInfo $storage -RuleSet $ruleSet -Environment $environment)
                     $match = @($eligible | Where-Object { $_.Name -eq $wantedName })
-                    if ($match.Count -eq 0) {
+                    if ($match.Count -eq 0 -and $eligible.Count -eq 0) {
+                        # Nothing eligible at all: any available NFS datastore may be named instead.
+                        $fallback = @(Get-PlacementFallbackChoice -StorageInfo $storage -RuleSet $ruleSet)
+                        $match = @($fallback | Where-Object { $_.Name -eq $wantedName })
+                        if ($match.Count -eq 0) {
+                            $names = @($fallback | ForEach-Object { "$($_.Name) ($($_.Label))" }) -join ', '
+                            if (-not $names) { $names = 'none' }
+                            throw "No $environment target is available on these clusters, and '$wantedName' is not one of their available NFS datastores either: $names."
+                        }
+                        Write-PlacementLog "'$wantedName' is not a $environment datastore ($($match[0].Label)) - none is available on these clusters - so VMs moved there will still be listed afterwards." -Level WARN
+                    }
+                    elseif ($match.Count -eq 0) {
                         $names = @($eligible | ForEach-Object { "$($_.Name) ($($_.Kind.ToLowerInvariant()))" }) -join ', '
-                        if (-not $names) { $names = 'none on these clusters' }
-                        throw "'$wantedName' is not an eligible $environment target. Eligible: $names."
+                        throw "'$wantedName' is not an eligible $environment target. Eligible: $names, or 'Suggested'."
                     }
                     if ($match.Count -gt 1) {
                         throw "'$wantedName' names both a datastore cluster and a datastore. Rename one, or migrate from the GUI."
@@ -3649,7 +4024,8 @@ try {
 
                 $patterns = $MigrateVM
                 $candidates = @(@($result.Findings) + @($result.Unscoped) | Where-Object { $vmName = $_.VMName; @($patterns | Where-Object { $vmName -like $_ }).Count -gt 0 })
-                $plan = @(Get-PlacementMigrationPlan -Finding $candidates -TargetByEnvironment $targetByEnvironment -MinFreeSpacePercent $MinFreeSpacePercent)
+                $suggestions = Get-PlacementSuggestion -Finding $candidates -StorageInfo $storage -RuleSet $ruleSet -MinFreeSpacePercent $MinFreeSpacePercent
+                $plan = @(Get-PlacementMigrationPlan -Finding $candidates -TargetByEnvironment $targetByEnvironment -Suggestion $suggestions -MinFreeSpacePercent $MinFreeSpacePercent)
                 $moves = @($plan | Where-Object { $_.Action -eq 'Migrate' })
                 Write-PlacementLog "Migration plan: $($plan.Count) VM(s), $($moves.Count) to move, $($plan.Count - $moves.Count) skipped." -Level INFO
                 foreach ($row in $plan) {

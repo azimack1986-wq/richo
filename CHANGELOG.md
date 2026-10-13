@@ -4104,6 +4104,58 @@ authentication removed, for operators who apply their own
 
 ## Test-VMDatastorePlacement.ps1
 
+### [1.4.0] — 2026-10-13
+
+#### Added
+
+- **A suggested destination for every VM on either list**, in a new
+  `SuggestedDestination` column and CSV. It is picked from the eligible targets for
+  the VM's environment that are mounted on the host it runs on:
+  - a datastore cluster before a single datastore
+  - then the one with the most free space
+  - only while the target still keeps `-MinFreeSpacePercent` free after taking it,
+    counting the VMs suggested to it before
+
+  Where there is none, the column says why, e.g. *None - no PROD datastore cluster or
+  NFS datastore is mounted on esx02. Migrate it on its own to choose from every NFS
+  datastore there.* Discovery reads the storage once, for both the placement check and
+  the suggestions.
+- **The migration dialog preselects "Suggested destination for each VM"** per
+  environment, e.g. *DSC_SHARED_01 for 3, NFS_SHARED_04 for 1; 2 with none
+  (skipped)*. Each VM goes to its own suggestion, recomputed from free space read
+  fresh when the dialog opens. One target for all, or "do not migrate", can still be
+  picked. Headless: `-MigrateTo @{ PROD = 'Suggested' }`.
+- **When an environment has no eligible target where its VMs run, every available NFS
+  datastore on the cluster is offered instead.** Each is labelled with its own
+  classification (e.g. `[DEV]`, `[no PROD/SIT/DEV keyword]`) and its datastore cluster
+  if any, and the unkeyworded ones are listed first. Nothing is preselected, and a red
+  note says none is named for the environment. Only a datastore picked from this list
+  passes the plan's environment check. The confirmation names these moves, and the
+  result row keeps saying the VM will still be listed afterwards. Headless allows the
+  same, and only when the clusters have no eligible target for that environment.
+
+#### Fixed
+
+- **The spinning wait cursor could stay on after discovery had finished.** The busy
+  state set the form's `Cursor`. A DataGridView keeps the cursor it had when the
+  pointer crossed a column divider and restores it later, so a wait cursor picked up
+  mid-discovery could stay on a grid once the form was idle — other WinForms grids are
+  documented doing the same. Now:
+  - busy uses `UseWaitCursor`, which every child control follows
+  - idle clears it, resets every grid's own cursor, and sets `Cursor.Current` so the
+    pointer changes immediately rather than on the next mouse move
+
+  Not reproduced: the window cannot run on the test host. A static test guards it —
+  every grid the window creates must be in the reset list, and nothing may set a wait
+  cursor any other way.
+
+#### Tests
+
+- `tests/Test-VMDatastorePlacement.ps1` — 345 assertions. Mutation-checked: a
+  non-fallback datastore of another environment allowed, suggestions ignoring the host
+  or free space, the fallback list shown when eligible targets exist, a grid left out
+  of the cursor reset, and the form cursor used for busy again each turn it red.
+
 ### [1.3.0] — 2026-10-13
 
 #### Changed

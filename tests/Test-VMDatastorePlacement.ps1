@@ -32,7 +32,7 @@ $wanted = @('Write-PlacementLog', 'Split-RuleValue', 'ConvertTo-PlacementRuleSet
             'Get-DnsEnvironment', 'Get-HostnameEnvironment', 'Resolve-VMExpectedEnvironment', 'Get-PlacementReportColumn',
             'Get-PlacementMigrationColumn', 'Format-PlacementSize', 'Test-VMPlacement', 'Invoke-PlacementEvaluation',
             'Format-PlacementSummary', 'Get-PlacementSiblingPath', 'Export-PlacementReport', 'Get-PlacementHostSeeing',
-            'Format-PlacementTarget', 'Get-PlacementTargetChoice', 'Get-PlacementMigrationPlan',
+            'Format-PlacementTarget', 'Get-PlacementTargetChoice', 'Get-PlacementSuggestion', 'Get-PlacementFallbackChoice', 'Get-PlacementMigrationPlan',
             'Get-ViewProperty', 'Get-DatastoreNameFromPath', 'Format-PlacementNameList', 'ConvertTo-PlacementVMRecord', 'ConvertTo-PlacementDataTable',
             'Connect-PlacementVCenter', 'Disconnect-PlacementVCenter', 'Get-PlacementClusterList', 'Get-ClusterPlacementInventory',
             'Get-PlacementStorageInfo', 'Get-PlacementTaskState', 'Invoke-PlacementMigration',
@@ -462,11 +462,44 @@ Assert-True "a datastore shared by two clusters is one target, usable from both"
 Assert-True "the target line names kind, free space and clusters" ((Format-PlacementTarget -Target $prod[0]) -match '^Datastore cluster  DSC_SHARED_01  -  2[.,]9 TB free of 5[.,]9 TB  -  CL-A$') (Format-PlacementTarget -Target $prod[0])
 
 # ---------------------------------------------------------------------------------------------
-Write-Host "`n=== Migration plan: who moves, who is skipped, and why ===" -ForegroundColor Cyan
+Write-Host "`n=== Suggested destination per VM ===" -ForegroundColor Cyan
 function New-Finding { param($Name, $Environment, $Cluster = 'CL-A', $EsxiHost = 'esxA1', [string[]]$Datastores = @('NFS_DEV_01'), [double]$SizeGB = 50, $Status = 'Wrong datastore', $Id = $Name)
     [pscustomobject]@{ VMName = $Name; VMId = $Id; VMRef = (New-Ref 'VirtualMachine' $Id); Cluster = $Cluster; EsxiHost = $EsxiHost; ExpectedEnvironment = $Environment
         DatastoreNames = $Datastores; SizeGB = $SizeGB; CommittedBytes = [long]($SizeGB * 1GB); Status = $Status }
 }
+$sug = Get-PlacementSuggestion -Finding @(
+    (New-Finding 'p1' 'PROD'),
+    (New-Finding 'p2' 'PROD' -EsxiHost 'esxA2'),
+    (New-Finding 'p3' 'PROD' -EsxiHost 'esxZ9'),
+    (New-Finding 'd1' 'DEV' -Datastores @('NFS_DEV_01')),
+    (New-Finding 'u1' '' -Status 'Environment undetermined')) -StorageInfo @($storageA) -RuleSet $rules
+Assert-True "a datastore cluster is suggested before a single datastore" ($sug['p1'].Target.Name -eq 'DSC_SHARED_01' -and $sug['p1'].Text -eq 'DSC_SHARED_01 (datastore cluster)')
+Assert-True "only targets mounted on the VM's own host are suggested" ($sug['p2'].Target.Name -eq 'DSC_SHARED_01')
+Assert-True "no target mounted on its host: none, and it says why and what to do" ($null -eq $sug['p3'].Target -and $sug['p3'].Text -match '^None - no PROD datastore cluster or NFS datastore is mounted on esxZ9\. Migrate it on its own')
+Assert-True "the datastore a VM is already on is not suggested to it" ($null -eq $sug['d1'].Target)
+Assert-True "unknown environment: none" ($sug['u1'].Text -eq 'None - its environment is not known.')
+$small = $storageA.PSObject.Copy()
+$small.Pods = @((New-PodInfo 'p1' 'DSC_SHARED_01' @('d6', 'd7') -FreeGB 700 -CapacityGB 6000))
+$small.Datastores = @((New-DsInfo 'd1' 'NFS_SHARED_01' -FreeGB 400 -CapacityGB 1000), (New-DsInfo 'd2' 'NFS_SHARED_41' -Type 'NFS41' -FreeGB 900 -CapacityGB 1000), (New-DsInfo 'd6' 'NFS_SHARED_P1' -Pod 'p1'), (New-DsInfo 'd7' 'NFS_SHARED_P2' -Pod 'p1'))
+$small.HostDatastores = @{ esxA1 = @('d1', 'd2', 'd6', 'd7') }
+$sug = Get-PlacementSuggestion -Finding @((New-Finding 'a' 'PROD' -SizeGB 200), (New-Finding 'b' 'PROD' -SizeGB 200), (New-Finding 'c' 'PROD' -SizeGB 200), (New-Finding 'd' 'PROD' -SizeGB 200)) -StorageInfo @($small) -RuleSet $rules
+Assert-True "space: a target is only suggested while it keeps 10% free, counting earlier suggestions" ($sug['a'].Target.Name -eq 'NFS_SHARED_41' -and $sug['b'].Target.Name -eq 'NFS_SHARED_41' -and $sug['c'].Target.Name -eq 'NFS_SHARED_41' -and $sug['d'].Target.Name -eq 'NFS_SHARED_01') "$($sug['a'].Text) / $($sug['b'].Text) / $($sug['c'].Text) / $($sug['d'].Text)"
+$sug = Get-PlacementSuggestion -Finding @((New-Finding 'big' 'PROD' -SizeGB 5000)) -StorageInfo @($small) -RuleSet $rules
+Assert-True "space: none big enough says so" ($null -eq $sug['big'].Target -and $sug['big'].Text -match 'has room for it while keeping 10% free')
+
+Write-Host "`n=== Every NFS datastore, when an environment has no target ===" -ForegroundColor Cyan
+$fb = @(Get-PlacementFallbackChoice -StorageInfo @($storageA) -RuleSet $rules)
+$fbNames = @($fb | ForEach-Object { $_.Name })
+Assert-True "NFS and NFS 4.1, whatever their name, members of datastore clusters included" (($fbNames -join ',') -eq 'NFS_DEV_01,NFS_DEV_P4,NFS_SHARED_01,NFS_SHARED_41,NFS_SHARED_P1,NFS_SHARED_P2,NFS_SHARED_P3') ($fbNames -join ',')
+Assert-True "  not vSAN, not in maintenance, not inaccessible, not mounted nowhere" (@($fbNames | Where-Object { $_ -match 'VSAN|MAINT|DOWN|UNMOUNTED' }).Count -eq 0)
+Assert-True "  each is marked Fallback and labelled with its own classification" (@($fb | Where-Object { -not $_.Fallback }).Count -eq 0 -and @($fb | Where-Object { $_.Name -eq 'NFS_DEV_01' })[0].Label -eq 'DEV')
+Assert-True "  a datastore cluster member says which cluster it is in" (@($fb | Where-Object { $_.Name -eq 'NFS_SHARED_P1' })[0].Pod -eq 'DSC_SHARED_01')
+$misc = [pscustomobject]@{ Cluster = 'CL-M'; Datastores = @((New-DsInfo 'm2' 'NFS_DEV_09'), (New-DsInfo 'm1' 'NFS_MISC_01')); Pods = @(); HostDatastores = @{ esxM1 = @('m1', 'm2') } }
+Assert-True "  a datastore with no keyword is listed before one named for another environment" ((@(Get-PlacementFallbackChoice -StorageInfo @($misc) -RuleSet $rules | ForEach-Object { $_.Name }) -join ',') -eq 'NFS_MISC_01,NFS_DEV_09')
+Assert-True "  and its line says what it is" ((Format-PlacementTarget -Target @($fb | Where-Object { $_.Name -eq 'NFS_SHARED_P1' })[0]) -match '\[PROD\].*\(in datastore cluster DSC_SHARED_01\)$')
+
+# ---------------------------------------------------------------------------------------------
+Write-Host "`n=== Migration plan: who moves, who is skipped, and why ===" -ForegroundColor Cyan
 $podTarget = $prod[0]
 $nfsTarget = $prod[1]
 $devTarget = $dev[0]
@@ -497,6 +530,19 @@ Assert-True "space: the second does not, counting the first" ($p[1].Action -eq '
 Assert-True "space: a smaller one after it still fits" ($p[2].Action -eq 'Migrate')
 $p = @(Get-PlacementMigrationPlan -Finding @((New-Finding 'a' 'PROD' -SizeGB 450)) -TargetByEnvironment @{ PROD = $tight } -MinFreeSpacePercent 0)
 Assert-True "space: 0% kept lets a VM fill the target" ($p[0].Action -eq 'Migrate')
+
+$suggestedFor = Get-PlacementSuggestion -Finding @((New-Finding 's1' 'PROD'), (New-Finding 's2' 'PROD' -EsxiHost 'esxZ9')) -StorageInfo @($storageA) -RuleSet $rules
+$p = @(Get-PlacementMigrationPlan -Finding @((New-Finding 's1' 'PROD'), (New-Finding 's2' 'PROD' -EsxiHost 'esxZ9')) -TargetByEnvironment @{ PROD = 'Suggested' } -Suggestion $suggestedFor)
+Assert-True "'Suggested': each VM goes to its own suggestion" ($p[0].Action -eq 'Migrate' -and $p[0].Target -eq 'DSC_SHARED_01')
+Assert-True "'Suggested': a VM with none is skipped, saying why" ($p[1].Action -eq 'Skip' -and $p[1].Reason -match '^No suggested destination: no PROD datastore cluster or NFS datastore is mounted on esxZ9')
+$fallbackTarget = @($fb | Where-Object { $_.Name -eq 'NFS_DEV_01' })[0]
+$p = @(Get-PlacementMigrationPlan -Finding @((New-Finding 'f1' 'PROD' -Datastores @('NFS_MISC_01'))) -TargetByEnvironment @{ PROD = $fallbackTarget })
+Assert-True "a fallback target the user picked passes the environment check, and says the VM will still be listed" ($p[0].Action -eq 'Migrate' -and $p[0].Fallback -and $p[0].Reason -match 'NOT a PROD datastore \(DEV\).*still be listed')
+$p = @(Get-PlacementMigrationPlan -Finding @((New-Finding 'f2' 'PROD' -Datastores @('NFS_DEV_01'))) -TargetByEnvironment @{ PROD = $fallbackTarget })
+Assert-True "  but not to the datastore it is already on" ($p[0].Action -eq 'Skip' -and $p[0].Reason -eq 'Already on NFS_DEV_01.')
+$notFallback = $fallbackTarget.PSObject.Copy(); $notFallback.Fallback = $false
+$p = @(Get-PlacementMigrationPlan -Finding @((New-Finding 'f3' 'PROD' -Datastores @('NFS_MISC_01'))) -TargetByEnvironment @{ PROD = $notFallback })
+Assert-True "  and a DEV datastore NOT picked as a fallback is still refused for a PROD VM" ($p[0].Action -eq 'Skip' -and $p[0].Reason -match 'belongs on PROD')
 
 # ---------------------------------------------------------------------------------------------
 # A stubbed vCenter. Get-View answers the shapes of request the script sends and throws on any
@@ -704,6 +750,11 @@ Assert-True "the vCLS VM and the VMFS-only VM are not reported" (@($rows | Where
 Assert-True "the -P VM is reported by its suffix" (@($rows | Where-Object { $_.VMName -eq 'SQLCLUSTER01-P' -and $_.ExpectedEnvironment -eq 'PROD' -and $_.Reason -match "suffix '-p'" }).Count -eq 1)
 Assert-True "the SRM placeholder is in neither list" (@($rows | Where-Object { $_.VMName -eq 'siepd85csp09' }).Count -eq 0 -and @(Import-Csv -Path (Join-Path $tmp 'run_NotOnProdSitDev.csv') | Where-Object { $_.VMName -eq 'siepd85csp09' }).Count -eq 0)
 Assert-True "the misplaced CSV holds the same rows" (@(Import-Csv -Path $csv).Count -eq 4)
+$byName = @{}; foreach ($row in @(Import-Csv -Path $csv) + @(Import-Csv -Path (Join-Path $tmp 'run_NotOnProdSitDev.csv'))) { $byName[$row.VMName] = $row.SuggestedDestination }
+Assert-True "suggested: the DEV VM on SHARED -> the DEV NFS datastore on its host" ($byName['siepd85csd02'] -eq 'NFS_DEV_01 (datastore)')
+Assert-True "suggested: the PROD VM on DEV -> the SHARED datastore cluster" ($byName['siepd85csp07'] -eq 'DSC_SHARED_01 (datastore cluster)')
+Assert-True "suggested: the PROD VM on NFS_MISC_01 too" ($byName['siepd85csp08'] -eq 'DSC_SHARED_01 (datastore cluster)')
+Assert-True "suggested: none for the PROD VMs on a host with no PROD datastore - and why" ($byName['siepd85csp03'] -match '^None - no PROD datastore cluster or NFS datastore is mounted on esx02' -and $byName['SQLCLUSTER01-P'] -match '^None - ')
 $unscopedCsv = @(Import-Csv -Path (Join-Path $tmp 'run_NotOnProdSitDev.csv'))
 Assert-True "the Not on PROD/SIT/DEV CSV holds the VM on NFS_MISC_01" ($unscopedCsv.Count -eq 1 -and $unscopedCsv[0].VMName -eq 'siepd85csp08')
 Assert-True "connected once and disconnected once" (($world.Calls.ToArray() -join ',') -eq 'connect vc.example,disconnect vc.example') "got $($world.Calls.ToArray() -join ',')"
@@ -743,6 +794,19 @@ $out = @(& $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath
 Assert-True "-MigrateVM picks the VMs" ((Get-Names $out) -eq 'siepd85csd02' -and ($world.Moves.ToArray() -join ',') -eq 'vm-2->ds-2')
 
 $world = New-World
+$out = @(& $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv -MigrateTo @{ PROD = 'Suggested'; DEV = 'Suggested' } -Confirm:$false 6>$null)
+Assert-True "'Suggested': every VM to its own suggestion" ((@($world.Moves.ToArray() | Sort-Object) -join ',') -eq 'vm-2->ds-2,vm-7->group-p1,vm-8->group-p1') "got $($world.Moves.ToArray() -join ',')"
+Assert-True "'Suggested': the VMs with none are skipped, saying why" (@($out | Where-Object { $_.Result -eq 'Skipped' -and $_.Detail -match '^No suggested destination: no PROD' }).Count -eq 2)
+
+$world = New-World
+$out = @(& $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv -Cluster 'CL-DEV-01' -MigrateTo @{ PROD = 'NFS_DEV_02' } -Confirm:$false 6>$null 3>$null)
+Assert-True "no PROD target on CL-DEV-01: an NFS datastore there may be named instead" ((@($world.Moves.ToArray() | Sort-Object) -join ',') -eq 'vm-11->ds-3,vm-4->ds-3') "got $($world.Moves.ToArray() -join ',')"
+Assert-True "  and every result says it is not a PROD datastore" (@($out | Where-Object { $_.Result -eq 'Migrated' -and $_.Detail -match 'NOT a PROD datastore' }).Count -eq 2)
+$world = New-World
+$message = try { & $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv -Cluster 'CL-DEV-01' -MigrateTo @{ PROD = 'NOPE' } -Confirm:$false 6>$null 2>$null; '' } catch { $_.Exception.Message }
+Assert-True "  a name that is not one of them is refused, listing them" ($message -match "No PROD target is available on these clusters, and 'NOPE' is not one of their available NFS datastores either: NFS_DEV_01 \(DEV\), NFS_DEV_02 \(DEV\)") $message
+
+$world = New-World
 $message = try { & $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv -MigrateTo @{ PROD = 'NFS_DEV_01' } -Confirm:$false 6>$null 2>$null; '' } catch { $_.Exception.Message }
 Assert-True "a target that is not eligible for the environment is refused, listing the eligible ones" ($message -match "'NFS_DEV_01' is not an eligible PROD target\. Eligible: DSC_SHARED_01 \(datastore cluster\), NFS_SHARED_01 \(datastore\)") $message
 Assert-True "  nothing moved, and the session closed" ($world.Moves.Count -eq 0 -and $world.Calls.ToArray() -contains 'disconnect vc.example')
@@ -759,11 +823,16 @@ function Exit-GuiBusyState { $script:GuiState.Busy = $false }
 function Show-GuiMessage { param([string]$Text, [string]$Icon = 'Information') $messages.Add("${Icon}: $Text") }
 function Wait-GuiInterval { param([int]$Seconds = 5) }
 function Show-MigrationDialog {
-    param($Environment, $Choice, $Count, $Unknown, $MaxConcurrent, $MinFreeSpacePercent, $WhatIfOnly)
-    $script:dialogSeen = [pscustomobject]@{ Environment = @($Environment); Choice = $Choice; Count = $Count; WhatIfOnly = $WhatIfOnly }
+    param($Environment, $Choice, $Count, $Suggested, $Fallback, $Unknown, $MaxConcurrent, $MinFreeSpacePercent, $WhatIfOnly)
+    $script:dialogSeen = [pscustomobject]@{ Environment = @($Environment); Choice = $Choice; Count = $Count; Suggested = $Suggested; Fallback = $Fallback; WhatIfOnly = $WhatIfOnly }
     if ($null -eq $script:dialogMode) { return $null }
+    # As the real dialog preselects: each VM's suggestion where there is one. A fallback datastore
+    # is only ever an explicit pick (dialogFallback).
     $picked = @{}
-    foreach ($name in @($Environment)) { if (@($Choice[$name]).Count -gt 0) { $picked[$name] = @($Choice[$name])[0] } }
+    foreach ($name in @($Environment)) {
+        if ($Suggested[$name]) { $picked[$name] = 'Suggested' }
+        elseif ($script:dialogFallback -and $Fallback.ContainsKey($name)) { $picked[$name] = @($Fallback[$name] | Where-Object { $_.Name -eq $script:dialogFallback })[0] }
+    }
     [pscustomobject]@{ Mode = $script:dialogMode; Targets = $picked; MaxConcurrent = 2; MinFreeSpacePercent = 10 }
 }
 function Confirm-GuiMigration { param($Plan, $MaxConcurrent) $script:confirmAsked++; $script:confirmAnswer }
@@ -888,6 +957,8 @@ Assert-True "dialog: offered PROD and DEV, in rule order" ((@($script:dialogSeen
 Assert-True "dialog: PROD choices - the datastore cluster, then the NFS datastore; VMFS never offered" ((@($script:dialogSeen.Choice['PROD'] | ForEach-Object { $_.Name }) -join ',') -eq 'DSC_SHARED_01,NFS_SHARED_01')
 Assert-True "dialog: DEV choices" ((@($script:dialogSeen.Choice['DEV'] | ForEach-Object { $_.Name }) -join ',') -eq 'NFS_DEV_01,NFS_DEV_02')
 Assert-True "dialog: counts per environment" ($script:dialogSeen.Count['PROD'] -eq 3 -and $script:dialogSeen.Count['DEV'] -eq 1)
+Assert-True "dialog: each environment's suggestions summarised, the ones with none counted" ($script:dialogSeen.Suggested['PROD'] -eq 'DSC_SHARED_01 for 1; 2 with none (skipped)' -and $script:dialogSeen.Suggested['DEV'] -eq 'NFS_DEV_01 for 1') "$($script:dialogSeen.Suggested['PROD']) | $($script:dialogSeen.Suggested['DEV'])"
+Assert-True "dialog: no fallback list while there are eligible targets" ($script:dialogSeen.Fallback.Count -eq 0)
 Assert-True "dialog cancelled: nothing happens" ($world.Moves.Count -eq 0 -and $null -eq $script:GuiState.Migrations -and $messages.Count -eq 0)
 
 $script:dialogMode = 'Preview'
@@ -895,7 +966,7 @@ $messages.Clear()
 Invoke-GuiAction { Invoke-GuiMigration -All } 6>$null
 Assert-True "preview: nothing moved, nothing asked" ($world.Moves.Count -eq 0 -and $script:confirmAsked -eq 0)
 Assert-True "preview: Migrations tab shows the plan" ($migrationTab.Text -eq 'Migrations (4)' -and $script:Gui.MigrationGrid.DataSource.Rows.Count -eq 4 -and [object]::ReferenceEquals($script:Gui.Tabs.SelectedTab, $migrationTab))
-Assert-True "preview: two would move, two skipped with the reason" ((Get-Names @($script:GuiState.Migrations | Where-Object { $_.Result -eq 'WhatIf' })) -eq 'siepd85csd02,siepd85csp07' -and @($script:GuiState.Migrations | Where-Object { $_.Result -eq 'Skipped' -and $_.Detail -match 'not mounted on esx02' }).Count -eq 2)
+Assert-True "preview: each to its suggestion - two would move, two skipped with the reason" ((Get-Names @($script:GuiState.Migrations | Where-Object { $_.Result -eq 'WhatIf' })) -eq 'siepd85csd02,siepd85csp07' -and @($script:GuiState.Migrations | Where-Object { $_.Result -eq 'Skipped' -and $_.Detail -match 'mounted on esx02' }).Count -eq 2)
 Assert-True "preview: says nothing was changed" ($messages.Count -eq 1 -and $messages[0] -match 'Preview only - nothing was changed')
 
 $script:Gui.Tabs.SelectedTab = $resultsTab
@@ -938,6 +1009,19 @@ $script:Gui.Tabs.SelectedTab = $migrationTab
 $active = Get-GuiActiveTable
 Assert-True "export from the Migrations tab exports the migration rows" ($active.Name -eq 'Migrations' -and @($active.Row).Count -eq 3 -and ($active.Column -join ',') -eq ((Get-PlacementMigrationColumn) -join ','))
 
+$script:Gui.Tabs.SelectedTab = $resultsTab
+$script:Gui.ResultsGrid.SelectedRows = New-StubSelection 'vm-4'
+$script:dialogFallback = 'NFS_DEV_02'
+$script:confirmAsked = 0
+$movesBefore = $world.Moves.Count
+$messages.Clear()
+Invoke-GuiAction { Invoke-GuiMigration } 6>$null 3>$null
+Assert-True "no PROD target where the VM runs: every NFS datastore on its cluster is offered instead" ((@($script:dialogSeen.Fallback['PROD'] | ForEach-Object { "$($_.Name)[$($_.Label)]" }) -join ',') -eq 'NFS_DEV_01[DEV],NFS_DEV_02[DEV]' -and @($script:dialogSeen.Choice['PROD']).Count -eq 0)
+Assert-True "  with no suggestion to preselect" (-not $script:dialogSeen.Suggested['PROD'])
+Assert-True "  the one picked is used, after the confirmation" ($script:confirmAsked -eq 1 -and $world.Moves.Count -eq $movesBefore + 1 -and $world.Moves.ToArray()[-1] -eq 'vm-4->ds-3')
+Assert-True "  and the result says it is not a PROD datastore, so the VM is still listed" (@($script:GuiState.Migrations)[0].Result -eq 'Migrated' -and @($script:GuiState.Migrations)[0].Detail -match 'NOT a PROD datastore' -and (Get-Names $script:GuiState.Result.Findings) -match 'siepd85csp03')
+$script:dialogFallback = $null
+
 $world.Calls.Clear()
 Invoke-GuiAction { Invoke-GuiDisconnect } 6>$null
 Assert-True "disconnect: signs out and empties the cluster list" (($world.Calls.ToArray() -join ',') -eq 'disconnect vc.example' -and $clusterList.Items.Count -eq 0 -and $null -eq $script:GuiState.Connection)
@@ -945,6 +1029,21 @@ Assert-True "disconnect: results stay exportable" ($null -ne $script:GuiState.Re
 $messages.Clear()
 Invoke-GuiAction { Invoke-GuiMigration -All } 6>$null 3>$null
 Assert-True "disconnected: migration refused" ($messages.Count -eq 1 -and $messages[0] -match 'Connect to vCenter first')
+
+Write-Host "`n=== The busy cursor is always undone ===" -ForegroundColor Cyan
+# The window cannot be run here, so this is checked from the source: busy goes through
+# UseWaitCursor only, and idle clears it and resets every grid the window creates - a
+# DataGridView can keep a wait cursor it picked up while busy.
+$guiFunctions = @{}
+foreach ($f in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { $guiFunctions[$f.Name] = $f.Extent.Text }
+$enterText = $guiFunctions['Enter-GuiBusyState']
+$exitText = $guiFunctions['Exit-GuiBusyState']
+Assert-True "busy sets UseWaitCursor, and never a control's Cursor to the wait cursor" ($enterText -match 'UseWaitCursor = \$true' -and $enterText -notmatch '\.Cursor = \[System\.Windows\.Forms\.Cursors\]::WaitCursor')
+Assert-True "idle clears UseWaitCursor and puts the pointer back at once" ($exitText -match 'UseWaitCursor = \$false' -and $exitText -match 'Cursor\]::Current = \[System\.Windows\.Forms\.Cursors\]::Default')
+$grids = @([regex]::Matches($guiFunctions['Show-PlacementGui'], '\$script:Gui\.(\w+Grid) = ') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+$missing = @($grids | Where-Object { $exitText -notmatch "'$_'" })
+Assert-True "idle resets the cursor of every grid the window creates ($($grids -join ', '))" ($grids.Count -ge 5 -and $missing.Count -eq 0) "missing: $($missing -join ', ')"
+Assert-True "nothing else in the script sets a wait cursor" (@([regex]::Matches((Get-Content -Path $scriptPath -Raw), 'Cursors\]::WaitCursor')).Count -eq 0)
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }
