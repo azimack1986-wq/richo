@@ -4104,6 +4104,48 @@ authentication removed, for operators who apply their own
 
 ## Test-VMDatastorePlacement.ps1
 
+### [1.3.0] — 2026-10-13
+
+#### Changed
+
+- **Only full VMs are shown. SRM placeholders and disk-less VMs are left out, and real
+  VMs are no longer at risk of being hidden.** Placeholder detection used to be a
+  single exact comparison of `Config.ManagedBy.ExtensionKey` with `com.vmware.vcDr`.
+  It is now:
+
+  - **SRM placeholder:** marked by SRM *and* no virtual disks — VMware's
+    documentation says a placeholder has no disks attached. The mark is matched as
+    `com.vmware.vcDr*` in any case (William Lam writes it `com.vmware.vcDR`; a
+    suffixed key matches too), or as type `placeholderVm` whatever the key. Not shown.
+  - **No disks, no mark:** not a full VM either. Not shown, counted separately.
+  - **Marked but has disks:** a real VM. Broadcom KB 412345 documents vCenter leaving
+    the placeholder mark on real production VMs after a failback (cleared from its
+    cache, not its database), so the mark alone must never hide a VM. It is shown,
+    its Reason says why, and the log warns with its name.
+
+  A VM whose configuration cannot be read is still judged on its datastore list,
+  never treated as disk-less. The log names the placeholders and disk-less VMs it
+  left out, per cluster, so the exclusion can be checked.
+
+#### Added
+
+- **Names ending -P or -S are PROD** (`-ProdNameSuffixes`, default `-P, -S`), and
+  are reported when not on a PROD (SHARED) datastore. A **Name suffixes** column in
+  the rules grid edits them per environment, like the hostname letters. They are
+  matched case-insensitively and ordinally on the name's first label — the VM name,
+  then the guest hostname — after the DNS name, which still decides first. When the
+  siepd letter and a suffix name different environments the VM is reported as
+  undetermined, naming both, rather than guessed. An unmapped letter with a suffix
+  goes by the suffix.
+
+#### Tests
+
+- `tests/Test-VMDatastorePlacement.ps1` — 306 assertions. The stubbed vCenter gains
+  a true placeholder, a real VM still carrying a placeholder mark, and
+  `SQLCLUSTER01-P` on a DEV datastore. Mutation-checked: hiding VMs on the mark
+  alone, an exact-match key, dropping the no-disk rule, ignoring suffixes, and
+  letting the letter win a conflict each turn it red.
+
 ### [1.2.0] — 2026-10-13
 
 #### Added

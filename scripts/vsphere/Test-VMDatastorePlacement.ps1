@@ -22,10 +22,12 @@
            dpesit, protectedsit    -> SIT
            dpedev, protecteddev    -> DEV
       2. When there is no DNS name, or it carries none of those labels, the VM name - then the
-         guest's short hostname - against the naming standard siepdXXxxL:
-           siepd + 2-digit site number + 2 letters + environment letter L
-           p -> PROD, t -> SIT, d -> DEV
-         e.g. siepd85csp1000 is PROD.
+         guest's short hostname - by either of two name rules:
+           - the naming standard siepdXXxxL: siepd + 2-digit site number + 2 letters +
+             environment letter L, where p -> PROD, t -> SIT, d -> DEV
+             e.g. siepd85csp1000 is PROD
+           - a name suffix: a name ending -P or -S is PROD, e.g. SQLCLUSTER01-P
+         When both apply and disagree, the VM is reported as undetermined rather than guessed.
 
     Which environment a datastore belongs to: a keyword in its name, as a word of its own -
     delimited by anything that is not a letter:
@@ -53,8 +55,14 @@
 
     Not on PROD/SIT/DEV tab: VMs none of whose (non-excluded) datastores carries a keyword.
 
-    Templates, vCLS/agent VMs (managed by ESX Agent Manager) and SRM placeholder VMs are skipped and
-    counted in the summary.
+    FULL VMs ONLY. Not shown, and counted in the summary:
+      - templates, and vCLS/agent VMs (managed by ESX Agent Manager)
+      - SRM placeholder VMs: marked by SRM (managedBy com.vmware.vcDr*, or type placeholderVm)
+        AND with no virtual disks - placeholders never have disks
+      - any other VM with no virtual disks
+    A VM that carries the SRM placeholder mark but HAS disks is a real VM - vCenter can leave the
+    mark behind after a failback (Broadcom KB 412345) - so it is shown, its Reason says so, and the
+    log lists it.
 
     MIGRATION. From either VM tab, Migrate selected or Migrate all in tab. For each environment among
     the chosen VMs you pick one target:
@@ -104,6 +112,15 @@
 
 .PARAMETER DevLetters
     Hostname environment letters that mean DEV. Default d.
+
+.PARAMETER ProdNameSuffixes
+    Name endings that mean PROD. Default -P, -S.
+
+.PARAMETER SitNameSuffixes
+    Name endings that mean SIT. Default none.
+
+.PARAMETER DevNameSuffixes
+    Name endings that mean DEV. Default none.
 
 .PARAMETER ProdDnsLabels
     DNS labels that mean PROD. Default dpe, protected.
@@ -194,6 +211,10 @@ param(
     [string[]]$SitLetters = @('t'),
     [string[]]$DevLetters = @('d'),
 
+    [string[]]$ProdNameSuffixes = @('-P', '-S'),
+    [string[]]$SitNameSuffixes = @(),
+    [string[]]$DevNameSuffixes = @(),
+
     [string[]]$ProdDnsLabels = @('dpe', 'protected'),
     [string[]]$SitDnsLabels = @('dpesit', 'protectedsit'),
     [string[]]$DevDnsLabels = @('dpedev', 'protecteddev'),
@@ -224,7 +245,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.2.0'
+$ScriptVersion = '1.3.0'
 
 $script:GuiLogSink = $null
 $script:Gui = $null
@@ -335,11 +356,13 @@ function ConvertTo-PlacementRuleSet {
         Validates the per-environment rules and compiles them into the matchers the evaluation uses.
 
     .DESCRIPTION
-        Each definition carries the environment name plus three comma-separated strings: hostname
-        letters, DNS labels and datastore keywords - exactly what the GUI rules grid holds.
+        Each definition carries the environment name plus comma-separated strings: hostname
+        letters, name suffixes, DNS labels and datastore keywords - exactly what the GUI rules
+        grid holds. Name suffixes are optional on a definition.
 
         Throws, listing every problem at once, when:
           - a hostname letter is not a single letter, or is mapped to two environments
+          - a name suffix has a space or symbol in it, or is mapped to two environments
           - a DNS label is not a single dot-free label, or is mapped to two environments
           - a datastore keyword is used by two environments
           - an environment has no datastore keyword (nothing could ever be classified as it)
@@ -349,7 +372,8 @@ function ConvertTo-PlacementRuleSet {
         decide where a VM belongs.
 
     .PARAMETER Definition
-        Objects with Environment, Letters, DnsLabels and DatastoreKeywords properties.
+        Objects with Environment, Letters, DnsLabels and DatastoreKeywords properties, and
+        optionally NameSuffixes.
 
     .PARAMETER HostnamePattern
         Regex for the naming standard; must contain (?<env>...).
@@ -371,6 +395,7 @@ function ConvertTo-PlacementRuleSet {
     $problems = New-Object System.Collections.Generic.List[string]
     $rules = New-Object System.Collections.Generic.List[object]
     $letterMap = @{}
+    $suffixMap = @{}
     $labelMap = @{}
     $keywordMap = @{}
     $environmentNames = New-Object System.Collections.Generic.List[string]
@@ -402,6 +427,24 @@ function ConvertTo-PlacementRuleSet {
             elseif (-not $letters.Contains($letter)) {
                 $letterMap[$letter] = $environment
                 $letters.Add($letter)
+            }
+        }
+
+        $suffixes = New-Object System.Collections.Generic.List[string]
+        $suffixText = ''
+        $suffixProperty = $item.PSObject.Properties['NameSuffixes']
+        if ($null -ne $suffixProperty) { $suffixText = [string]$suffixProperty.Value }
+        foreach ($suffix in @(Split-RuleValue $suffixText)) {
+            $suffix = $suffix.ToLowerInvariant()
+            if ($suffix -notmatch '^[a-z0-9._-]+$') {
+                $problems.Add("$environment name suffix '$suffix' may only contain letters, digits, '.', '_' and '-'.")
+            }
+            elseif ($suffixMap.ContainsKey($suffix) -and $suffixMap[$suffix] -ne $environment) {
+                $problems.Add("Name suffix '$suffix' is mapped to both $($suffixMap[$suffix]) and $environment.")
+            }
+            elseif (-not $suffixes.Contains($suffix)) {
+                $suffixMap[$suffix] = $environment
+                $suffixes.Add($suffix)
             }
         }
 
@@ -446,6 +489,7 @@ function ConvertTo-PlacementRuleSet {
         $rules.Add([pscustomobject]@{
                 Environment = $environment
                 Letters = $letters.ToArray()
+                NameSuffixes = $suffixes.ToArray()
                 DnsLabels = $labels.ToArray()
                 DatastoreKeywords = $keywords.ToArray()
                 DatastoreRegex = $datastoreRegex
@@ -474,10 +518,15 @@ function ConvertTo-PlacementRuleSet {
         throw ("Placement rules are not valid:`n  - " + ($problems.ToArray() -join "`n  - "))
     }
 
+    # Longest first, so when one suffix ends another the more specific one decides.
+    $suffixList = @($suffixMap.Keys | Sort-Object -Property @{ Expression = { $_.Length }; Descending = $true }, @{ Expression = { $_ } } |
+            ForEach-Object { [pscustomobject]@{ Suffix = $_; Environment = $suffixMap[$_] } })
+
     [pscustomobject]@{
         Rules = $rules.ToArray()
         EnvironmentNames = $environmentNames.ToArray()
         LetterMap = $letterMap
+        SuffixList = $suffixList
         LabelMap = $labelMap
         HostnameRegex = $hostnameRegex
         HostnamePattern = $HostnamePattern
@@ -576,12 +625,18 @@ function Get-DnsEnvironment {
 function Get-HostnameEnvironment {
     <#
     .SYNOPSIS
-        Works out the environment from a name that follows the siepdXXxxL naming standard.
+        Works out the environment from a name: the siepdXXxxL naming standard, or a name suffix
+        such as -P.
 
     .DESCRIPTION
-        Only the first label is used, so a VM named with its FQDN works too. Matched says whether
-        the name follows the standard at all; Environment is '' when it does but its letter is not
-        mapped to any environment - that case is reported, so the letter can be added.
+        Only the first label is used, so a VM named with its FQDN works too. Both rules are
+        checked:
+          - the hostname pattern, whose 'env' group is the environment letter
+          - the name suffixes, case-insensitive, longest first
+        Matched says whether either applies. Environment is '' when the pattern matched but its
+        letter is not mapped and no suffix applies - that is reported so the letter can be added -
+        or when the letter and the suffix name different environments (Conflict), which is
+        reported rather than guessed.
 
     .PARAMETER Name
         VM name or guest hostname.
@@ -603,20 +658,44 @@ function Get-HostnameEnvironment {
     )
 
     $short = ($Name.Trim() -split '\.')[0]
-    if ($short -eq '') {
-        return [pscustomobject]@{ Matched = $false; Letter = ''; Environment = '' }
+    $letter = ''
+    $letterEnvironment = ''
+    $patternMatched = $false
+    $suffix = ''
+    $suffixEnvironment = ''
+
+    if ($short -ne '') {
+        $match = $RuleSet.HostnameRegex.Match($short)
+        if ($match.Success -and $match.Groups['env'].Success) {
+            $patternMatched = $true
+            $letter = $match.Groups['env'].Value.ToLowerInvariant()
+            if ($RuleSet.LetterMap.ContainsKey($letter)) { $letterEnvironment = $RuleSet.LetterMap[$letter] }
+        }
+        $lowered = $short.ToLowerInvariant()
+        foreach ($entry in @($RuleSet.SuffixList)) {
+            # Ordinal: a culture-aware EndsWith treats '-' specially on Windows PowerShell 5.1.
+            if ($null -ne $entry -and $lowered.EndsWith([string]$entry.Suffix, [System.StringComparison]::Ordinal)) {
+                $suffix = $entry.Suffix
+                $suffixEnvironment = $entry.Environment
+                break
+            }
+        }
     }
 
-    $match = $RuleSet.HostnameRegex.Match($short)
-    if (-not $match.Success -or -not $match.Groups['env'].Success) {
-        return [pscustomobject]@{ Matched = $false; Letter = ''; Environment = '' }
+    $environment = $letterEnvironment
+    if (-not $environment) { $environment = $suffixEnvironment }
+    $conflict = [bool]($letterEnvironment -and $suffixEnvironment -and $letterEnvironment -ne $suffixEnvironment)
+    if ($conflict) { $environment = '' }
+
+    [pscustomobject]@{
+        Matched = ($patternMatched -or [bool]$suffixEnvironment)
+        Letter = $letter
+        Suffix = $suffix
+        Environment = $environment
+        LetterEnvironment = $letterEnvironment
+        SuffixEnvironment = $suffixEnvironment
+        Conflict = $conflict
     }
-
-    $letter = $match.Groups['env'].Value.ToLowerInvariant()
-    $environment = ''
-    if ($RuleSet.LetterMap.ContainsKey($letter)) { $environment = $RuleSet.LetterMap[$letter] }
-
-    [pscustomobject]@{ Matched = $true; Letter = $letter; Environment = $environment }
 }
 
 function Resolve-VMExpectedEnvironment {
@@ -629,8 +708,8 @@ function Resolve-VMExpectedEnvironment {
         Status is '' when an environment was found, otherwise 'Unmapped hostname letter' or
         'Environment undetermined', with Detail saying why in a sentence for the report.
 
-        The DNS name wins when it carries a known label. A conflicting hostname letter does not
-        override it.
+        The DNS name wins when it carries a known label. A conflicting hostname letter or suffix
+        does not override it.
 
     .PARAMETER VmName
         VM name in the vCenter inventory.
@@ -686,13 +765,24 @@ function Resolve-VMExpectedEnvironment {
         $byName = Get-HostnameEnvironment -Name $candidate.Value -RuleSet $RuleSet
         if (-not $byName.Matched) { continue }
 
+        if ($byName.Conflict) {
+            return [pscustomobject]@{
+                Environment = ''
+                DeterminedBy = $candidate.Source
+                Letter = $byName.Letter
+                Status = 'Environment undetermined'
+                Detail = "$($candidate.Source) '$($candidate.Value)' says $($byName.LetterEnvironment) by its letter '$($byName.Letter)' but $($byName.SuffixEnvironment) by its suffix '$($byName.Suffix)'."
+            }
+        }
         if ($byName.Environment -ne '') {
+            $how = "letter '$($byName.Letter)'"
+            if (-not $byName.LetterEnvironment) { $how = "suffix '$($byName.Suffix)'" }
             return [pscustomobject]@{
                 Environment = $byName.Environment
                 DeterminedBy = $candidate.Source
                 Letter = $byName.Letter
                 Status = ''
-                Detail = "$($candidate.Source) '$($candidate.Value)' (letter '$($byName.Letter)') says $($byName.Environment)"
+                Detail = "$($candidate.Source) '$($candidate.Value)' ($how) says $($byName.Environment)"
             }
         }
         return [pscustomobject]@{
@@ -713,12 +803,17 @@ function Resolve-VMExpectedEnvironment {
     else {
         "DNS name '$DnsName' has no domain"
     }
+    $knownSuffixes = @(@($RuleSet.SuffixList) | Where-Object { $null -ne $_ } | ForEach-Object { $_.Suffix })
+    $nameText = "the name does not match the hostname pattern $($RuleSet.HostnamePattern)"
+    if ($knownSuffixes.Count -gt 0) {
+        $nameText = "the name matches neither the hostname pattern $($RuleSet.HostnamePattern) nor a name suffix ($($knownSuffixes -join ', '))"
+    }
     [pscustomobject]@{
         Environment = ''
         DeterminedBy = ''
         Letter = ''
         Status = 'Environment undetermined'
-        Detail = "$why, and the name does not match the hostname pattern $($RuleSet.HostnamePattern)."
+        Detail = "$why, and $nameText."
     }
 }
 
@@ -877,6 +972,10 @@ function Test-VMPlacement {
         $reason = "$($expected.Detail), but the VM uses $wrongText."
     }
 
+    if ([bool](Get-ViewProperty $Record 'SrmPlaceholderFlag')) {
+        $reason += ' vCenter also marks this VM as an SRM placeholder although it has disks - most likely a mark left behind by a failback (Broadcom KB 412345), which can make operations on it fail until cleared.'
+    }
+
     $committed = [long]$Record.CommittedBytes
     $finding = [pscustomobject]@{
         Status = $status
@@ -953,13 +1052,14 @@ function Invoke-PlacementEvaluation {
     $datastoreRows = New-Object System.Collections.Generic.List[object]
     $excludedTypes = New-Object System.Collections.Generic.List[string]
     $clusters = 0; $vmCount = 0; $correct = 0; $hidden = 0
-    $skippedTemplates = 0; $skippedAgents = 0; $skippedPlaceholders = 0; $skippedExcluded = 0
+    $skippedTemplates = 0; $skippedAgents = 0; $skippedPlaceholders = 0; $skippedNoDisks = 0; $skippedExcluded = 0
 
     foreach ($cluster in $Inventory) {
         $clusters++
         $skippedTemplates += [int]$cluster.SkippedTemplates
         $skippedAgents += [int]$cluster.SkippedAgents
         $skippedPlaceholders += [int]$cluster.SkippedPlaceholders
+        $skippedNoDisks += [int]$cluster.SkippedNoDisks
         $skippedExcluded += [int]$cluster.SkippedExcluded
         foreach ($type in @($cluster.ExcludedTypes)) {
             if ($type -and -not $excludedTypes.Contains([string]$type)) { $excludedTypes.Add([string]$type) }
@@ -1014,6 +1114,7 @@ function Invoke-PlacementEvaluation {
             SkippedTemplates = $skippedTemplates
             SkippedAgents = $skippedAgents
             SkippedPlaceholders = $skippedPlaceholders
+            SkippedNoDisks = $skippedNoDisks
             SkippedExcluded = $skippedExcluded
             ExcludedTypes = $excludedTypes.ToArray()
         }
@@ -1042,11 +1143,11 @@ function Format-PlacementSummary {
     $reported = "$($Summary.Reported) misplaced"
     if ($statusParts.Count -gt 0) { $reported += " ($($statusParts -join ', '))" }
 
-    $text = "$($Summary.Clusters) cluster(s), $($Summary.VMs) VMs: $($Summary.Correct) correct, $reported, $($Summary.NotOnScoped) not on a PROD/SIT/DEV datastore"
+    $text = "$($Summary.Clusters) cluster(s), $($Summary.VMs) full VMs: $($Summary.Correct) correct, $reported, $($Summary.NotOnScoped) not on a PROD/SIT/DEV datastore"
     if ($Summary.HiddenUndetermined -gt 0) { $text += ", $($Summary.HiddenUndetermined) undetermined hidden" }
     $excluded = @($Summary.ExcludedTypes) -join '/'
     if (-not $excluded) { $excluded = 'excluded' }
-    $text + ". Skipped $($Summary.SkippedTemplates) template(s), $($Summary.SkippedAgents) vCLS/agent VM(s), $($Summary.SkippedPlaceholders) SRM placeholder(s), $($Summary.SkippedExcluded) only on $excluded datastores."
+    $text + ". Not shown: $($Summary.SkippedTemplates) template(s), $($Summary.SkippedAgents) vCLS/agent VM(s), $($Summary.SkippedPlaceholders) SRM placeholder(s), $($Summary.SkippedNoDisks) with no disks, $($Summary.SkippedExcluded) only on $excluded datastores."
 }
 
 function Get-PlacementSiblingPath {
@@ -1484,19 +1585,58 @@ function Get-DatastoreNameFromPath {
     ''
 }
 
+function Format-PlacementNameList {
+    <#
+    .SYNOPSIS
+        "a, b, c (+12 more)" - a name list short enough for one log line.
+
+    .PARAMETER Name
+        The names.
+
+    .PARAMETER Max
+        How many to spell out.
+
+    .EXAMPLE
+        Format-PlacementNameList -Name $names -Max 10
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Name,
+
+        [int]$Max = 10
+    )
+
+    $sorted = @($Name | Sort-Object)
+    $text = @($sorted | Select-Object -First $Max) -join ', '
+    if ($sorted.Count -gt $Max) { $text += " (+$($sorted.Count - $Max) more)" }
+    $text
+}
+
 function ConvertTo-PlacementVMRecord {
     <#
     .SYNOPSIS
         Turns one VirtualMachine view into the plain record the evaluation works on, or a skip reason.
 
     .DESCRIPTION
-        Skip is one of:
+        Only full VMs come through. Skip is one of:
           Template     a VM template
-          Placeholder  an SRM placeholder VM (managed by com.vmware.vcDr) - the real VM is at the
-                       protected site and is evaluated there
           Agent        a vCLS or other ESX Agent Manager VM (managed by com.vmware.vim.eam, or named
                        vCLS*) - placed by vSphere, not by us
+          Placeholder  an SRM placeholder: marked by SRM (managedBy extension com.vmware.vcDr*, any
+                       case, or type placeholderVm) AND no virtual disks. The real VM is at the
+                       protected site and is evaluated there.
+          NoDisks      no virtual disks and no SRM mark - not a full VM either
           Excluded     every datastore the VM uses is an excluded type (VMFS by default)
+
+        The SRM mark alone is not enough. vCenter can leave it on real VMs after a failback
+        (Broadcom KB 412345), and a placeholder never has disks - so a marked VM WITH disks is a
+        full VM, returned with SrmPlaceholderFlag set so the report can say so.
+
+        A VM whose configuration cannot be read (inaccessible) cannot be judged on disks; it is
+        kept and evaluated on its datastore list.
 
         Datastores are the home (.vmx) datastore and each virtual disk's datastore, home first,
         without duplicates, leaving out excluded types. CD-ROM ISOs and swap are deliberately not
@@ -1560,20 +1700,25 @@ function ConvertTo-PlacementVMRecord {
         return [pscustomobject]@{ Skip = 'Template'; Record = $null }
     }
     $managedBy = [string](Get-ViewProperty $View 'Config.ManagedBy.ExtensionKey')
-    if ($managedBy -eq 'com.vmware.vcDr') {
-        return [pscustomobject]@{ Skip = 'Placeholder'; Record = $null }
-    }
+    $managedType = [string](Get-ViewProperty $View 'Config.ManagedBy.Type')
     if ($managedBy -eq 'com.vmware.vim.eam' -or $name -match '^vCLS') {
         return [pscustomobject]@{ Skip = 'Agent'; Record = $null }
+    }
+
+    $srmMarked = ($managedBy -like 'com.vmware.vcDr*') -or ($managedType -eq 'placeholderVm')
+    $config = Get-ViewProperty $View 'Config'
+    $devices = @(Get-ViewProperty $View 'Config.Hardware.Device' | Where-Object { $null -ne $_ })
+    $disks = @($devices | Where-Object { @($_.PSObject.TypeNames) -contains 'VMware.Vim.VirtualDisk' })
+    if ($null -ne $config -and $disks.Count -eq 0) {
+        if ($srmMarked) { return [pscustomobject]@{ Skip = 'Placeholder'; Record = $null } }
+        return [pscustomobject]@{ Skip = 'NoDisks'; Record = $null }
     }
 
     $datastores = New-Object System.Collections.Specialized.OrderedDictionary
     $excludedHits = 0
     $paths = New-Object System.Collections.Generic.List[object]
     $paths.Add([pscustomobject]@{ Ref = ''; FileName = [string](Get-ViewProperty $View 'Config.Files.VmPathName') })
-    foreach ($device in @(Get-ViewProperty $View 'Config.Hardware.Device')) {
-        if ($null -eq $device) { continue }
-        if (@($device.PSObject.TypeNames) -notcontains 'VMware.Vim.VirtualDisk') { continue }
+    foreach ($device in $disks) {
         $backing = Get-ViewProperty $device 'Backing'
         $paths.Add([pscustomobject]@{
                 Ref = [string](Get-ViewProperty $backing 'Datastore.Value')
@@ -1635,6 +1780,7 @@ function ConvertTo-PlacementVMRecord {
         vCenter = $VCenter
         DiscoveredAt = $DiscoveredAt
         CommittedBytes = [long](Get-ViewProperty $View 'Summary.Storage.Committed')
+        SrmPlaceholderFlag = [bool]$srmMarked
         Datastores = @($datastores.Values)
     }
     [pscustomobject]@{ Skip = ''; Record = $record }
@@ -1838,7 +1984,10 @@ function Get-ClusterPlacementInventory {
     $vmViews = @(Get-View -Server $Server -ViewType VirtualMachine -SearchRoot $clusterInfo.MoRef -Property $vmProperties)
 
     $records = New-Object System.Collections.Generic.List[object]
-    $skipped = @{ Template = 0; Agent = 0; Placeholder = 0; Excluded = 0 }
+    $skipped = @{ Template = 0; Agent = 0; Placeholder = 0; NoDisks = 0; Excluded = 0 }
+    $placeholderNames = New-Object System.Collections.Generic.List[string]
+    $noDiskNames = New-Object System.Collections.Generic.List[string]
+    $flaggedNames = New-Object System.Collections.Generic.List[string]
     $seen = @{}
     foreach ($view in $vmViews) {
         $id = [string]$view.MoRef.Value
@@ -1848,12 +1997,24 @@ function Get-ClusterPlacementInventory {
         $converted = ConvertTo-PlacementVMRecord -View $view -DatastoreByRef $datastoreByRef -DatastoreByName $datastoreByName -ExcludedByRef $excludedByRef -ExcludedByName $excludedByName -HostByRef $hostByRef -Cluster $clusterInfo.Name -VCenter ([string]$Server.Name) -DiscoveredAt $discoveredAt
         if ($converted.Skip) {
             $skipped[$converted.Skip] = $skipped[$converted.Skip] + 1
+            if ($converted.Skip -eq 'Placeholder') { $placeholderNames.Add([string]$view.Name) }
+            if ($converted.Skip -eq 'NoDisks') { $noDiskNames.Add([string]$view.Name) }
             continue
         }
+        if ($converted.Record.SrmPlaceholderFlag) { $flaggedNames.Add($converted.Record.VMName) }
         $records.Add($converted.Record)
     }
 
-    Write-PlacementLog ("Cluster {0}: {1} VMs, {2} datastores ({3} {4} not discovered); skipped {5} template(s), {6} vCLS/agent VM(s), {7} SRM placeholder(s), {8} VM(s) only on {4}." -f $clusterInfo.Name, $records.Count, $datastoreByName.Count, $excludedByName.Count, ($excludedTypes -join '/'), $skipped.Template, $skipped.Agent, $skipped.Placeholder, $skipped.Excluded) -Level INFO
+    Write-PlacementLog ("Cluster {0}: {1} full VMs, {2} datastores ({3} {4} not discovered); not shown: {5} template(s), {6} vCLS/agent VM(s), {7} SRM placeholder(s), {8} VM(s) with no disks, {9} VM(s) only on {4}." -f $clusterInfo.Name, $records.Count, $datastoreByName.Count, $excludedByName.Count, ($excludedTypes -join '/'), $skipped.Template, $skipped.Agent, $skipped.Placeholder, $skipped.NoDisks, $skipped.Excluded) -Level INFO
+    if ($placeholderNames.Count -gt 0) {
+        Write-PlacementLog "Cluster $($clusterInfo.Name): SRM placeholders not shown: $(Format-PlacementNameList -Name $placeholderNames.ToArray())" -Level INFO
+    }
+    if ($noDiskNames.Count -gt 0) {
+        Write-PlacementLog "Cluster $($clusterInfo.Name): VMs with no disks not shown: $(Format-PlacementNameList -Name $noDiskNames.ToArray())" -Level INFO
+    }
+    if ($flaggedNames.Count -gt 0) {
+        Write-PlacementLog "Cluster $($clusterInfo.Name): $($flaggedNames.Count) VM(s) carry the SRM placeholder mark but have disks, so are shown as full VMs - most likely a mark left by a failback (Broadcom KB 412345): $(Format-PlacementNameList -Name $flaggedNames.ToArray())" -Level WARN
+    }
 
     [pscustomobject]@{
         Cluster = [string]$clusterInfo.Name
@@ -1865,6 +2026,7 @@ function Get-ClusterPlacementInventory {
         SkippedTemplates = $skipped.Template
         SkippedAgents = $skipped.Agent
         SkippedPlaceholders = $skipped.Placeholder
+        SkippedNoDisks = $skipped.NoDisks
         SkippedExcluded = $skipped.Excluded
     }
 }
@@ -2408,6 +2570,7 @@ function Get-GuiRuleDefinition {
         [pscustomobject]@{
             Environment = [string]$gridRow.Cells['Environment'].Value
             Letters = [string]$gridRow.Cells['Letters'].Value
+            NameSuffixes = [string]$gridRow.Cells['NameSuffixes'].Value
             DnsLabels = [string]$gridRow.Cells['DnsLabels'].Value
             DatastoreKeywords = [string]$gridRow.Cells['DatastoreKeywords'].Value
         }
@@ -3196,7 +3359,7 @@ function Show-PlacementGui {
     $tips.SetToolTip($script:Gui.Pattern, "Regex matched against the VM name. The environment letter must be captured as (?<env>...).")
 
     # ---- Row 3/4: rules --------------------------------------------------------------------
-    $rulesLabel = & $newLabel 'Placement rules - comma-separate values. Example: if VMs with letter b belong on DEV, add b to DEV''s hostname letters and click Re-apply rules.'
+    $rulesLabel = & $newLabel 'Placement rules - comma-separate values, then click Re-apply rules. E.g. VMs with letter b belong on DEV: add b to DEV''s hostname letters. Names ending -Q are SIT: add -Q to SIT''s name suffixes.'
     $rulesLabel.Margin = New-Object System.Windows.Forms.Padding(3, 6, 3, 3)
 
     $rulesGrid = New-Object System.Windows.Forms.DataGridView
@@ -3212,10 +3375,11 @@ function Show-PlacementGui {
     $rulesGrid.ColumnHeadersHeight = $rowHeight
     $rulesGrid.RowTemplate.Height = $rowHeight
     foreach ($spec in @(
-            @('Environment', 'Environment', 15, $true),
-            @('Letters', 'Hostname letters (p / t / d)', 20, $false),
-            @('DnsLabels', 'DNS labels', 35, $false),
-            @('DatastoreKeywords', 'Datastore keywords', 30, $false))) {
+            @('Environment', 'Environment', 11, $true),
+            @('Letters', 'Hostname letters (p / t / d)', 17, $false),
+            @('NameSuffixes', 'Name suffixes (e.g. -P, -S)', 17, $false),
+            @('DnsLabels', 'DNS labels', 30, $false),
+            @('DatastoreKeywords', 'Datastore keywords', 25, $false))) {
         $column = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
         $column.Name = $spec[0]
         $column.HeaderText = $spec[1]
@@ -3226,7 +3390,7 @@ function Show-PlacementGui {
     }
     $rulesGrid.Columns['Environment'].DefaultCellStyle.BackColor = [System.Drawing.SystemColors]::Control
     foreach ($definition in $RuleDefinition) {
-        [void]$rulesGrid.Rows.Add([string]$definition.Environment, [string]$definition.Letters, [string]$definition.DnsLabels, [string]$definition.DatastoreKeywords)
+        [void]$rulesGrid.Rows.Add([string]$definition.Environment, [string]$definition.Letters, [string]$definition.NameSuffixes, [string]$definition.DnsLabels, [string]$definition.DatastoreKeywords)
     }
     $rulesHeight = $rowHeight * ([Math]::Max(1, $RuleDefinition.Count) + 1) + 4
     $script:Gui.RulesGrid = $rulesGrid
@@ -3405,9 +3569,9 @@ function Show-PlacementGui {
 
 try {
     $ruleDefinition = @(
-        [pscustomobject]@{ Environment = 'PROD'; Letters = ($ProdLetters -join ', '); DnsLabels = ($ProdDnsLabels -join ', '); DatastoreKeywords = ($ProdDatastoreKeywords -join ', ') }
-        [pscustomobject]@{ Environment = 'SIT'; Letters = ($SitLetters -join ', '); DnsLabels = ($SitDnsLabels -join ', '); DatastoreKeywords = ($SitDatastoreKeywords -join ', ') }
-        [pscustomobject]@{ Environment = 'DEV'; Letters = ($DevLetters -join ', '); DnsLabels = ($DevDnsLabels -join ', '); DatastoreKeywords = ($DevDatastoreKeywords -join ', ') }
+        [pscustomobject]@{ Environment = 'PROD'; Letters = ($ProdLetters -join ', '); NameSuffixes = ($ProdNameSuffixes -join ', '); DnsLabels = ($ProdDnsLabels -join ', '); DatastoreKeywords = ($ProdDatastoreKeywords -join ', ') }
+        [pscustomobject]@{ Environment = 'SIT'; Letters = ($SitLetters -join ', '); NameSuffixes = ($SitNameSuffixes -join ', '); DnsLabels = ($SitDnsLabels -join ', '); DatastoreKeywords = ($SitDatastoreKeywords -join ', ') }
+        [pscustomobject]@{ Environment = 'DEV'; Letters = ($DevLetters -join ', '); NameSuffixes = ($DevNameSuffixes -join ', '); DnsLabels = ($DevDnsLabels -join ', '); DatastoreKeywords = ($DevDatastoreKeywords -join ', ') }
     )
 
     # Validated before anything else, so a bad -DevLetters fails before a sign-in prompt.

@@ -8,7 +8,9 @@
     vSphere views and inventory records - DNS-label matching, the siepdXXxxL hostname fallback,
     letter remapping (the "add b to DEV and rediscover" case), datastore keywords (SHARED is PROD),
     VMFS exclusion, the Not on PROD/SIT/DEV list, migration target eligibility, the migration plan,
-    and the migration engine's throttling, failure, stop and -WhatIf behaviour.
+    and the migration engine's throttling, failure, stop and -WhatIf behaviour. Names ending -P or -S
+    are PROD, and only full VMs are shown: SRM placeholders and disk-less VMs are left out, while a
+    real VM still carrying a stale SRM placeholder mark is kept.
 
     Then runs the script itself, headless, against a stubbed vCenter in which a Storage vMotion
     really moves the VM's files - so a migration followed by re-discovery shows the VM where it went
@@ -31,7 +33,7 @@ $wanted = @('Write-PlacementLog', 'Split-RuleValue', 'ConvertTo-PlacementRuleSet
             'Get-PlacementMigrationColumn', 'Format-PlacementSize', 'Test-VMPlacement', 'Invoke-PlacementEvaluation',
             'Format-PlacementSummary', 'Get-PlacementSiblingPath', 'Export-PlacementReport', 'Get-PlacementHostSeeing',
             'Format-PlacementTarget', 'Get-PlacementTargetChoice', 'Get-PlacementMigrationPlan',
-            'Get-ViewProperty', 'Get-DatastoreNameFromPath', 'ConvertTo-PlacementVMRecord', 'ConvertTo-PlacementDataTable',
+            'Get-ViewProperty', 'Get-DatastoreNameFromPath', 'Format-PlacementNameList', 'ConvertTo-PlacementVMRecord', 'ConvertTo-PlacementDataTable',
             'Connect-PlacementVCenter', 'Disconnect-PlacementVCenter', 'Get-PlacementClusterList', 'Get-ClusterPlacementInventory',
             'Get-PlacementStorageInfo', 'Get-PlacementTaskState', 'Invoke-PlacementMigration',
             'Invoke-GuiAction', 'Get-GuiRuleDefinition', 'Invoke-GuiConnect', 'Invoke-GuiDisconnect', 'Invoke-GuiDiscovery',
@@ -64,11 +66,12 @@ function Get-DefaultValue([string]$Name) {
 $defaultPattern = Get-DefaultValue 'HostnamePattern'
 
 function New-Definition {
-    param([string]$ProdLetters = 'p', [string]$SitLetters = 't', [string]$DevLetters = 'd')
+    param([string]$ProdLetters = 'p', [string]$SitLetters = 't', [string]$DevLetters = 'd',
+        [string]$ProdSuffixes = ((Get-DefaultValue 'ProdNameSuffixes') -join ', '), [string]$SitSuffixes = '', [string]$DevSuffixes = '')
     @(
-        [pscustomobject]@{ Environment = 'PROD'; Letters = $ProdLetters; DnsLabels = ((Get-DefaultValue 'ProdDnsLabels') -join ', '); DatastoreKeywords = ((Get-DefaultValue 'ProdDatastoreKeywords') -join ', ') }
-        [pscustomobject]@{ Environment = 'SIT'; Letters = $SitLetters; DnsLabels = ((Get-DefaultValue 'SitDnsLabels') -join ', '); DatastoreKeywords = ((Get-DefaultValue 'SitDatastoreKeywords') -join ', ') }
-        [pscustomobject]@{ Environment = 'DEV'; Letters = $DevLetters; DnsLabels = ((Get-DefaultValue 'DevDnsLabels') -join ', '); DatastoreKeywords = ((Get-DefaultValue 'DevDatastoreKeywords') -join ', ') }
+        [pscustomobject]@{ Environment = 'PROD'; Letters = $ProdLetters; NameSuffixes = $ProdSuffixes; DnsLabels = ((Get-DefaultValue 'ProdDnsLabels') -join ', '); DatastoreKeywords = ((Get-DefaultValue 'ProdDatastoreKeywords') -join ', ') }
+        [pscustomobject]@{ Environment = 'SIT'; Letters = $SitLetters; NameSuffixes = $SitSuffixes; DnsLabels = ((Get-DefaultValue 'SitDnsLabels') -join ', '); DatastoreKeywords = ((Get-DefaultValue 'SitDatastoreKeywords') -join ', ') }
+        [pscustomobject]@{ Environment = 'DEV'; Letters = $DevLetters; NameSuffixes = $DevSuffixes; DnsLabels = ((Get-DefaultValue 'DevDnsLabels') -join ', '); DatastoreKeywords = ((Get-DefaultValue 'DevDatastoreKeywords') -join ', ') }
     )
 }
 $rules = ConvertTo-PlacementRuleSet -Definition (New-Definition) -HostnamePattern $defaultPattern
@@ -90,6 +93,8 @@ Write-Host "`n=== Defaults match the requirement ===" -ForegroundColor Cyan
 Assert-True "PROD letters default to p" ((Get-DefaultValue 'ProdLetters') -join ',' -eq 'p')
 Assert-True "SIT letters default to t" ((Get-DefaultValue 'SitLetters') -join ',' -eq 't')
 Assert-True "DEV letters default to d" ((Get-DefaultValue 'DevLetters') -join ',' -eq 'd')
+Assert-True "names ending -P or -S are PROD by default" ((Get-DefaultValue 'ProdNameSuffixes') -join ',' -eq '-P,-S')
+Assert-True "SIT and DEV have no name suffixes by default" (@(Get-DefaultValue 'SitNameSuffixes').Count -eq 0 -and @(Get-DefaultValue 'DevNameSuffixes').Count -eq 0)
 Assert-True "PROD DNS labels are dpe, protected" ((Get-DefaultValue 'ProdDnsLabels') -join ',' -eq 'dpe,protected')
 Assert-True "SIT DNS labels are dpesit, protectedsit" ((Get-DefaultValue 'SitDnsLabels') -join ',' -eq 'dpesit,protectedsit')
 Assert-True "DEV DNS labels are dpedev, protecteddev" ((Get-DefaultValue 'DevDnsLabels') -join ',' -eq 'dpedev,protecteddev')
@@ -135,6 +140,42 @@ foreach ($name in @('vcenter01', 'siepdXXcsp01', 'siepd8csp01', 'xsiepd85csp01',
 }
 $r = Get-HostnameEnvironment -Name 'siepd85csb01' -RuleSet $rules
 Assert-True "'siepd85csb01' matches with an unmapped letter b" ($r.Matched -and $r.Letter -eq 'b' -and $r.Environment -eq '')
+
+Write-Host "`n=== Names ending -P or -S are PROD ===" -ForegroundColor Cyan
+$cases = @(
+    @{ Name = 'SQLCLUSTER01-P'; Suffix = '-p' }
+    @{ Name = 'web01-s'; Suffix = '-s' }
+    @{ Name = 'APP-02-P'; Suffix = '-p' }
+    @{ Name = 'sql01-p.corp.local'; Suffix = '-p' }
+)
+foreach ($case in $cases) {
+    $r = Get-HostnameEnvironment -Name $case.Name -RuleSet $rules
+    Assert-True "'$($case.Name)' is PROD by suffix $($case.Suffix)" ($r.Matched -and $r.Environment -eq 'PROD' -and $r.Suffix -eq $case.Suffix) "got '$($r.Environment)'/'$($r.Suffix)'"
+}
+foreach ($name in @('APP-PROD', 'SERVERS', 'web01-sp', 'web01_p', 'p', 'sql-p (old)')) {
+    Assert-True "'$name' does not end in a suffix" (-not (Get-HostnameEnvironment -Name $name -RuleSet $rules).Matched)
+}
+$r = Get-HostnameEnvironment -Name 'siepd85csp01-S' -RuleSet $rules
+Assert-True "letter p and suffix -S agree: PROD" ($r.Environment -eq 'PROD' -and -not $r.Conflict)
+$r = Get-HostnameEnvironment -Name 'siepd85csb01-P' -RuleSet $rules
+Assert-True "unmapped letter b, suffix -P: the suffix decides, PROD" ($r.Environment -eq 'PROD' -and -not $r.Conflict)
+$r = Get-HostnameEnvironment -Name 'siepd85csd01-P' -RuleSet $rules
+Assert-True "letter d but suffix -P: a conflict, not a guess" ($r.Matched -and $r.Conflict -and $r.Environment -eq '' -and $r.LetterEnvironment -eq 'DEV' -and $r.SuffixEnvironment -eq 'PROD')
+$r = Resolve-VMExpectedEnvironment -VmName 'siepd85csd01-P' -DnsName '' -RuleSet $rules
+Assert-True "  reported as undetermined, naming both" ($r.Status -eq 'Environment undetermined' -and $r.Detail -match "DEV by its letter 'd' but PROD by its suffix '-p'")
+$r = Resolve-VMExpectedEnvironment -VmName 'SQLCLUSTER01-P' -DnsName '' -RuleSet $rules
+Assert-True "the reason names the suffix" ($r.Environment -eq 'PROD' -and $r.DeterminedBy -eq 'VM name' -and $r.Detail -match "suffix '-p'")
+$r = Resolve-VMExpectedEnvironment -VmName 'SQLCLUSTER01-P' -DnsName 'sqlcluster01.dpedev.protecteddev.mil.au' -RuleSet $rules
+Assert-True "a DEV DNS name still wins over a -P suffix" ($r.Environment -eq 'DEV' -and $r.DeterminedBy -eq 'DNS name')
+$r = Resolve-VMExpectedEnvironment -VmName 'Payroll' -DnsName 'payroll-s' -RuleSet $rules
+Assert-True "the guest hostname's suffix counts too" ($r.Environment -eq 'PROD' -and $r.DeterminedBy -eq 'Guest hostname')
+$r = Resolve-VMExpectedEnvironment -VmName 'vcenter01' -DnsName '' -RuleSet $rules
+Assert-True "an undetermined VM's reason lists the suffixes it was checked against" ($r.Detail -match 'nor a name suffix \(-p, -s\)')
+$withQ = ConvertTo-PlacementRuleSet -Definition (New-Definition -SitSuffixes '-Q') -HostnamePattern $defaultPattern
+Assert-True "a suffix added in the grid works the same - -Q to SIT" ((Get-HostnameEnvironment -Name 'APP01-Q' -RuleSet $withQ).Environment -eq 'SIT')
+$noSuffix = ConvertTo-PlacementRuleSet -Definition (New-Definition -ProdSuffixes '') -HostnamePattern $defaultPattern
+Assert-True "with the suffixes cleared, -P means nothing" (-not (Get-HostnameEnvironment -Name 'SQLCLUSTER01-P' -RuleSet $noSuffix).Matched)
+Assert-True "  and an undetermined VM's reason does not mention suffixes" ((Resolve-VMExpectedEnvironment -VmName 'vcenter01' -DnsName '' -RuleSet $noSuffix).Detail -match 'the name does not match the hostname pattern .*\.$')
 
 # ---------------------------------------------------------------------------------------------
 Write-Host "`n=== Which source wins ===" -ForegroundColor Cyan
@@ -189,6 +230,16 @@ $o = Get-Outcome (New-VM 'siepd85cst01' '' 'NFS_SHARED_01')
 Assert-True "SIT VM (by name) on SHARED datastore is misplaced" ($o.Outcome -eq 'Reported' -and $o.Finding.DeterminedBy -eq 'VM name' -and $o.Finding.HostnameLetter -eq 't')
 $o = Get-Outcome (New-VM 'siepd85csd01' '' 'NFS_DEV_01')
 Assert-True "DEV VM (by name) on DEV datastore is not reported" ($o.Outcome -eq 'Correct')
+$o = Get-Outcome (New-VM 'SQLCLUSTER01-P' '' 'NFS_DEV_01')
+Assert-True "a -P VM on a DEV datastore is misplaced, expected PROD" ($o.Outcome -eq 'Reported' -and $o.Finding.Status -eq 'Wrong datastore' -and $o.Finding.ExpectedEnvironment -eq 'PROD')
+$o = Get-Outcome (New-VM 'WEB01-S' '' 'NFS_SHARED_01')
+Assert-True "a -S VM on a SHARED datastore is not reported" ($o.Outcome -eq 'Correct')
+$o = Get-Outcome (New-VM 'WEB02-S' '' 'NFS_MISC_01')
+Assert-True "a -S VM on no PROD/SIT/DEV datastore is listed, expected PROD" ($o.Outcome -eq 'Unscoped' -and $o.Finding.ExpectedEnvironment -eq 'PROD')
+$flagged = New-VM 'siepd85csp01' '' 'NFS_DEV_01'
+$flagged | Add-Member -NotePropertyName SrmPlaceholderFlag -NotePropertyValue $true
+$o = Get-Outcome $flagged
+Assert-True "a full VM still carrying an SRM placeholder mark is reported, and the reason says so" ($o.Outcome -eq 'Reported' -and $o.Finding.Reason -match 'KB 412345')
 $o = Get-Outcome (New-VM 'siepd85csp01' '' @('NFS_SHARED_01', 'NFS_DEV_02'))
 Assert-True "a disk on the wrong datastore is enough to report" ($o.Outcome -eq 'Reported' -and $o.Finding.WrongDatastores -eq 'NFS_DEV_02 (DEV)' -and $o.Finding.DatastoreEnvironment -eq 'PROD, DEV')
 $o = Get-Outcome (New-VM 'siepd85csp01' '' @('NFS_SHARED_01', 'ISO_LIBRARY'))
@@ -239,6 +290,8 @@ $noKeyword = New-Definition; $noKeyword[1].DatastoreKeywords = ''
 Assert-True "an environment with no datastore keyword" ((Get-RuleError $noKeyword) -match 'SIT has no datastore keyword')
 Assert-True "a pattern without an env group" ((Get-RuleError (New-Definition) '^siepd\d{2}[a-z]{3}') -match "group named 'env'")
 Assert-True "an invalid regex" ((Get-RuleError (New-Definition) '^siepd(?<env>[a-z]') -match 'not a valid regular expression')
+Assert-True "a suffix in two environments" ((Get-RuleError (New-Definition -DevSuffixes '-p')) -match "'-p' is mapped to both PROD and DEV")
+Assert-True "a suffix with a symbol in it" ((Get-RuleError (New-Definition -ProdSuffixes '-P!')) -match "may only contain")
 Assert-True "several problems are listed together" (((Get-RuleError (New-Definition -DevLetters 'db, p')) -split "`n").Count -ge 3)
 Assert-True "the defaults are valid" ((Get-RuleError (New-Definition)) -eq '')
 
@@ -248,12 +301,12 @@ function New-Ref([string]$Type, [string]$Value) { [pscustomobject]@{ Type = $Typ
 function New-Disk { param($Ref, $File)
     [pscustomobject]@{ PSTypeName = 'VMware.Vim.VirtualDisk'; Backing = [pscustomobject]@{ FileName = $File; Datastore = $(if ($Ref) { New-Ref 'Datastore' $Ref } else { $null }) } }
 }
-function New-View { param($Name, $Template = $false, $ManagedBy = $null, $VmPath = '', $Devices = @(), $Datastore = @(), $HostName = '', $HostRef = 'host-1', $Id = '', [double]$CommittedGB = 0)
+function New-View { param($Name, $Template = $false, $ManagedBy = $null, $ManagedType = 'x', $VmPath = '', $Devices = @(), $Datastore = @(), $HostName = '', $HostRef = 'host-1', $Id = '', [double]$CommittedGB = 0)
     $view = [pscustomobject]@{
         Name = $Name
         Config = [pscustomobject]@{
             Template = $Template
-            ManagedBy = $(if ($ManagedBy) { [pscustomobject]@{ ExtensionKey = $ManagedBy; Type = 'x' } } else { $null })
+            ManagedBy = $(if ($ManagedBy) { [pscustomobject]@{ ExtensionKey = $ManagedBy; Type = $ManagedType } } else { $null })
             Files = [pscustomobject]@{ VmPathName = $VmPath }
             Hardware = [pscustomobject]@{ Device = $Devices }
         }
@@ -292,11 +345,25 @@ $c = ConvertTo-PlacementVMRecord -View (New-View -Name 'siepd85csp03' -VmPath '[
 Assert-True "home on VMFS, disk on SHARED: judged on the SHARED disk" ($c.Skip -eq '' -and (@($c.Record.Datastores | ForEach-Object { $_.Name }) -join ',') -eq 'NFS_SHARED_01')
 $c = ConvertTo-PlacementVMRecord -View (New-View -Name 't1' -Template $true) -DatastoreByRef $byRef -DatastoreByName $byName
 Assert-True "a template is skipped" ($c.Skip -eq 'Template')
+
+Write-Host "`n=== Full VMs only: SRM placeholders and disk-less VMs left out ===" -ForegroundColor Cyan
 $c = ConvertTo-PlacementVMRecord -View (New-View -Name 'siepd85csp01' -ManagedBy 'com.vmware.vcDr' -VmPath '[NFS_SHARED_01] x/x.vmx') -DatastoreByRef $byRef -DatastoreByName $byName
-Assert-True "an SRM placeholder is skipped" ($c.Skip -eq 'Placeholder')
+Assert-True "an SRM placeholder (marked, no disks) is left out" ($c.Skip -eq 'Placeholder')
+$c = ConvertTo-PlacementVMRecord -View (New-View -Name 'siepd85csp01' -ManagedBy 'com.vmware.vcDR' -ManagedType 'placeholderVm' -VmPath '[SRM_PH_01] x/x.vmx') -DatastoreByRef $byRef -DatastoreByName $byName
+Assert-True "  the key in any case - com.vmware.vcDR as written by William Lam" ($c.Skip -eq 'Placeholder')
+$c = ConvertTo-PlacementVMRecord -View (New-View -Name 'siepd85csp01' -ManagedBy 'com.vmware.vcDr-site2' -VmPath '[SRM_PH_01] x/x.vmx') -DatastoreByRef $byRef -DatastoreByName $byName
+Assert-True "  a key with a suffix after com.vmware.vcDr" ($c.Skip -eq 'Placeholder')
+$c = ConvertTo-PlacementVMRecord -View (New-View -Name 'siepd85csp01' -ManagedBy 'com.example.other' -ManagedType 'placeholderVm' -VmPath '[SRM_PH_01] x/x.vmx') -DatastoreByRef $byRef -DatastoreByName $byName
+Assert-True "  type placeholderVm whatever the key" ($c.Skip -eq 'Placeholder')
+$c = ConvertTo-PlacementVMRecord -View (New-View -Name 'shell01' -VmPath '[NFS_SHARED_01] s/s.vmx') -DatastoreByRef $byRef -DatastoreByName $byName
+Assert-True "a VM with no disks and no SRM mark is left out too - not a full VM" ($c.Skip -eq 'NoDisks')
+$c = ConvertTo-PlacementVMRecord -View (New-View -Name 'siepd85csp44' -ManagedBy 'com.vmware.vcDr' -ManagedType 'placeholderVm' -VmPath '[NFS_DEV_01] r/r.vmx' -Devices @((New-Disk 'ds-2' '[NFS_DEV_01] r/r.vmdk'))) -DatastoreByRef $byRef -DatastoreByName $byName
+Assert-True "a marked VM WITH disks is a real VM (stale mark, KB 412345): kept" ($c.Skip -eq '' -and $c.Record.SrmPlaceholderFlag -eq $true)
+Assert-True "an ordinary VM is not flagged" ((ConvertTo-PlacementVMRecord -View $view -DatastoreByRef $byRef -DatastoreByName $byName).Record.SrmPlaceholderFlag -eq $false)
+Assert-True "long name lists are cut short in the log" ((Format-PlacementNameList -Name @('c', 'a', 'b', 'd') -Max 2) -eq 'a, b (+2 more)' -and (Format-PlacementNameList -Name @('b', 'a')) -eq 'a, b')
 $c = ConvertTo-PlacementVMRecord -View (New-View -Name 'vCLS-1234' -VmPath '[NFS_DEV_01] vCLS/vCLS.vmx') -DatastoreByRef $byRef -DatastoreByName $byName
 Assert-True "a vCLS VM is skipped" ($c.Skip -eq 'Agent')
-$c = ConvertTo-PlacementVMRecord -View (New-View -Name 'nsx-agent' -ManagedBy 'com.vmware.vim.eam') -DatastoreByRef $byRef -DatastoreByName $byName
+$c = ConvertTo-PlacementVMRecord -View (New-View -Name 'nsx-agent' -ManagedBy 'com.vmware.vim.eam' -VmPath '[NFS_SHARED_01] n/n.vmx' -Devices @((New-Disk 'ds-1' '[NFS_SHARED_01] n/n.vmdk'))) -DatastoreByRef $byRef -DatastoreByName $byName
 Assert-True "an ESX Agent Manager VM is skipped" ($c.Skip -eq 'Agent')
 $c = ConvertTo-PlacementVMRecord -View (New-View -Name 'x' -VmPath '[NFS_UNKNOWN] x/x.vmx' -Devices @((New-Disk $null '[NFS_DEV_01] x/x.vmdk'))) -DatastoreByRef $byRef -DatastoreByName $byName
 Assert-True "a datastore is found by name when the backing has no reference" (@($c.Record.Datastores | ForEach-Object { $_.Name }) -contains 'NFS_DEV_01')
@@ -321,19 +388,19 @@ $inventory = @([pscustomobject]@{
         (New-VM 'vcenter01' '' 'NFS_SHARED_01'),
         (New-VM 'siepd85csp03' '' 'NFS_MISC_01'))
     ExcludedTypes = @('VMFS')
-    SkippedTemplates = 2; SkippedAgents = 3; SkippedPlaceholders = 4; SkippedExcluded = 5
+    SkippedTemplates = 2; SkippedAgents = 3; SkippedPlaceholders = 4; SkippedNoDisks = 6; SkippedExcluded = 5
 })
 $result = Invoke-PlacementEvaluation -Inventory $inventory -RuleSet $rules -ScriptVersion '9.9.9'
 $s = $result.Summary
 Assert-True "6 VMs: 2 correct, 3 misplaced, 1 not on PROD/SIT/DEV" ($s.VMs -eq 6 -and $s.Correct -eq 2 -and $s.Reported -eq 3 -and $s.NotOnScoped -eq 1) "got $($s.VMs)/$($s.Correct)/$($s.Reported)/$($s.NotOnScoped)"
-Assert-True "skips are carried into the summary, VMFS-only included" ($s.SkippedTemplates -eq 2 -and $s.SkippedAgents -eq 3 -and $s.SkippedPlaceholders -eq 4 -and $s.SkippedExcluded -eq 5)
+Assert-True "skips are carried into the summary, placeholders, disk-less and VMFS-only included" ($s.SkippedTemplates -eq 2 -and $s.SkippedAgents -eq 3 -and $s.SkippedPlaceholders -eq 4 -and $s.SkippedNoDisks -eq 6 -and $s.SkippedExcluded -eq 5)
 Assert-True "the misplaced list" ((Get-Names $result.Findings) -eq 'siepd85csb01,siepd85csp02,vcenter01')
 Assert-True "the Not on PROD/SIT/DEV list" ((Get-Names $result.Unscoped) -eq 'siepd85csp03')
 Assert-True "every row carries the script version" (@(@($result.Findings) + @($result.Unscoped) | Where-Object { $_.ScriptVersion -ne '9.9.9' }).Count -eq 0)
 $dsRow = @($result.Datastores | Where-Object { $_.Datastore -eq 'NFS_DEV_01' })
 Assert-True "Datastores tab classifies and counts VMs" ($dsRow.Count -eq 1 -and $dsRow[0].Environment -eq 'DEV' -and $dsRow[0].VMs -eq 3)
 $line = Format-PlacementSummary -Summary $s
-Assert-True "summary line reads cleanly" ($line -match '^1 cluster\(s\), 6 VMs: 2 correct, 3 misplaced \(.*\), 1 not on a PROD/SIT/DEV datastore\. ' -and $line -match '5 only on VMFS datastores\.$') $line
+Assert-True "summary line reads cleanly" ($line -match '^1 cluster\(s\), 6 full VMs: 2 correct, 3 misplaced \(.*\), 1 not on a PROD/SIT/DEV datastore\. Not shown: ' -and $line -match '4 SRM placeholder\(s\), 6 with no disks, 5 only on VMFS datastores\.$') $line
 
 Assert-True "sibling CSV name" ((Get-PlacementSiblingPath -Path 'C:\Temp\report.csv' -Suffix 'Migration') -eq 'C:\Temp\report_Migration.csv')
 Assert-True "sibling CSV name with no extension" ((Get-PlacementSiblingPath -Path '/tmp/report' -Suffix 'NotOnProdSitDev') -eq '/tmp/report_NotOnProdSitDev.csv')
@@ -468,9 +535,12 @@ function New-World {
                 (New-View -Id 'vm-6' -Name 'siepd85csp06' -VmPath '[NFS_SHARED_01] f/f.vmx' -Devices @((New-Disk 'ds-5' '[LOCAL_ESX01] f/f.vmdk')))
                 (New-View -Id 'vm-7' -Name 'siepd85csp07' -VmPath '[NFS_DEV_01] g/g.vmx' -Devices @((New-Disk 'ds-2' '[NFS_DEV_01] g/g.vmdk')) -CommittedGB 80)
                 (New-View -Id 'vm-8' -Name 'siepd85csp08' -VmPath '[NFS_MISC_01] h/h.vmx' -Devices @((New-Disk 'ds-4' '[NFS_MISC_01] h/h.vmdk')) -CommittedGB 20)
+                (New-View -Id 'vm-9' -Name 'siepd85csp09' -ManagedBy 'com.vmware.vcDr' -ManagedType 'placeholderVm' -VmPath '[NFS_MISC_01] i/i.vmx')
+                (New-View -Id 'vm-10' -Name 'siepd85csp10' -ManagedBy 'com.vmware.vcDr' -ManagedType 'placeholderVm' -VmPath '[NFS_SHARED_01] j/j.vmx' -Devices @((New-Disk 'ds-1' '[NFS_SHARED_01] j/j.vmdk')))
             )
             'domain-c2' = @(
                 (New-View -Id 'vm-4' -Name 'siepd85csp03' -HostRef 'host-2' -VmPath '[NFS_DEV_01] c/c.vmx' -Devices @((New-Disk 'ds-2' '[NFS_DEV_01] c/c.vmdk')))
+                (New-View -Id 'vm-11' -Name 'SQLCLUSTER01-P' -HostRef 'host-2' -VmPath '[NFS_DEV_01] k/k.vmx' -Devices @((New-Disk 'ds-2' '[NFS_DEV_01] k/k.vmdk')))
             )
         }
         Calls = New-Object System.Collections.Generic.List[string]
@@ -627,11 +697,13 @@ $tmp = Join-Path ([IO.Path]::GetTempPath()) ("placement-" + [Guid]::NewGuid().To
 $csv = Join-Path $tmp 'run.csv'
 $cred = New-Object System.Management.Automation.PSCredential('DPE\tester', (New-Object System.Security.SecureString))
 $rows = @(& $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv 6>$null)
-Assert-True "all clusters: three misplaced VMs output" ((@($rows | ForEach-Object { "$($_.Cluster)/$($_.VMName)" } | Sort-Object) -join ',') -eq 'CL-DEV-01/siepd85csp03,CL-PROD-01/siepd85csd02,CL-PROD-01/siepd85csp07') "got $(@($rows | ForEach-Object { $_.VMName }) -join ',')"
+Assert-True "all clusters: four misplaced VMs output, the -P one included" ((@($rows | ForEach-Object { "$($_.Cluster)/$($_.VMName)" } | Sort-Object) -join ',') -eq 'CL-DEV-01/siepd85csp03,CL-DEV-01/SQLCLUSTER01-P,CL-PROD-01/siepd85csd02,CL-PROD-01/siepd85csp07') "got $(@($rows | ForEach-Object { $_.VMName }) -join ',')"
 Assert-True "the PROD VM on SHARED by DNS is not reported" (@($rows | Where-Object { $_.VMName -eq 'siepd85csp01' }).Count -eq 0)
 Assert-True "a VM with its home on SHARED and a disk on VMFS is correct" (@($rows | Where-Object { $_.VMName -eq 'siepd85csp06' }).Count -eq 0)
 Assert-True "the vCLS VM and the VMFS-only VM are not reported" (@($rows | Where-Object { $_.VMName -match 'vCLS|csp05' }).Count -eq 0)
-Assert-True "the misplaced CSV holds the same rows" (@(Import-Csv -Path $csv).Count -eq 3)
+Assert-True "the -P VM is reported by its suffix" (@($rows | Where-Object { $_.VMName -eq 'SQLCLUSTER01-P' -and $_.ExpectedEnvironment -eq 'PROD' -and $_.Reason -match "suffix '-p'" }).Count -eq 1)
+Assert-True "the SRM placeholder is in neither list" (@($rows | Where-Object { $_.VMName -eq 'siepd85csp09' }).Count -eq 0 -and @(Import-Csv -Path (Join-Path $tmp 'run_NotOnProdSitDev.csv') | Where-Object { $_.VMName -eq 'siepd85csp09' }).Count -eq 0)
+Assert-True "the misplaced CSV holds the same rows" (@(Import-Csv -Path $csv).Count -eq 4)
 $unscopedCsv = @(Import-Csv -Path (Join-Path $tmp 'run_NotOnProdSitDev.csv'))
 Assert-True "the Not on PROD/SIT/DEV CSV holds the VM on NFS_MISC_01" ($unscopedCsv.Count -eq 1 -and $unscopedCsv[0].VMName -eq 'siepd85csp08')
 Assert-True "connected once and disconnected once" (($world.Calls.ToArray() -join ',') -eq 'connect vc.example,disconnect vc.example') "got $($world.Calls.ToArray() -join ',')"
@@ -652,11 +724,11 @@ $targets = @{ PROD = 'DSC_SHARED_01'; DEV = 'NFS_DEV_01' }
 $world = New-World
 $out = @(& $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv -MigrateTo $targets -WhatIf 6>$null)
 Assert-True "-WhatIf: nothing is moved" ($world.Moves.Count -eq 0)
-Assert-True "-WhatIf: the output is the migration plan, both lists included" ((Get-Names $out) -eq 'siepd85csd02,siepd85csp03,siepd85csp07,siepd85csp08')
+Assert-True "-WhatIf: the output is the migration plan, both lists included" ((Get-Names $out) -eq 'siepd85csd02,siepd85csp03,siepd85csp07,siepd85csp08,SQLCLUSTER01-P')
 Assert-True "-WhatIf: the three reachable VMs would move" ((Get-Names @($out | Where-Object { $_.Result -eq 'WhatIf' })) -eq 'siepd85csd02,siepd85csp07,siepd85csp08')
 $skip = @($out | Where-Object { $_.VMName -eq 'siepd85csp03' })
 Assert-True "-WhatIf: the CL-DEV-01 VM is skipped - the PROD target is not on its host" ($skip[0].Result -eq 'Skipped' -and $skip[0].Detail -match 'not mounted on esx02')
-Assert-True "-WhatIf: the reports and the migration CSV are still written" ((Test-Path $csv) -and @(Import-Csv -Path (Join-Path $tmp 'run_Migration.csv')).Count -eq 4)
+Assert-True "-WhatIf: the reports and the migration CSV are still written" ((Test-Path $csv) -and @(Import-Csv -Path (Join-Path $tmp 'run_Migration.csv')).Count -eq 5)
 
 $world = New-World
 $out = @(& $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv -MigrateTo $targets -Confirm:$false 6>$null)
@@ -664,7 +736,7 @@ Assert-True "live: the three moved, to the right places" ((@($world.Moves.ToArra
 Assert-True "live: results say so" ((Get-Names @($out | Where-Object { $_.Result -eq 'Migrated' })) -eq 'siepd85csd02,siepd85csp07,siepd85csp08')
 Assert-True "live: never more than two at once" ($world.MaxActive -le 2)
 $after = @(& $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv 6>$null)
-Assert-True "live: a fresh report shows only the VM that could not move" ((Get-Names $after) -eq 'siepd85csp03')
+Assert-True "live: a fresh report shows only the VMs that could not move" ((Get-Names $after) -eq 'siepd85csp03,SQLCLUSTER01-P')
 
 $world = New-World
 $out = @(& $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv -MigrateTo $targets -MigrateVM 'siepd85csd*' -Confirm:$false 6>$null)
@@ -698,16 +770,16 @@ function Confirm-GuiMigration { param($Plan, $MaxConcurrent) $script:confirmAske
 $busyTexts = New-Object System.Collections.Generic.List[string]
 $messages = New-Object System.Collections.Generic.List[string]
 
-function New-StubRulesRow([string]$Environment, [string]$Letters, [string]$DnsLabels, [string]$Keywords) {
+function New-StubRulesRow([string]$Environment, [string]$Letters, [string]$Suffixes, [string]$DnsLabels, [string]$Keywords) {
     [pscustomobject]@{ IsNewRow = $false; Cells = @{
-            Environment = [pscustomobject]@{ Value = $Environment }; Letters = [pscustomobject]@{ Value = $Letters }
+            Environment = [pscustomobject]@{ Value = $Environment }; Letters = [pscustomobject]@{ Value = $Letters }; NameSuffixes = [pscustomobject]@{ Value = $Suffixes }
             DnsLabels = [pscustomobject]@{ Value = $DnsLabels }; DatastoreKeywords = [pscustomobject]@{ Value = $Keywords } } }
 }
 function New-StubSelection([string[]]$Id) { @($Id | ForEach-Object { [pscustomobject]@{ Cells = @{ VMId = [pscustomobject]@{ Value = $_ } } } }) }
 $rulesRows = @(
-    (New-StubRulesRow 'PROD' 'p' 'dpe, protected' 'SHARED')
-    (New-StubRulesRow 'SIT' 't' 'dpesit, protectedsit' 'SIT')
-    (New-StubRulesRow 'DEV' 'd' 'dpedev, protecteddev' 'DEV')
+    (New-StubRulesRow 'PROD' 'p' '-P, -S' 'dpe, protected' 'SHARED')
+    (New-StubRulesRow 'SIT' 't' '' 'dpesit, protectedsit' 'SIT')
+    (New-StubRulesRow 'DEV' 'd' '' 'dpedev, protecteddev' 'DEV')
 )
 $clusterList = [pscustomobject]@{ Items = (New-Object System.Collections.ArrayList); SelectedIndex = -1; Enabled = $true }
 $clusterList | Add-Member -MemberType ScriptProperty -Name SelectedItem -Value { if ($this.SelectedIndex -ge 0 -and $this.SelectedIndex -lt $this.Items.Count) { $this.Items[$this.SelectedIndex] } }
@@ -760,14 +832,15 @@ Assert-True "discover one cluster: misplaced tab" ((Get-Names $script:GuiState.R
 Assert-True "discover one cluster: Not on PROD/SIT/DEV tab" ((Get-Names $script:GuiState.Result.Unscoped) -eq 'siepd85csp08' -and $unscopedTab.Text -eq 'Not on PROD/SIT/DEV (1)' -and $script:Gui.UnscopedGrid.DataSource.Rows.Count -eq 1)
 Assert-True "discover one cluster: grids carry the hidden VMId" ($script:Gui.ResultsGrid.DataSource.Columns.Contains('VMId') -and $script:GuiState.FindingById.ContainsKey('vm-2') -and $script:GuiState.FindingById.ContainsKey('vm-8'))
 Assert-True "discover one cluster: datastores tab leaves VMFS out" ($script:Gui.DatastoreGrid.DataSource.Rows.Count -eq 5 -and @($script:Gui.DatastoreGrid.DataSource.Rows | Where-Object { $_['Datastore'] -eq 'LOCAL_ESX01' }).Count -eq 0)
-Assert-True "discover one cluster: status bar summarises, VMFS-only VM counted" ($script:Gui.Status.Text -match '^CL-PROD-01: 1 cluster\(s\), 5 VMs: 2 correct, 2 misplaced' -and $script:Gui.Status.Text -match '1 only on VMFS datastores') $script:Gui.Status.Text
+Assert-True "discover one cluster: status bar summarises - the stale-marked VM counted as a full VM" ($script:Gui.Status.Text -match '^CL-PROD-01: 1 cluster\(s\), 6 full VMs: 3 correct, 2 misplaced') $script:Gui.Status.Text
+Assert-True "discover one cluster: the placeholder and the VMFS-only VM are counted as not shown" ($script:Gui.Status.Text -match '1 SRM placeholder\(s\), 0 with no disks, 1 only on VMFS datastores') $script:Gui.Status.Text
 
 $clusterList.SelectedIndex = 0
 $busyTexts.Clear(); $messages.Clear()
 Invoke-GuiAction { Invoke-GuiDiscovery } 6>$null
 Assert-True "discover all: no error shown" ($messages.Count -eq 0) ($messages.ToArray() -join ' | ')
 Assert-True "discover all: progress reads 1 of 2, 2 of 2" ((@($busyTexts.ToArray() | Where-Object { $_ -like 'Discovering*' }) -join ' | ') -eq 'Discovering CL-DEV-01 (1 of 2)... | Discovering CL-PROD-01 (2 of 2)...')
-Assert-True "discover all: both clusters' misplaced VMs" ((Get-Names $script:GuiState.Result.Findings) -eq 'siepd85csd02,siepd85csp03,siepd85csp07')
+Assert-True "discover all: both clusters' misplaced VMs, the -P one included" ((Get-Names $script:GuiState.Result.Findings) -eq 'siepd85csd02,siepd85csp03,siepd85csp07,SQLCLUSTER01-P')
 
 # Re-apply after editing the grid: letter p moved to DEV. No vCenter read.
 $viewCallsBefore = $world.ViewCalls
@@ -776,7 +849,7 @@ $rulesRows[2].Cells.Letters.Value = 'd, p'
 $messages.Clear()
 Invoke-GuiAction { Invoke-GuiEvaluation } 6>$null
 Assert-True "re-apply: no error shown" ($messages.Count -eq 0) ($messages.ToArray() -join ' | ')
-Assert-True "re-apply: p VMs on DEV are now correct, p VMs on SHARED now wrong" ((Get-Names $script:GuiState.Result.Findings) -eq 'siepd85csd02,siepd85csp06')
+Assert-True "re-apply: p VMs on DEV are now correct, p VMs on SHARED now wrong; the -P suffix still says PROD" ((Get-Names $script:GuiState.Result.Findings) -eq 'siepd85csd02,siepd85csp06,siepd85csp10,SQLCLUSTER01-P')
 Assert-True "re-apply: vCenter was not read again" ($world.ViewCalls -eq $viewCallsBefore)
 
 $rulesRows[0].Cells.Letters.Value = 'p'
@@ -784,7 +857,7 @@ $messages.Clear()
 Invoke-GuiAction { Invoke-GuiEvaluation } 6>$null 3>$null
 Assert-True "re-apply bad rules: refused with a message" ($messages.Count -eq 1 -and $messages[0] -match "'p' is mapped to both PROD and DEV")
 Assert-True "re-apply bad rules: status says it failed" ($script:Gui.Status.Text -eq 'Failed - see the Log tab.')
-Assert-True "re-apply bad rules: last result kept" ($script:GuiState.Result.Findings.Count -eq 2)
+Assert-True "re-apply bad rules: last result kept" ($script:GuiState.Result.Findings.Count -eq 4)
 $rulesRows[2].Cells.Letters.Value = 'd'
 Invoke-GuiAction { Invoke-GuiEvaluation } 6>$null
 
@@ -814,15 +887,15 @@ Invoke-GuiAction { Invoke-GuiMigration -All } 6>$null
 Assert-True "dialog: offered PROD and DEV, in rule order" ((@($script:dialogSeen.Environment) -join ',') -eq 'PROD,DEV')
 Assert-True "dialog: PROD choices - the datastore cluster, then the NFS datastore; VMFS never offered" ((@($script:dialogSeen.Choice['PROD'] | ForEach-Object { $_.Name }) -join ',') -eq 'DSC_SHARED_01,NFS_SHARED_01')
 Assert-True "dialog: DEV choices" ((@($script:dialogSeen.Choice['DEV'] | ForEach-Object { $_.Name }) -join ',') -eq 'NFS_DEV_01,NFS_DEV_02')
-Assert-True "dialog: counts per environment" ($script:dialogSeen.Count['PROD'] -eq 2 -and $script:dialogSeen.Count['DEV'] -eq 1)
+Assert-True "dialog: counts per environment" ($script:dialogSeen.Count['PROD'] -eq 3 -and $script:dialogSeen.Count['DEV'] -eq 1)
 Assert-True "dialog cancelled: nothing happens" ($world.Moves.Count -eq 0 -and $null -eq $script:GuiState.Migrations -and $messages.Count -eq 0)
 
 $script:dialogMode = 'Preview'
 $messages.Clear()
 Invoke-GuiAction { Invoke-GuiMigration -All } 6>$null
 Assert-True "preview: nothing moved, nothing asked" ($world.Moves.Count -eq 0 -and $script:confirmAsked -eq 0)
-Assert-True "preview: Migrations tab shows the plan" ($migrationTab.Text -eq 'Migrations (3)' -and $script:Gui.MigrationGrid.DataSource.Rows.Count -eq 3 -and [object]::ReferenceEquals($script:Gui.Tabs.SelectedTab, $migrationTab))
-Assert-True "preview: two would move, one skipped with the reason" ((Get-Names @($script:GuiState.Migrations | Where-Object { $_.Result -eq 'WhatIf' })) -eq 'siepd85csd02,siepd85csp07' -and @($script:GuiState.Migrations | Where-Object { $_.Result -eq 'Skipped' -and $_.Detail -match 'not mounted on esx02' }).Count -eq 1)
+Assert-True "preview: Migrations tab shows the plan" ($migrationTab.Text -eq 'Migrations (4)' -and $script:Gui.MigrationGrid.DataSource.Rows.Count -eq 4 -and [object]::ReferenceEquals($script:Gui.Tabs.SelectedTab, $migrationTab))
+Assert-True "preview: two would move, two skipped with the reason" ((Get-Names @($script:GuiState.Migrations | Where-Object { $_.Result -eq 'WhatIf' })) -eq 'siepd85csd02,siepd85csp07' -and @($script:GuiState.Migrations | Where-Object { $_.Result -eq 'Skipped' -and $_.Detail -match 'not mounted on esx02' }).Count -eq 2)
 Assert-True "preview: says nothing was changed" ($messages.Count -eq 1 -and $messages[0] -match 'Preview only - nothing was changed')
 
 $script:Gui.Tabs.SelectedTab = $resultsTab
@@ -846,7 +919,7 @@ $messages.Clear()
 Invoke-GuiAction { Invoke-GuiMigration } 6>$null
 Assert-True "migrate selected: only the selected VM moves, to DEV" (($world.Moves.ToArray() -join ',') -eq 'vm-2->ds-2')
 Assert-True "migrate selected: result Migrated" ((@($script:GuiState.Migrations | ForEach-Object { "$($_.VMName)=$($_.Result)" }) -join ',') -eq 'siepd85csd02=Migrated')
-Assert-True "migrate selected: the cluster is re-discovered and the VM is gone from the list" ($world.ViewCalls -gt $viewCallsBefore -and (Get-Names $script:GuiState.Result.Findings) -eq 'siepd85csp03,siepd85csp07')
+Assert-True "migrate selected: the cluster is re-discovered and the VM is gone from the list" ($world.ViewCalls -gt $viewCallsBefore -and (Get-Names $script:GuiState.Result.Findings) -eq 'siepd85csp03,siepd85csp07,SQLCLUSTER01-P')
 Assert-True "migrate selected: not left in a migrating state" (-not $script:GuiState.Migrating)
 
 $script:Gui.Tabs.SelectedTab = $unscopedTab
@@ -859,11 +932,11 @@ $script:Gui.Tabs.SelectedTab = $resultsTab
 $world.FailTask['vm-7'] = $true
 $messages.Clear()
 Invoke-GuiAction { Invoke-GuiMigration -All } 6>$null 3>$null
-Assert-True "a failed move is reported as a warning, and the VM stays listed" ($messages.Count -eq 1 -and $messages[0] -match '^Warning: 0 VM\(s\) migrated, 1 failed' -and (Get-Names $script:GuiState.Result.Findings) -eq 'siepd85csp03,siepd85csp07')
+Assert-True "a failed move is reported as a warning, and the VM stays listed" ($messages.Count -eq 1 -and $messages[0] -match '^Warning: 0 VM\(s\) migrated, 1 failed' -and (Get-Names $script:GuiState.Result.Findings) -eq 'siepd85csp03,siepd85csp07,SQLCLUSTER01-P')
 
 $script:Gui.Tabs.SelectedTab = $migrationTab
 $active = Get-GuiActiveTable
-Assert-True "export from the Migrations tab exports the migration rows" ($active.Name -eq 'Migrations' -and @($active.Row).Count -eq 2 -and ($active.Column -join ',') -eq ((Get-PlacementMigrationColumn) -join ','))
+Assert-True "export from the Migrations tab exports the migration rows" ($active.Name -eq 'Migrations' -and @($active.Row).Count -eq 3 -and ($active.Column -join ',') -eq ((Get-PlacementMigrationColumn) -join ','))
 
 $world.Calls.Clear()
 Invoke-GuiAction { Invoke-GuiDisconnect } 6>$null
