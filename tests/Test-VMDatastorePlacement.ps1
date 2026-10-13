@@ -36,7 +36,7 @@ $wanted = @('Write-PlacementLog', 'Split-RuleValue', 'ConvertTo-PlacementRuleSet
             'Get-ViewProperty', 'Get-DatastoreNameFromPath', 'Format-PlacementNameList', 'ConvertTo-PlacementVMRecord', 'ConvertTo-PlacementDataTable',
             'Connect-PlacementVCenter', 'Disconnect-PlacementVCenter', 'Get-PlacementClusterList', 'Get-ClusterPlacementInventory',
             'Get-PlacementStorageInfo', 'Get-PlacementTaskState', 'Invoke-PlacementMigration',
-            'Get-PlacementSite', 'Format-PlacementLocation', 'Show-GuiLocation',
+            'Get-PlacementSite', 'Format-PlacementLocation', 'Show-GuiLocation', 'Get-PlacementBannerImage',
             'Invoke-GuiAction', 'Get-GuiRuleDefinition', 'Invoke-GuiConnect', 'Invoke-GuiDisconnect', 'Invoke-GuiDiscovery',
             'Invoke-GuiEvaluation', 'Get-GuiActiveTable', 'Show-GuiMigrationProgress', 'Invoke-GuiMigration')
 $funcs = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
@@ -1083,12 +1083,34 @@ $missing = @($grids | Where-Object { $exitText -notmatch "'$_'" })
 Assert-True "idle resets the cursor of every grid the window creates ($($grids -join ', '))" ($grids.Count -ge 5 -and $missing.Count -eq 0) "missing: $($missing -join ', ')"
 Write-Host "`n=== The banner is in the window and kept current ===" -ForegroundColor Cyan
 $guiText = $guiFunctions['Show-PlacementGui']
-Assert-True "the window has a banner naming the tool, as its first row" ($guiText -match "'VM Datastore Placement'" -and $guiText -match '\$layout\.Controls\.Add\(\$banner, 0, 0\)')
+Assert-True "the window has a banner naming the tool, as its first row" ($guiText -match "'VM Datastore Placement'" -and $guiText -match '\$layout\.Controls\.Add\(\$bannerHost, 0, 0\)')
 Assert-True "the banner turns amber under -WhatIf and says preview only" ($guiText -match 'if \(\$script:WhatIfRun\) \{\s+\$banner\.BackColor' -and $guiText -match 'PREVIEW ONLY')
 Assert-True "the banner refreshes when the cluster selection changes" ($guiText -match 'ClusterList\.Add_SelectedIndexChanged\(\{ Show-GuiLocation \}\)')
 foreach ($name in @('Invoke-GuiConnect', 'Invoke-GuiDisconnect', 'Invoke-GuiEvaluation')) {
     Assert-True "$name refreshes the banner" ($guiFunctions[$name] -match 'Show-GuiLocation')
 }
+Write-Host "`n=== The Re-align Tool picture: embedded, valid, shown once ===" -ForegroundColor Cyan
+$imageAssignment = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:BannerImageBase64' }, $true))
+Assert-True "the picture is embedded in the script, assigned once" ($imageAssignment.Count -eq 1)
+$imageData = $imageAssignment[0].Right.Extent.Text -replace "^@'\r?\n", '' -replace "\r?\n'@$", ''
+$imageBytes = [Convert]::FromBase64String($imageData)
+Assert-True "it decodes to a complete JPEG" ($imageBytes.Length -gt 10000 -and $imageBytes[0] -eq 0xFF -and $imageBytes[1] -eq 0xD8 -and $imageBytes[-2] -eq 0xFF -and $imageBytes[-1] -eq 0xD9)
+$width = 0; $height = 0; $i = 2
+while ($i + 8 -lt $imageBytes.Length -and $imageBytes[$i] -eq 0xFF) {
+    $marker = $imageBytes[$i + 1]
+    if ($marker -ge 0xC0 -and $marker -le 0xC2) { $height = $imageBytes[$i + 5] * 256 + $imageBytes[$i + 6]; $width = $imageBytes[$i + 7] * 256 + $imageBytes[$i + 8]; break }
+    $i += 2 + $imageBytes[$i + 2] * 256 + $imageBytes[$i + 3]
+}
+Assert-True "it is 768 x 512 - baseline JPEG, which every Windows PowerShell can draw" ($width -eq 768 -and $height -eq 512) "got $width x $height"
+$calls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-PlacementBannerImage' }, $true))
+Assert-True "the picture is placed in exactly one spot in the window" ($calls.Count -eq 1 -and @([regex]::Matches($guiText, 'New-Object System\.Windows\.Forms\.PictureBox')).Count -eq 1)
+Assert-True "it sits in the banner's right-hand column" ($guiText -match '\$bannerHost\.Controls\.Add\(\$picture, 1, 0\)')
+$script:BannerImageBase64 = $imageData
+$loaded = $null; $threw = $false
+try { $loaded = Get-PlacementBannerImage } catch { $threw = $true }
+Assert-True "loading it never throws - where pictures cannot be drawn the banner shows without it" (-not $threw -and ($null -eq $loaded -or $loaded.Width -eq 768))
+if ($null -ne $loaded) { $loaded.Dispose() }
+
 Assert-True "nothing else in the script sets a wait cursor" (@([regex]::Matches((Get-Content -Path $scriptPath -Raw), 'Cursors\]::WaitCursor')).Count -eq 0)
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })

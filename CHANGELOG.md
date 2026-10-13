@@ -4104,6 +4104,26 @@ authentication removed, for operators who apply their own
 
 ## Test-VMDatastorePlacement.ps1
 
+### [1.6.0] — 2026-10-13
+
+#### Added
+
+- **The Re-align Tool picture, in the banner's spare space on the right** — its one
+  place in the tool. It is shown at 150 × 100 and opens full size when clicked; a
+  click on the full-size view closes it.
+
+  It is embedded in the script as a base64 JPEG, so the script stays a single
+  download: 768 × 512, about 85 KB, about 113 KB as text. That takes the script from
+  about 190 KB to about 300 KB. It was converted from the supplied WebP because
+  Windows PowerShell's image loader (GDI+) cannot read WebP. If the picture cannot be
+  drawn, the banner is shown without it rather than failing.
+
+#### Tests
+
+- `tests/Test-VMDatastorePlacement.ps1` — 376 assertions. The embedded data decodes
+  to a complete 768 × 512 baseline JPEG, is placed in exactly one spot (the banner's
+  right-hand column), and loading it never throws.
+
 ### [1.5.0] — 2026-10-13
 
 #### Added
