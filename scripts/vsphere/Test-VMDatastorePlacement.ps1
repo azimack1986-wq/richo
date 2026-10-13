@@ -1992,8 +1992,16 @@ function Get-PlacementTaskState {
     $task = Get-Task -Server $Server -Id $TaskId -ErrorAction Stop
     $message = [string](Get-ViewProperty $task 'ExtensionData.Info.Error.LocalizedMessage')
     if (-not $message) { $message = [string](Get-ViewProperty $task 'Description') }
+
+    # PowerCLI's State and the vSphere API's Info.State (queued, running, success, error) should
+    # agree. The API's is the documented one, so a finished API state wins - a move must never be
+    # left polled as Running forever because the two name a state differently.
+    $state = [string]$task.State
+    $apiState = [string](Get-ViewProperty $task 'ExtensionData.Info.State')
+    if (@('success', 'error') -contains $apiState -and @('success', 'error') -notcontains $state) { $state = $apiState }
+
     [pscustomobject]@{
-        State = [string]$task.State
+        State = $state
         Progress = [int](Get-ViewProperty $task 'PercentComplete')
         Error = $message
     }

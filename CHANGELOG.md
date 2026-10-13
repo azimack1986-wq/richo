@@ -4135,7 +4135,10 @@ authentication removed, for operators who apply their own
   runs the same plan with `-WhatIf`. At most `-MaxConcurrentMigrations` run at once
   (default 2, at most 4). **Stop** starts nothing new and lets running moves finish.
   Each task is polled, a failure carries vCenter's own message, and a task that can
-  no longer be read becomes *Unknown* rather than a guess. Clusters whose VMs moved
+  no longer be read becomes *Unknown* rather than a guess. A task counts as finished
+  when either PowerCLI's `State` or the vSphere API's documented `Info.State` says
+  so. PowerCLI's exact state names could not be confirmed from its documentation,
+  and a mismatch must never leave a move polled as Running forever. Clusters whose VMs moved
   are discovered again, so the lists show where things are now.
 
   Headless: `-MigrateTo @{ PROD = '<datastore cluster or NFS datastore>'; ... }`,
@@ -4166,7 +4169,7 @@ authentication removed, for operators who apply their own
 
 #### Tests
 
-- `tests/Test-VMDatastorePlacement.ps1` — 265 assertions, rewritten around a stubbed
+- `tests/Test-VMDatastorePlacement.ps1` — 266 assertions, rewritten around a stubbed
   vCenter. It has two clusters and two hosts with their own mounts, SHARED/DEV/
   unkeyworded/VMFS datastores, and a datastore cluster with NFS and NFS 4.1 members.
   A successful Storage vMotion task really moves the VM's files in the stub, so

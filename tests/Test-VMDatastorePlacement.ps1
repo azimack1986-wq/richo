@@ -483,6 +483,7 @@ function New-World {
         FailStart = @{}
         FailTask = @{}
         LoseTask = @{}
+        ApiStateOnly = @{}
     }
 }
 function Move-WorldVM { param([string]$VmRef, [string]$TargetRef)
@@ -536,6 +537,14 @@ function Get-Task {
     param($Server, $Id)
     $task = $world.Tasks[$Id]
     if ($world.LoseTask.ContainsKey($task.Vm)) { throw "The object 'vim.Task:$Id' has already been deleted or has not been completely created" }
+    if ($world.ApiStateOnly.ContainsKey($task.Vm)) {
+        # PowerCLI's State never moves on; only the API's Info.State says it finished.
+        $task.Polls = $task.Polls + 1
+        if ($task.Polls -gt 10) { throw 'stub Get-Task: still polled after 10 tries - the finished API state was ignored' }
+        $apiState = 'running'
+        if ($task.Polls -ge 2) { $apiState = 'success' }
+        return [pscustomobject]@{ State = 'Unknown'; PercentComplete = 50; ExtensionData = [pscustomobject]@{ Info = [pscustomobject]@{ State = $apiState; Error = $null } } }
+    }
     $task.Polls = $task.Polls + 1
     if ($task.Polls -lt 2) { return [pscustomobject]@{ State = 'Running'; PercentComplete = 40; ExtensionData = $null } }
     if (-not $task.Done) {
@@ -585,6 +594,11 @@ $world = New-World
 $world.LoseTask['x-1'] = $true
 $out = @(Invoke-PlacementMigration -Server $vc -Plan @($enginePlan[0]) -Wait {} -Confirm:$false 6>$null 3>$null)
 Assert-True "a task that can no longer be read is Unknown after three tries, not a guess" ($out[0].Result -eq 'Unknown' -and $out[0].Detail -match 'check it in vCenter')
+
+$world = New-World
+$world.ApiStateOnly['x-1'] = $true
+$out = @(Invoke-PlacementMigration -Server $vc -Plan @($enginePlan[0]) -Wait {} -Confirm:$false 6>$null 3>$null)
+Assert-True "a task PowerCLI never reports finished still completes on the API's own state" ($out[0].Result -eq 'Migrated')
 
 $world = New-World
 $script:startedSoFar = 0
