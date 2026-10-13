@@ -4104,6 +4104,68 @@ authentication removed, for operators who apply their own
 
 ## Test-VMDatastorePlacement.ps1
 
+### [1.7.0] — 2026-10-13
+
+#### Removed
+
+- **The Re-align Tool picture** added in 1.6.0. It was too small to be useful and
+  added about 110 KB to the script. The banner is back to the 1.5.0 layout, and the
+  script is back to about 190 KB.
+
+#### Fixed
+
+- **Migrating VMs whose environment is not known no longer stops with an error.**
+  Up to 1.6.0, choosing only such VMs stopped with *"None of the chosen VMs has a
+  known environment, so there is nowhere correct to move them"*. If they were chosen
+  alongside others, they were skipped. That refusal was deliberate, but it left no
+  way to move them from the tool.
+
+#### Added
+
+- **A destination you pick for VMs with no known environment.** This covers
+  *Environment undetermined*, *Unmapped hostname letter* and VMs on the Not on
+  PROD/SIT/DEV tab with no environment. The migration dialog gets one more row,
+  *Environment not known — N VM(s)*. It lists every datastore cluster and every
+  available NFS datastore on the VMs' clusters, each labelled with what its name
+  says (`[PROD]`, `[no PROD/SIT/DEV keyword]`, `[mixed - PROD, DEV]`, …).
+  - **Nothing is preselected.** The row starts at *(do not migrate)*, so those VMs
+    move only to a datastore you choose.
+  - **The usual checks still apply.** The target must be mounted on the VM's host,
+    the VM is not moved to a datastore it is already on, and the free-space floor
+    still holds.
+  - **Plan, confirmation and Migrations tab say so.** Each says the VM's
+    environment is not known, so it goes where you picked. It stays listed afterwards
+    until the rules can work out its environment.
+  - **A datastore cluster is offered** only when every member was discovered (a VMFS
+    member rules it out), every member is mounted on at least one host, and at least
+    one member is usable.
+  - **Headless:** `-MigrateTo @{ UNKNOWN = '<datastore or datastore cluster>' }`,
+    best narrowed with `-MigrateVM`. A name is required, because there is no
+    suggestion for these VMs. A wrong name is refused with the list of what is
+    available.
+- These VMs' *SuggestedDestination* now says how to move them: *None - its
+  environment is not known. Migrate it to pick any datastore cluster or NFS
+  datastore yourself.*
+
+#### Tests
+
+- `tests/Test-VMDatastorePlacement.ps1` — 401 assertions. The 1.6.0 picture tests
+  are gone with the picture. New tests cover:
+  - the list of targets for these VMs
+  - the plan for them, including that a VM of a known environment never uses the
+    target picked for unknown ones
+  - the GUI case that raised the error: a VM with an unmapped letter, previewed with
+    nothing picked, then moved to a picked datastore
+  - headless `UNKNOWN`, both preview and live, and its refusal of `'Suggested'`
+
+  Mutation-checked, and each of these breaks turns the suite red:
+  - putting the refusal back
+  - letting known-environment VMs use the unknown target
+  - dropping the host check for unknown VMs
+  - not passing the pick through (GUI or headless)
+  - offering a datastore cluster with an excluded or unusable member
+  - dropping the "still listed" note
+
 ### [1.6.0] — 2026-10-13
 
 #### Added

@@ -32,11 +32,11 @@ $wanted = @('Write-PlacementLog', 'Split-RuleValue', 'ConvertTo-PlacementRuleSet
             'Get-DnsEnvironment', 'Get-HostnameEnvironment', 'Resolve-VMExpectedEnvironment', 'Get-PlacementReportColumn',
             'Get-PlacementMigrationColumn', 'Format-PlacementSize', 'Test-VMPlacement', 'Invoke-PlacementEvaluation',
             'Format-PlacementSummary', 'Get-PlacementSiblingPath', 'Export-PlacementReport', 'Get-PlacementHostSeeing',
-            'Format-PlacementTarget', 'Get-PlacementTargetChoice', 'Get-PlacementSuggestion', 'Get-PlacementFallbackChoice', 'Get-PlacementMigrationPlan',
+            'Format-PlacementTarget', 'Get-PlacementTargetChoice', 'Get-PlacementSuggestion', 'Get-PlacementFallbackChoice', 'Get-PlacementAnyChoice', 'Get-PlacementMigrationPlan',
             'Get-ViewProperty', 'Get-DatastoreNameFromPath', 'Format-PlacementNameList', 'ConvertTo-PlacementVMRecord', 'ConvertTo-PlacementDataTable',
             'Connect-PlacementVCenter', 'Disconnect-PlacementVCenter', 'Get-PlacementClusterList', 'Get-ClusterPlacementInventory',
             'Get-PlacementStorageInfo', 'Get-PlacementTaskState', 'Invoke-PlacementMigration',
-            'Get-PlacementSite', 'Format-PlacementLocation', 'Show-GuiLocation', 'Get-PlacementBannerImage',
+            'Get-PlacementSite', 'Format-PlacementLocation', 'Show-GuiLocation',
             'Invoke-GuiAction', 'Get-GuiRuleDefinition', 'Invoke-GuiConnect', 'Invoke-GuiDisconnect', 'Invoke-GuiDiscovery',
             'Invoke-GuiEvaluation', 'Get-GuiActiveTable', 'Show-GuiMigrationProgress', 'Invoke-GuiMigration')
 $funcs = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
@@ -478,7 +478,7 @@ Assert-True "a datastore cluster is suggested before a single datastore" ($sug['
 Assert-True "only targets mounted on the VM's own host are suggested" ($sug['p2'].Target.Name -eq 'DSC_SHARED_01')
 Assert-True "no target mounted on its host: none, and it says why and what to do" ($null -eq $sug['p3'].Target -and $sug['p3'].Text -match '^None - no PROD datastore cluster or NFS datastore is mounted on esxZ9\. Migrate it on its own')
 Assert-True "the datastore a VM is already on is not suggested to it" ($null -eq $sug['d1'].Target)
-Assert-True "unknown environment: none" ($sug['u1'].Text -eq 'None - its environment is not known.')
+Assert-True "unknown environment: none, and it says the target can be picked when migrating" ($null -eq $sug['u1'].Target -and $sug['u1'].Text -eq 'None - its environment is not known. Migrate it to pick any datastore cluster or NFS datastore yourself.') $sug['u1'].Text
 $small = $storageA.PSObject.Copy()
 $small.Pods = @((New-PodInfo 'p1' 'DSC_SHARED_01' @('d6', 'd7') -FreeGB 700 -CapacityGB 6000))
 $small.Datastores = @((New-DsInfo 'd1' 'NFS_SHARED_01' -FreeGB 400 -CapacityGB 1000), (New-DsInfo 'd2' 'NFS_SHARED_41' -Type 'NFS41' -FreeGB 900 -CapacityGB 1000), (New-DsInfo 'd6' 'NFS_SHARED_P1' -Pod 'p1'), (New-DsInfo 'd7' 'NFS_SHARED_P2' -Pod 'p1'))
@@ -499,6 +499,26 @@ $misc = [pscustomobject]@{ Cluster = 'CL-M'; Datastores = @((New-DsInfo 'm2' 'NF
 Assert-True "  a datastore with no keyword is listed before one named for another environment" ((@(Get-PlacementFallbackChoice -StorageInfo @($misc) -RuleSet $rules | ForEach-Object { $_.Name }) -join ',') -eq 'NFS_MISC_01,NFS_DEV_09')
 Assert-True "  and its line says what it is" ((Format-PlacementTarget -Target @($fb | Where-Object { $_.Name -eq 'NFS_SHARED_P1' })[0]) -match '\[PROD\].*\(in datastore cluster DSC_SHARED_01\)$')
 
+Write-Host "`n=== Any target, for VMs whose environment is not known ===" -ForegroundColor Cyan
+$any = @(Get-PlacementAnyChoice -StorageInfo @($storageA) -RuleSet $rules)
+$anyNames = @($any | ForEach-Object { $_.Name })
+Assert-True "datastore clusters first - mixed ones too - then every NFS datastore" (($anyNames -join ',') -eq 'DSC_MIXED,DSC_SHARED_01,NFS_DEV_01,NFS_DEV_P4,NFS_SHARED_01,NFS_SHARED_41,NFS_SHARED_P1,NFS_SHARED_P2,NFS_SHARED_P3') ($anyNames -join ',')
+Assert-True "  not a datastore cluster with a member that was not discovered" ($anyNames -notcontains 'DSC_SHARED_HALF')
+Assert-True "  not vSAN, not in maintenance, not inaccessible, not mounted nowhere" (@($anyNames | Where-Object { $_ -match 'VSAN|MAINT|DOWN|UNMOUNTED' }).Count -eq 0)
+Assert-True "  each is marked Fallback" (@($any | Where-Object { -not $_.Fallback }).Count -eq 0)
+$mixedPod = @($any | Where-Object { $_.Name -eq 'DSC_MIXED' })[0]
+$sharedPod = @($any | Where-Object { $_.Name -eq 'DSC_SHARED_01' })[0]
+Assert-True "  a datastore cluster is labelled by its members: one environment, or mixed" ($sharedPod.Label -eq 'PROD' -and $sharedPod.Environment -eq 'PROD' -and $mixedPod.Label -eq 'mixed - PROD, DEV' -and $mixedPod.Environment -eq '') "$($sharedPod.Label) / $($mixedPod.Label)"
+Assert-True "  a datastore cluster knows the hosts that mount every member" ((@($sharedPod.Hosts) -join ',') -eq 'esxA1,esxA2' -and (@($mixedPod.Hosts) -join ',') -eq 'esxA1')
+Assert-True "  and its line says what it is, with no 'in datastore cluster'" ((Format-PlacementTarget -Target $mixedPod) -match '^Datastore cluster  DSC_MIXED  \[mixed - PROD, DEV\]  -  .* free of .*  -  CL-A$') (Format-PlacementTarget -Target $mixedPod)
+$downPods = $storageA.PSObject.Copy()
+$downPods.Pods = @((New-PodInfo 'p4' 'DSC_ALL_DOWN' @('d3', 'd4')))
+$vmfsPod = [pscustomobject]@{ Cluster = 'CL-V'; Datastores = @((New-DsInfo 'v1' 'NFS_SHARED_V1' -Pod 'p5')); Pods = @((New-PodInfo 'p5' 'DSC_WITH_VMFS' @('v1', 'v2'))); HostDatastores = @{ esxV1 = @('v1', 'v2') } }
+Assert-True "  not a datastore cluster with a member of an excluded type, even one every host mounts" (@(Get-PlacementAnyChoice -StorageInfo @($vmfsPod) -RuleSet $rules | Where-Object { $_.Kind -eq 'Datastore cluster' }).Count -eq 0)
+Assert-True "  not a datastore cluster none of whose members can take a VM" (@(Get-PlacementAnyChoice -StorageInfo @($downPods) -RuleSet $rules | Where-Object { $_.Kind -eq 'Datastore cluster' }).Count -eq 0)
+$merged = @(Get-PlacementAnyChoice -StorageInfo @($storageA, [pscustomobject]@{ Cluster = 'CL-B'; Datastores = @((New-DsInfo 'd6' 'NFS_SHARED_P1' -Pod 'p1'), (New-DsInfo 'd7' 'NFS_SHARED_P2' -Pod 'p1')); Pods = @((New-PodInfo 'p1' 'DSC_SHARED_01' @('d6', 'd7'))); HostDatastores = @{ esxB1 = @('d6', 'd7') } }) -RuleSet $rules | Where-Object { $_.Name -eq 'DSC_SHARED_01' })
+Assert-True "  a datastore cluster shared by two clusters is one target, usable from both" ($merged.Count -eq 1 -and (@($merged[0].Clusters) -join ',') -eq 'CL-A,CL-B' -and @($merged[0].Hosts) -contains 'esxB1')
+
 # ---------------------------------------------------------------------------------------------
 Write-Host "`n=== Migration plan: who moves, who is skipped, and why ===" -ForegroundColor Cyan
 $podTarget = $prod[0]
@@ -516,7 +536,7 @@ Assert-True "one row per VM given" ($plan.Count -eq 6)
 Assert-True "a PROD VM moves to the PROD datastore cluster" ((Get-PlanRow 'move-me')[0].Action -eq 'Migrate' -and (Get-PlanRow 'move-me')[0].Target -eq 'DSC_SHARED_01' -and (Get-PlanRow 'move-me')[0].TargetKind -eq 'Datastore cluster')
 Assert-True "  and the move carries the VM and target references" ((Get-PlanRow 'move-me')[0].VMRef.Value -eq 'move-me' -and (Get-PlanRow 'move-me')[0].TargetRef.Value -eq 'p1')
 Assert-True "a VM listed twice is planned once" ((Get-PlanRow 'move-me')[1].Action -eq 'Skip' -and (Get-PlanRow 'move-me')[1].Reason -match 'twice')
-Assert-True "unknown environment: skipped - nowhere correct to go" ((Get-PlanRow 'no-env')[0].Action -eq 'Skip' -and (Get-PlanRow 'no-env')[0].Reason -match 'nowhere correct')
+Assert-True "unknown environment, nothing picked for it: skipped, saying so" ((Get-PlanRow 'no-env')[0].Action -eq 'Skip' -and (Get-PlanRow 'no-env')[0].Reason -eq 'Environment not known (Environment undetermined) and no datastore was picked for it.') (Get-PlanRow 'no-env')[0].Reason
 Assert-True "no target picked for SIT: skipped" ((Get-PlanRow 'no-target')[0].Action -eq 'Skip' -and (Get-PlanRow 'no-target')[0].Reason -eq 'No SIT target was picked.')
 Assert-True "target not mounted on the VM's host: skipped" ((Get-PlanRow 'wrong-host')[0].Action -eq 'Skip' -and (Get-PlanRow 'wrong-host')[0].Reason -match 'not mounted on esxZ9')
 Assert-True "already wholly on the target datastore: skipped" ((Get-PlanRow 'already')[0].Action -eq 'Skip' -and (Get-PlanRow 'already')[0].Reason -eq 'Already on NFS_DEV_01.')
@@ -544,6 +564,23 @@ Assert-True "  but not to the datastore it is already on" ($p[0].Action -eq 'Ski
 $notFallback = $fallbackTarget.PSObject.Copy(); $notFallback.Fallback = $false
 $p = @(Get-PlacementMigrationPlan -Finding @((New-Finding 'f3' 'PROD' -Datastores @('NFS_MISC_01'))) -TargetByEnvironment @{ PROD = $notFallback })
 Assert-True "  and a DEV datastore NOT picked as a fallback is still refused for a PROD VM" ($p[0].Action -eq 'Skip' -and $p[0].Reason -match 'belongs on PROD')
+
+$p = @(Get-PlacementMigrationPlan -Finding @(
+        (New-Finding 'u-move' '' -Status 'Unmapped hostname letter'),
+        (New-Finding 'u-host' '' -EsxiHost 'esxA2' -Status 'Environment undetermined'),
+        (New-Finding 'u-there' '' -Datastores @('NFS_SHARED_01')),
+        (New-Finding 'sit-vm' 'SIT')) -UnknownEnvironmentTarget $mixedPod)
+Assert-True "unknown environment: goes to the target picked for it, whatever its environment" ($p[0].Action -eq 'Migrate' -and $p[0].Target -eq 'DSC_MIXED' -and $p[0].TargetKind -eq 'Datastore cluster' -and $p[0].TargetRef.Value -eq 'p2')
+Assert-True "  marked Fallback, and the reason says it will still be listed" ($p[0].Fallback -and $p[0].Reason -match 'environment is not known, so it goes where you picked \(mixed - PROD, DEV\) - and will still be listed afterwards') $p[0].Reason
+Assert-True "  still skipped when the target is not mounted on its host" ($p[1].Action -eq 'Skip' -and $p[1].Reason -match 'DSC_MIXED is not mounted on esxA2')
+Assert-True "  a VM of a known environment does not use it" ($p[3].Action -eq 'Skip' -and $p[3].Reason -eq 'No SIT target was picked.')
+$p = @(Get-PlacementMigrationPlan -Finding @((New-Finding 'u-there' '' -Datastores @('NFS_SHARED_01'))) -UnknownEnvironmentTarget @($any | Where-Object { $_.Name -eq 'NFS_SHARED_01' })[0])
+Assert-True "  not to the datastore it is already on" ($p[0].Action -eq 'Skip' -and $p[0].Reason -eq 'Already on NFS_SHARED_01.')
+$p = @(Get-PlacementMigrationPlan -Finding @((New-Finding 'u-plain' '')) -UnknownEnvironmentTarget $podTarget)
+Assert-True "  an environment's own target is fine too, labelled by its environment" ($p[0].Action -eq 'Migrate' -and $p[0].Fallback -and $p[0].Reason -match 'goes where you picked \(PROD\)') $p[0].Reason
+$tightAny = $mixedPod.PSObject.Copy(); $tightAny.FreeBytes = 500GB; $tightAny.CapacityBytes = 1000GB
+$p = @(Get-PlacementMigrationPlan -Finding @((New-Finding 'u-a' '' -SizeGB 250), (New-Finding 'u-b' '' -SizeGB 250)) -UnknownEnvironmentTarget $tightAny -MinFreeSpacePercent 10)
+Assert-True "  and the free space rule still holds" ($p[0].Action -eq 'Migrate' -and $p[1].Action -eq 'Skip' -and $p[1].Reason -match 'Not enough space on DSC_MIXED')
 
 # ---------------------------------------------------------------------------------------------
 # A stubbed vCenter. Get-View answers the shapes of request the script sends and throws on any
@@ -833,6 +870,22 @@ $world = New-World
 $message = try { & $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv -MigrateTo @{ PROD = 'NFS_DEV_01' } -Confirm:$false 6>$null 2>$null; '' } catch { $_.Exception.Message }
 Assert-True "a target that is not eligible for the environment is refused, listing the eligible ones" ($message -match "'NFS_DEV_01' is not an eligible PROD target\. Eligible: DSC_SHARED_01 \(datastore cluster\), NFS_SHARED_01 \(datastore\)") $message
 Assert-True "  nothing moved, and the session closed" ($world.Moves.Count -eq 0 -and $world.Calls.ToArray() -contains 'disconnect vc.example')
+
+# With p mapped to nothing, the siepd85csp VMs have no known environment (siepd85csp01 is still
+# PROD by its DNS name, SQLCLUSTER01-P by its suffix).
+$world = New-World
+$out = @(& $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv -ProdLetters 'q' -MigrateTo @{ unknown = 'NFS_MISC_01' } -WhatIf 6>$null 3>$null)
+Assert-True "UNKNOWN: the VMs with no known environment would go to the datastore named" ((Get-Names @($out | Where-Object { $_.Result -eq 'WhatIf' })) -eq 'siepd85csp06,siepd85csp07,siepd85csp10') "got $(Get-Names @($out | Where-Object { $_.Result -eq 'WhatIf' }))"
+Assert-True "  not the one already there, nor the one on a host that does not mount it" (@($out | Where-Object { $_.VMName -eq 'siepd85csp08' })[0].Detail -eq 'Already on NFS_MISC_01.' -and @($out | Where-Object { $_.VMName -eq 'siepd85csp03' })[0].Detail -match 'not mounted on esx02')
+Assert-True "  and VMs of a known environment are left alone" (@($out | Where-Object { $_.VMName -eq 'SQLCLUSTER01-P' })[0].Detail -eq 'No PROD target was picked.' -and $world.Moves.Count -eq 0)
+$world = New-World
+$out = @(& $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv -ProdLetters 'q' -MigrateTo @{ UNKNOWN = 'DSC_SHARED_01' } -MigrateVM 'siepd85csp07' -Confirm:$false 6>$null 3>$null)
+Assert-True "UNKNOWN live: the VM goes to the datastore cluster named" (($world.Moves.ToArray() -join ',') -eq 'vm-7->group-p1' -and $out[0].Result -eq 'Migrated')
+Assert-True "  and the result says its environment is not known, so it is still listed" ($out[0].Detail -match 'environment is not known.*still be listed') $out[0].Detail
+$world = New-World
+$message = try { & $scriptPath -NoGui -Server 'vc.example' -Credential $cred -OutputPath $csv -Cluster 'CL-DEV-01' -MigrateTo @{ UNKNOWN = 'Suggested' } -Confirm:$false 6>$null 2>$null 3>$null; '' } catch { $_.Exception.Message }
+Assert-True "UNKNOWN needs a name - there is no suggestion - and the error lists what there is" ($message -match "UNKNOWN needs the name of a datastore cluster or NFS datastore.*'Suggested' is not one of them: NFS_DEV_01 \(datastore, DEV\), NFS_DEV_02 \(datastore, DEV\)\.$") $message
+Assert-True "  nothing moved" ($world.Moves.Count -eq 0)
 Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------------------------
@@ -846,21 +899,25 @@ function Exit-GuiBusyState { $script:GuiState.Busy = $false }
 function Show-GuiMessage { param([string]$Text, [string]$Icon = 'Information') $messages.Add("${Icon}: $Text") }
 function Wait-GuiInterval { param([int]$Seconds = 5) }
 function Show-MigrationDialog {
-    param($Environment, $Choice, $Count, $Suggested, $Fallback, $Unknown, $MaxConcurrent, $MinFreeSpacePercent, $WhatIfOnly)
-    $script:dialogSeen = [pscustomobject]@{ Environment = @($Environment); Choice = $Choice; Count = $Count; Suggested = $Suggested; Fallback = $Fallback; WhatIfOnly = $WhatIfOnly }
+    param($Environment, $Choice, $Count, $Suggested, $Fallback, $Unknown, $UnknownChoice, $MaxConcurrent, $MinFreeSpacePercent, $WhatIfOnly)
+    $script:dialogSeen = [pscustomobject]@{ Environment = @($Environment); Choice = $Choice; Count = $Count; Suggested = $Suggested; Fallback = $Fallback; Unknown = $Unknown; UnknownChoice = @($UnknownChoice); WhatIfOnly = $WhatIfOnly }
     if ($null -eq $script:dialogMode) { return $null }
-    # As the real dialog preselects: each VM's suggestion where there is one. A fallback datastore
-    # is only ever an explicit pick (dialogFallback).
+    # As the real dialog preselects: each VM's suggestion where there is one. A fallback datastore,
+    # and a target for VMs with no known environment, is only ever an explicit pick (dialogFallback,
+    # dialogUnknown).
     $picked = @{}
     foreach ($name in @($Environment)) {
         if ($Suggested[$name]) { $picked[$name] = 'Suggested' }
         elseif ($script:dialogFallback -and $Fallback.ContainsKey($name)) { $picked[$name] = @($Fallback[$name] | Where-Object { $_.Name -eq $script:dialogFallback })[0] }
     }
-    [pscustomobject]@{ Mode = $script:dialogMode; Targets = $picked; MaxConcurrent = 2; MinFreeSpacePercent = 10 }
+    $unknownTarget = $null
+    if ($script:dialogUnknown) { $unknownTarget = @(@($UnknownChoice) | Where-Object { $_.Name -eq $script:dialogUnknown })[0] }
+    [pscustomobject]@{ Mode = $script:dialogMode; Targets = $picked; UnknownTarget = $unknownTarget; MaxConcurrent = 2; MinFreeSpacePercent = 10 }
 }
 function Confirm-GuiMigration { param($Plan, $MaxConcurrent, $VCenter) $script:confirmAsked++; $script:confirmVCenter = $VCenter; $script:confirmAnswer }
 $busyTexts = New-Object System.Collections.Generic.List[string]
 $messages = New-Object System.Collections.Generic.List[string]
+$script:dialogMode = $null; $script:dialogFallback = $null; $script:dialogUnknown = $null
 
 function New-StubRulesRow([string]$Environment, [string]$Letters, [string]$Suffixes, [string]$DnsLabels, [string]$Keywords) {
     [pscustomobject]@{ IsNewRow = $false; Cells = @{
@@ -995,6 +1052,7 @@ Assert-True "dialog: DEV choices" ((@($script:dialogSeen.Choice['DEV'] | ForEach
 Assert-True "dialog: counts per environment" ($script:dialogSeen.Count['PROD'] -eq 3 -and $script:dialogSeen.Count['DEV'] -eq 1)
 Assert-True "dialog: each environment's suggestions summarised, the ones with none counted" ($script:dialogSeen.Suggested['PROD'] -eq 'DSC_SHARED_01 for 1; 2 with none (skipped)' -and $script:dialogSeen.Suggested['DEV'] -eq 'NFS_DEV_01 for 1') "$($script:dialogSeen.Suggested['PROD']) | $($script:dialogSeen.Suggested['DEV'])"
 Assert-True "dialog: no fallback list while there are eligible targets" ($script:dialogSeen.Fallback.Count -eq 0)
+Assert-True "dialog: no row for unknown environments when every VM's is known" ($script:dialogSeen.Unknown -eq 0 -and $script:dialogSeen.UnknownChoice.Count -eq 0)
 Assert-True "dialog cancelled: nothing happens" ($world.Moves.Count -eq 0 -and $null -eq $script:GuiState.Migrations -and $messages.Count -eq 0)
 
 $script:dialogMode = 'Preview'
@@ -1059,6 +1117,35 @@ Assert-True "  the one picked is used, after the confirmation" ($script:confirmA
 Assert-True "  and the result says it is not a PROD datastore, so the VM is still listed" (@($script:GuiState.Migrations)[0].Result -eq 'Migrated' -and @($script:GuiState.Migrations)[0].Detail -match 'NOT a PROD datastore' -and (Get-Names $script:GuiState.Result.Findings) -match 'siepd85csp03')
 $script:dialogFallback = $null
 
+# The 1.6.0 error prompt: VMs with no known environment chosen. p mapped to nothing makes the
+# siepd85csp VMs unknown; siepd85csp07 (whose earlier move failed) is picked.
+$world.FailTask.Remove('vm-7')
+$rulesRows[0].Cells.Letters.Value = ''
+Invoke-GuiAction { Invoke-GuiEvaluation } 6>$null
+$unknownVM = @($script:GuiState.Result.Findings | Where-Object { $_.VMName -eq 'siepd85csp07' })
+Assert-True "unknown environment: the VM is listed with no environment" ($unknownVM.Count -eq 1 -and $unknownVM[0].ExpectedEnvironment -eq '' -and $unknownVM[0].Status -eq 'Unmapped hostname letter')
+$script:Gui.Tabs.SelectedTab = $resultsTab
+$script:Gui.ResultsGrid.SelectedRows = New-StubSelection 'vm-7'
+$script:dialogMode = 'Preview'
+$script:dialogUnknown = $null
+$messages.Clear()
+Invoke-GuiAction { Invoke-GuiMigration } 6>$null 3>$null
+Assert-True "unknown environment: no error - the dialog opens, with no environment rows and a row for it" ($messages.Count -eq 1 -and $messages[0] -match 'Preview only' -and $script:dialogSeen.Environment.Count -eq 0 -and $script:dialogSeen.Unknown -eq 1) ($messages.ToArray() -join ' | ')
+Assert-True "  offering every datastore cluster, then every NFS datastore, on its cluster - not VMFS" ((@($script:dialogSeen.UnknownChoice | ForEach-Object { $_.Name }) -join ',') -eq 'DSC_SHARED_01,NFS_MISC_01,NFS_DEV_01,NFS_SHARED_01,NFS_SHARED_02,NFS_SHARED_03') (@($script:dialogSeen.UnknownChoice | ForEach-Object { $_.Name }) -join ',')
+Assert-True "  left at (do not migrate): skipped, saying nothing was picked" (@($script:GuiState.Migrations)[0].Result -eq 'Skipped' -and @($script:GuiState.Migrations)[0].Detail -match 'no datastore was picked for it' -and $world.Moves.Count -eq $movesBefore + 1)
+$script:Gui.Tabs.SelectedTab = $resultsTab
+$script:dialogMode = 'Migrate'
+$script:dialogUnknown = 'NFS_MISC_01'
+$script:confirmAsked = 0
+$movesBefore = $world.Moves.Count
+$messages.Clear()
+Invoke-GuiAction { Invoke-GuiMigration } 6>$null 3>$null
+Assert-True "  a datastore picked for it: moved there, after the confirmation" ($script:confirmAsked -eq 1 -and $world.Moves.Count -eq $movesBefore + 1 -and $world.Moves.ToArray()[-1] -eq 'vm-7->ds-4') ($messages.ToArray() -join ' | ')
+Assert-True "  the result says its environment is not known, and it is still listed" (@($script:GuiState.Migrations)[0].Result -eq 'Migrated' -and @($script:GuiState.Migrations)[0].Detail -match 'environment is not known' -and (Get-Names $script:GuiState.Result.Unscoped) -match 'siepd85csp07')
+$script:dialogUnknown = $null
+$rulesRows[0].Cells.Letters.Value = 'p'
+Invoke-GuiAction { Invoke-GuiEvaluation } 6>$null
+
 $world.Calls.Clear()
 Invoke-GuiAction { Invoke-GuiDisconnect } 6>$null
 Assert-True "disconnect: signs out and empties the cluster list" (($world.Calls.ToArray() -join ',') -eq 'disconnect vc.example' -and $clusterList.Items.Count -eq 0 -and $null -eq $script:GuiState.Connection)
@@ -1083,34 +1170,12 @@ $missing = @($grids | Where-Object { $exitText -notmatch "'$_'" })
 Assert-True "idle resets the cursor of every grid the window creates ($($grids -join ', '))" ($grids.Count -ge 5 -and $missing.Count -eq 0) "missing: $($missing -join ', ')"
 Write-Host "`n=== The banner is in the window and kept current ===" -ForegroundColor Cyan
 $guiText = $guiFunctions['Show-PlacementGui']
-Assert-True "the window has a banner naming the tool, as its first row" ($guiText -match "'VM Datastore Placement'" -and $guiText -match '\$layout\.Controls\.Add\(\$bannerHost, 0, 0\)')
+Assert-True "the window has a banner naming the tool, as its first row" ($guiText -match "'VM Datastore Placement'" -and $guiText -match '\$layout\.Controls\.Add\(\$banner, 0, 0\)')
 Assert-True "the banner turns amber under -WhatIf and says preview only" ($guiText -match 'if \(\$script:WhatIfRun\) \{\s+\$banner\.BackColor' -and $guiText -match 'PREVIEW ONLY')
 Assert-True "the banner refreshes when the cluster selection changes" ($guiText -match 'ClusterList\.Add_SelectedIndexChanged\(\{ Show-GuiLocation \}\)')
 foreach ($name in @('Invoke-GuiConnect', 'Invoke-GuiDisconnect', 'Invoke-GuiEvaluation')) {
     Assert-True "$name refreshes the banner" ($guiFunctions[$name] -match 'Show-GuiLocation')
 }
-Write-Host "`n=== The Re-align Tool picture: embedded, valid, shown once ===" -ForegroundColor Cyan
-$imageAssignment = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$script:BannerImageBase64' }, $true))
-Assert-True "the picture is embedded in the script, assigned once" ($imageAssignment.Count -eq 1)
-$imageData = $imageAssignment[0].Right.Extent.Text -replace "^@'\r?\n", '' -replace "\r?\n'@$", ''
-$imageBytes = [Convert]::FromBase64String($imageData)
-Assert-True "it decodes to a complete JPEG" ($imageBytes.Length -gt 10000 -and $imageBytes[0] -eq 0xFF -and $imageBytes[1] -eq 0xD8 -and $imageBytes[-2] -eq 0xFF -and $imageBytes[-1] -eq 0xD9)
-$width = 0; $height = 0; $i = 2
-while ($i + 8 -lt $imageBytes.Length -and $imageBytes[$i] -eq 0xFF) {
-    $marker = $imageBytes[$i + 1]
-    if ($marker -ge 0xC0 -and $marker -le 0xC2) { $height = $imageBytes[$i + 5] * 256 + $imageBytes[$i + 6]; $width = $imageBytes[$i + 7] * 256 + $imageBytes[$i + 8]; break }
-    $i += 2 + $imageBytes[$i + 2] * 256 + $imageBytes[$i + 3]
-}
-Assert-True "it is 768 x 512 - baseline JPEG, which every Windows PowerShell can draw" ($width -eq 768 -and $height -eq 512) "got $width x $height"
-$calls = @($ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-PlacementBannerImage' }, $true))
-Assert-True "the picture is placed in exactly one spot in the window" ($calls.Count -eq 1 -and @([regex]::Matches($guiText, 'New-Object System\.Windows\.Forms\.PictureBox')).Count -eq 1)
-Assert-True "it sits in the banner's right-hand column" ($guiText -match '\$bannerHost\.Controls\.Add\(\$picture, 1, 0\)')
-$script:BannerImageBase64 = $imageData
-$loaded = $null; $threw = $false
-try { $loaded = Get-PlacementBannerImage } catch { $threw = $true }
-Assert-True "loading it never throws - where pictures cannot be drawn the banner shows without it" (-not $threw -and ($null -eq $loaded -or $loaded.Width -eq 768))
-if ($null -ne $loaded) { $loaded.Dispose() }
-
 Assert-True "nothing else in the script sets a wait cursor" (@([regex]::Matches((Get-Content -Path $scriptPath -Raw), 'Cursors\]::WaitCursor')).Count -eq 0)
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
