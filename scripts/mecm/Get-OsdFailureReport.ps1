@@ -82,8 +82,25 @@
     Folder to write the CSV, JSON and HTML reports to. Created if missing. Nothing is written to disk
     when omitted.
 
+.PARAMETER SelectBundle
+    List the bundles on the share (after any -LastHours / -Since / -ComputerName narrowing) in a
+    grid view, newest first, and analyse only the ones you pick. Nothing is opened until you
+    choose. Hold Ctrl or Shift to pick several; Cancel analyses nothing. Where Out-GridView is not
+    available (Server Core, no desktop) a numbered list is shown in the console instead. The fault
+    details for each picked bundle, including the evidence lines, are written to the console.
+
 .PARAMETER GridView
     Also show the results in Out-GridView (Windows desktop sessions only).
+
+.EXAMPLE
+    .\Get-OsdFailureReport.ps1 -SelectBundle
+
+    Pick one or more bundles from the share in a grid view and see the fault details for them.
+
+.EXAMPLE
+    .\Get-OsdFailureReport.ps1 -SelectBundle -LastHours 48
+
+    The same, listing only bundles uploaded in the last 48 hours.
 
 .EXAMPLE
     .\Get-OsdFailureReport.ps1 -LastHours 24
@@ -147,13 +164,16 @@ param(
 
     [string]$OutputPath,
 
+    [Alias('Pick')]
+    [switch]$SelectBundle,
+
     [switch]$GridView
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 
 # Run options read by the helper functions, captured once so their inputs are explicit.
 $script:Options = @{
@@ -1706,7 +1726,7 @@ function Export-OsdFailureReport {
         $rows = [ordered]@{
             'Summary' = $r.Summary; 'Failed step' = $r.FailedStep; 'Group' = $r.FailedGroup
             'Error code' = ('{0} {1}' -f $r.ErrorCode, $r.ErrorDescription).Trim(); 'Failure message' = $r.FailureMessage
-            'Root cause' = ('{0} [{1}]' -f $r.RootCause, $r.Category).Trim(' []'); 'Detail' = $r.RootCauseDetail
+            'Root cause' = $(if ($r.Category) { '{0} [{1}]' -f $r.RootCause, $r.Category } else { $r.RootCause }); 'Detail' = $r.RootCauseDetail
             'Recommended action' = $r.RecommendedAction
             'Build start' = $(if ($r.BuildStart) { $r.BuildStart.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
             'Failure time' = $(if ($r.FailureTime) { $r.FailureTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
@@ -1732,6 +1752,124 @@ function Export-OsdFailureReport {
     [void]$sb.AppendLine('</body></html>')
     [IO.File]::WriteAllText("$base.html", $sb.ToString(), (New-Object Text.UTF8Encoding $false))
     return $base
+}
+# endregion
+
+# ---------------------------------------------------------------------------------------------
+# region SELECTION
+# ---------------------------------------------------------------------------------------------
+function Select-OsdBundle {
+    <#
+    .SYNOPSIS
+        Lets the operator pick bundles to analyse from a grid view, or a console list when no
+        grid view is available.
+    .PARAMETER Bundle
+        Candidate bundles, newest first.
+    .PARAMETER Scope
+        Text describing the selection, shown in the title.
+    .EXAMPLE
+        $picked = Select-OsdBundle -Bundle $files -Scope 'Last 24 hours'
+    #>
+    param([AllowEmptyCollection()][IO.FileInfo[]]$Bundle, [string]$Scope)
+    # Results are emitted one by one; the caller collects them with @().
+    if ($null -eq $Bundle -or $Bundle.Count -eq 0) { return }
+
+    $now = Get-Date
+    $rows = for ($n = 0; $n -lt $Bundle.Count; $n++) {
+        $b = $Bundle[$n]
+        [pscustomobject][ordered]@{
+            '#' = $n + 1
+            Name = $b.Name
+            Uploaded = $b.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+            AgeHours = [Math]::Round(($now - $b.LastWriteTime).TotalHours, 1)
+            SizeKB = [int][Math]::Ceiling($b.Length / 1KB)
+            Folder = $b.DirectoryName
+        }
+    }
+
+    $indexes = @()
+    if (Get-Command -Name Out-GridView -ErrorAction SilentlyContinue) {
+        $title = "Select OSD failure bundle(s) to analyse - $Scope - $($Bundle.Count) listed (Ctrl/Shift for several)"
+        try {
+            $indexes = @($rows | Out-GridView -Title $title -OutputMode Multiple | ForEach-Object { $_.'#' - 1 })
+            foreach ($ix in $indexes) { $Bundle[$ix] }
+            return
+        }
+        catch {
+            # Out-GridView exists but cannot open a window (no desktop session); use the console.
+            Write-OsdLog "Grid view unavailable ($($_.Exception.Message)); using a console list." -Level WARN
+        }
+    }
+
+    $shown = [Math]::Min($Bundle.Count, 50)
+    $listing = ($rows | Select-Object -First $shown | Format-Table -AutoSize | Out-String -Width 200).TrimEnd()
+    Write-OsdLog "Bundles ($Scope), newest first$(if ($shown -lt $Bundle.Count) { " - showing $shown of $($Bundle.Count); narrow with -LastHours or -ComputerName" }):`n$listing" -Level INFO
+    $answer = Read-Host 'Number(s) to analyse, e.g. 1 or 1,3 or 2-5 (blank to cancel)'
+    foreach ($part in ("$answer" -split ',')) {
+        $part = $part.Trim()
+        if ($part -match '^(\d+)\s*-\s*(\d+)$') {
+            $from = [int]$Matches[1]; $to = [int]$Matches[2]
+            if ($from -gt $to) { $from, $to = $to, $from }
+            $indexes += ($from..$to)
+        }
+        elseif ($part -match '^\d+$') { $indexes += [int]$part }
+        elseif ($part) { Write-OsdLog "Ignored '$part' - not a number or range." -Level WARN }
+    }
+    $valid = @($indexes | Select-Object -Unique | Where-Object { $_ -ge 1 -and $_ -le $shown })
+    if (@($indexes | Select-Object -Unique).Count -ne $valid.Count) { Write-OsdLog "Numbers outside 1-$shown were ignored." -Level WARN }
+    foreach ($ix in $valid) { $Bundle[$ix - 1] }
+}
+
+function Write-OsdFaultDetail {
+    <#
+    .SYNOPSIS
+        Writes one bundle's fault details, including evidence lines, to the console log.
+    .PARAMETER Result
+        A report object from Invoke-BundleAnalysis.
+    .EXAMPLE
+        Write-OsdFaultDetail -Result $r
+    #>
+    param($Result)
+    $sb = New-Object Text.StringBuilder
+    [void]$sb.AppendLine(('=' * 100))
+    [void]$sb.AppendLine("$($Result.Hostname)  ($($Result.BundleName), uploaded $($Result.BundleUploaded.ToString('yyyy-MM-dd HH:mm')))")
+    [void]$sb.AppendLine(('=' * 100))
+    $fields = [ordered]@{
+        'Summary' = $Result.Summary
+        'Failed step' = $Result.FailedStep
+        'Group' = $Result.FailedGroup
+        'Error code' = ('{0}  {1}' -f $Result.ErrorCode, $Result.ErrorDescription).Trim()
+        'Failure message' = $Result.FailureMessage
+        'Root cause' = $(if ($Result.Category) { '{0} [{1}]' -f $Result.RootCause, $Result.Category } else { $Result.RootCause })
+        'Detail' = $Result.RootCauseDetail
+        'Recommended action' = $Result.RecommendedAction
+        'Build start' = $(if ($Result.BuildStart) { $Result.BuildStart.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
+        'Failure time' = $(if ($Result.FailureTime) { $Result.FailureTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
+        'Duration' = ('{0}  {1}' -f $Result.Duration, $(if ($Result.StartConfidence) { "($($Result.StartConfidence))" } else { '' })).Trim()
+        'Device' = (@($Result.Make, $Result.Model, $(if ($Result.SerialNumber) { "S/N $($Result.SerialNumber)" } else { '' })) | Where-Object { $_ }) -join ' / '
+        'Hostname source' = $Result.HostnameSource
+        'Status' = $Result.Status
+    }
+    foreach ($k in $fields.Keys) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$fields[$k])) { [void]$sb.AppendLine(('{0,-19}: {1}' -f $k, $fields[$k])) }
+    }
+    foreach ($list in @(@('Other failures', $Result.OtherFailures), @('Known issues', $Result.KnownIssues), @('Notes', $Result.Notes), @('Logs reviewed', $Result.LogsReviewed))) {
+        $items = @($list[1])
+        if ($items.Count -eq 0) { continue }
+        [void]$sb.AppendLine("$($list[0]):")
+        foreach ($item in $items) { [void]$sb.AppendLine("    $item") }
+    }
+    $evidence = @($Result.Evidence)
+    if ($evidence.Count -gt 0) {
+        [void]$sb.AppendLine('Evidence:')
+        foreach ($e in $evidence) {
+            $where = $e.Log
+            if ($e.Line -gt 0) { $where = "$($e.Log):$($e.Line)" }
+            [void]$sb.AppendLine(('    [{0}] {1} {2}' -f $e.Kind, $where, $e.Time).TrimEnd())
+            [void]$sb.AppendLine("        $($e.Text)")
+        }
+    }
+    Write-OsdLog $sb.ToString().TrimEnd() -Level INFO
 }
 # endregion
 
@@ -1764,7 +1902,13 @@ try {
     Write-OsdLog "$total bundle(s) found, $($selected.Count) in scope ($scope)." -Level INFO
 
     $postFilterHost = $false
-    if ($ComputerName) {
+    if ($ComputerName -and $SelectBundle) {
+        # The operator chooses from the list, so only narrow it by file name.
+        $byName = @($selected | Where-Object { $n = $_.BaseName; @($ComputerName | Where-Object { $n -like "*$_*" }).Count -gt 0 })
+        if ($byName.Count -gt 0) { $selected = $byName }
+        else { Write-OsdLog 'No bundle file name matches -ComputerName; listing every in-scope bundle.' -Level INFO }
+    }
+    elseif ($ComputerName) {
         $byName = @($selected | Where-Object { $n = $_.BaseName; @($ComputerName | Where-Object { $n -like "*$_*" }).Count -gt 0 })
         if ($byName.Count -gt 0) {
             $selected = $byName
@@ -1774,6 +1918,20 @@ try {
             $postFilterHost = $true
             Write-OsdLog 'No bundle file name matches -ComputerName; opening every in-scope bundle and filtering on the hostname in the logs.' -Level INFO
         }
+    }
+
+    if ($SelectBundle) {
+        if ($selected.Count -eq 0) {
+            Write-OsdLog 'No bundles to choose from.' -Level WARN
+            return
+        }
+        $selected = @(Select-OsdBundle -Bundle $selected -Scope $scope)
+        if ($selected.Count -eq 0) {
+            Write-OsdLog 'No bundle selected - nothing analysed.' -Level INFO
+            return
+        }
+        $scope = "$scope, $($selected.Count) selected"
+        Write-OsdLog "Selected: $(($selected | ForEach-Object { $_.Name }) -join ', ')" -Level INFO
     }
 
     # ---- Analyse --------------------------------------------------------------------------------
@@ -1796,6 +1954,7 @@ try {
         $results.Add($r)
         $lvl = 'INFO'; if ($r.Status -eq 'Unreadable') { $lvl = 'WARN' }
         Write-OsdLog ('{0,-15} | {1,8} | {2} | {3}  [{4} ms]' -f $r.Hostname, $r.Duration, $r.Summary, $r.RootCause, $sw.ElapsedMilliseconds) -Level $lvl
+        if ($SelectBundle) { Write-OsdFaultDetail -Result $r }
         $r
     }
     Write-Progress -Activity 'Analysing OSD failure bundles' -Completed

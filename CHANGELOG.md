@@ -12,6 +12,24 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Get-OsdFailureReport.ps1
 
+### [1.1.0] — 2026-11-09
+
+#### Added
+
+- **`-SelectBundle` (alias `-Pick`) for testing against chosen bundles.** It lists the
+  bundles on the share in Out-GridView, newest first, with upload time, age and size, and
+  analyses only the ones picked (Ctrl/Shift to pick several, Cancel to analyse nothing).
+  No bundle is opened until one is chosen. `-LastHours`, `-Since` and `-ComputerName`
+  narrow the list first. Where no grid view is available (Server Core, no desktop) a
+  numbered console list is shown instead; it accepts `1`, `1,3` or `2-5`.
+- Each picked bundle's full fault details are written to the console: summary, step,
+  error, root cause, action, timings, device, known issues, notes, logs reviewed and
+  the evidence lines with log:line and time.
+
+#### Fixed
+
+- The root cause line in the HTML report lost its closing bracket ("[Content").
+
 ### [1.0.0] — 2026-11-09
 
 #### Added
