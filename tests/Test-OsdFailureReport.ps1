@@ -1,0 +1,356 @@
+<#
+.SYNOPSIS
+    End-to-end tests for scripts/mecm/Get-OsdFailureReport.ps1 against generated failure bundles.
+
+.DESCRIPTION
+    Builds a folder of synthetic MECM OSD failure bundles (.zip) that reproduce the shapes real
+    bundles take, runs the report against them, and checks what comes back:
+
+      - CMTrace smsts.log with multi-line entries, so "Failed to run the action" stays joined to its
+        "(Error: ...; Source: ...)" line;
+      - the WinPE (+480) to full OS bias change part-way through a build;
+      - smsts.log copies from several locations plus a rolled-over smsts-*.log (de-duplication);
+      - a log with no start banner (rolled over) and a log holding two task sequence runs;
+      - a failure-handling task sequence that copies the logs and then forces a failure;
+      - UTF-16 Panther logs, NetSetup.log, AppEnforce.log, ZTIGather.log, unattend.xml with a
+        password that must never be reported;
+      - a nested zip, a bundle with no smsts.log, an empty bundle, and a corrupt file;
+      - the -LastHours, -Since and -ComputerName filters, and -OutputPath reports.
+
+    The log lines are modelled on real ConfigMgr output, but they are synthetic. A pass here proves
+    the parsing and ranking logic, not that every wording in a production log is covered.
+
+    Standalone - no Pester, no MECM, no network share.
+
+.PARAMETER FixtureDirectory
+    Keep the generated bundles here instead of a temp folder that is deleted afterwards.
+
+.EXAMPLE
+    pwsh -File ./tests/Test-OsdFailureReport.ps1
+#>
+param([string]$FixtureDirectory)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$repoRoot = Split-Path $PSScriptRoot -Parent
+$scriptPath = Join-Path $repoRoot 'scripts/mecm/Get-OsdFailureReport.ps1'
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+$keep = [bool]$FixtureDirectory
+if (-not $FixtureDirectory) { $FixtureDirectory = Join-Path ([IO.Path]::GetTempPath()) ("osdfixtures-" + [guid]::NewGuid().ToString('N').Substring(0, 8)) }
+if (Test-Path $FixtureDirectory) { Remove-Item $FixtureDirectory -Recurse -Force }
+New-Item -ItemType Directory -Path $FixtureDirectory | Out-Null
+
+$script:pass = 0; $script:fail = 0
+function Assert-That {
+    param([string]$Name, [bool]$Condition, [string]$Detail = '')
+    if ($Condition) { $script:pass++; Write-Host "  PASS  $Name" -ForegroundColor Green }
+    else { $script:fail++; Write-Host "  FAIL  $Name" -ForegroundColor Red; if ($Detail) { Write-Host "          $Detail" -ForegroundColor Red } }
+}
+
+# ---- Fixture helpers ----------------------------------------------------------------------------
+function L {
+    # One CMTrace line. Type 1 info, 2 warning, 3 error.
+    param([datetime]$At, [string]$Msg, [string]$Comp = 'TSManager', [int]$Type = 1, [string]$Bias = '+480')
+    '<![LOG[{0}]LOG]!><time="{1}{2}" date="{3}" component="{4}" context="" type="{5}" thread="1234" file="tsmanager.cpp:100">' -f `
+        $Msg, $At.ToString('HH:mm:ss.fff'), $Bias, $At.ToString('MM-dd-yyyy'), $Comp, $Type
+}
+
+function New-Bundle {
+    param([string]$Name, [hashtable]$Files, [datetime]$Uploaded, [hashtable]$Encodings = @{})
+    $path = Join-Path $FixtureDirectory $Name
+    $fs = [IO.File]::Open($path, 'Create')
+    $zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Create)
+    foreach ($k in $Files.Keys) {
+        $entry = $zip.CreateEntry($k)
+        $s = $entry.Open()
+        $content = $Files[$k]
+        if ($content -is [byte[]]) { $bytes = $content }
+        else {
+            $enc = New-Object Text.UTF8Encoding $false
+            if ($Encodings.ContainsKey($k)) { $enc = $Encodings[$k] }
+            $text = ($content -join "`r`n")
+            $bytes = $enc.GetPreamble() + $enc.GetBytes($text)
+        }
+        $s.Write($bytes, 0, $bytes.Length); $s.Dispose()
+    }
+    $zip.Dispose(); $fs.Dispose()
+    (Get-Item $path).LastWriteTime = $Uploaded
+}
+
+function New-ZipBytes {
+    param([hashtable]$Files)
+    $ms = New-Object IO.MemoryStream
+    $zip = New-Object IO.Compression.ZipArchive($ms, [IO.Compression.ZipArchiveMode]::Create, $true)
+    foreach ($k in $Files.Keys) {
+        $entry = $zip.CreateEntry($k); $s = $entry.Open()
+        $b = (New-Object Text.UTF8Encoding $false).GetBytes(($Files[$k] -join "`r`n")); $s.Write($b, 0, $b.Length); $s.Dispose()
+    }
+    $zip.Dispose()
+    # Comma: stop PowerShell unrolling the byte[] into object[].
+    return , $ms.ToArray()
+}
+
+$now = Get-Date
+$day = $now.Date.AddHours(8)   # builds start 08:00 local "today"
+
+# ---- PC1001: content not on DP during the driver package (WinPE) --------------------------------
+$t = $day
+$smsts = @(
+    (L $t '==============================[ TSBootShell.exe ]==============================' 'TSBootShell')
+    (L $t.AddSeconds(5) 'Booted from network (PXE)' 'TSBootShell')
+    (L $t.AddMinutes(2) '==============================[ TSManager.exe ]==============================')
+    (L $t.AddMinutes(3) 'Start executing an instruction. Instruction name: Partition Disk 0 - UEFI. Instruction pointer: 5')
+    (L $t.AddMinutes(4) 'Process completed with exit code 0')
+    (L $t.AddMinutes(5) 'Start executing an instruction. Instruction name: Apply Operating System. Instruction pointer: 9')
+    (L $t.AddMinutes(19) 'Process completed with exit code 0')
+    (L $t.AddMinutes(20) 'Start executing an instruction. Instruction name: Apply Driver Package - Latitude 7450. Instruction pointer: 14')
+    (L $t.AddMinutes(21) 'Failed to resolve PackageID=P0100123, hr=0x80040104' 'OSDDriverClient' 3)
+    (L $t.AddMinutes(21).AddSeconds(1) 'Process completed with exit code 2147942402')
+    (L $t.AddMinutes(21).AddSeconds(2) ("Failed to run the action: Apply Driver Package - Latitude 7450. `r`nThe system cannot find the file specified. (Error: 80070002; Source: Windows)") 'TSManager' 3)
+    (L $t.AddMinutes(21).AddSeconds(3) 'The execution of the group (Drivers) has failed and the execution has been aborted. An action failed. Operation aborted (Error: 80004004; Source: Windows)' 'TSManager' 2)
+    (L $t.AddMinutes(21).AddSeconds(4) 'Execution of task sequence failed. The system cannot find the file specified. (Error: 80070002; Source: Windows)' 'TSManager' 3)
+)
+$gather = @(
+    (L $t.AddMinutes(2) 'Property Make is now = Dell Inc.' 'ZTIGather')
+    (L $t.AddMinutes(2) 'Property Model is now = Latitude 7450' 'ZTIGather')
+    (L $t.AddMinutes(2) 'Property SerialNumber is now = 7XK2Q34' 'ZTIGather')
+    (L $t.AddMinutes(2) 'Property OSDComputerName is now = PC1001' 'ZTIGather')
+)
+New-Bundle 'PC1001_20261109-0821.zip' @{ 'X/Windows/Temp/SMSTSLog/smsts.log' = $smsts; 'X/Windows/Temp/SMSTSLog/ZTIGather.log' = $gather } $now.AddHours(-3)
+
+# ---- PC1002: domain join 0xaac, WinPE -> full OS, UTF-16 Panther, password in unattend ----------
+$t = $day.AddMinutes(10)
+$smstsPe = @(
+    (L $t '==============================[ TSBootShell.exe ]==============================' 'TSBootShell')
+    (L $t.AddMinutes(1) '==============================[ TSManager.exe ]==============================')
+    (L $t.AddMinutes(2) 'Start executing an instruction. Instruction name: Apply Operating System. Instruction pointer: 9')
+    (L $t.AddMinutes(18) 'Start executing an instruction. Instruction name: Setup Windows and ConfigMgr. Instruction pointer: 20')
+)
+$smstsOs = @(
+    (L $t.AddMinutes(18) 'Start executing an instruction. Instruction name: Setup Windows and ConfigMgr. Instruction pointer: 20')
+    (L $t.AddMinutes(30) '==============================[ TSManager.exe ]==============================' 'TSManager' 1 '-600')
+    (L $t.AddMinutes(41) 'Start executing an instruction. Instruction name: Install Application - Corp Baseline. Instruction pointer: 31' 'TSManager' 1 '-600')
+    (L $t.AddMinutes(52) ("Failed to run the action: Install Application - Corp Baseline. `r`nUnspecified error (Error: 80004005; Source: Windows)") 'TSManager' 3 '-600')
+)
+$netsetup = @(
+    ('{0} -----------------------------------------------------------------' -f $t.AddMinutes(25).ToString('MM/dd/yyyy HH:mm:ss:fff'))
+    ('{0} NetpDoDomainJoin' -f $t.AddMinutes(25).ToString('MM/dd/yyyy HH:mm:ss:fff'))
+    ('{0} NetpJoinDomainOnDs: ...' -f $t.AddMinutes(25).ToString('MM/dd/yyyy HH:mm:ss:fff'))
+    ("{0} `tHostName: PC1002" -f $t.AddMinutes(25).ToString('MM/dd/yyyy HH:mm:ss:fff'))
+    ("{0} `tDomain: corp.example.local" -f $t.AddMinutes(25).ToString('MM/dd/yyyy HH:mm:ss:fff'))
+    ("{0} `tMachineAccountOU: OU=Win11,OU=Workstations,DC=corp,DC=example,DC=local" -f $t.AddMinutes(25).ToString('MM/dd/yyyy HH:mm:ss:fff'))
+    ("{0} `tAccount: CORP\svc-osdjoin" -f $t.AddMinutes(25).ToString('MM/dd/yyyy HH:mm:ss:fff'))
+    ('{0} NetpDoDomainJoin: status: 0xaac' -f $t.AddMinutes(26).ToString('MM/dd/yyyy HH:mm:ss:fff'))
+)
+$setupact = @(
+    ('{0}, Info                  [DJOIN.EXE] Unattended Join: Begin' -f $t.AddMinutes(25).ToString('yyyy-MM-dd HH:mm:ss'))
+    ('{0}, Error                 [DJOIN.EXE] Unattended Join: NetJoinDomain attempt failed: 0xaac, will retry in 10 seconds...' -f $t.AddMinutes(26).ToString('yyyy-MM-dd HH:mm:ss'))
+)
+$unattend = @('<?xml version="1.0"?>', '<unattend><settings pass="specialize"><component><ComputerName>PC1002</ComputerName>',
+    '<Identification><Credentials><Password>Sup3rS3cret!</Password></Credentials></Identification></component></settings></unattend>')
+New-Bundle 'PC1002.zip' @{
+    'X/Windows/Temp/SMSTSLog/smsts.log' = $smstsPe
+    'C/Windows/CCM/Logs/SMSTSLog/smsts.log' = $smstsOs
+    'C/Windows/debug/NetSetup.LOG' = $netsetup
+    'C/Windows/Panther/UnattendGC/setupact.log' = $setupact
+    'C/Windows/Panther/unattend.xml' = $unattend
+} $now.AddHours(-5) @{ 'C/Windows/Panther/UnattendGC/setupact.log' = [Text.Encoding]::Unicode }
+
+# ---- PC1003: app exit 1603, failure-handling group then a forced failure ------------------------
+$t = $day.AddMinutes(20)
+$smsts = @(
+    (L $t '==============================[ TSManager.exe ]==============================' 'TSManager' 1 '-600')
+    (L $t.AddMinutes(40) 'Start executing an instruction. Instruction name: Install Application - 7-Zip. Instruction pointer: 33' 'TSManager' 1 '-600')
+    (L $t.AddMinutes(43) ("Failed to run the action: Install Application - 7-Zip. `r`nUnspecified error (Error: 80004005; Source: Windows)") 'TSManager' 3 '-600')
+    (L $t.AddMinutes(43) 'Ignoring the failure because continue on error is set for the group (Main)' 'TSManager' 2 '-600')
+    (L $t.AddMinutes(44) 'Start executing an instruction. Instruction name: Copy Logs to Share. Instruction pointer: 60' 'TSManager' 1 '-600')
+    (L $t.AddMinutes(45) 'Start executing an instruction. Instruction name: Force Failure. Instruction pointer: 61' 'TSManager' 1 '-600')
+    (L $t.AddMinutes(45) ("Failed to run the action: Force Failure. `r`nIncorrect function. (Error: 00000001; Source: Windows)") 'TSManager' 3 '-600')
+)
+$appEnforce = @(
+    (L $t.AddMinutes(41) '+++ Starting Install enforcement for App DT "7-Zip 24.08 x64 - MSI" ApplicationDeliveryType - ScopeId_1/DeploymentType_2, Revision - 3' 'AppEnforce' 1 '-600')
+    (L $t.AddMinutes(43) 'Process 4242 terminated with exitcode: 1603' 'AppEnforce' 1 '-600')
+    (L $t.AddMinutes(43) 'Unmatched exit code (1603) is considered an execution failure.' 'AppEnforce' 2 '-600')
+)
+New-Bundle 'PC1003_20261109-0905.zip' @{ 'smsts.log' = $smsts; 'AppEnforce.log' = $appEnforce } $now.AddHours(-1)
+
+# ---- PC1004: no disk (VMD), only a MININT name in the logs, uploaded 30 h ago -------------------
+$t = $now.AddHours(-31)
+$smsts = @(
+    (L $t '==============================[ TSBootShell.exe ]==============================' 'TSBootShell')
+    (L $t.AddSeconds(30) 'OSDComputerName = MININT-8H2K1L' 'TSManager')
+    (L $t.AddMinutes(2) 'Start executing an instruction. Instruction name: Partition Disk 0 - UEFI. Instruction pointer: 5')
+    (L $t.AddMinutes(2).AddSeconds(5) 'Unable to find a suitable disk. There are no fixed disks on this computer.' 'OSDDiskPart' 3)
+    (L $t.AddMinutes(2).AddSeconds(6) ("Failed to run the action: Partition Disk 0 - UEFI. `r`nThe parameter is incorrect. (Error: 80070057; Source: Windows)") 'TSManager' 3)
+)
+New-Bundle 'PC1004_20261108.zip' @{ 'smsts.log' = $smsts } $now.AddHours(-30)
+
+# ---- PC1005: hash mismatch, 50 h ago --------------------------------------------------------------
+$t = $now.AddHours(-51)
+$smsts = @(
+    (L $t '==============================[ TSBootShell.exe ]==============================' 'TSBootShell')
+    (L $t.AddMinutes(4) 'Start executing an instruction. Instruction name: Apply Operating System. Instruction pointer: 9')
+    (L $t.AddMinutes(9) 'Hash could not be matched for the downloaded content. Original ContentHash = AB12, Downloaded ContentHash = CD34' 'ApplyOperatingSystem' 3)
+    (L $t.AddMinutes(9) ("Failed to run the action: Apply Operating System. `r`nThe hash value is not correct. (Error: 80091007; Source: Windows)") 'TSManager' 3)
+)
+New-Bundle 'PC1005.zip' @{ 'smsts.log' = $smsts } $now.AddHours(-50)
+
+# ---- PC1006: no smsts.log, unattend error in setupact ----------------------------------------------
+$setupact = @(
+    ('{0}, Error                 [setup.exe] Windows could not parse or process the unattend answer file for pass [specialize].' -f $now.AddHours(-2).ToString('yyyy-MM-dd HH:mm:ss'))
+)
+New-Bundle 'PC1006.zip' @{ 'Panther/setupact.log' = $setupact } $now.AddHours(-2)
+
+# ---- Corrupt / empty --------------------------------------------------------------------------------
+[IO.File]::WriteAllBytes((Join-Path $FixtureDirectory 'PC1007.zip'), [byte[]](1..200))
+(Get-Item (Join-Path $FixtureDirectory 'PC1007.zip')).LastWriteTime = $now.AddHours(-1)
+New-Bundle 'PC1011.zip' @{ 'readme.bin' = [byte[]](0, 1, 2) } $now.AddHours(-1)
+
+# ---- PC1008: two runs, rollover + duplicate copies, last run fails on updates ---------------------
+$r1 = $now.AddHours(-9)
+$r2 = $now.AddHours(-6)
+$rolled = @(
+    (L $r1 '==============================[ TSBootShell.exe ]==============================' 'TSBootShell')
+    (L $r1.AddMinutes(10) ("Failed to run the action: Apply Operating System. `r`nThe system cannot find the file specified. (Error: 80070002; Source: Windows)") 'TSManager' 3)
+    (L $r1.AddMinutes(10) 'Execution of task sequence failed.' 'TSManager' 3)
+    (L $r2 '==============================[ TSBootShell.exe ]==============================' 'TSBootShell')
+    (L $r2.AddMinutes(1) '==============================[ TSManager.exe ]==============================')
+)
+$current = @(
+    (L $r2.AddMinutes(1) '==============================[ TSManager.exe ]==============================')
+    (L $r2.AddMinutes(30) '==============================[ TSManager.exe ]==============================' 'TSManager' 1 '-600')
+    (L $r2.AddMinutes(62) 'Start executing an instruction. Instruction name: Install Software Updates. Instruction pointer: 40' 'TSManager' 1 '-600')
+    (L $r2.AddMinutes(95) 'Failed to install updates. Error = 0x80240022' 'InstallSWUpdate' 3 '-600')
+    (L $r2.AddMinutes(95) ("Failed to run the action: Install Software Updates. `r`nUnspecified error (Error: 80004005; Source: Windows)") 'TSManager' 3 '-600')
+)
+New-Bundle 'PC1008_20261109.zip' @{
+    'Logs/smsts-20261109-020000.log' = $rolled
+    'Logs/smsts.log' = $current
+    'Copy2/smsts.log' = $current
+} $now.AddHours(-4)
+
+# ---- PC1009: nested zip, legacy-format line ----------------------------------------------------------
+$t = $now.AddHours(-7)
+$inner = New-ZipBytes @{
+    'smsts.log' = @(
+        (L $t '==============================[ TSBootShell.exe ]==============================' 'TSBootShell')
+        (L $t.AddMinutes(1) 'Start executing an instruction. Instruction name: Use Toolkit Package. Instruction pointer: 2')
+        (L $t.AddMinutes(1) 'There are no active network adapters in this computer' 'TSBootShell' 3)
+        (L $t.AddMinutes(2) ("Failed to run the action: Use Toolkit Package. `r`nThe network path was not found. (Error: 80070035; Source: Windows)") 'TSManager' 3)
+    )
+}
+$legacy = @('Starting legacy component  $$<LegacyComp><{0}+480><thread=1 (0x1)>' -f $t.ToString('MM-dd-yyyy HH:mm:ss.fff'))
+New-Bundle 'PC1009.zip' @{ 'inner/X_logs.zip' = $inner; 'legacy.log' = $legacy } $now.AddHours(-7)
+
+# ---- PC1010: rolled over (no banner), PKI/clock failure on policy ------------------------------------
+$t = $now.AddHours(-10)
+$smsts = @(
+    (L $t 'Getting policy for CCM_SoftwareDistribution' 'TSPxe')
+    (L $t.AddMinutes(1) 'Failed to get client identity (80072f8f)' 'TSPxe' 3)
+    (L $t.AddMinutes(1).AddSeconds(2) 'Failed to download the task sequence policy (0x80072f8f)' 'TSPxe' 3)
+)
+New-Bundle 'PC1010.zip' @{ 'smsts.log' = $smsts } $now.AddHours(-10)
+
+# =====================================================================================================
+Write-Host "`n=== Get-OsdFailureReport.ps1 against $FixtureDirectory ===" -ForegroundColor Cyan
+$all = @(& $scriptPath -Path $FixtureDirectory 6>$null)
+$by = @{}
+foreach ($r in $all) { $by[$r.BundleName] = $r }
+
+Assert-That 'one result per bundle (11)' ($all.Count -eq 11) "got $($all.Count)"
+
+$r = $by['PC1001_20261109-0821.zip']
+Assert-That 'PC1001 hostname from ZTIGather' ($r.Hostname -eq 'PC1001' -and $r.HostnameSource -like 'ZTIGather*') "$($r.Hostname) / $($r.HostnameSource)"
+Assert-That 'PC1001 failed step joined across a multi-line entry' ($r.FailedStep -eq 'Apply Driver Package - Latitude 7450') $r.FailedStep
+Assert-That 'PC1001 error code normalised' ($r.ErrorCode -eq '0x80070002') $r.ErrorCode
+Assert-That 'PC1001 root cause is content not on DP' ($r.RootCause -eq 'Content not available on a distribution point') $r.RootCause
+Assert-That 'PC1001 package ID surfaced' ($r.RootCauseDetail -match 'P0100123') $r.RootCauseDetail
+Assert-That 'PC1001 failed group from the abort line' ($r.FailedGroup -eq 'Drivers') $r.FailedGroup
+Assert-That 'PC1001 duration 00:21:02' ($r.Duration -eq '00:21:02') $r.Duration
+Assert-That 'PC1001 model and serial from gather' ($r.Model -eq 'Latitude 7450' -and $r.SerialNumber -eq '7XK2Q34') "$($r.Model) $($r.SerialNumber)"
+Assert-That 'PC1001 start marker found' ($r.StartConfidence -eq 'Start marker found') $r.StartConfidence
+
+$r = $by['PC1002.zip']
+Assert-That 'PC1002 hostname from unattend/NetSetup, not the file' ($r.Hostname -eq 'PC1002' -and $r.HostnameSource -ne 'Bundle file name') $r.HostnameSource
+Assert-That 'PC1002 WinPE and OS smsts copies merged: duration 00:52:00' ($r.Duration -eq '00:52:00') $r.Duration
+Assert-That 'PC1002 bias change noted' (@($r.Notes | Where-Object { $_ -like '*bias changed*' }).Count -eq 1) ($r.Notes -join ' | ')
+Assert-That 'PC1002 domain join found in UTF-16 setupact and NetSetup' (@($r.KnownIssues | Where-Object { $_ -like 'Domain join failed*' }).Count -eq 1) ($r.KnownIssues -join ' | ')
+Assert-That 'PC1002 domain join evidence decodes 0xaac' (@($r.Evidence | Where-Object { $_.Kind -eq 'DOMAIN_JOIN' }).Count -ge 1) ''
+$dj = & $scriptPath -Path (Join-Path $FixtureDirectory 'PC1002.zip') -IgnoreStepPattern 'Install Application' 6>$null
+Assert-That 'PC1002 domain join is the cause when the app step is excluded' ($dj.RootCause -eq 'Domain join failed' -and $dj.RootCauseDetail -match 'blocked by security policy' -and $dj.RootCauseDetail -match 'MachineAccountOU=OU=Win11') $dj.RootCauseDetail
+$json = $all | ConvertTo-Json -Depth 6
+Assert-That 'unattend.xml password never reported' ($json -notmatch 'Sup3rS3cret') ''
+
+$r = $by['PC1003_20261109-0905.zip']
+Assert-That 'PC1003 real failure reported, not the forced failure' ($r.FailedStep -eq 'Install Application - 7-Zip') $r.FailedStep
+Assert-That 'PC1003 forced failure listed as ignored' (@($r.OtherFailures | Where-Object { $_ -like 'Force Failure*ignored*' }).Count -eq 1) ($r.OtherFailures -join ' | ')
+Assert-That 'PC1003 root cause is the app exit code' ($r.RootCause -eq 'Application installer returned a failure exit code') $r.RootCause
+Assert-That 'PC1003 application name and 1603 decoded' ($r.RootCauseDetail -match '7-Zip 24.08' -and $r.RootCauseDetail -match '1603') $r.RootCauseDetail
+
+$r = $by['PC1004_20261108.zip']
+Assert-That 'PC1004 MININT ignored, hostname from file name' ($r.Hostname -eq 'PC1004' -and $r.HostnameSource -eq 'Bundle file name') "$($r.Hostname) / $($r.HostnameSource)"
+Assert-That 'PC1004 root cause is no disk' ($r.RootCause -eq 'No disk found') $r.RootCause
+
+$r = $by['PC1005.zip']
+Assert-That 'PC1005 hash mismatch' ($r.RootCause -eq 'Content hash mismatch' -and $r.ErrorCode -eq '0x80091007') "$($r.RootCause) $($r.ErrorCode)"
+
+$r = $by['PC1006.zip']
+Assert-That 'PC1006 no smsts.log status' ($r.Status -eq 'NoTaskSequenceLog') $r.Status
+Assert-That 'PC1006 unattend cause found without smsts.log' ($r.RootCause -like 'Unattend*') $r.RootCause
+
+Assert-That 'PC1007 corrupt bundle reported, not fatal' ($by['PC1007.zip'].Status -eq 'Unreadable') $by['PC1007.zip'].Status
+Assert-That 'PC1011 bundle without logs is Empty' ($by['PC1011.zip'].Status -eq 'Empty') $by['PC1011.zip'].Status
+
+$r = $by['PC1008_20261109.zip']
+Assert-That 'PC1008 last run only: failed step' ($r.FailedStep -eq 'Install Software Updates') $r.FailedStep
+Assert-That 'PC1008 last run only: duration 01:35:00' ($r.Duration -eq '01:35:00') $r.Duration
+Assert-That 'PC1008 earlier run noted' (@($r.Notes | Where-Object { $_ -like '*more than one task sequence run*' }).Count -eq 1) ($r.Notes -join ' | ')
+Assert-That 'PC1008 earlier run failure not listed as other failure' (@($r.OtherFailures).Count -eq 0) ($r.OtherFailures -join ' | ')
+Assert-That 'PC1008 updates root cause' ($r.RootCause -eq 'Install Software Updates failed') $r.RootCause
+
+$r = $by['PC1009.zip']
+Assert-That 'PC1009 nested zip read' ($r.FailedStep -eq 'Use Toolkit Package' -and $r.RootCause -eq 'No network adapter in WinPE') "$($r.FailedStep) / $($r.RootCause)"
+Assert-That 'PC1009 legacy-format log parsed' (@($r.LogsReviewed | Where-Object { $_ -like 'legacy.log (1 lines*' }).Count -eq 1) ($r.LogsReviewed -join ' | ')
+
+$r = $by['PC1010.zip']
+Assert-That 'PC1010 no banner -> earliest entry, flagged' ($r.StartConfidence -like 'Earliest surviving*') $r.StartConfidence
+Assert-That 'PC1010 certificate/clock cause' ($r.RootCause -eq 'Certificate or device clock problem') $r.RootCause
+
+# ---- Filters ------------------------------------------------------------------------------------------
+$h24 = @(& $scriptPath -Path $FixtureDirectory -LastHours 24 6>$null)
+Assert-That '-LastHours 24 excludes the 30 h and 50 h bundles' ($h24.Count -eq 9 -and -not ($h24.BundleName -contains 'PC1004_20261108.zip')) "got $($h24.Count)"
+$h48 = @(& $scriptPath -Path $FixtureDirectory -LastHours 48 6>$null)
+Assert-That '-LastHours 48 includes the 30 h bundle only' ($h48.Count -eq 10) "got $($h48.Count)"
+$since = @(& $scriptPath -Path $FixtureDirectory -Since $now.AddHours(-2.5) 6>$null)
+Assert-That '-Since' ($since.Count -eq 4) "got $($since.Count): $($since.BundleName -join ', ')"
+$one = @(& $scriptPath -Path $FixtureDirectory -ComputerName PC1003 6>$null)
+Assert-That '-ComputerName by file name' ($one.Count -eq 1 -and $one[0].Hostname -eq 'PC1003') "got $($one.Count)"
+$err = $null
+try { & $scriptPath -Path $FixtureDirectory -LastHours 12 -Since $now 6>$null | Out-Null } catch { $err = $_ }
+Assert-That '-LastHours and -Since cannot be combined' ($null -ne $err) ''
+
+# ---- Reports ------------------------------------------------------------------------------------------
+$out = Join-Path $FixtureDirectory 'out'
+& $scriptPath -Path $FixtureDirectory -OutputPath $out 6>$null | Out-Null
+$files = @(Get-ChildItem $out -File)
+Assert-That '-OutputPath writes csv, evidence csv, json and html' ($files.Count -eq 4) ($files.Name -join ', ')
+$html = Get-Content (Get-ChildItem $out -Filter *.html).FullName -Raw
+$missing = @(@('PC1001', 'PC1002', 'PC1003', 'PC1009') | Where-Object { $html -notmatch $_ })
+Assert-That 'html report lists every device' ($missing.Count -eq 0) ($missing -join ', ')
+Assert-That 'html report never contains the unattend password' ($html -notmatch 'Sup3rS3cret') ''
+$csv = @(Import-Csv (Get-ChildItem $out -Filter *-summary.csv).FullName)
+Assert-That 'summary csv has a row per bundle' ($csv.Count -eq 11) "got $($csv.Count)"
+
+# ---- Read-only ---------------------------------------------------------------------------------------
+$before = @(Get-ChildItem $FixtureDirectory -File | ForEach-Object { '{0}|{1}|{2}' -f $_.Name, $_.Length, $_.LastWriteTimeUtc.Ticks })
+& $scriptPath -Path $FixtureDirectory 6>$null | Out-Null
+$after = @(Get-ChildItem $FixtureDirectory -File | ForEach-Object { '{0}|{1}|{2}' -f $_.Name, $_.Length, $_.LastWriteTimeUtc.Ticks })
+Assert-That 'bundles are untouched (name, size, timestamp)' ($null -eq (Compare-Object $before $after)) ''
+
+if (-not $keep) { Remove-Item $FixtureDirectory -Recurse -Force }
+
+Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
+if ($script:fail -gt 0) { exit 1 }

@@ -10,6 +10,35 @@ versioning is [semantic](https://semver.org/) per script.
 
 ---
 
+## Get-OsdFailureReport.ps1
+
+### [1.0.0] — 2026-11-09
+
+#### Added
+
+- **Read-only review of MECM OSD failure bundles** on
+  `\\sccmstore\osdlogs\Workstation\WIN11\Failure`. Opens each `.zip` in place with
+  shared read access (nothing extracted, moved or locked) and reviews every text log in
+  it, one nested zip deep, not just `smsts.log`.
+- Per device: hostname (with its source), build start, failure time, duration, failed
+  step and group, decoded error code, root cause, recommended action, make/model/serial
+  where ZTIGather logged them, every known issue matched, and the evidence lines with
+  log, line number and time.
+- Around 40 failure signatures (content/DP, hash mismatch, NIC/IP/MP/PKI/clock, no disk
+  / VMD, partition, disk space, apply OS, unattend, drivers, domain join with decoded
+  NetSetup codes, client install, application exit codes, timeouts, scripts, updates,
+  BitLocker/TPM/Windows 11 readiness). They are ranked by specificity, by how well they
+  fit the failed step, and by how close they sit to the failure time.
+- Failure-group task sequences are handled. A step matching `-IgnoreStepPattern` (forced
+  failure, copy logs) is passed over in favour of the real failure, and the rest of the
+  run's failures are listed in `OtherFailures`. When `smsts.log` holds a retried build,
+  only the last run is reported.
+- Bundles can be selected with `-LastHours` / `-Since` (judged on the share's
+  LastWriteTime) and `-ComputerName`. `-OutputPath` writes a summary CSV, an evidence
+  CSV, JSON and an HTML report; `-GridView` opens the results in Out-GridView.
+- Passwords are masked in reported lines. The body of `unattend.xml` is never reported;
+  only its ComputerName is read.
+
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
 ### [23.32.0] — 2026-08-21

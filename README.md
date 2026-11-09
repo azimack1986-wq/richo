@@ -3,6 +3,9 @@
 PowerShell automation for VMware and Cisco infrastructure — vSphere/vCenter,
 Cisco UCS Manager, Intersight (SaaS and PVA), and Site Recovery Manager.
 
+`scripts/mecm/Get-OsdFailureReport.ps1` reviews MECM OSD failure log bundles
+(read-only) and reports the failed step and likely root cause per device.
+
 ## Layout
 
 ```
