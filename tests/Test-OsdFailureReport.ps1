@@ -59,12 +59,13 @@ function L {
 }
 
 function New-Bundle {
-    param([string]$Name, [hashtable]$Files, [datetime]$Uploaded, [hashtable]$Encodings = @{})
+    param([string]$Name, [hashtable]$Files, [datetime]$Uploaded, [hashtable]$Encodings = @{}, [hashtable]$Written = @{})
     $path = Join-Path $FixtureDirectory $Name
     $fs = [IO.File]::Open($path, 'Create')
     $zip = New-Object IO.Compression.ZipArchive($fs, [IO.Compression.ZipArchiveMode]::Create)
     foreach ($k in $Files.Keys) {
         $entry = $zip.CreateEntry($k)
+        if ($Written.ContainsKey($k)) { $entry.LastWriteTime = [DateTimeOffset]$Written[$k] }
         $s = $entry.Open()
         $content = $Files[$k]
         if ($content -is [byte[]]) { $bytes = $content }
@@ -254,13 +255,66 @@ $smsts = @(
 )
 New-Bundle 'PC1010.zip' @{ 'smsts.log' = $smsts } $now.AddHours(-10)
 
+# ---- APTEST0001: modelled on a real bundle. Install Application fails because app policy never
+# evaluates; NetSetup is full of SUCCESSFUL 0x0 join lines; reference-image MSI logs are baked in;
+# the failure line uses the signed-decimal form; file named HOST.yyyy-MM-dd_HHmmss.zip ------------
+$t0 = $now.AddHours(-2)
+$ia = 'InstallApplication'
+$app = 'BigFix Client - 11.0.5.204 - R1'
+$smsts = @(
+    (L $t0 '==============================[ TSBootShell.exe ]==============================' 'TSBootShell')
+    (L $t0.AddMinutes(2) '==============================[ TSManager.exe ]==============================')
+    (L $t0.AddMinutes(60) '==============================[ TSManager.exe ]==============================' 'TSManager' 1 '-660')
+    (L $t0.AddMinutes(61) 'Task Sequence environment is not initialized' 'TSManager' 3 '-660')
+    (L $t0.AddMinutes(89) 'unknown host (gethostbyname failed)' 'TSManager' 3 '-660')
+    (L $t0.AddMinutes(89) 'Sending with winhttp failed; 80072ee7' 'TSManager' 3 '-660')
+    (L $t0.AddMinutes(92) 'Start executing an instruction. Instruction name: Install - Agents - Asset Management. Instruction pointer: 145' 'TSManager' 1 '-660')
+    (L $t0.AddMinutes(92) "Installing application '$app'" $ia 1 '-660')
+)
+1..8 | ForEach-Object { $smsts += (L $t0.AddMinutes(92) 'CCMGetGlobalService(&spService), HRESULT=87d00219 (F:\dbs\sh\cmgm\src\Framework\Core\CCMCore\CcmConditions.cpp,162)' $ia 1 '-660') }
+$smsts += @(
+    (L $t0.AddMinutes(92) 'CAppMgmtSDK::GetEvaluationState - ScopeId_1/RequiredApplication_55b9.3 Not found in CI state store. Marking CIs state as EvaluationFailed' 'DCMAgent' 1 '-660')
+    (L $t0.AddMinutes(92) 'NotifyProgress received: 16 (Application failed to evaluate )' $ia 1 '-660')
+    (L $t0.AddMinutes(97) 'Waiting for job status notification...' $ia 1 '-660')
+    (L $t0.AddMinutes(97) 'Retrying: 1 attempt' $ia 1 '-660')
+    (L $t0.AddMinutes(102) 'Waiting for job status notification...' $ia 1 '-660')
+    (L $t0.AddMinutes(102) 'Retrying: 2 attempt' $ia 1 '-660')
+    (L $t0.AddMinutes(107) 'Waiting for job status notification...' $ia 1 '-660')
+    (L $t0.AddMinutes(107) 'Retrying: 3 attempt' $ia 1 '-660')
+    (L $t0.AddMinutes(107) 'nRetryVal != 0, HRESULT=80004005 (installapplication.cpp,1492)' $ia 3 '-660')
+    (L $t0.AddMinutes(107) 'Exhausted retry attempts. Giving up. ' $ia 3 '-660')
+    (L $t0.AddMinutes(107) "Install Dynamic application action failed to install application: '$app'. Error Code 0x80004005" $ia 3 '-660')
+    (L $t0.AddMinutes(107) 'Install Dynamic application action cannot continue. ContinueOnErrorFlag is set to false.' $ia 3 '-660')
+    (L $t0.AddMinutes(107).AddSeconds(1) ("Failed to run the action: Install - Agents - Asset Management. `r`nError -2147467259") 'TSManager' 3 '-660')
+)
+$ns = { param($at, $m) '{0} {1}' -f $at.ToString('MM/dd/yyyy HH:mm:ss:fff'), $m }
+$netsetup = @(
+    (& $ns $t0.AddMinutes(37) 'NetpDoDomainJoin')
+    (& $ns $t0.AddMinutes(37) "NetpJoinDomain`r`n`tHostName: APTEST0001")
+    (& $ns $t0.AddMinutes(37) "`tDomain: corp.example.local")
+    (& $ns $t0.AddMinutes(37) "`tMachineAccountOU: OU=Thick,OU=End Points,DC=corp,DC=example,DC=local")
+    (& $ns $t0.AddMinutes(37) "NetpJoinDomainOnDs: status of connecting to dc '\\DC01.corp.example.local': 0x0")
+    (& $ns $t0.AddMinutes(37) 'NetpJoinDomainOnDs: status of setting netlogon cache: 0x0')
+    (& $ns $t0.AddMinutes(37) "NetpJoinDomainOnDs: status of disconnecting from '\\DC01.corp.example.local': 0x0")
+    (& $ns $t0.AddMinutes(37) 'NetpDoDomainJoin: status: 0x0')
+)
+$refImage = $now.AddDays(-49)
+$msiOld = @('MSI (s) (30:F8) [16:05:36:673]: SOFTWARE RESTRICTION POLICY: C:\Windows\ccmcache\b\Objective Reporting.msi is not digitally signed')
+$ciDownloader = @((L $t0.AddMinutes(80) 'Failed to download CI ScopeId_1/RequiredApplication_55b9 (0x87d00215)' 'CIDownloader' 3 '-660'))
+New-Bundle 'APTEST0001.2026-11-09_034325.zip' @{
+    'smsts.log' = $smsts
+    'netsetup.log' = $netsetup
+    'Objective_Reporting_11.log' = $msiOld
+    'CIDownloader.log' = $ciDownloader
+} $now.AddMinutes(-10) -Written @{ 'Objective_Reporting_11.log' = $refImage; 'smsts.log' = $t0.AddMinutes(108); 'netsetup.log' = $t0.AddMinutes(37); 'CIDownloader.log' = $t0.AddMinutes(80) }
+
 # =====================================================================================================
 Write-Host "`n=== Get-OsdFailureReport.ps1 against $FixtureDirectory ===" -ForegroundColor Cyan
 $all = @(& $scriptPath -Path $FixtureDirectory 6>$null)
 $by = @{}
 foreach ($r in $all) { $by[$r.BundleName] = $r }
 
-Assert-That 'one result per bundle (11)' ($all.Count -eq 11) "got $($all.Count)"
+Assert-That 'one result per bundle (12)' ($all.Count -eq 12) "got $($all.Count)"
 
 $r = $by['PC1001_20261109-0821.zip']
 Assert-That 'PC1001 hostname from ZTIGather' ($r.Hostname -eq 'PC1001' -and $r.HostnameSource -like 'ZTIGather*') "$($r.Hostname) / $($r.HostnameSource)"
@@ -319,13 +373,26 @@ $r = $by['PC1010.zip']
 Assert-That 'PC1010 no banner -> earliest entry, flagged' ($r.StartConfidence -like 'Earliest surviving*') $r.StartConfidence
 Assert-That 'PC1010 certificate/clock cause' ($r.RootCause -eq 'Certificate or device clock problem') $r.RootCause
 
+$r = $by['APTEST0001.2026-11-09_034325.zip']
+Assert-That 'APTEST hostname split at the dot in HOST.yyyy-MM-dd_HHmmss.zip' ($r.Hostname -eq 'APTEST0001' -and @($r.Notes | Where-Object { $_ -like 'Bundle file name suggests*' }).Count -eq 0) "$($r.Hostname) | $($r.Notes -join ' | ')"
+Assert-That 'APTEST failed step from the signed-decimal failure line' ($r.FailedStep -eq 'Install - Agents - Asset Management' -and $r.ErrorCode -eq '0x80004005') "$($r.FailedStep) / $($r.ErrorCode)"
+Assert-That 'APTEST root cause comes from the failing step in smsts.log' ($r.RootCause -eq 'Application policy evaluation failed (Install Application)') $r.RootCause
+Assert-That 'APTEST application named' ($r.Application -eq 'BigFix Client - 11.0.5.204 - R1' -and $r.Summary -match 'BigFix Client') "$($r.Application) | $($r.Summary)"
+Assert-That 'APTEST failure message filled from the step block' ($r.FailureMessage -match 'failed to install application') $r.FailureMessage
+Assert-That 'APTEST successful 0x0 NetSetup lines are not a domain join failure' (@($r.KnownIssues | Where-Object { $_ -like 'Domain join*' }).Count -eq 0) ($r.KnownIssues -join ' | ')
+Assert-That 'APTEST informational MSI "not digitally signed" is not a script failure' (@($r.KnownIssues | Where-Object { $_ -like '*script*' }).Count -eq 0) ($r.KnownIssues -join ' | ')
+Assert-That 'APTEST DNS failure before the step is a contributing factor' (@($r.ContributingFactors | Where-Object { $_ -like 'DNS resolution failure*' }).Count -eq 1) ($r.ContributingFactors -join ' | ')
+Assert-That 'APTEST step log shows the retries and give-up' (@($r.StepLog | Where-Object { $_ -match 'Exhausted retry attempts' }).Count -eq 1 -and @($r.StepLog | Where-Object { $_ -match 'Retrying: 3 attempt' }).Count -eq 1) ($r.StepLog -join ' | ')
+Assert-That 'APTEST benign CCMGetGlobalService and TS-env noise kept out' (@($r.StepLog | Where-Object { $_ -match 'CCMGetGlobalService' }).Count -eq 0 -and @($r.Evidence | Where-Object { $_.Text -match 'environment is not initialized' }).Count -eq 0) ''
+Assert-That 'APTEST "ContinueOnErrorFlag is set to false" does not mark the failure as continued' (@($r.OtherFailures).Count -eq 0) ($r.OtherFailures -join ' | ')
+
 # ---- Filters ------------------------------------------------------------------------------------------
 $h24 = @(& $scriptPath -Path $FixtureDirectory -LastHours 24 6>$null)
-Assert-That '-LastHours 24 excludes the 30 h and 50 h bundles' ($h24.Count -eq 9 -and -not ($h24.BundleName -contains 'PC1004_20261108.zip')) "got $($h24.Count)"
+Assert-That '-LastHours 24 excludes the 30 h and 50 h bundles' ($h24.Count -eq 10 -and -not ($h24.BundleName -contains 'PC1004_20261108.zip')) "got $($h24.Count)"
 $h48 = @(& $scriptPath -Path $FixtureDirectory -LastHours 48 6>$null)
-Assert-That '-LastHours 48 includes the 30 h bundle only' ($h48.Count -eq 10) "got $($h48.Count)"
+Assert-That '-LastHours 48 includes the 30 h bundle only' ($h48.Count -eq 11) "got $($h48.Count)"
 $since = @(& $scriptPath -Path $FixtureDirectory -Since $now.AddHours(-2.5) 6>$null)
-Assert-That '-Since' ($since.Count -eq 4) "got $($since.Count): $($since.BundleName -join ', ')"
+Assert-That '-Since' ($since.Count -eq 5) "got $($since.Count): $($since.BundleName -join ', ')"
 $one = @(& $scriptPath -Path $FixtureDirectory -ComputerName PC1003 6>$null)
 Assert-That '-ComputerName by file name' ($one.Count -eq 1 -and $one[0].Hostname -eq 'PC1003') "got $($one.Count)"
 $err = $null
@@ -342,7 +409,7 @@ $missing = @(@('PC1001', 'PC1002', 'PC1003', 'PC1009') | Where-Object { $html -n
 Assert-That 'html report lists every device' ($missing.Count -eq 0) ($missing -join ', ')
 Assert-That 'html report never contains the unattend password' ($html -notmatch 'Sup3rS3cret') ''
 $csv = @(Import-Csv (Get-ChildItem $out -Filter *-summary.csv).FullName)
-Assert-That 'summary csv has a row per bundle' ($csv.Count -eq 11) "got $($csv.Count)"
+Assert-That 'summary csv has a row per bundle' ($csv.Count -eq 12) "got $($csv.Count)"
 
 # ---- Read-only ---------------------------------------------------------------------------------------
 $before = @(Get-ChildItem $FixtureDirectory -File | ForEach-Object { '{0}|{1}|{2}' -f $_.Name, $_.Length, $_.LastWriteTimeUtc.Ticks })

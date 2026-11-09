@@ -12,6 +12,49 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Get-OsdFailureReport.ps1
 
+### [1.2.0] — 2026-11-09
+
+First run against a real bundle (an Install Application failure) blamed a domain join that had
+in fact succeeded. Fixed so smsts.log drives the verdict and other logs support it.
+
+#### Fixed
+
+- **Successful NetSetup.log lines were read as a domain join failure.** Lines ending
+  `status of ...: 0x0` were not recognised as success. A join status now counts only
+  when its code is non-zero, and the join details (Domain, MachineAccountOU, Account)
+  are read only from NetSetup's own parameter block.
+- **The failing step's own smsts.log block now decides the root cause.** Signatures inside
+  that block get the largest boost, smsts.log outranks every other log, and findings
+  outside this build are no longer root-cause candidates. Those are lines timestamped
+  outside the run, or undated lines in a log last written before the run started, such
+  as reference-image logs baked into the OS.
+- New signature for the real case: **Application policy evaluation failed** ("Application
+  failed to evaluate", "Not found in CI state store", "Exhausted retry attempts"). Also
+  new: CIDownloader/CIAgent errors.
+- The failure line `Failed to run the action: X. Error -2147467259` (signed decimal) is
+  parsed.
+- "ContinueOnErrorFlag is set to false" no longer marks a failure as continued.
+- The informational MSI line "SOFTWARE RESTRICTION POLICY: ... is not digitally signed"
+  no longer counts as a script failure.
+- DNS and management point codes are recognised without the `0x` prefix (`80072ee7`),
+  along with "unknown host (gethostbyname failed)".
+- The default `-HostnamePattern` stops at a dot, for `HOST.yyyy-MM-dd_HHmmss.zip`.
+
+#### Added
+
+- `StepLog`: the key lines of the failing step's smsts.log block (errors, warnings,
+  retries, the application being installed), with repeats collapsed and known-benign
+  noise removed. Shown first in the console detail view and included in the HTML and
+  evidence CSV.
+- `Application`: the application the failing Install Application step was installing,
+  also named in the summary.
+- `ContributingFactors`: other findings from this build, outside the failing step,
+  within two hours before the failure (for example DNS failures resolving the MP).
+- `FailureMessage` falls back to the step's own last failure line when the engine's
+  failure line carries no text.
+- The console detail view lists smsts.log and logs with evidence instead of every log
+  in the bundle.
+
 ### [1.1.0] — 2026-11-09
 
 #### Added

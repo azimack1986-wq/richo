@@ -62,8 +62,9 @@
 .PARAMETER HostnamePattern
     Regular expression with a named group 'Host', applied to the bundle file name (without
     extension) to derive the hostname when the logs do not name the device. The default takes
-    everything up to the first underscore, space, or a hyphen followed by six or more digits
-    (a date stamp), so PC0123_20261109.zip, PC0123-20261109-1022.zip and PC0123.zip all give PC0123.
+    everything up to the first underscore, space, dot, or a hyphen followed by six or more digits
+    (a date stamp), so PC0123.2026-11-09_034325.zip, PC0123_20261109.zip, PC0123-20261109-1022.zip
+    and PC0123.zip all give PC0123.
 
 .PARAMETER IgnoreStepPattern
     Regular expression for steps whose failure is NOT the real fault - a failure-handling group's
@@ -152,7 +153,7 @@ param(
 
     [string]$Filter = '*.zip',
 
-    [string]$HostnamePattern = '^(?<Host>.+?)(?=[_ ]|-\d{6,}|$)',
+    [string]$HostnamePattern = '^(?<Host>.+?)(?=[_ .]|-\d{6,}|$)',
 
     [string]$IgnoreStepPattern = '(?i)force[ds]?\s*-?\s*fail|fail(ing)?\s+(the\s+)?(task\s*sequence|ts|build)|(copy|capture|gather|collect|zip|upload|save)\s*(the\s*)?(smsts\s*)?logs?\b|^exit\b',
 
@@ -173,7 +174,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.2.0'
 
 # Run options read by the helper functions, captured once so their inputs are explicit.
 $script:Options = @{
@@ -335,7 +336,7 @@ $script:SignatureDefinitions = @(
     }
     @{ Id = 'MP_UNREACHABLE'; Category = 'Network'; Weight = 75; Files = '.'
         Title = 'Management point unreachable / policy request failed'
-        Pattern = 'Failed to get client identity|Failed to read client identity|Failed to request policy assignments|Failed to download policy|failed to get (mp|management point) (list|location|information)|WinHttpSendRequest.*fail|0x80072ee2|0x80072efd|0x80072efe'
+        Pattern = 'Failed to get client identity|Failed to read client identity|Failed to request policy assignments|Failed to download policy|failed to get (mp|management point) (list|location|information)|WinHttpSendRequest.*fail|(0x)?80072ee2|(0x)?80072efd|(0x)?80072efe'
         Cause = 'WinPE/the TS could not talk to the management point (network, firewall, MP health, or boundary).'
         Action = 'Check MP health (mpcontrol.log) and that the device''s subnet reaches the MP over HTTP/HTTPS.'
     }
@@ -345,10 +346,10 @@ $script:SignatureDefinitions = @(
         Cause = 'The device clock (BIOS/RTC) is wrong, or a certificate/CRL could not be validated, so HTTPS/PKI communication with the site fails.'
         Action = 'Check and correct the BIOS date/time on the device first; then check the PKI certificate chain and CRL reachability from WinPE.'
     }
-    @{ Id = 'DNS'; Category = 'Network'; Weight = 60; Files = '.'
+    @{ Id = 'DNS'; Category = 'Network'; Weight = 75; Files = '.'
         Title = 'DNS resolution failure'
-        Pattern = '(name|host) (could not be|not) resolved|DNS (lookup|resolution|query) fail|0x80072ee7|DNS_ERROR'
-        Cause = 'A site system or domain name could not be resolved.'
+        Pattern = '(name|host) (could not be|not) resolved|DNS (lookup|resolution|query) fail|(0x)?80072ee7|DNS_ERROR|unknown host|gethostbyname failed'
+        Cause = 'A site system (MP/DP) or domain name could not be resolved, so the client could not reach it.'
         Action = 'Check the DNS servers handed out by DHCP for the build subnet and the record for the MP/DP/domain.'
     }
 
@@ -415,8 +416,9 @@ $script:SignatureDefinitions = @(
     # ---- Domain join ---------------------------------------------------------------------------
     @{ Id = 'DOMAIN_JOIN'; StepHint = 'domain|join|setup windows|network settings'; Category = 'Domain Join'; Weight = 90; Files = 'netsetup|setupact|setuperr|smsts|ztidomainjoin'
         Title = 'Domain join failed'
-        Pattern = '(NetJoinDomain attempt failed|NetpDoDomainJoin: status|NetpJoinDomain(OnDs)?: status|NetpProvisionComputerAccount.*fail|Unattended Join:.*fail|Failed to join (the )?domain|djoin.*fail)\D*(?<JoinCode>0x[0-9a-f]+)?'
-        Exclude = '(status|failed|error)[:=]?\s*0x0+\b(?!x)'
+        # A join status line is only a failure when its code is non-zero; 0x0 lines are success and
+        # are dropped in Find-LogSignature (NetSetup.log writes dozens of them on a good join).
+        Pattern = '(NetJoinDomain attempt failed|NetpDoDomainJoin: status|NetpJoinDomain\w*:[^\r\n]*status)[^\r\n]*?(?<JoinCode>0x[0-9a-f]+)|NetpProvisionComputerAccount[^\r\n]*fail|Unattended Join:[^\r\n]*fail|Failed to join (the )?domain|djoin[^\r\n]*fail'
         Cause = 'The device did not join the domain; the code identifies why.'
         Action = 'Use the decoded join code below; check the join account, the MachineObjectOU and any stale computer object for this hostname.'
     }
@@ -450,9 +452,21 @@ $script:SignatureDefinitions = @(
         Cause = 'The installer finished but the detection method did not find the app - silent install failed quietly, or the detection rule is wrong for Windows 11.'
         Action = 'Check the detection method for the application in the evidence and its install log.'
     }
+    @{ Id = 'APP_POLICY_EVAL'; StepHint = 'install|application'; Category = 'Applications'; Weight = 92; Files = 'smsts|dcmagent|appintenteval'
+        Title = 'Application policy evaluation failed (Install Application)'
+        Pattern = 'Application failed to evaluate|Marking CIs state as EvaluationFailed|Not found in CI state store|Exhausted retry attempts'
+        Cause = 'The client never finished evaluating the application''s policy ("Application failed to evaluate" / CI not found in the CI state store), so the Install Application step waited, retried and gave up. The installer itself never ran. Usual causes: the client could not download or compile the application''s policy (MP/DNS reachability, CIDownloader errors), the current application/deployment type revision is not available to the client, or the application or one of its dependencies does not allow installation from the Install Application task sequence action.'
+        Action = 'Check the contributing factors and CIDownloader.log/DCMAgent.log/CIAgent.log for this application around the step time; confirm the application and every dependency have "Allow this application to be installed from the Install Application task sequence action without being deployed" ticked and the current revision''s content is on a DP in the boundary group.'
+    }
+    @{ Id = 'CI_DOWNLOAD'; StepHint = 'install|application'; Category = 'Applications'; Weight = 65; Files = 'cidownloader|ciagent'; ErrorOnly = $true
+        Title = 'Configuration item (policy) download errors'
+        Pattern = 'fail|error'
+        Cause = 'The client logged errors downloading or processing configuration items (application/compliance policy).'
+        Action = 'Read the CIDownloader.log/CIAgent.log evidence for the CI and the error; check MP reachability.'
+    }
     @{ Id = 'APP_INSTALL'; StepHint = 'application'; Category = 'Applications'; Weight = 70; Files = 'smsts'
         Title = 'Install Application step failed'
-        Pattern = 'Install(ing)? (static |dynamic )?applications?.*(fail|error)|Application .{1,120} failed to install|Failed to install application|InstallApplication.*fail'
+        Pattern = 'failed to install application:? ''(?<Application>[^'']+)''|Install(ing)? (static |dynamic )?applications?.*(fail|error)|Application .{1,120} failed to install|Failed to install application|InstallApplication.*fail'
         Cause = 'An application in an Install Application step failed (download, install or detection).'
         Action = 'AppEnforce.log/AppDiscovery.log in the bundle identify which application and why.'
     }
@@ -490,7 +504,9 @@ $script:SignatureDefinitions = @(
     # ---- Scripts -------------------------------------------------------------------------------
     @{ Id = 'SCRIPT'; StepHint = 'script|powershell|command'; Category = 'Scripts'; Weight = 75; Files = '.'
         Title = 'Task sequence script failed'
-        Pattern = 'Run PowerShell Script.*fail|PowerShell script.*(fail|exit code [1-9])|execution of scripts is disabled|is not digitally signed|\.ps1.*(exit code|returned) [1-9]\d*'
+        # "is not digitally signed" alone is not used: MSI logs print it as an informational
+        # SOFTWARE RESTRICTION POLICY line on every unsigned package.
+        Pattern = 'Run PowerShell Script.*fail|PowerShell script.*(fail|exit code [1-9])|execution of scripts is disabled|\.ps1[^\r\n]*(cannot be loaded|is not digitally signed)|\.ps1.*(exit code|returned) [1-9]\d*'
         Cause = 'A script step failed or was blocked by execution policy/signing.'
         Action = 'Check the step''s execution policy setting and run the script manually in WinPE/Windows 11 with the same parameters.'
     }
@@ -768,10 +784,12 @@ function Find-LogSignature {
         Signatures whose Files pattern matches this log.
     .PARAMETER Findings
         List to add findings to.
+    .PARAMETER Written
+        The log file's last-write time inside the zip, used to place undated lines in time.
     .EXAMPLE
         Find-LogSignature -Text $text -Log 'smsts.log' -Format CmTrace -Applicable $sigs -Findings $list
     #>
-    param([string]$Text, [string]$Log, [string]$Format, [object[]]$Applicable, $Findings)
+    param([string]$Text, [string]$Log, [string]$Format, [object[]]$Applicable, $Findings, $Written = $null)
     if ($null -eq $Applicable -or $Applicable.Count -eq 0) { return }
 
     $contexts = @{}
@@ -859,6 +877,14 @@ function Find-LogSignature {
                 $g = $sm.Groups[$gName]
                 if ($g.Success -and $g.Value) { $detail[($gName -replace '\d+$', '')] = $g.Value }
             }
+            if ($sig.Id -eq 'DOMAIN_JOIN') {
+                if (-not $detail.Contains('JoinCode')) {
+                    $jm = [regex]::Match($msg, '(?i)(failed|status)[^\r\n]*?(?<c>0x[0-9a-f]+)')
+                    if ($jm.Success) { $detail['JoinCode'] = $jm.Groups['c'].Value }
+                }
+                # 0x0 is success.
+                if ($detail.Contains('JoinCode') -and $detail['JoinCode'] -match '^0x0+$') { continue }
+            }
             if ($contexts.ContainsKey($sig.Id)) {
                 $cm = $null
                 foreach ($c in $contexts[$sig.Id]) { if ($c.Index -lt $hitIndex) { $cm = $c } else { break } }
@@ -894,6 +920,7 @@ function Find-LogSignature {
                     Text = Protect-LogText $msg
                     Detail = $detail
                     Context = $context
+                    FileWritten = $Written
                 })
         }
     }
@@ -981,6 +1008,9 @@ $script:RxRunStart = New-Object Text.RegularExpressions.Regex(
 $script:RxFailAction = New-Object Text.RegularExpressions.Regex(
     'Failed to run the (?:last )?action: (?<step>[^\r\n]+?)\.?\s*(?:Execution of task sequence failed\.)?\s*(?:[\r\n]+(?<detail>.*?))?\(Error: (?<code>[0-9A-Fa-f]{8}); Source: (?<src>[^)]+)\)',
     'IgnoreCase, Singleline')
+# Current builds write the code as a signed decimal: "Failed to run the action: X. Error -2147467259"
+$script:RxFailActionDecimal = New-Object Text.RegularExpressions.Regex(
+    'Failed to run the (?:last )?action: (?<step>[^\r\n]+?)\.\s+Error (?<code>-?\d+)', 'IgnoreCase')
 $script:RxFailActionNoCode = New-Object Text.RegularExpressions.Regex('Failed to run the (?:last )?action: (?<step>[^\r\n.]+)', 'IgnoreCase')
 $script:RxEngineFail = New-Object Text.RegularExpressions.Regex(
     'task sequence execution engine failed executing the action \((?<step>[^)]+)\) in the group \((?<group>[^)]+)\) with the error code (?<code>-?\d+)',
@@ -992,7 +1022,15 @@ $script:RxInstruction = New-Object Text.RegularExpressions.Regex(
     'Start executing an instruction\. Instruction name: (?<step>[^\r\n]+?)\. Instruction pointer|Running action: (?<step>[^\r\n]+)',
     'IgnoreCase')
 $script:RxExitCode = New-Object Text.RegularExpressions.Regex('Process completed with exit code (?<code>-?\d+)', 'IgnoreCase')
-$script:RxContinue = New-Object Text.RegularExpressions.Regex('continue ?on ?error|ignor(e|ing) (the )?(error|failure)|failure is ignored', 'IgnoreCase')
+# "ContinueOnErrorFlag is set to false" must NOT count, so only an affirmative form matches.
+$script:RxContinue = New-Object Text.RegularExpressions.Regex('continue ?on ?error(flag)?\s*(is\s*)?(set\s*)?(to\s*)?(true|enabled)|continue on error is set|ignor(e|ing) (the )?(error|failure)|failure is ignored', 'IgnoreCase')
+# Benign smsts.log lines that are logged as errors or repeat constantly; kept out of evidence.
+$script:RxSmstsNoise = New-Object Text.RegularExpressions.Regex('Task Sequence environment is not initialized|CCMGetGlobalService\(&spService\), HRESULT=87d00219', 'IgnoreCase')
+# Lines worth showing from the failing step's own smsts.log block.
+$script:RxStepKey = New-Object Text.RegularExpressions.Regex(
+    'fail|error|retry|exhausted|giving up|time ?out|timed out|not found|NotifyProgress|denied|unable|cannot|could not|HRESULT=8|exit code|Installing application|Install(ing)? (static |dynamic )?application|Executing command line|Start executing an instruction|Waiting for (job|installation)',
+    'IgnoreCase')
+$script:RxStepApplication = New-Object Text.RegularExpressions.Regex('failed to install application:? ''(?<a>[^'']+)''|Installing application ''(?<a>[^'']+)''', 'IgnoreCase')
 $script:RxTsSuccess = New-Object Text.RegularExpressions.Regex('Task sequence completed 0x00000000|Execution of task sequence completed successfully|Task Sequence Manager ended successfully', 'IgnoreCase')
 $script:RxGroupAbort = New-Object Text.RegularExpressions.Regex('execution of the group \((?<g>[^)]+)\) has failed', 'IgnoreCase')
 $script:RxErrorInMsg = New-Object Text.RegularExpressions.Regex('\(Error: (?<code>[0-9A-Fa-f]{8}); Source: (?<src>[^)]+)\)', 'IgnoreCase')
@@ -1016,7 +1054,7 @@ $script:HostnameExtractors = @(
 $script:RxGatherProperty = New-Object Text.RegularExpressions.Regex(
     'Property (?<k>Make|Model|SerialNumber|Product) is now = (?<v>[^\]\r\n]+)', 'IgnoreCase')
 $script:RxJoinDetail = New-Object Text.RegularExpressions.Regex(
-    '(?m)\b(?<k>Domain|MachineAccountOU|Account|DomainName|OU):[ \t]*(?<v>[^\r\n]*\S)', 'IgnoreCase')
+    '(?m)^[^\r\n]*?\s(?<k>Domain|MachineAccountOU|Account|Options):[ \t]+(?<v>[^\r\n]*\S)', 'None')
 
 function Get-BundleTextEntry {
     <#
@@ -1057,7 +1095,9 @@ function Get-BundleTextEntry {
             [void]$Notes.Add("Skipped $full ($([Math]::Round($entry.Length / 1MB)) MB > -MaxLogSizeMB $($script:Options.MaxLogSizeMB))")
             continue
         }
-        [pscustomobject]@{ Path = $full; Name = $entry.Name; Entry = $entry }
+        $written = $null
+        try { $written = $entry.LastWriteTime.DateTime } catch { $written = $null }
+        [pscustomobject]@{ Path = $full; Name = $entry.Name; Entry = $entry; Written = $written }
     }
 }
 
@@ -1142,7 +1182,7 @@ function Invoke-BundleAnalysis {
             # The body of unattend.xml is never scanned for evidence: it can hold credentials.
             if (-not ($leaf -like 'unattend*.xml' -or $leaf -like 'autounattend*.xml')) {
                 $applicable = @($script:Signatures | Where-Object { $_.Files.IsMatch($leaf) })
-                Find-LogSignature -Text $text -Log $e.Path -Format $format -Applicable $applicable -Findings $findings
+                Find-LogSignature -Text $text -Log $e.Path -Format $format -Applicable $applicable -Findings $findings -Written $e.Written
             }
 
             $lines = $text.Length - $text.Replace("`n", '').Length
@@ -1228,7 +1268,12 @@ function Invoke-BundleAnalysis {
 
         # ---- One-line summary for the engineer -------------------------------------------------------
         $summary = New-Object System.Collections.Generic.List[string]
-        if ($tl.FailedStep) { [void]$summary.Add("Failed at step '$($tl.FailedStep)'") } elseif ($status -eq 'NoTaskSequenceLog') { [void]$summary.Add('No smsts.log, so no failed step') }
+        if ($tl.FailedStep) {
+            $s = "Failed at step '$($tl.FailedStep)'"
+            if ($tl.Application) { $s += " installing '$($tl.Application)'" }
+            [void]$summary.Add($s)
+        }
+        elseif ($status -eq 'NoTaskSequenceLog') { [void]$summary.Add('No smsts.log, so no failed step') }
         else { [void]$summary.Add('No failing step recorded (failed before the task sequence engine ran a step - PXE/WinPE/policy stage - or smsts.log is incomplete)') }
         if ($codeText) {
             $s = "with $codeText"
@@ -1256,13 +1301,17 @@ function Invoke-BundleAnalysis {
 
         $known = @($findings | Group-Object { $_.Signature.Id } | ForEach-Object {
                 $first = $_.Group[0]
-                '{0} [{1}] x{2}' -f $first.Signature.Title, $first.Signature.Category, $_.Count
+                $inWindow = @($_.Group | Where-Object { Test-InBuildWindow -Finding $_ -Timeline $tl }).Count
+                $suffix = ''
+                if ($inWindow -eq 0) { $suffix = ' (outside this build - older run or reference image logs)' }
+                elseif ($inWindow -lt $_.Count) { $suffix = " ($($_.Count - $inWindow) outside this build)" }
+                '{0} [{1}] x{2}{3}' -f $first.Signature.Title, $first.Signature.Category, $_.Count, $suffix
             })
 
         return ConvertTo-OsdReportObject -File $File -Status $status -FileHost $fileHost -Hostname $hostname -HostnameSource $hostSource `
             -Timeline $tl -ErrorCode $codeText -ErrorDescription $codeDesc -Summary $summaryText -RootCause $rootTitle `
             -Category $category -RootCauseDetail $rootDetail -Action $action -KnownIssues $known -Evidence $evidence.ToArray() `
-            -Inventory $inventory.ToArray() -Notes $notes.ToArray() -Device $device
+            -Inventory $inventory.ToArray() -Notes $notes.ToArray() -Device $device -Contributing $verdict.Contributing
     }
     finally {
         if ($null -ne $zip) { $zip.Dispose() }
@@ -1299,6 +1348,7 @@ function Get-TaskSequenceTimeline {
         Start = $null; End = $null; Duration = $null; StartConfidence = ''
         FailedStep = ''; Group = ''; ErrorCode = ''; ErrorSource = ''; FailureDetail = ''
         FailureRecord = $null; ErrorsBefore = @(); OtherFailures = @()
+        StepStart = $null; Application = ''; StepLog = @()
     }
     if ($null -eq $Records -or $Records.Count -eq 0) { return [pscustomobject]$result }
 
@@ -1327,8 +1377,12 @@ function Get-TaskSequenceTimeline {
         }
         else {
             $m = $script:RxEngineFail.Match($msg)
+            $md = $script:RxFailActionDecimal.Match($msg)
             if ($m.Success) {
                 $f = @{ Index = $i; Step = $m.Groups['step'].Value.Trim(); Code = $m.Groups['code'].Value; Source = ''; Detail = ''; Group = $m.Groups['group'].Value.Trim() }
+            }
+            elseif ($md.Success) {
+                $f = @{ Index = $i; Step = $md.Groups['step'].Value.Trim(); Code = $md.Groups['code'].Value; Source = ''; Detail = ''; Group = '' }
             }
             else {
                 $m = $script:RxFailActionNoCode.Match($msg)
@@ -1462,10 +1516,78 @@ function Get-TaskSequenceTimeline {
         })
 
     $result.ErrorsBefore = @(
-        $sorted[$runStart..$failIdx] | Where-Object { $_.Severity -eq 'Error' -and -not [object]::ReferenceEquals($_, $result.FailureRecord) } |
+        $sorted[$runStart..$failIdx] | Where-Object { $_.Severity -eq 'Error' -and -not [object]::ReferenceEquals($_, $result.FailureRecord) -and -not $script:RxSmstsNoise.IsMatch($_.Message) } |
             Select-Object -Last $script:Options.EvidenceLines
     )
+
+    # ---- The failing step's own block of smsts.log -----------------------------------------------
+    # This is what an engineer reads in CMTrace first, so it is reported in full (key lines) and
+    # signatures found inside it outrank anything found in other logs.
+    $stepStart = -1
+    for ($i = $failIdx; $i -ge [Math]::Max($runStart, $failIdx - 20000); $i--) {
+        $m = $script:RxInstruction.Match($sorted[$i].Message)
+        if ($m.Success) {
+            if (-not $result.FailedStep -or $m.Groups['step'].Value.Trim() -eq $result.FailedStep) { $stepStart = $i; break }
+            if ($stepStart -lt 0) { $stepStart = -2 - $i }   # remember the nearest instruction of any name
+        }
+    }
+    if ($stepStart -lt -1) { $stepStart = -2 - $stepStart }
+    if ($stepStart -lt 0) { $stepStart = [Math]::Max($runStart, $failIdx - 300) }
+    $result.StepStart = $sorted[$stepStart].Time
+    $block = @($sorted[$stepStart..$failIdx])
+
+    foreach ($r in $block) {
+        $m = $script:RxStepApplication.Match($r.Message)
+        if ($m.Success) { $result.Application = $m.Groups['a'].Value }
+    }
+    if (-not $result.FailureDetail) {
+        $errs = @($block | Where-Object { $_.Severity -eq 'Error' -and -not [object]::ReferenceEquals($_, $result.FailureRecord) -and -not $script:RxSmstsNoise.IsMatch($_.Message) })
+        $failing = @($errs | Where-Object { $_.Message -match '(?i)fail' })
+        if ($failing.Count -gt 0) { $result.FailureDetail = $failing[$failing.Count - 1].Message }
+        elseif ($errs.Count -gt 0) { $result.FailureDetail = $errs[$errs.Count - 1].Message }
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $prevText = $null; $repeat = 0
+    foreach ($r in $block) {
+        if ($script:RxSmstsNoise.IsMatch($r.Message)) { continue }
+        if ($r.Severity -ne 'Error' -and $r.Severity -ne 'Warning' -and -not $script:RxStepKey.IsMatch($r.Message)) { continue }
+        $text = Protect-LogText $r.Message 300
+        if ($text -eq $prevText) { $repeat++; continue }
+        if ($repeat -gt 0) { $lines[$lines.Count - 1] = $lines[$lines.Count - 1] + " (x$($repeat + 1))"; $repeat = 0 }
+        $mark = switch ($r.Severity) { 'Error' { 'E' } 'Warning' { 'W' } default { ' ' } }
+        $t = ''; if ($null -ne $r.Time) { $t = $r.Time.ToString('HH:mm:ss') }
+        $lines.Add(('{0} [{1}] {2,-18} {3}' -f $t, $mark, $r.Component, $text))
+        $prevText = $text
+    }
+    if ($repeat -gt 0) { $lines[$lines.Count - 1] = $lines[$lines.Count - 1] + " (x$($repeat + 1))" }
+    $result.StepLog = @($lines.ToArray() | Select-Object -Last 40)
     return [pscustomobject]$result
+}
+
+function Test-InBuildWindow {
+    <#
+    .SYNOPSIS
+        True when a finding belongs to the build that failed rather than to an older run or to the
+        reference image (whose logs are often baked into the OS and copied into the bundle).
+    .DESCRIPTION
+        Timestamped findings must fall between 5 minutes before the run started and 30 minutes
+        after the failure. Lines with no date (MSI logs, plain text) are judged by their log
+        file's last-write time inside the zip: it must be after the run started.
+    .PARAMETER Finding
+        A finding from Find-LogSignature.
+    .PARAMETER Timeline
+        Output of Get-TaskSequenceTimeline.
+    .EXAMPLE
+        Test-InBuildWindow -Finding $f -Timeline $tl
+    #>
+    param($Finding, $Timeline)
+    if ($null -eq $Timeline -or $null -eq $Timeline.Start -or $null -eq $Timeline.End) { return $true }
+    if ($null -ne $Finding.Time) {
+        return ($Finding.Time -ge $Timeline.Start.AddMinutes(-5) -and $Finding.Time -le $Timeline.End.AddMinutes(30))
+    }
+    if ($null -ne $Finding.FileWritten) { return ($Finding.FileWritten -ge $Timeline.Start.AddMinutes(-30)) }
+    return $true
 }
 
 function Select-RootCause {
@@ -1483,17 +1605,25 @@ function Select-RootCause {
         Select-RootCause -Findings $findings -Timeline $tl
     #>
     param($Findings, $Timeline)
-    if ($null -eq $Findings -or $Findings.Count -eq 0) { return [pscustomobject]@{ Primary = $null; Ranked = @() } }
+    $empty = [pscustomobject]@{ Primary = $null; Ranked = @(); Contributing = @() }
+    if ($null -eq $Findings -or $Findings.Count -eq 0) { return $empty }
 
-    $scored = foreach ($f in $Findings) {
+    # Only findings from this build can be the cause. Older ones stay in KnownIssues, marked.
+    $candidates = @($Findings | Where-Object { Test-InBuildWindow -Finding $_ -Timeline $Timeline })
+    if ($candidates.Count -eq 0) { return $empty }
+
+    $isSmsts = { param($f) ($f.Log -replace '^.*/', '') -match '^smsts' }
+    $scored = foreach ($f in $candidates) {
         $score = [double]$f.Signature.Weight
-        if ($null -ne $f.Time -and $null -ne $Timeline.End -and $null -ne $Timeline.Start) {
-            if ($f.Time -lt $Timeline.Start.AddMinutes(-5)) { $score -= 40 }       # previous run / previous OS
-            elseif ($f.Time -gt $Timeline.End.AddMinutes(10)) { $score -= 20 }     # after the failure
-            else {
-                $minsBefore = ($Timeline.End - $f.Time).TotalMinutes
-                $score += [Math]::Max(0, 10 - ($minsBefore / 6))                   # up to +10 near the failure
-            }
+        if ($null -ne $f.Time -and $null -ne $Timeline.End) {
+            $minsBefore = ($Timeline.End - $f.Time).TotalMinutes
+            if ($minsBefore -ge 0) { $score += [Math]::Max(0, 10 - ($minsBefore / 6)) }   # up to +10 near the failure
+        }
+        # smsts.log is the primary record of the build: a signature inside the failing step's own
+        # block is the strongest evidence there is, and smsts.log in general outranks other logs.
+        if (& $isSmsts $f) {
+            $score += 10
+            if ($null -ne $f.Time -and $null -ne $Timeline.StepStart -and $f.Time -ge $Timeline.StepStart -and $f.Time -le $Timeline.End) { $score += 30 }
         }
         # A signature that fits the step that failed, or sits on the failure line itself, is
         # strong support.
@@ -1516,7 +1646,29 @@ function Select-RootCause {
         $taken[$id]++
         $ranked.Add($s.Finding)
     }
-    return [pscustomobject]@{ Primary = $ordered[0].Finding; Ranked = $ranked.ToArray() }
+
+    # Contributing factors: other signatures from this build, outside the failing step, within two
+    # hours before the failure.
+    $contributing = New-Object System.Collections.Generic.List[string]
+    $seenIds = @{ $ordered[0].Finding.Signature.Id = $true }
+    foreach ($s in $ordered) {
+        $f = $s.Finding
+        if ($seenIds.ContainsKey($f.Signature.Id) -or $f.Signature.Weight -lt 40) { continue }
+        # Lines inside the failing step's own block are the failure itself (shown in StepLog), not
+        # something that contributed to it.
+        if ((& $isSmsts $f) -and $null -ne $f.Time -and $null -ne $Timeline.StepStart -and $f.Time -ge $Timeline.StepStart -and $f.Time -le $Timeline.End) { continue }
+        $when = ''
+        if ($null -ne $f.Time -and $null -ne $Timeline.End) {
+            $mins = [Math]::Round(($Timeline.End - $f.Time).TotalMinutes)
+            if ($mins -gt 120) { continue }
+            $when = " at $($f.Time.ToString('HH:mm:ss'))"
+            if ($mins -gt 0) { $when += " ($mins min before the failure)" }
+        }
+        $seenIds[$f.Signature.Id] = $true
+        $contributing.Add(('{0} - {1}:{2}{3}: {4}' -f $f.Signature.Title, ($f.Log -replace '^.*/', ''), $f.Line, $when, (Protect-LogText $f.Text 160)))
+        if ($contributing.Count -ge 4) { break }
+    }
+    return [pscustomobject]@{ Primary = $ordered[0].Finding; Ranked = $ranked.ToArray(); Contributing = $contributing.ToArray() }
 }
 
 function ConvertTo-EvidenceLine {
@@ -1582,6 +1734,8 @@ function ConvertTo-OsdReportObject {
         Caveats.
     .PARAMETER Device
         Make/Model/SerialNumber hashtable.
+    .PARAMETER Contributing
+        Other signatures from this build shortly before the failure.
     .EXAMPLE
         ConvertTo-OsdReportObject -File $f -Status Unreadable
     #>
@@ -1590,7 +1744,8 @@ function ConvertTo-OsdReportObject {
         $Timeline = $null, [string]$ErrorCode = '', [string]$ErrorDescription = '', [string]$Summary = '',
         [string]$RootCause = '', [string]$Category = '', [string]$RootCauseDetail = '', [string]$Action = '',
         [string[]]$KnownIssues = @(), [object[]]$Evidence = @(), [string[]]$Inventory = @(), [string[]]$Notes = @(),
-        [hashtable]$Device = @{ Make = ''; Model = ''; SerialNumber = '' }
+        [hashtable]$Device = @{ Make = ''; Model = ''; SerialNumber = '' },
+        [string[]]$Contributing = @()
     )
     if (-not $Hostname -and $FileHost) { $Hostname = $FileHost.ToUpperInvariant(); $HostnameSource = 'Bundle file name' }
     if (-not $Summary) {
@@ -1601,11 +1756,13 @@ function ConvertTo-OsdReportObject {
         }
     }
     $start = $null; $end = $null; $duration = ''; $durationMin = $null; $conf = ''; $step = ''; $group = ''; $src = ''; $detail = ''
-    $others = @()
+    $others = @(); $app = ''; $stepLog = @()
     if ($null -ne $Timeline) {
         $start = $Timeline.Start; $end = $Timeline.End; $conf = $Timeline.StartConfidence
         $step = $Timeline.FailedStep; $group = $Timeline.Group; $src = $Timeline.ErrorSource; $detail = Protect-LogText $Timeline.FailureDetail
         $others = @($Timeline.OtherFailures)
+        $app = $Timeline.Application
+        $stepLog = @($Timeline.StepLog)
         if ($null -ne $Timeline.Duration) {
             $d = $Timeline.Duration
             $sign = ''
@@ -1621,6 +1778,7 @@ function ConvertTo-OsdReportObject {
         Summary = $Summary
         FailedStep = $step
         FailedGroup = $group
+        Application = $app
         ErrorCode = $ErrorCode
         ErrorDescription = $ErrorDescription
         ErrorSource = $src
@@ -1629,6 +1787,8 @@ function ConvertTo-OsdReportObject {
         Category = $Category
         RootCauseDetail = $RootCauseDetail
         RecommendedAction = $Action
+        ContributingFactors = $Contributing
+        StepLog = $stepLog
         BuildStart = $start
         FailureTime = $end
         Duration = $duration
@@ -1675,9 +1835,9 @@ function Export-OsdFailureReport {
 
     $flat = foreach ($r in $Results) {
         [pscustomobject][ordered]@{
-            Hostname = $r.Hostname; Status = $r.Status; Summary = $r.Summary; FailedStep = $r.FailedStep; FailedGroup = $r.FailedGroup
+            Hostname = $r.Hostname; Status = $r.Status; Summary = $r.Summary; FailedStep = $r.FailedStep; FailedGroup = $r.FailedGroup; Application = $r.Application
             ErrorCode = $r.ErrorCode; ErrorDescription = $r.ErrorDescription; RootCause = $r.RootCause; Category = $r.Category
-            RootCauseDetail = $r.RootCauseDetail; RecommendedAction = $r.RecommendedAction
+            RootCauseDetail = $r.RootCauseDetail; RecommendedAction = $r.RecommendedAction; ContributingFactors = ($r.ContributingFactors -join '; ')
             BuildStart = $(if ($r.BuildStart) { $r.BuildStart.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
             FailureTime = $(if ($r.FailureTime) { $r.FailureTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
             Duration = $r.Duration; DurationMinutes = $r.DurationMinutes; StartConfidence = $r.StartConfidence
@@ -1692,6 +1852,9 @@ function Export-OsdFailureReport {
     $ev = foreach ($r in $Results) {
         foreach ($e in $r.Evidence) {
             [pscustomobject][ordered]@{ Hostname = $r.Hostname; BundleName = $r.BundleName; Kind = $e.Kind; Log = $e.Log; Line = $e.Line; Time = $e.Time; Text = $e.Text }
+        }
+        foreach ($l in $r.StepLog) {
+            [pscustomobject][ordered]@{ Hostname = $r.Hostname; BundleName = $r.BundleName; Kind = 'Failed step (smsts.log)'; Log = 'smsts.log'; Line = 0; Time = ''; Text = $l }
         }
     }
     @($ev) | Export-Csv -Path "$base-evidence.csv" -NoTypeInformation -Encoding UTF8
@@ -1724,10 +1887,12 @@ function Export-OsdFailureReport {
     foreach ($r in $Results) {
         [void]$sb.AppendLine("<h2 id='$(& $enc $r.BundleName)'>$(& $enc $r.Hostname) <span class='muted'>&mdash; $(& $enc $r.BundleName)</span></h2><table>")
         $rows = [ordered]@{
-            'Summary' = $r.Summary; 'Failed step' = $r.FailedStep; 'Group' = $r.FailedGroup
+            'Summary' = $r.Summary; 'Failed step' = $r.FailedStep; 'Group' = $r.FailedGroup; 'Application' = $r.Application
             'Error code' = ('{0} {1}' -f $r.ErrorCode, $r.ErrorDescription).Trim(); 'Failure message' = $r.FailureMessage
             'Root cause' = $(if ($r.Category) { '{0} [{1}]' -f $r.RootCause, $r.Category } else { $r.RootCause }); 'Detail' = $r.RootCauseDetail
             'Recommended action' = $r.RecommendedAction
+            'Contributing factors' = ($r.ContributingFactors -join "`n")
+            'Failed step in smsts.log' = ($r.StepLog -join "`n")
             'Build start' = $(if ($r.BuildStart) { $r.BuildStart.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
             'Failure time' = $(if ($r.FailureTime) { $r.FailureTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
             'Duration' = ('{0} {1}' -f $r.Duration, $(if ($r.StartConfidence) { "($($r.StartConfidence))" } else { '' })).Trim()
@@ -1838,6 +2003,7 @@ function Write-OsdFaultDetail {
         'Summary' = $Result.Summary
         'Failed step' = $Result.FailedStep
         'Group' = $Result.FailedGroup
+        'Application' = $Result.Application
         'Error code' = ('{0}  {1}' -f $Result.ErrorCode, $Result.ErrorDescription).Trim()
         'Failure message' = $Result.FailureMessage
         'Root cause' = $(if ($Result.Category) { '{0} [{1}]' -f $Result.RootCause, $Result.Category } else { $Result.RootCause })
@@ -1853,7 +2019,10 @@ function Write-OsdFaultDetail {
     foreach ($k in $fields.Keys) {
         if (-not [string]::IsNullOrWhiteSpace([string]$fields[$k])) { [void]$sb.AppendLine(('{0,-19}: {1}' -f $k, $fields[$k])) }
     }
-    foreach ($list in @(@('Other failures', $Result.OtherFailures), @('Known issues', $Result.KnownIssues), @('Notes', $Result.Notes), @('Logs reviewed', $Result.LogsReviewed))) {
+    $logsWithFindings = @($Result.Evidence | ForEach-Object { $_.Log } | Select-Object -Unique)
+    $logSummary = @("$(@($Result.LogsReviewed).Count) logs reviewed (full list in the object, CSV and HTML); smsts.log and logs with evidence:")
+    $logSummary += @($Result.LogsReviewed | Where-Object { $l = $_; ($l -match '(^|/)smsts') -or @($logsWithFindings | Where-Object { $l.StartsWith("$_ (") }).Count -gt 0 })
+    foreach ($list in @(@('Failed step in smsts.log (key lines)', $Result.StepLog), @('Contributing factors', $Result.ContributingFactors), @('Other failures', $Result.OtherFailures), @('Known issues', $Result.KnownIssues), @('Notes', $Result.Notes), @('Logs', $logSummary))) {
         $items = @($list[1])
         if ($items.Count -eq 0) { continue }
         [void]$sb.AppendLine("$($list[0]):")
