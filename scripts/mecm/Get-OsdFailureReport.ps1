@@ -174,7 +174,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.4.0'
 
 # Run options read by the helper functions, captured once so their inputs are explicit.
 $script:Options = @{
@@ -469,7 +469,13 @@ $script:SignatureDefinitions = @(
         Title = 'BITS reported no active network connection - download stalled'
         Pattern = '0x80200010|There are currently no active network connections'
         Cause = 'BITS (which the ConfigMgr client uses to download application CI documents and content) put the download on hold with BG_E_NETWORK_DISCONNECTED: Windows did not consider the network connected, although the task sequence''s own HTTP traffic to the MP was working. BITS waits for Windows to report the network connected again; that did not happen before the step''s 3 x 5 minute evaluation retries ran out. The installer never ran.'
-        Action = 'Look at how soon after a restart the step ran (see detail). If it is the first Install Application step after a restart, add a step before it that waits until Windows reports the network connected (e.g. Get-NetConnectionProfile shows IPv4Connectivity other than NoTraffic/Disconnected, or the profile is DomainAuthenticated), and check what delays it after a reboot on the build network (802.1X/NAC re-authentication, NLA/NCSI probing). Re-running the build usually succeeds.'
+        Action = 'Look at how soon after a restart the step ran (see detail). Before Install Application steps that follow a restart, add a step that waits until Windows reports the network connected (scripts/mecm/Wait-OsdNetworkConnected.ps1 does this and logs the network state if it never connects), and find what leaves Windows reporting no connection after a reboot on the build network (802.1X/NAC re-authentication, VPN/filter drivers installed earlier in the build, NLA/NCSI). Re-running the build usually succeeds.'
+    }
+    @{ Id = 'NLM_DISCONNECTED'; StepHint = 'install|application|download|package'; Category = 'Network'; Weight = 70; Files = 'ccmexec'
+        Title = 'Windows reported the network as not connected'
+        Pattern = 'Connected to Network: FALSE'
+        Cause = 'Windows Network List Manager (the connectivity state BITS and the ConfigMgr client rely on) reported no network connection, even though task sequence traffic to the MP may still have been working.'
+        Action = 'On an affected device after a restart, compare Get-NetConnectionProfile (IPv4Connectivity) and the NetworkProfile/NCSI event logs with real reachability; look for what changes the network state after boot (802.1X re-authentication, VPN/filter drivers installed earlier in the build).'
     }
     @{ Id = 'BITS_ERROR'; StepHint = 'install|application|download|package'; Category = 'Network'; Weight = 80; Files = 'datatransferservice|filebits'
         Explains = @('APP_POLICY_EVAL', 'CI_DOWNLOAD', 'CONTENT_DOWNLOAD')
@@ -1293,6 +1299,10 @@ function Invoke-BundleAnalysis {
                     $gapText = if ($gap.TotalMinutes -lt 2) { "$([Math]::Round($gap.TotalSeconds)) seconds" } else { "$([Math]::Round($gap.TotalMinutes, 1)) minutes" }
                     [void]$parts.Add("The failing step started $gapText after the task sequence restarted the computer (restart step at $($before[$before.Count - 1].ToString('HH:mm:ss')))")
                 }
+            }
+            if ($root.Signature.Id -eq 'BITS_NETWORK_DISCONNECTED') {
+                $nlm = @($findings | Where-Object { $_.Signature.Id -eq 'NLM_DISCONNECTED' -and $null -ne $_.Time -and $null -ne $root.Time -and $_.Time -le $root.Time -and $_.Time -ge $root.Time.AddMinutes(-30) } | Sort-Object Time)
+                if ($nlm.Count -gt 0) { [void]$parts.Add("Windows itself reported 'Connected to Network: FALSE' at $($nlm[$nlm.Count - 1].Time.ToString('HH:mm:ss')) (CcmExec.log), before BITS gave up") }
             }
             if ($null -ne $verdict.Symptom) { [void]$parts.Add("Symptom in smsts.log: $($verdict.Symptom.Signature.Title)") }
             $rootDetail = $parts.ToArray() -join ' | '

@@ -35,6 +35,7 @@ $targets = @(
     Join-Path $repoRoot 'scripts/firmware/Invoke-AutoDeployFirmwareBatchPreAuth.ps1'
     Join-Path $repoRoot 'scripts/intersight/Test-IntersightApiKey.ps1'
     Join-Path $repoRoot 'scripts/mecm/Get-OsdFailureReport.ps1'
+    Join-Path $repoRoot 'scripts/mecm/Wait-OsdNetworkConnected.ps1'
     Join-Path $repoRoot 'tools/Save-RichoModuleBundle.ps1'
 )
 

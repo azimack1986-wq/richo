@@ -347,9 +347,13 @@ $dts = @(
     (& $tsl $r0.AddSeconds(94) $bitsError 0 'DataTransferService')
 )
 $ciAgent = @((& $tsl $r0.AddSeconds(85) 'GetLoggedOnUserToken returning failure with Win32 error code=1008' 3 'CIAgent'))
+$ccmExec = @(
+    (& $tsl $r0.AddSeconds(60) 'Connected to Network: TRUE ' 1 'CcmExec')
+    (& $tsl $r0.AddSeconds(91) 'Connected to Network: FALSE ' 1 'CcmExec')
+)
 $ciDl = @((& $tsl $r0.AddSeconds(86) 'DeleteInstanceFromLantern failed (0x80041002).' 3 'CIDownloader'))
 New-Bundle 'BITSTEST0001.2026-11-10_001748.zip' @{
-    'smsts.log' = $smsts; 'DataTransferService.log' = $dts; 'CIAgent.log' = $ciAgent; 'CIDownloader.log' = $ciDl
+    'smsts.log' = $smsts; 'DataTransferService.log' = $dts; 'CIAgent.log' = $ciAgent; 'CIDownloader.log' = $ciDl; 'CcmExec.log' = $ccmExec
 } $now.AddHours(-30)
 
 # =====================================================================================================
@@ -439,6 +443,7 @@ Assert-That 'BITS error-routine log copy failure is passed over' ($r.FailedStep 
 Assert-That 'BITS DNS errors just after the restart are not contributing' (@($r.ContributingFactors | Where-Object { $_ -like 'DNS*' }).Count -eq 0) ($r.ContributingFactors -join ' | ')
 Assert-That 'BITS DNS errors just after the restart are labelled normal' (@($r.KnownIssues | Where-Object { $_ -like 'DNS resolution failure*just after a restart*' }).Count -eq 1) ($r.KnownIssues -join ' | ')
 Assert-That 'BITS CIAgent 1008 and Lantern 0x80041002 housekeeping is ignored' (@($r.KnownIssues | Where-Object { $_ -like 'Configuration item*' }).Count -eq 0) ($r.KnownIssues -join ' | ')
+Assert-That 'BITS detail cites Windows reporting the network not connected' ($r.RootCauseDetail -match "Connected to Network: FALSE") $r.RootCauseDetail
 Assert-That 'BITS summary names symptom and cause' ($r.Summary -match 'application policy evaluation failed' -and $r.Summary -match 'likely cause: BITS reported no active network connection') $r.Summary
 
 # ---- Filters ------------------------------------------------------------------------------------------

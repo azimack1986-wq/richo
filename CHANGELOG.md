@@ -10,7 +10,40 @@ versioning is [semantic](https://semver.org/) per script.
 
 ---
 
+## Wait-OsdNetworkConnected.ps1
+
+### [1.0.0] — 2026-11-10
+
+#### Added
+
+- **Task sequence step that waits for Windows to report the network connected**, for use
+  before Install Application steps that follow a restart. It is read-only. It polls Network
+  List Manager's IsConnected, the state BITS and the ConfigMgr client use, and falls back to
+  the connection profiles' IPv4/IPv6 connectivity. It returns once the network has stayed
+  connected for `-StableSeconds`.
+- Every state change is written to the step output (so to smsts.log) with its time. On
+  timeout it writes a diagnostic snapshot (adapters, connection profiles, IP/gateway/DNS,
+  NlaSvc/netprofm/Dot3svc/BITS service state, BITS jobs), then exits 0, or exits 1 with
+  `-FailOnTimeout`.
+- Why it exists: see Get-OsdFailureReport 1.3.0 and 1.4.0. Failed builds showed Windows
+  reporting "Connected to Network: FALSE" after a restart while the network actually
+  worked, and BITS refusing to download application policy as a result.
+
+---
+
 ## Get-OsdFailureReport.ps1
+
+### [1.4.0] — 2026-11-10
+
+#### Added
+
+- **Windows network state as evidence.** New signature for CcmExec.log
+  "Connected to Network: FALSE" (Network List Manager). When the root cause is BITS
+  network-disconnected, the detail cites when Windows itself reported the network not
+  connected. In the five real bundles this happened 15 to 30 seconds before BITS gave up,
+  or from the moment the client started after the restart. Every Install Application step
+  that succeeded in those builds ran while Windows reported `TRUE`.
+- The BITS recommended action now points at `scripts/mecm/Wait-OsdNetworkConnected.ps1`.
 
 ### [1.3.0] — 2026-11-10
 
