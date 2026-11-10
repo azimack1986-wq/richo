@@ -12,6 +12,43 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Get-OsdFailureReport.ps1
 
+### [1.3.0] — 2026-11-10
+
+Tuned against five real failure bundles. All five are the same failure, and v1.2.0 named
+the step-level symptom but not its cause.
+
+#### Added
+
+- **BITS "no active network connection" (0x80200010) as a root cause.** In all five
+  bundles the client's BITS job for the failing app's CI documents was parked with
+  BG_E_NETWORK_DISCONNECTED, so "Application failed to evaluate" followed and the step
+  gave up after 3 x 5 minutes. Every other CI download in those builds completed. Also
+  added: other BITS job errors, with 0x8019xxxx decoded to the HTTP status.
+- **Root cause and symptom.** A signature can declare which step-level signatures it
+  explains. When one of those is what the failing step reported, and the explaining
+  signature was logged while that step ran, it becomes `RootCause` and the step's own
+  report becomes `Symptom`. The summary names both.
+- **How soon after a restart the failing step ran** is added to the root cause detail.
+  In the five real bundles the failing step was the first Install Application step after
+  a restart, starting 80 seconds to 9.6 minutes after it.
+- `StepType` (e.g. `InstallApplicationAction`).
+
+#### Fixed
+
+- Current builds write the step start as `Instruction name: 'X'.  Pointer: 297. Type:
+  '...'`. This was not recognised, so the failing step's block was found only by
+  fallback.
+- DNS / MP connection errors between a restart step and three minutes after the task
+  sequence resumes are normal while the network comes up. They are no longer root-cause
+  or contributing candidates; KnownIssues marks them.
+- Contributing factors are limited to the lead-up to the failing step: from ten minutes
+  before it started.
+- CIAgent/CIDownloader housekeeping errors (`GetLoggedOnUserToken ... 1008`, WMI
+  `0x80041002` on the Lantern store) are ignored. Reboot-required (3010) no longer counts
+  as a contributing factor.
+- The default `-IgnoreStepPattern` also covers log-collection steps worded like
+  "Copy - Archive Logs to Network".
+
 ### [1.2.0] — 2026-11-09
 
 First run against a real bundle (an Install Application failure) blamed a domain join that had

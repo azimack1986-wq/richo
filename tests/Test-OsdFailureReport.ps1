@@ -260,7 +260,7 @@ New-Bundle 'PC1010.zip' @{ 'smsts.log' = $smsts } $now.AddHours(-10)
 # the failure line uses the signed-decimal form; file named HOST.yyyy-MM-dd_HHmmss.zip ------------
 $t0 = $now.AddHours(-2)
 $ia = 'InstallApplication'
-$app = 'BigFix Client - 11.0.5.204 - R1'
+$app = 'Example Agent - 11.0 - R1'
 $smsts = @(
     (L $t0 '==============================[ TSBootShell.exe ]==============================' 'TSBootShell')
     (L $t0.AddMinutes(2) '==============================[ TSManager.exe ]==============================')
@@ -308,13 +308,57 @@ New-Bundle 'APTEST0001.2026-11-09_034325.zip' @{
     'CIDownloader.log' = $ciDownloader
 } $now.AddMinutes(-10) -Written @{ 'Objective_Reporting_11.log' = $refImage; 'smsts.log' = $t0.AddMinutes(108); 'netsetup.log' = $t0.AddMinutes(37); 'CIDownloader.log' = $t0.AddMinutes(80) }
 
+# ---- BITSTEST0001: modelled on five real bundles. First Install Application step after a restart:
+# BITS parks the app's CI download with 0x80200010 (no active network connection), so app policy
+# evaluation fails. Current-build instruction format; DNS errors right after the restart are
+# normal; CIAgent/CIDownloader housekeeping errors; the error routine's log-copy step also fails --
+$r0 = $now.AddHours(-34)
+$tsl = { param($at, $m, $type = 1, $comp = 'TSManager') L $at $m $comp $type '-660' }
+$ins = { param($at, $name, $type) & $tsl $at "Start executing an instruction. Instruction name: '$name'.  Pointer: 290. Type: '$type'. Disabled: 0" }
+$bitsError = "DTSJob({53D3B2A4-457F-40A3-A35C-27D60428B78E}):CDTSJob::HandleErrors - BITS Job '{DC2D5B9F-C0D8-4A15-914E-CF871C75CE2A}' under user 'S-1-5-18', ErrorCount=0, ErrorCode=0x80200010, ErrorText='BITS error: 'There are currently no active network connections. Background Intelligent Transfer Service (BITS) will try again when an adapter is connected.''"
+$smsts = @(
+    (L $r0.AddMinutes(-60) '==============================[ TSBootShell.exe ]==============================' 'TSBootShell')
+    (& $ins $r0 'Restart - System - Windows Full Operating System' 'SMS_TaskSequence_RebootAction')
+    (& $tsl $r0.AddSeconds(5) 'Rebooting the computer')
+    (& $tsl $r0.AddSeconds(50) '==============================[ TSManager.exe ]==============================')
+    (& $tsl $r0.AddSeconds(55) 'CLibSMSMessageWinHttpTransport::Send: WinHttpOpenRequest - URL: MP01.corp.example.local:80  CCM_POST /ccm_system/request')
+    (& $tsl $r0.AddSeconds(55) 'Error. Received 0x80072ee7 from WinHttpSendRequest.')
+    (& $tsl $r0.AddSeconds(55) 'unknown host (gethostbyname failed)' 3)
+    (& $tsl $r0.AddSeconds(55) 'Sending with winhttp failed; 80072ee7' 3)
+    (& $ins $r0.AddSeconds(80) 'Configure - Start BITS Service and Logging' 'SMS_TaskSequence_RunPowerShellScriptAction')
+    (& $ins $r0.AddSeconds(90) 'Install - Applications - Desktop' 'SMS_TaskSequence_InstallApplicationAction')
+    (& $tsl $r0.AddSeconds(92) "Installing application 'Example Maintenance Tool 2.4'" 1 'InstallApplication')
+    (& $tsl $r0.AddSeconds(93) 'CAppMgmtSDK::GetEvaluationState - ScopeId_1/RequiredApplication_81d5.3 Not found in CI state store. Marking CIs state as EvaluationFailed' 1 'DCMAgent')
+    (& $tsl $r0.AddSeconds(93) 'NotifyProgress received: 16 (Application failed to evaluate )' 1 'InstallApplication')
+    (& $tsl $r0.AddSeconds(393) 'Retrying: 1 attempt' 1 'InstallApplication')
+    (& $tsl $r0.AddSeconds(693) 'Retrying: 2 attempt' 1 'InstallApplication')
+    (& $tsl $r0.AddSeconds(993) 'Retrying: 3 attempt' 1 'InstallApplication')
+    (& $tsl $r0.AddSeconds(993) 'Exhausted retry attempts. Giving up. ' 3 'InstallApplication')
+    (& $tsl $r0.AddSeconds(993) "Install Dynamic application action failed to install application: 'Example Maintenance Tool 2.4'. Error Code 0x80004005" 3 'InstallApplication')
+    (& $tsl $r0.AddSeconds(994) ("Failed to run the action: Install - Applications - Desktop. `r`nError -2147467259") 3)
+    (& $ins $r0.AddSeconds(995) 'Error Routine' '')
+    (& $ins $r0.AddSeconds(996) 'Copy - Archive Logs to Network' 'SMS_TaskSequence_RunPowerShellScriptAction')
+    (& $tsl $r0.AddSeconds(998) ("Failed to run the action: Copy - Archive Logs to Network. `r`nError -2147024894") 3)
+)
+$dts = @(
+    (& $tsl $r0.AddSeconds(94) "DataTransferService: DTSJob({53D3B2A4-457F-40A3-A35C-27D60428B78E}) - Processing DTS job for user 'S-1-5-18'." 1 'DataTransferService')
+    (& $tsl $r0.AddSeconds(94) 'Added (source=.sms_dcm?Id&DocumentId=ScopeId_1/RequiredApplication_81d5/3/MANIFEST)' 1 'DataTransferService')
+    (& $tsl $r0.AddSeconds(94) "DataTransferService: DTSJob({53D3B2A4-457F-40A3-A35C-27D60428B78E}): state changing from 'PendingDownload' to state 'DownloadingData'." 1 'DataTransferService')
+    (& $tsl $r0.AddSeconds(94) $bitsError 0 'DataTransferService')
+)
+$ciAgent = @((& $tsl $r0.AddSeconds(85) 'GetLoggedOnUserToken returning failure with Win32 error code=1008' 3 'CIAgent'))
+$ciDl = @((& $tsl $r0.AddSeconds(86) 'DeleteInstanceFromLantern failed (0x80041002).' 3 'CIDownloader'))
+New-Bundle 'BITSTEST0001.2026-11-10_001748.zip' @{
+    'smsts.log' = $smsts; 'DataTransferService.log' = $dts; 'CIAgent.log' = $ciAgent; 'CIDownloader.log' = $ciDl
+} $now.AddHours(-30)
+
 # =====================================================================================================
 Write-Host "`n=== Get-OsdFailureReport.ps1 against $FixtureDirectory ===" -ForegroundColor Cyan
 $all = @(& $scriptPath -Path $FixtureDirectory 6>$null)
 $by = @{}
 foreach ($r in $all) { $by[$r.BundleName] = $r }
 
-Assert-That 'one result per bundle (12)' ($all.Count -eq 12) "got $($all.Count)"
+Assert-That 'one result per bundle (13)' ($all.Count -eq 13) "got $($all.Count)"
 
 $r = $by['PC1001_20261109-0821.zip']
 Assert-That 'PC1001 hostname from ZTIGather' ($r.Hostname -eq 'PC1001' -and $r.HostnameSource -like 'ZTIGather*') "$($r.Hostname) / $($r.HostnameSource)"
@@ -377,7 +421,7 @@ $r = $by['APTEST0001.2026-11-09_034325.zip']
 Assert-That 'APTEST hostname split at the dot in HOST.yyyy-MM-dd_HHmmss.zip' ($r.Hostname -eq 'APTEST0001' -and @($r.Notes | Where-Object { $_ -like 'Bundle file name suggests*' }).Count -eq 0) "$($r.Hostname) | $($r.Notes -join ' | ')"
 Assert-That 'APTEST failed step from the signed-decimal failure line' ($r.FailedStep -eq 'Install - Agents - Asset Management' -and $r.ErrorCode -eq '0x80004005') "$($r.FailedStep) / $($r.ErrorCode)"
 Assert-That 'APTEST root cause comes from the failing step in smsts.log' ($r.RootCause -eq 'Application policy evaluation failed (Install Application)') $r.RootCause
-Assert-That 'APTEST application named' ($r.Application -eq 'BigFix Client - 11.0.5.204 - R1' -and $r.Summary -match 'BigFix Client') "$($r.Application) | $($r.Summary)"
+Assert-That 'APTEST application named' ($r.Application -eq 'Example Agent - 11.0 - R1' -and $r.Summary -match 'Example Agent') "$($r.Application) | $($r.Summary)"
 Assert-That 'APTEST failure message filled from the step block' ($r.FailureMessage -match 'failed to install application') $r.FailureMessage
 Assert-That 'APTEST successful 0x0 NetSetup lines are not a domain join failure' (@($r.KnownIssues | Where-Object { $_ -like 'Domain join*' }).Count -eq 0) ($r.KnownIssues -join ' | ')
 Assert-That 'APTEST informational MSI "not digitally signed" is not a script failure' (@($r.KnownIssues | Where-Object { $_ -like '*script*' }).Count -eq 0) ($r.KnownIssues -join ' | ')
@@ -386,11 +430,22 @@ Assert-That 'APTEST step log shows the retries and give-up' (@($r.StepLog | Wher
 Assert-That 'APTEST benign CCMGetGlobalService and TS-env noise kept out' (@($r.StepLog | Where-Object { $_ -match 'CCMGetGlobalService' }).Count -eq 0 -and @($r.Evidence | Where-Object { $_.Text -match 'environment is not initialized' }).Count -eq 0) ''
 Assert-That 'APTEST "ContinueOnErrorFlag is set to false" does not mark the failure as continued' (@($r.OtherFailures).Count -eq 0) ($r.OtherFailures -join ' | ')
 
+$r = $by['BITSTEST0001.2026-11-10_001748.zip']
+Assert-That 'BITS root cause: BITS network disconnected found during the failing step' ($r.RootCause -eq 'BITS reported no active network connection - download stalled') $r.RootCause
+Assert-That 'BITS symptom: the step-level app policy evaluation failure' ($r.Symptom -eq 'Application policy evaluation failed (Install Application)') $r.Symptom
+Assert-That 'BITS current-build instruction format: step and type parsed' ($r.FailedStep -eq 'Install - Applications - Desktop' -and $r.StepType -eq 'InstallApplicationAction') "$($r.FailedStep) [$($r.StepType)]"
+Assert-That 'BITS detail says how soon after a restart the step ran' ($r.RootCauseDetail -match '90 seconds after the task sequence restarted') $r.RootCauseDetail
+Assert-That 'BITS error-routine log copy failure is passed over' ($r.FailedStep -notmatch 'Archive' -and @($r.OtherFailures | Where-Object { $_ -like 'Copy - Archive Logs*ignored*' }).Count -eq 1) ($r.OtherFailures -join ' | ')
+Assert-That 'BITS DNS errors just after the restart are not contributing' (@($r.ContributingFactors | Where-Object { $_ -like 'DNS*' }).Count -eq 0) ($r.ContributingFactors -join ' | ')
+Assert-That 'BITS DNS errors just after the restart are labelled normal' (@($r.KnownIssues | Where-Object { $_ -like 'DNS resolution failure*just after a restart*' }).Count -eq 1) ($r.KnownIssues -join ' | ')
+Assert-That 'BITS CIAgent 1008 and Lantern 0x80041002 housekeeping is ignored' (@($r.KnownIssues | Where-Object { $_ -like 'Configuration item*' }).Count -eq 0) ($r.KnownIssues -join ' | ')
+Assert-That 'BITS summary names symptom and cause' ($r.Summary -match 'application policy evaluation failed' -and $r.Summary -match 'likely cause: BITS reported no active network connection') $r.Summary
+
 # ---- Filters ------------------------------------------------------------------------------------------
 $h24 = @(& $scriptPath -Path $FixtureDirectory -LastHours 24 6>$null)
 Assert-That '-LastHours 24 excludes the 30 h and 50 h bundles' ($h24.Count -eq 10 -and -not ($h24.BundleName -contains 'PC1004_20261108.zip')) "got $($h24.Count)"
 $h48 = @(& $scriptPath -Path $FixtureDirectory -LastHours 48 6>$null)
-Assert-That '-LastHours 48 includes the 30 h bundle only' ($h48.Count -eq 11) "got $($h48.Count)"
+Assert-That '-LastHours 48 includes the 30 h bundles only' ($h48.Count -eq 12) "got $($h48.Count)"
 $since = @(& $scriptPath -Path $FixtureDirectory -Since $now.AddHours(-2.5) 6>$null)
 Assert-That '-Since' ($since.Count -eq 5) "got $($since.Count): $($since.BundleName -join ', ')"
 $one = @(& $scriptPath -Path $FixtureDirectory -ComputerName PC1003 6>$null)
@@ -409,7 +464,7 @@ $missing = @(@('PC1001', 'PC1002', 'PC1003', 'PC1009') | Where-Object { $html -n
 Assert-That 'html report lists every device' ($missing.Count -eq 0) ($missing -join ', ')
 Assert-That 'html report never contains the unattend password' ($html -notmatch 'Sup3rS3cret') ''
 $csv = @(Import-Csv (Get-ChildItem $out -Filter *-summary.csv).FullName)
-Assert-That 'summary csv has a row per bundle' ($csv.Count -eq 12) "got $($csv.Count)"
+Assert-That 'summary csv has a row per bundle' ($csv.Count -eq 13) "got $($csv.Count)"
 
 # ---- Read-only ---------------------------------------------------------------------------------------
 $before = @(Get-ChildItem $FixtureDirectory -File | ForEach-Object { '{0}|{1}|{2}' -f $_.Name, $_.Length, $_.LastWriteTimeUtc.Ticks })

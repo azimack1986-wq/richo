@@ -155,7 +155,7 @@ param(
 
     [string]$HostnamePattern = '^(?<Host>.+?)(?=[_ .]|-\d{6,}|$)',
 
-    [string]$IgnoreStepPattern = '(?i)force[ds]?\s*-?\s*fail|fail(ing)?\s+(the\s+)?(task\s*sequence|ts|build)|(copy|capture|gather|collect|zip|upload|save)\s*(the\s*)?(smsts\s*)?logs?\b|^exit\b',
+    [string]$IgnoreStepPattern = '(?i)force[ds]?\s*-?\s*fail|fail(ing)?\s+(the\s+)?(task\s*sequence|ts|build)|(copy|capture|gather|collect|zip|upload|save|archive)\b[^\r\n]*?\blogs?\b|^exit\b',
 
     [ValidateRange(1, 4096)]
     [int]$MaxLogSizeMB = 100,
@@ -174,7 +174,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.2.0'
+$ScriptVersion = '1.3.0'
 
 # Run options read by the helper functions, captured once so their inputs are explicit.
 $script:Options = @{
@@ -294,6 +294,9 @@ $script:DomainJoinCodes = @{
 #             "Error") count - for patterns that also turn up in harmless information lines.
 #   Exclude   optional regex; a matching line is ignored (e.g. a status of 0x0 means success).
 #   StepHint  optional regex on the failed step's name; a match makes this cause more likely.
+#   Explains  signature IDs this one is the underlying cause of. When the step-level symptom is one
+#             of them and this signature is found during the failing step, this one is reported as
+#             the root cause and the step-level signature as the symptom.
 $script:SignatureDefinitions = @(
     # ---- Content / distribution -------------------------------------------------------------
     @{ Id = 'CONTENT_NOT_ON_DP'; StepHint = 'download|package|driver|apply|install'; Category = 'Content'; Weight = 90; Files = '.'
@@ -458,9 +461,30 @@ $script:SignatureDefinitions = @(
         Cause = 'The client never finished evaluating the application''s policy ("Application failed to evaluate" / CI not found in the CI state store), so the Install Application step waited, retried and gave up. The installer itself never ran. Usual causes: the client could not download or compile the application''s policy (MP/DNS reachability, CIDownloader errors), the current application/deployment type revision is not available to the client, or the application or one of its dependencies does not allow installation from the Install Application task sequence action.'
         Action = 'Check the contributing factors and CIDownloader.log/DCMAgent.log/CIAgent.log for this application around the step time; confirm the application and every dependency have "Allow this application to be installed from the Install Application task sequence action without being deployed" ticked and the current revision''s content is on a DP in the boundary group.'
     }
-    @{ Id = 'CI_DOWNLOAD'; StepHint = 'install|application'; Category = 'Applications'; Weight = 65; Files = 'cidownloader|ciagent'; ErrorOnly = $true
+    @{ Id = 'BITS_NETWORK_DISCONNECTED'; StepHint = 'install|application|download|package'; Category = 'Network'; Weight = 95
+        Files = 'datatransferservice|filebits|ciagent|cidownloader|contenttransfer|cas|smsts'
+        # The CI/content download job is parked by BITS, so whatever needed it fails: the
+        # application policy evaluation, a content download, or a CI download.
+        Explains = @('APP_POLICY_EVAL', 'CI_DOWNLOAD', 'CONTENT_DOWNLOAD', 'APP_INSTALL', 'TIMEOUT')
+        Title = 'BITS reported no active network connection - download stalled'
+        Pattern = '0x80200010|There are currently no active network connections'
+        Cause = 'BITS (which the ConfigMgr client uses to download application CI documents and content) put the download on hold with BG_E_NETWORK_DISCONNECTED: Windows did not consider the network connected, although the task sequence''s own HTTP traffic to the MP was working. BITS waits for Windows to report the network connected again; that did not happen before the step''s 3 x 5 minute evaluation retries ran out. The installer never ran.'
+        Action = 'Look at how soon after a restart the step ran (see detail). If it is the first Install Application step after a restart, add a step before it that waits until Windows reports the network connected (e.g. Get-NetConnectionProfile shows IPv4Connectivity other than NoTraffic/Disconnected, or the profile is DomainAuthenticated), and check what delays it after a reboot on the build network (802.1X/NAC re-authentication, NLA/NCSI probing). Re-running the build usually succeeds.'
+    }
+    @{ Id = 'BITS_ERROR'; StepHint = 'install|application|download|package'; Category = 'Network'; Weight = 80; Files = 'datatransferservice|filebits'
+        Explains = @('APP_POLICY_EVAL', 'CI_DOWNLOAD', 'CONTENT_DOWNLOAD')
+        Title = 'BITS download job error'
+        Pattern = 'HandleErrors[^\r\n]*ErrorCode=(?<BitsCode>0x8[0-9a-f]{7})'
+        Exclude = '0x80200010'
+        Cause = 'A BITS job carrying ConfigMgr policy or content failed; the code says why (0x8019xxxx = the HTTP status returned by the MP/DP).'
+        Action = 'Decode the BitsCode (e.g. 0x80190194 = HTTP 404 not found, 0x80190193 = 403 forbidden, 0x80190191 = 401 unauthorised) and check the MP/DP IIS logs for the request.'
+    }
+    @{ Id = 'CI_DOWNLOAD'; StepHint = 'install|application'; Category = 'Applications'; Weight = 50; Files = 'cidownloader|ciagent'; ErrorOnly = $true
         Title = 'Configuration item (policy) download errors'
         Pattern = 'fail|error'
+        # Routine client noise: WMI "not found" (0x80041002) on the Lantern store, and no logged-on
+        # user token (1008) - nobody is logged on during OSD.
+        Exclude = '0x80041002|GetLoggedOnUserToken'
         Cause = 'The client logged errors downloading or processing configuration items (application/compliance policy).'
         Action = 'Read the CIDownloader.log/CIAgent.log evidence for the CI and the error; check MP reachability.'
     }
@@ -488,7 +512,8 @@ $script:SignatureDefinitions = @(
         Cause = 'An MSI-based installer failed; 1603 is generic.'
         Action = 'Read the installer''s verbose log for "Return value 3".'
     }
-    @{ Id = 'REBOOT_REQUIRED'; Category = 'Applications'; Weight = 45; Files = '.'
+    # Usually informational: deployment types commonly map 3010 to a soft reboot.
+    @{ Id = 'REBOOT_REQUIRED'; Category = 'Applications'; Weight = 30; Files = '.'
         Title = 'Step returned reboot-required (3010)'
         Pattern = '0x80070bc2|exit code 3010\b'
         Cause = 'An installer asked for a reboot that the step was not configured to allow.'
@@ -569,6 +594,7 @@ $script:Signatures = foreach ($def in $script:SignatureDefinitions) {
         Action = $def.Action
         ErrorOnly = ($def.ContainsKey('ErrorOnly') -and $def.ErrorOnly)
         ContextBefore = $(if ($def.ContainsKey('ContextBefore')) { [int]$def.ContextBefore } else { 0 })
+        Explains = $(if ($def.ContainsKey('Explains')) { @($def.Explains) } else { @() })
         StepHint = $(if ($def.ContainsKey('StepHint')) { New-Object Text.RegularExpressions.Regex($def.StepHint, $opts) } else { $null })
         Files = New-Object Text.RegularExpressions.Regex($def.Files, $opts)
         Regex = New-Object Text.RegularExpressions.Regex($def.Pattern, $opts)
@@ -1018,9 +1044,12 @@ $script:RxEngineFail = New-Object Text.RegularExpressions.Regex(
 $script:RxTsFail = New-Object Text.RegularExpressions.Regex(
     'Task Sequence Engine failed!?\s*Code:\s*(?<code>\w+)|Execution of task sequence failed|Task sequence execution failed with error code (?<code>\w+)',
     'IgnoreCase')
+# Two forms: "Instruction name: 'X'.  Pointer: 297. Type: 'SMS_TaskSequence_...'. Disabled: 0"
+# (current builds) and "Instruction name: X. Instruction pointer: 12" (older).
 $script:RxInstruction = New-Object Text.RegularExpressions.Regex(
-    'Start executing an instruction\. Instruction name: (?<step>[^\r\n]+?)\. Instruction pointer|Running action: (?<step>[^\r\n]+)',
+    'Start executing an instruction\. Instruction name: (?:''(?<step>[^'']+)''\.\s+Pointer: \d+\.(?:\s+Type: ''(?<type>[^'']*)'')?|(?<step>[^\r\n]+?)\. Instruction pointer)|Running action: (?<step>[^\r\n]+)',
     'IgnoreCase')
+$script:RxRebootStep = New-Object Text.RegularExpressions.Regex('RebootAction|^(restart|reboot)\b|\b(restart|reboot) (computer|system)', 'IgnoreCase')
 $script:RxExitCode = New-Object Text.RegularExpressions.Regex('Process completed with exit code (?<code>-?\d+)', 'IgnoreCase')
 # "ContinueOnErrorFlag is set to false" must NOT count, so only an affirmative form matches.
 $script:RxContinue = New-Object Text.RegularExpressions.Regex('continue ?on ?error(flag)?\s*(is\s*)?(set\s*)?(to\s*)?(true|enabled)|continue on error is set|ignor(e|ing) (the )?(error|failure)|failure is ignored', 'IgnoreCase')
@@ -1254,6 +1283,18 @@ function Invoke-BundleAnalysis {
                     if ($d) { [void]$parts.Add("Exit code $($ec.Display): $d") }
                 }
             }
+            if ($root.Signature.Id -eq 'BITS_ERROR' -and $root.Detail.Contains('BitsCode') -and $root.Detail['BitsCode'] -match '^0x8019(?<http>[0-9a-f]{4})$') {
+                [void]$parts.Add("HTTP status $([Convert]::ToInt32($Matches['http'], 16)) from the server")
+            }
+            if ($null -ne $tl.StepStart -and @($tl.RebootTimes).Count -gt 0) {
+                $before = @($tl.RebootTimes | Where-Object { $_ -le $tl.StepStart } | Sort-Object)
+                if ($before.Count -gt 0) {
+                    $gap = $tl.StepStart - $before[$before.Count - 1]
+                    $gapText = if ($gap.TotalMinutes -lt 2) { "$([Math]::Round($gap.TotalSeconds)) seconds" } else { "$([Math]::Round($gap.TotalMinutes, 1)) minutes" }
+                    [void]$parts.Add("The failing step started $gapText after the task sequence restarted the computer (restart step at $($before[$before.Count - 1].ToString('HH:mm:ss')))")
+                }
+            }
+            if ($null -ne $verdict.Symptom) { [void]$parts.Add("Symptom in smsts.log: $($verdict.Symptom.Signature.Title)") }
             $rootDetail = $parts.ToArray() -join ' | '
         }
         elseif ($codeDesc) {
@@ -1280,7 +1321,10 @@ function Invoke-BundleAnalysis {
             if ($codeDesc) { $s += " ($($codeDesc.Split('-')[0].Trim().TrimEnd('.')))" }
             [void]$summary.Add($s)
         }
-        if ($rootTitle -and $null -ne $root) { [void]$summary.Add("- likely cause: $rootTitle") }
+        if ($rootTitle -and $null -ne $root) {
+            if ($null -ne $verdict.Symptom) { [void]$summary.Add("- $($verdict.Symptom.Signature.Title.ToLowerInvariant()); likely cause: $rootTitle") }
+            else { [void]$summary.Add("- likely cause: $rootTitle") }
+        }
         $summaryText = ($summary.ToArray() -join ' ').Trim() + '.'
 
         # ---- Evidence -------------------------------------------------------------------------------
@@ -1302,16 +1346,19 @@ function Invoke-BundleAnalysis {
         $known = @($findings | Group-Object { $_.Signature.Id } | ForEach-Object {
                 $first = $_.Group[0]
                 $inWindow = @($_.Group | Where-Object { Test-InBuildWindow -Finding $_ -Timeline $tl }).Count
+                $afterRestart = @($_.Group | Where-Object { Test-PostRebootNoise -Finding $_ -Timeline $tl }).Count
                 $suffix = ''
                 if ($inWindow -eq 0) { $suffix = ' (outside this build - older run or reference image logs)' }
                 elseif ($inWindow -lt $_.Count) { $suffix = " ($($_.Count - $inWindow) outside this build)" }
+                if ($afterRestart -gt 0) { $suffix += " ($afterRestart just after a restart - normal while the network comes up)" }
                 '{0} [{1}] x{2}{3}' -f $first.Signature.Title, $first.Signature.Category, $_.Count, $suffix
             })
 
         return ConvertTo-OsdReportObject -File $File -Status $status -FileHost $fileHost -Hostname $hostname -HostnameSource $hostSource `
             -Timeline $tl -ErrorCode $codeText -ErrorDescription $codeDesc -Summary $summaryText -RootCause $rootTitle `
             -Category $category -RootCauseDetail $rootDetail -Action $action -KnownIssues $known -Evidence $evidence.ToArray() `
-            -Inventory $inventory.ToArray() -Notes $notes.ToArray() -Device $device -Contributing $verdict.Contributing
+            -Inventory $inventory.ToArray() -Notes $notes.ToArray() -Device $device -Contributing $verdict.Contributing `
+            -Symptom $(if ($null -ne $verdict.Symptom) { $verdict.Symptom.Signature.Title } else { '' })
     }
     finally {
         if ($null -ne $zip) { $zip.Dispose() }
@@ -1348,7 +1395,7 @@ function Get-TaskSequenceTimeline {
         Start = $null; End = $null; Duration = $null; StartConfidence = ''
         FailedStep = ''; Group = ''; ErrorCode = ''; ErrorSource = ''; FailureDetail = ''
         FailureRecord = $null; ErrorsBefore = @(); OtherFailures = @()
-        StepStart = $null; Application = ''; StepLog = @()
+        StepStart = $null; Application = ''; StepLog = @(); StepType = ''; RebootTimes = @(); RebootWindows = @()
     }
     if ($null -eq $Records -or $Records.Count -eq 0) { return [pscustomobject]$result }
 
@@ -1527,13 +1574,42 @@ function Get-TaskSequenceTimeline {
     for ($i = $failIdx; $i -ge [Math]::Max($runStart, $failIdx - 20000); $i--) {
         $m = $script:RxInstruction.Match($sorted[$i].Message)
         if ($m.Success) {
-            if (-not $result.FailedStep -or $m.Groups['step'].Value.Trim() -eq $result.FailedStep) { $stepStart = $i; break }
+            if (-not $result.FailedStep -or $m.Groups['step'].Value.Trim() -eq $result.FailedStep) {
+                $stepStart = $i
+                if ($m.Groups['type'].Success) { $result.StepType = $m.Groups['type'].Value -replace '^SMS_TaskSequence_', '' }
+                break
+            }
             if ($stepStart -lt 0) { $stepStart = -2 - $i }   # remember the nearest instruction of any name
         }
     }
     if ($stepStart -lt -1) { $stepStart = -2 - $stepStart }
     if ($stepStart -lt 0) { $stepStart = [Math]::Max($runStart, $failIdx - 300) }
     $result.StepStart = $sorted[$stepStart].Time
+
+    # When the task sequence restarted the computer. Network errors in the first minutes after a
+    # restart are normal while the network comes up, and how soon after a restart the failing step
+    # ran is often the clue.
+    $reboots = New-Object System.Collections.Generic.List[datetime]
+    $windows = New-Object System.Collections.Generic.List[object]
+    for ($i = $runStart; $i -le $failIdx; $i++) {
+        $m = $script:RxInstruction.Match($sorted[$i].Message)
+        if (-not $m.Success -or $sorted[$i].Message -match 'Disabled: 1') { continue }
+        $label = $m.Groups['step'].Value + ' ' + $m.Groups['type'].Value
+        if ($script:RxRebootStep.IsMatch($m.Groups['type'].Value) -or $script:RxRebootStep.IsMatch($m.Groups['step'].Value.Trim()) -or $label -match '(?i)RebootAction') {
+            if ($null -eq $sorted[$i].Time) { continue }
+            $reboots.Add($sorted[$i].Time)
+            # The task sequence resumes at the first entry after a gap of 20 s or more (the machine
+            # was down). Firmware updates can make that many minutes after the restart step.
+            $resume = $sorted[$i].Time
+            for ($j = $i + 1; $j -le [Math]::Min($failIdx, $i + 5000); $j++) {
+                if ($null -eq $sorted[$j].Time -or $null -eq $sorted[$j - 1].Time) { continue }
+                if (($sorted[$j].Time - $sorted[$j - 1].Time).TotalSeconds -ge 20) { $resume = $sorted[$j].Time; break }
+            }
+            $windows.Add([pscustomobject]@{ Restart = $sorted[$i].Time; Settled = $resume.AddMinutes(3) })
+        }
+    }
+    $result.RebootTimes = $reboots.ToArray()
+    $result.RebootWindows = $windows.ToArray()
     $block = @($sorted[$stepStart..$failIdx])
 
     foreach ($r in $block) {
@@ -1590,6 +1666,45 @@ function Test-InBuildWindow {
     return $true
 }
 
+function Test-PostRebootNoise {
+    <#
+    .SYNOPSIS
+        True for a name-resolution / MP connection error between a restart step and three minutes
+        after the task sequence resumed, when such errors are expected while the network comes up.
+    .PARAMETER Finding
+        A finding from Find-LogSignature.
+    .PARAMETER Timeline
+        Output of Get-TaskSequenceTimeline.
+    .EXAMPLE
+        Test-PostRebootNoise -Finding $f -Timeline $tl
+    #>
+    param($Finding, $Timeline)
+    if ($Finding.Signature.Id -notin @('DNS', 'MP_UNREACHABLE')) { return $false }
+    if ($null -eq $Finding.Time -or $null -eq $Timeline -or $null -eq $Timeline.RebootWindows) { return $false }
+    foreach ($w in $Timeline.RebootWindows) {
+        if ($Finding.Time -ge $w.Restart -and $Finding.Time -le $w.Settled) { return $true }
+    }
+    return $false
+}
+
+function Test-InStepWindow {
+    <#
+    .SYNOPSIS
+        True when a finding happened while the failing step was running.
+    .PARAMETER Finding
+        A finding from Find-LogSignature.
+    .PARAMETER Timeline
+        Output of Get-TaskSequenceTimeline.
+    .EXAMPLE
+        Test-InStepWindow -Finding $f -Timeline $tl
+    #>
+    param($Finding, $Timeline)
+    if ($null -eq $Timeline -or $null -eq $Timeline.StepStart -or $null -eq $Timeline.End) { return $false }
+    if ($null -ne $Finding.Time) { return ($Finding.Time -ge $Timeline.StepStart.AddMinutes(-2) -and $Finding.Time -le $Timeline.End.AddMinutes(1)) }
+    if ($null -ne $Finding.FileWritten) { return ($Finding.FileWritten -ge $Timeline.StepStart.AddMinutes(-2)) }
+    return $false
+}
+
 function Select-RootCause {
     <#
     .SYNOPSIS
@@ -1605,11 +1720,12 @@ function Select-RootCause {
         Select-RootCause -Findings $findings -Timeline $tl
     #>
     param($Findings, $Timeline)
-    $empty = [pscustomobject]@{ Primary = $null; Ranked = @(); Contributing = @() }
+    $empty = [pscustomobject]@{ Primary = $null; Symptom = $null; Ranked = @(); Contributing = @() }
     if ($null -eq $Findings -or $Findings.Count -eq 0) { return $empty }
 
-    # Only findings from this build can be the cause. Older ones stay in KnownIssues, marked.
-    $candidates = @($Findings | Where-Object { Test-InBuildWindow -Finding $_ -Timeline $Timeline })
+    # Only findings from this build can be the cause, and not the network errors every restart
+    # produces. Both stay in KnownIssues, marked.
+    $candidates = @($Findings | Where-Object { (Test-InBuildWindow -Finding $_ -Timeline $Timeline) -and -not (Test-PostRebootNoise -Finding $_ -Timeline $Timeline) })
     if ($candidates.Count -eq 0) { return $empty }
 
     $isSmsts = { param($f) ($f.Log -replace '^.*/', '') -match '^smsts' }
@@ -1633,24 +1749,30 @@ function Select-RootCause {
     }
     $ordered = @($scored | Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { $_.Finding.Line } })
 
-    # Evidence: the top three signatures, up to three lines each.
+    # The best-scoring finding is what the failing step itself reported. If another finding,
+    # logged while that step ran, is a known underlying cause of it, that one is the root cause
+    # and the step's own report is the symptom.
+    $primary = $ordered[0].Finding
+    $symptom = $null
+    $explainer = @($ordered | Where-Object { $_.Finding.Signature.Explains -contains $primary.Signature.Id -and (Test-InStepWindow -Finding $_.Finding -Timeline $Timeline) } | Select-Object -First 1)
+    if ($explainer.Count -gt 0) { $symptom = $primary; $primary = $explainer[0].Finding }
+
+    # Evidence: root cause first, then the symptom, then the next best; up to three lines each.
+    $idOrder = New-Object System.Collections.Generic.List[string]
+    $idOrder.Add($primary.Signature.Id)
+    if ($null -ne $symptom) { $idOrder.Add($symptom.Signature.Id) }
+    foreach ($s in $ordered) { if (-not $idOrder.Contains($s.Finding.Signature.Id) -and $idOrder.Count -lt 4) { $idOrder.Add($s.Finding.Signature.Id) } }
     $ranked = New-Object System.Collections.Generic.List[object]
-    $taken = @{}
-    foreach ($s in $ordered) {
-        $id = $s.Finding.Signature.Id
-        if (-not $taken.ContainsKey($id)) {
-            if ($taken.Count -ge 3) { continue }
-            $taken[$id] = 0
-        }
-        if ($taken[$id] -ge 3) { continue }
-        $taken[$id]++
-        $ranked.Add($s.Finding)
+    foreach ($id in $idOrder) {
+        foreach ($s in @($ordered | Where-Object { $_.Finding.Signature.Id -eq $id } | Select-Object -First 3)) { $ranked.Add($s.Finding) }
     }
 
-    # Contributing factors: other signatures from this build, outside the failing step, within two
-    # hours before the failure.
+    # Contributing factors: other signatures from this build, outside the failing step's own smsts.log
+    # block, from ten minutes before the step started to the failure. Older errors that the build
+    # got past are not reported as contributing.
     $contributing = New-Object System.Collections.Generic.List[string]
-    $seenIds = @{ $ordered[0].Finding.Signature.Id = $true }
+    $seenIds = @{ $primary.Signature.Id = $true }
+    if ($null -ne $symptom) { $seenIds[$symptom.Signature.Id] = $true }
     foreach ($s in $ordered) {
         $f = $s.Finding
         if ($seenIds.ContainsKey($f.Signature.Id) -or $f.Signature.Weight -lt 40) { continue }
@@ -1660,7 +1782,9 @@ function Select-RootCause {
         $when = ''
         if ($null -ne $f.Time -and $null -ne $Timeline.End) {
             $mins = [Math]::Round(($Timeline.End - $f.Time).TotalMinutes)
-            if ($mins -gt 120) { continue }
+            $leadUp = $Timeline.End.AddMinutes(-120)
+            if ($null -ne $Timeline.StepStart) { $leadUp = $Timeline.StepStart.AddMinutes(-10) }
+            if ($f.Time -lt $leadUp) { continue }
             $when = " at $($f.Time.ToString('HH:mm:ss'))"
             if ($mins -gt 0) { $when += " ($mins min before the failure)" }
         }
@@ -1668,7 +1792,7 @@ function Select-RootCause {
         $contributing.Add(('{0} - {1}:{2}{3}: {4}' -f $f.Signature.Title, ($f.Log -replace '^.*/', ''), $f.Line, $when, (Protect-LogText $f.Text 160)))
         if ($contributing.Count -ge 4) { break }
     }
-    return [pscustomobject]@{ Primary = $ordered[0].Finding; Ranked = $ranked.ToArray(); Contributing = $contributing.ToArray() }
+    return [pscustomobject]@{ Primary = $primary; Symptom = $symptom; Ranked = $ranked.ToArray(); Contributing = $contributing.ToArray() }
 }
 
 function ConvertTo-EvidenceLine {
@@ -1736,6 +1860,8 @@ function ConvertTo-OsdReportObject {
         Make/Model/SerialNumber hashtable.
     .PARAMETER Contributing
         Other signatures from this build shortly before the failure.
+    .PARAMETER Symptom
+        What the failing step itself reported, when a deeper root cause was found.
     .EXAMPLE
         ConvertTo-OsdReportObject -File $f -Status Unreadable
     #>
@@ -1745,7 +1871,8 @@ function ConvertTo-OsdReportObject {
         [string]$RootCause = '', [string]$Category = '', [string]$RootCauseDetail = '', [string]$Action = '',
         [string[]]$KnownIssues = @(), [object[]]$Evidence = @(), [string[]]$Inventory = @(), [string[]]$Notes = @(),
         [hashtable]$Device = @{ Make = ''; Model = ''; SerialNumber = '' },
-        [string[]]$Contributing = @()
+        [string[]]$Contributing = @(),
+        [string]$Symptom = ''
     )
     if (-not $Hostname -and $FileHost) { $Hostname = $FileHost.ToUpperInvariant(); $HostnameSource = 'Bundle file name' }
     if (-not $Summary) {
@@ -1756,13 +1883,14 @@ function ConvertTo-OsdReportObject {
         }
     }
     $start = $null; $end = $null; $duration = ''; $durationMin = $null; $conf = ''; $step = ''; $group = ''; $src = ''; $detail = ''
-    $others = @(); $app = ''; $stepLog = @()
+    $others = @(); $app = ''; $stepLog = @(); $stepType = ''
     if ($null -ne $Timeline) {
         $start = $Timeline.Start; $end = $Timeline.End; $conf = $Timeline.StartConfidence
         $step = $Timeline.FailedStep; $group = $Timeline.Group; $src = $Timeline.ErrorSource; $detail = Protect-LogText $Timeline.FailureDetail
         $others = @($Timeline.OtherFailures)
         $app = $Timeline.Application
         $stepLog = @($Timeline.StepLog)
+        $stepType = $Timeline.StepType
         if ($null -ne $Timeline.Duration) {
             $d = $Timeline.Duration
             $sign = ''
@@ -1778,6 +1906,7 @@ function ConvertTo-OsdReportObject {
         Summary = $Summary
         FailedStep = $step
         FailedGroup = $group
+        StepType = $stepType
         Application = $app
         ErrorCode = $ErrorCode
         ErrorDescription = $ErrorDescription
@@ -1785,6 +1914,7 @@ function ConvertTo-OsdReportObject {
         FailureMessage = $detail
         RootCause = $RootCause
         Category = $Category
+        Symptom = $Symptom
         RootCauseDetail = $RootCauseDetail
         RecommendedAction = $Action
         ContributingFactors = $Contributing
@@ -1835,8 +1965,8 @@ function Export-OsdFailureReport {
 
     $flat = foreach ($r in $Results) {
         [pscustomobject][ordered]@{
-            Hostname = $r.Hostname; Status = $r.Status; Summary = $r.Summary; FailedStep = $r.FailedStep; FailedGroup = $r.FailedGroup; Application = $r.Application
-            ErrorCode = $r.ErrorCode; ErrorDescription = $r.ErrorDescription; RootCause = $r.RootCause; Category = $r.Category
+            Hostname = $r.Hostname; Status = $r.Status; Summary = $r.Summary; FailedStep = $r.FailedStep; FailedGroup = $r.FailedGroup; StepType = $r.StepType; Application = $r.Application
+            ErrorCode = $r.ErrorCode; ErrorDescription = $r.ErrorDescription; RootCause = $r.RootCause; Category = $r.Category; Symptom = $r.Symptom
             RootCauseDetail = $r.RootCauseDetail; RecommendedAction = $r.RecommendedAction; ContributingFactors = ($r.ContributingFactors -join '; ')
             BuildStart = $(if ($r.BuildStart) { $r.BuildStart.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
             FailureTime = $(if ($r.FailureTime) { $r.FailureTime.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
@@ -1887,9 +2017,10 @@ function Export-OsdFailureReport {
     foreach ($r in $Results) {
         [void]$sb.AppendLine("<h2 id='$(& $enc $r.BundleName)'>$(& $enc $r.Hostname) <span class='muted'>&mdash; $(& $enc $r.BundleName)</span></h2><table>")
         $rows = [ordered]@{
-            'Summary' = $r.Summary; 'Failed step' = $r.FailedStep; 'Group' = $r.FailedGroup; 'Application' = $r.Application
+            'Summary' = $r.Summary; 'Failed step' = $r.FailedStep; 'Group' = $r.FailedGroup; 'Step type' = $r.StepType; 'Application' = $r.Application
             'Error code' = ('{0} {1}' -f $r.ErrorCode, $r.ErrorDescription).Trim(); 'Failure message' = $r.FailureMessage
             'Root cause' = $(if ($r.Category) { '{0} [{1}]' -f $r.RootCause, $r.Category } else { $r.RootCause }); 'Detail' = $r.RootCauseDetail
+            'Symptom (what the step reported)' = $r.Symptom
             'Recommended action' = $r.RecommendedAction
             'Contributing factors' = ($r.ContributingFactors -join "`n")
             'Failed step in smsts.log' = ($r.StepLog -join "`n")
@@ -2003,10 +2134,12 @@ function Write-OsdFaultDetail {
         'Summary' = $Result.Summary
         'Failed step' = $Result.FailedStep
         'Group' = $Result.FailedGroup
+        'Step type' = $Result.StepType
         'Application' = $Result.Application
         'Error code' = ('{0}  {1}' -f $Result.ErrorCode, $Result.ErrorDescription).Trim()
         'Failure message' = $Result.FailureMessage
         'Root cause' = $(if ($Result.Category) { '{0} [{1}]' -f $Result.RootCause, $Result.Category } else { $Result.RootCause })
+        'Symptom' = $Result.Symptom
         'Detail' = $Result.RootCauseDetail
         'Recommended action' = $Result.RecommendedAction
         'Build start' = $(if ($Result.BuildStart) { $Result.BuildStart.ToString('yyyy-MM-dd HH:mm:ss') } else { '' })
