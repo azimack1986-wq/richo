@@ -10,6 +10,26 @@ versioning is [semantic](https://semver.org/) per script.
 
 ---
 
+## Export-WindowsVmNoCpuNoIpReport.ps1
+
+### [1.0.0] — 2026-11-11
+
+#### Added
+
+- **New read-only report: Windows VMs with zero CPU usage and no VMware Tools IP.**
+  A WinForms picker lists the vCenter sites from `config/environments.json`; pick one
+  or more and the script exports a CSV of every VM that is Windows (configured guest
+  OS), shows `OverallCpuUsage` at or below the threshold (default 0 MHz), and has no
+  IP reported by Tools. Columns lead with Server, Datastore and VM Folder, then
+  datacenter, cluster, host, guest OS, vCPU, CPU MHz and Tools status.
+- Templates are skipped; powered-off/suspended VMs are skipped unless asked for.
+- `-Site` runs it without the window (scheduled tasks); comma-separated values work
+  under `-File`. One unreachable vCenter is reported and skipped, not fatal.
+- `tests/Test-WindowsVmNoCpuNoIp.ps1` covers the match rules and folder paths; the
+  script is added to `Test-ScriptLint.ps1`.
+
+---
+
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
 ### [23.32.0] — 2026-08-21
