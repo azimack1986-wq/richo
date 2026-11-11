@@ -1,17 +1,22 @@
 <#
 .SYNOPSIS
-    Finds Windows VMs with zero CPU usage and no VMware Tools IP address, and exports them to CSV.
+    Finds Windows VMs with zero CPU usage and no VMware Tools IP address, shows them in a window,
+    and exports them to CSV.
 
 .DESCRIPTION
-    Opens a small window to pick one or more sites (the vCenter entries in
-    config/environments.json), then for every VM in each selected vCenter checks:
+    Run it with no parameters and a window asks which vCenter to query: type one or more vCenter
+    names, tick sites from config/environments.json, or both. Credentials come from
+    Get-RichoCredential (SecretManagement, then RICHO_* environment variables, then a prompt).
+
+    Every check uses what vCenter already holds for each VM - nothing logs into the guest:
 
       1. Windows    - the configured guest OS (Config.GuestId starts with "win", or
                       Config.GuestFullName contains "Windows"). The configured value is used
                       because a VM with no Tools heartbeat reports no guest family at all. The
                       Tools-reported family (windowsGuest) also counts when it is present.
       2. CPU zero   - Summary.QuickStats.OverallCpuUsage (MHz) is at or below -CpuThresholdMhz,
-                      which defaults to 0. This is CPU *usage*, not the vCPU count.
+                      which defaults to 0. This is CPU *usage*, not the vCPU count, and it is a
+                      single ~20-second sample.
       3. No IP      - VMware Tools reports no IP address, neither Guest.IpAddress nor any
                       address on Guest.Net.
 
@@ -19,24 +24,32 @@
     suspended VMs are skipped unless -IncludePoweredOff is given (or ticked in the window),
     because they always have zero CPU and no IP and would bury the VMs worth looking at.
 
-    The CSV holds Server (VM name), Datastore, and VM Folder, plus the datacenter, cluster,
-    host, guest OS, vCPU count, CPU usage and Tools status, so each row can be judged
-    without going back to vCenter.
+    Results open in a second window: a sortable grid with a filter box, the CSV path, and
+    buttons to open the CSV or save a copy. The CSV holds Server (VM name), Datastore and VM
+    Folder, plus datacenter, cluster, host, guest OS, vCPU count, CPU usage and Tools status.
 
     READ ONLY against vCenter. The only thing written is the CSV (and, with -Transcript, a
-    transcript under logs/). Each vCenter connection this script opens is closed again at the
-    end; existing PowerCLI sessions in the same console are left alone.
+    transcript under logs/). The vCenter connections this script opens are closed before the
+    results window appears; other PowerCLI sessions in the same console are left alone.
 
-    Requires VMware.VimAutomation.Core (PowerCLI). The site picker needs Windows; pass -Site to
-    run without it, for example from a scheduled task.
+    SINGLE FILE. Inside the repo it uses Richo.Common; copied anywhere on its own it uses
+    built-in fallbacks and keeps output/, logs/ and an optional environments.json next to itself.
+
+    Requires VMware.VimAutomation.Core (PowerCLI). The windows need Windows; pass -VCenter or
+    -Site to run without them, for example from a scheduled task.
+
+.PARAMETER VCenter
+    One or more vCenter server names to query without showing the window. Credentials are
+    looked up under the server name, or under the matching site's credentialName when the
+    server is also in config/environments.json.
 
 .PARAMETER Site
-    One or more environment keys from config/environments.json. When given, the window is not
-    shown and the script runs unattended with the other parameters as passed.
+    One or more environment keys from config/environments.json to query without showing the
+    window. Can be combined with -VCenter.
 
 .PARAMETER OutputPath
     CSV to write. Defaults to output/WindowsVmNoCpuNoIp_<timestamp>.csv at the repo root
-    (output/ is gitignored).
+    (output/ is gitignored), or in output/ next to the script when it runs on its own.
 
 .PARAMETER IncludePoweredOff
     Also report powered-off and suspended Windows VMs. Off by default.
@@ -46,7 +59,8 @@
 
 .PARAMETER ConfigPath
     Override the environments file. Defaults to $env:RICHO_CONFIG when set, otherwise
-    config/environments.json at the repo root.
+    config/environments.json at the repo root - or environments.json next to the script when it
+    runs on its own. Optional: a typed vCenter needs no config.
 
 .PARAMETER PassThru
     Also write the report rows to the pipeline.
@@ -57,22 +71,24 @@
 .EXAMPLE
     .\Export-WindowsVmNoCpuNoIpReport.ps1
 
-    Opens the site picker, runs the report against the chosen sites, writes the CSV and offers
-    to open it.
+    Asks for the vCenter, runs the checks, shows the results window and writes the CSV.
 
 .EXAMPLE
-    .\Export-WindowsVmNoCpuNoIpReport.ps1 -Site prod, dr -OutputPath D:\Reports\win-no-ip.csv
+    .\Export-WindowsVmNoCpuNoIpReport.ps1 -VCenter vcenter01.example.com -OutputPath D:\Reports\win-no-ip.csv
 
-    No window. Queries the prod and dr vCenters and writes the CSV to the given path.
+    No window. Queries one vCenter by name and writes the CSV to the given path.
 
 .EXAMPLE
-    .\Export-WindowsVmNoCpuNoIpReport.ps1 -Site lab -CpuThresholdMhz 20 -PassThru | Format-Table Server, Host, CpuUsageMhz
+    .\Export-WindowsVmNoCpuNoIpReport.ps1 -Site prod, dr -CpuThresholdMhz 20 -PassThru | Format-Table Server, Host, CpuUsageMhz
 
-    Treats anything at or below 20 MHz as zero and shows the matches in the console too.
+    No window. Queries two configured sites, treats anything at or below 20 MHz as zero, and
+    shows the matches in the console as well.
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
+    [string[]]$VCenter,
+
     [string[]]$Site,
 
     [string]$OutputPath,
@@ -92,8 +108,15 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 $repoRoot = Split-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -Parent
+
+# Works in two places. Inside the repo it uses Richo.Common and the repo's config/ and output/.
+# Copied anywhere on its own it uses the built-in fallbacks below and keeps environments.json,
+# output/ and logs/ next to itself - one file, nothing else to copy.
+$richoCommonPath = Join-Path -Path $repoRoot -ChildPath 'modules/Richo.Common/Richo.Common.psd1'
+$standalone = -not (Test-Path -LiteralPath $richoCommonPath)
+$baseDir = if ($standalone) { $PSScriptRoot } else { $repoRoot }
 
 # Column order of the CSV. The three asked-for columns come straight after the site.
 $reportColumns = @(
@@ -609,17 +632,24 @@ function Get-SiteList {
     .PARAMETER Path
         The environments JSON file.
 
+    .PARAMETER AllowMissing
+        Return nothing, instead of throwing, when the file does not exist. The window can still
+        run on a typed vCenter name without any config file.
+
     .EXAMPLE
-        Get-SiteList -Path .\config\environments.json
+        Get-SiteList -Path .\config\environments.json -AllowMissing
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory)]
-        [string]$Path
+        [string]$Path,
+
+        [switch]$AllowMissing
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
+        if ($AllowMissing) { return }
         throw "Config file not found: $Path. Copy config/environments.example.json to config/environments.json and fill it in."
     }
 
@@ -629,24 +659,247 @@ function Get-SiteList {
     $default = [string](Get-SafeProperty -InputObject $raw -Path 'default')
 
     foreach ($entry in $environments.PSObject.Properties) {
-        $server = [string](Get-SafeProperty -InputObject $entry.Value -Path 'vcenter.server')
-        if ([string]::IsNullOrWhiteSpace($server)) { continue }
+        $vcServer = [string](Get-SafeProperty -InputObject $entry.Value -Path 'vcenter.server')
+        if ([string]::IsNullOrWhiteSpace($vcServer)) { continue }
+        $credentialName = [string](Get-SafeProperty -InputObject $entry.Value -Path 'vcenter.credentialName')
+        if ([string]::IsNullOrWhiteSpace($credentialName)) { $credentialName = $vcServer }
         [pscustomobject]@{
-            Name        = $entry.Name
-            Server      = $server
-            Description = [string](Get-SafeProperty -InputObject $entry.Value -Path 'description')
-            IsDefault   = ($entry.Name -eq $default)
+            Name           = $entry.Name
+            Server         = $vcServer
+            CredentialName = $credentialName
+            Description    = [string](Get-SafeProperty -InputObject $entry.Value -Path 'description')
+            IsDefault      = ($entry.Name -eq $default)
         }
     }
+}
+
+function ConvertTo-NameList {
+    <#
+    .SYNOPSIS
+        Splits typed or passed names on commas, semicolons and whitespace; trims and de-duplicates.
+
+    .DESCRIPTION
+        Handles both a real array and the single "a,b" string that 'pwsh -File' and
+        'powershell.exe -File' (a scheduled task, for instance) pass for "-Site a,b". Order is
+        kept; duplicates are dropped case-insensitively.
+
+    .PARAMETER Value
+        Names, or strings holding several names.
+
+    .EXAMPLE
+        ConvertTo-NameList -Value 'vc01, vc02;vc03'
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [string[]]$Value
+    )
+
+    $seen = @{}
+    $names = New-Object System.Collections.Generic.List[string]
+    foreach ($item in @($Value)) {
+        if ($null -eq $item) { continue }
+        foreach ($part in ($item -split '[,;\s]+')) {
+            $name = $part.Trim()
+            if (-not $name) { continue }
+            if ($seen.ContainsKey($name)) { continue }
+            $seen[$name] = $true
+            $names.Add($name)
+        }
+    }
+    return $names.ToArray()
+}
+
+function Resolve-ReportTarget {
+    <#
+    .SYNOPSIS
+        Turns chosen site names and typed vCenter names into a list of vCenters to query.
+
+    .DESCRIPTION
+        A configured site brings its own server and credential name. A typed vCenter that matches
+        a configured site's server uses that site's name and credential; any other typed vCenter
+        is labelled with its own name and its credential is looked up (and prompted for) under that
+        name. Each vCenter appears once however it was chosen. A site name that is not in the
+        config comes back with Problem set, so the run can report it and carry on.
+
+    .PARAMETER SiteList
+        Sites from Get-SiteList.
+
+    .PARAMETER SiteName
+        Environment keys that were chosen.
+
+    .PARAMETER VCenter
+        vCenter names that were typed.
+
+    .EXAMPLE
+        Resolve-ReportTarget -SiteList $sites -SiteName prod -VCenter vc-test01.example.com
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]]$SiteList = @(),
+
+        [AllowEmptyCollection()]
+        [string[]]$SiteName = @(),
+
+        [AllowEmptyCollection()]
+        [string[]]$VCenter = @()
+    )
+
+    $seenServers = @{}
+    $known = (@($SiteList | ForEach-Object { $_.Name }) -join ', ')
+    if (-not $known) { $known = '(none)' }
+
+    foreach ($name in @($SiteName)) {
+        if ([string]::IsNullOrWhiteSpace($name)) { continue }
+        $match = @($SiteList | Where-Object { $_.Name -eq $name } | Select-Object -First 1)
+        if ($match.Count -eq 0) {
+            [pscustomobject]@{ Label = $name; Server = ''; CredentialName = ''; Problem = "Site '$name' is not in the config. Known sites: $known" }
+            continue
+        }
+        if ($seenServers.ContainsKey($match[0].Server)) { continue }
+        $seenServers[$match[0].Server] = $true
+        [pscustomobject]@{ Label = $match[0].Name; Server = $match[0].Server; CredentialName = $match[0].CredentialName; Problem = '' }
+    }
+
+    foreach ($vcName in @($VCenter)) {
+        if ([string]::IsNullOrWhiteSpace($vcName)) { continue }
+        if ($seenServers.ContainsKey($vcName)) { continue }
+        $seenServers[$vcName] = $true
+        $match = @($SiteList | Where-Object { $_.Server -eq $vcName } | Select-Object -First 1)
+        if ($match.Count -gt 0) {
+            [pscustomobject]@{ Label = $match[0].Name; Server = $vcName; CredentialName = $match[0].CredentialName; Problem = '' }
+        }
+        else {
+            [pscustomobject]@{ Label = $vcName; Server = $vcName; CredentialName = $vcName; Problem = '' }
+        }
+    }
+}
+
+function ConvertTo-RowFilterLiteral {
+    <#
+    .SYNOPSIS
+        Escapes text for use inside a DataView RowFilter LIKE '%...%' pattern.
+
+    .DESCRIPTION
+        Wildcard and bracket characters are wrapped in brackets and single quotes are doubled,
+        so typing a VM name such as "app[1]" or "50%" filters literally instead of throwing or
+        matching everything.
+
+    .PARAMETER Value
+        The text typed in the filter box.
+
+    .EXAMPLE
+        ConvertTo-RowFilterLiteral -Value "o'brien*"
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string]$Value
+    )
+
+    return (($Value -replace '([\[\]\*%])', '[$1]') -replace "'", "''")
+}
+
+function Get-ReportRowFilter {
+    <#
+    .SYNOPSIS
+        Builds the RowFilter expression for the results filter box.
+
+    .PARAMETER Text
+        The text typed in the filter box. Empty clears the filter.
+
+    .PARAMETER Column
+        The text columns to search.
+
+    .EXAMPLE
+        $table.DefaultView.RowFilter = Get-ReportRowFilter -Text 'DS_GOLD' -Column Server, Datastore
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string]$Text,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Column
+    )
+
+    $trimmed = ([string]$Text).Trim()
+    if (-not $trimmed) { return '' }
+    $literal = ConvertTo-RowFilterLiteral -Value $trimmed
+    return ((@($Column) | ForEach-Object { "[{0}] LIKE '%{1}%'" -f $_, $literal }) -join ' OR ')
+}
+
+function ConvertTo-ReportDataTable {
+    <#
+    .SYNOPSIS
+        Loads report rows into a DataTable for the results grid.
+
+    .DESCRIPTION
+        A DataTable gives the grid click-to-sort columns and a filterable view. vCPU and CPU MHz
+        are typed as numbers so they sort as numbers; empty values become DBNull.
+
+    .PARAMETER Row
+        Report rows from ConvertTo-ReportRow.
+
+    .PARAMETER Column
+        Column names, in display order.
+
+    .EXAMPLE
+        $table = ConvertTo-ReportDataTable -Row $rows -Column $reportColumns
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Data.DataTable])]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Row,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Column
+    )
+
+    $numericColumns = @('vCPU', 'CpuUsageMhz')
+    $table = New-Object System.Data.DataTable 'Report'
+    foreach ($name in $Column) {
+        $type = if ($numericColumns -contains $name) { [int] } else { [string] }
+        [void]$table.Columns.Add($name, $type)
+    }
+
+    foreach ($item in $Row) {
+        if ($null -eq $item) { continue }
+        $dataRow = $table.NewRow()
+        foreach ($name in $Column) {
+            $value = Get-SafeProperty -InputObject $item -Path $name
+            if (($null -eq $value) -or ([string]$value -eq '')) { $dataRow[$name] = [System.DBNull]::Value }
+            elseif ($numericColumns -contains $name) { $dataRow[$name] = [int]$value }
+            else { $dataRow[$name] = [string]$value }
+        }
+        $table.Rows.Add($dataRow)
+    }
+
+    # The comma stops PowerShell unrolling the table into its rows on the way out.
+    return , $table
 }
 
 function Show-SiteSelectionForm {
     <#
     .SYNOPSIS
-        Shows the site picker. Returns the choices, or $null when cancelled.
+        Asks which vCenter(s) to query. Returns the choices, or $null when cancelled.
+
+    .DESCRIPTION
+        Type one or more vCenter names, tick configured sites, or both. The configured list is
+        optional; with no config file the window still works from typed names.
 
     .PARAMETER SiteList
-        Sites from Get-SiteList.
+        Sites from Get-SiteList. May be empty.
 
     .PARAMETER DefaultOutputPath
         CSV path to pre-fill.
@@ -686,32 +939,44 @@ function Show-SiteSelectionForm {
         $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
         $form.MaximizeBox = $false
         $form.MinimizeBox = $false
-        $form.ClientSize = New-Object System.Drawing.Size(540, 440)
+        $form.ClientSize = New-Object System.Drawing.Size(560, 520)
         $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
+        $lblServer = New-Object System.Windows.Forms.Label
+        $lblServer.Text = 'vCenter server - type one or more, separated by commas:'
+        $lblServer.Location = New-Object System.Drawing.Point(12, 12)
+        $lblServer.AutoSize = $true
+        $form.Controls.Add($lblServer)
+
+        $txtServer = New-Object System.Windows.Forms.TextBox
+        $txtServer.Location = New-Object System.Drawing.Point(12, 34)
+        $txtServer.Size = New-Object System.Drawing.Size(536, 24)
+        $form.Controls.Add($txtServer)
+
         $lblSites = New-Object System.Windows.Forms.Label
-        $lblSites.Text = 'Select one or more sites (vCenter):'
-        $lblSites.Location = New-Object System.Drawing.Point(12, 12)
+        $lblSites.Location = New-Object System.Drawing.Point(12, 70)
         $lblSites.AutoSize = $true
+        $lblSites.Text = if ($SiteList.Count -gt 0) { '...and/or tick configured sites (environments.json):' } else { 'No configured sites found - type a vCenter above.' }
         $form.Controls.Add($lblSites)
 
         $clbSites = New-Object System.Windows.Forms.CheckedListBox
-        $clbSites.Location = New-Object System.Drawing.Point(12, 34)
-        $clbSites.Size = New-Object System.Drawing.Size(516, 160)
+        $clbSites.Location = New-Object System.Drawing.Point(12, 92)
+        $clbSites.Size = New-Object System.Drawing.Size(536, 140)
         $clbSites.CheckOnClick = $true
         $clbSites.IntegralHeight = $false
         foreach ($entry in $SiteList) {
             $label = '{0}  -  {1}' -f $entry.Name, $entry.Server
             if (-not [string]::IsNullOrWhiteSpace($entry.Description)) { $label += "  ($($entry.Description))" }
-            $index = $clbSites.Items.Add($label)
-            if ($entry.IsDefault) { $clbSites.SetItemChecked($index, $true) }
+            [void]$clbSites.Items.Add($label)
         }
+        $clbSites.Enabled = ($SiteList.Count -gt 0)
         $form.Controls.Add($clbSites)
 
         $chkAll = New-Object System.Windows.Forms.CheckBox
-        $chkAll.Text = 'Select all sites'
-        $chkAll.Location = New-Object System.Drawing.Point(12, 200)
+        $chkAll.Text = 'Select all configured sites'
+        $chkAll.Location = New-Object System.Drawing.Point(12, 238)
         $chkAll.AutoSize = $true
+        $chkAll.Enabled = ($SiteList.Count -gt 0)
         $chkAll.Add_CheckedChanged({
                 for ($i = 0; $i -lt $clbSites.Items.Count; $i++) { $clbSites.SetItemChecked($i, $chkAll.Checked) }
             })
@@ -719,19 +984,19 @@ function Show-SiteSelectionForm {
 
         $chkPoweredOff = New-Object System.Windows.Forms.CheckBox
         $chkPoweredOff.Text = 'Include powered-off / suspended VMs (they always have no CPU and no IP)'
-        $chkPoweredOff.Location = New-Object System.Drawing.Point(12, 230)
+        $chkPoweredOff.Location = New-Object System.Drawing.Point(12, 268)
         $chkPoweredOff.AutoSize = $true
         $chkPoweredOff.Checked = $IncludePoweredOff
         $form.Controls.Add($chkPoweredOff)
 
         $lblCpu = New-Object System.Windows.Forms.Label
         $lblCpu.Text = 'Treat CPU usage at or below this many MHz as zero:'
-        $lblCpu.Location = New-Object System.Drawing.Point(12, 264)
+        $lblCpu.Location = New-Object System.Drawing.Point(12, 302)
         $lblCpu.AutoSize = $true
         $form.Controls.Add($lblCpu)
 
         $numCpu = New-Object System.Windows.Forms.NumericUpDown
-        $numCpu.Location = New-Object System.Drawing.Point(340, 261)
+        $numCpu.Location = New-Object System.Drawing.Point(340, 299)
         $numCpu.Size = New-Object System.Drawing.Size(90, 24)
         $numCpu.Minimum = 0
         $numCpu.Maximum = 1000000
@@ -740,19 +1005,19 @@ function Show-SiteSelectionForm {
 
         $lblOut = New-Object System.Windows.Forms.Label
         $lblOut.Text = 'Save CSV to:'
-        $lblOut.Location = New-Object System.Drawing.Point(12, 298)
+        $lblOut.Location = New-Object System.Drawing.Point(12, 336)
         $lblOut.AutoSize = $true
         $form.Controls.Add($lblOut)
 
         $txtOut = New-Object System.Windows.Forms.TextBox
-        $txtOut.Location = New-Object System.Drawing.Point(12, 318)
-        $txtOut.Size = New-Object System.Drawing.Size(420, 24)
+        $txtOut.Location = New-Object System.Drawing.Point(12, 356)
+        $txtOut.Size = New-Object System.Drawing.Size(440, 24)
         $txtOut.Text = $DefaultOutputPath
         $form.Controls.Add($txtOut)
 
         $btnBrowse = New-Object System.Windows.Forms.Button
         $btnBrowse.Text = 'Browse...'
-        $btnBrowse.Location = New-Object System.Drawing.Point(440, 316)
+        $btnBrowse.Location = New-Object System.Drawing.Point(460, 354)
         $btnBrowse.Size = New-Object System.Drawing.Size(88, 26)
         # File dialogs need a single-threaded apartment. Rather than guess how this host was
         # started, check, and fall back to typing the path.
@@ -781,19 +1046,20 @@ function Show-SiteSelectionForm {
         $form.Controls.Add($btnBrowse)
 
         $lblCriteria = New-Object System.Windows.Forms.Label
-        $lblCriteria.Text = 'Reports VMs that are Windows (configured guest OS) AND show CPU usage at or below the threshold AND have no IP address reported by VMware Tools. Read only - nothing in vCenter is changed.'
-        $lblCriteria.Location = New-Object System.Drawing.Point(12, 352)
-        $lblCriteria.Size = New-Object System.Drawing.Size(516, 40)
+        $lblCriteria.Text = 'Finds VMs that are Windows (configured guest OS) AND show CPU usage at or below the threshold AND have no IP address reported by VMware Tools. Read only - nothing in vCenter is changed. You will be asked for credentials for each vCenter that has none stored.'
+        $lblCriteria.Location = New-Object System.Drawing.Point(12, 392)
+        $lblCriteria.Size = New-Object System.Drawing.Size(536, 64)
         $lblCriteria.ForeColor = [System.Drawing.SystemColors]::GrayText
         $form.Controls.Add($lblCriteria)
 
         $btnRun = New-Object System.Windows.Forms.Button
         $btnRun.Text = 'Run report'
-        $btnRun.Location = New-Object System.Drawing.Point(340, 400)
+        $btnRun.Location = New-Object System.Drawing.Point(360, 480)
         $btnRun.Size = New-Object System.Drawing.Size(90, 28)
         $btnRun.Add_Click({
-                if ($clbSites.CheckedIndices.Count -eq 0) {
-                    [void][System.Windows.Forms.MessageBox]::Show($form, 'Select at least one site.', $form.Text,
+                $typed = @(ConvertTo-NameList -Value $txtServer.Text)
+                if (($typed.Count -eq 0) -and ($clbSites.CheckedIndices.Count -eq 0)) {
+                    [void][System.Windows.Forms.MessageBox]::Show($form, 'Type a vCenter server or tick at least one site.', $form.Text,
                         [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
                     return
                 }
@@ -808,13 +1074,14 @@ function Show-SiteSelectionForm {
 
         $btnCancel = New-Object System.Windows.Forms.Button
         $btnCancel.Text = 'Cancel'
-        $btnCancel.Location = New-Object System.Drawing.Point(438, 400)
+        $btnCancel.Location = New-Object System.Drawing.Point(458, 480)
         $btnCancel.Size = New-Object System.Drawing.Size(90, 28)
         $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
         $form.Controls.Add($btnCancel)
 
         $form.AcceptButton = $btnRun
         $form.CancelButton = $btnCancel
+        $form.ActiveControl = $txtServer
 
         if ($form.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
 
@@ -822,6 +1089,7 @@ function Show-SiteSelectionForm {
         foreach ($index in $clbSites.CheckedIndices) { $selected.Add($SiteList[$index]) }
 
         return [pscustomobject]@{
+            VCenters          = @(ConvertTo-NameList -Value $txtServer.Text)
             Sites             = $selected.ToArray()
             OutputPath        = $txtOut.Text.Trim()
             IncludePoweredOff = $chkPoweredOff.Checked
@@ -833,62 +1101,362 @@ function Show-SiteSelectionForm {
     }
 }
 
+function Show-ResultsForm {
+    <#
+    .SYNOPSIS
+        Shows the report in a sortable, filterable grid, with buttons to open or copy the CSV.
+
+    .PARAMETER Row
+        Report rows.
+
+    .PARAMETER Column
+        Column names, in display order.
+
+    .PARAMETER CsvPath
+        The CSV this run wrote.
+
+    .PARAMETER Summary
+        One line describing what was queried and with which settings.
+
+    .PARAMETER FailedTarget
+        vCenters that could not be queried, shown in red so a short list is not mistaken for a
+        complete one.
+
+    .EXAMPLE
+        Show-ResultsForm -Row $rows -Column $reportColumns -CsvPath $csv -Summary 'lab; CPU <= 0 MHz'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Row,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Column,
+
+        [Parameter(Mandatory)]
+        [string]$CsvPath,
+
+        [string]$Summary = '',
+
+        [AllowEmptyCollection()]
+        [string[]]$FailedTarget = @()
+    )
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    Add-Type -AssemblyName System.Data
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    $table = ConvertTo-ReportDataTable -Row $Row -Column $Column
+    $textColumns = @($Column | Where-Object { $table.Columns[$_].DataType -eq [string] })
+    $total = $table.Rows.Count
+
+    $form = New-Object System.Windows.Forms.Form
+    try {
+        $form.Text = 'Windows VMs - no CPU / no IP - results'
+        $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+        $form.Size = New-Object System.Drawing.Size(1280, 700)
+        $form.MinimumSize = New-Object System.Drawing.Size(800, 400)
+        $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+
+        # Fill control first: WinForms docks the last-added control first, so the panels added
+        # after this take their edges and the grid gets what is left.
+        $grid = New-Object System.Windows.Forms.DataGridView
+        $grid.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $grid.ReadOnly = $true
+        $grid.AllowUserToAddRows = $false
+        $grid.AllowUserToDeleteRows = $false
+        $grid.AllowUserToResizeRows = $false
+        $grid.RowHeadersVisible = $false
+        $grid.SelectionMode = [System.Windows.Forms.DataGridViewSelectionMode]::FullRowSelect
+        $grid.AutoSizeColumnsMode = [System.Windows.Forms.DataGridViewAutoSizeColumnsMode]::DisplayedCells
+        $grid.ClipboardCopyMode = [System.Windows.Forms.DataGridViewClipboardCopyMode]::EnableWithAutoHeaderText
+        $grid.DataSource = $table
+        $form.Controls.Add($grid)
+
+        $top = New-Object System.Windows.Forms.Panel
+        $top.Dock = [System.Windows.Forms.DockStyle]::Top
+        $top.Height = 84
+        $form.Controls.Add($top)
+
+        $lblSummary = New-Object System.Windows.Forms.Label
+        $lblSummary.Location = New-Object System.Drawing.Point(10, 8)
+        $lblSummary.AutoSize = $true
+        $lblSummary.Font = New-Object System.Drawing.Font('Segoe UI', 10, [System.Drawing.FontStyle]::Bold)
+        $lblSummary.Text = "$total Windows VM(s) with no CPU usage and no VMware Tools IP"
+        $top.Controls.Add($lblSummary)
+
+        $lblDetail = New-Object System.Windows.Forms.Label
+        $lblDetail.Location = New-Object System.Drawing.Point(10, 32)
+        $lblDetail.AutoSize = $true
+        $lblDetail.Text = $Summary
+        if ($FailedTarget.Count -gt 0) {
+            $lblDetail.Text = "$Summary    NOT INCLUDED - could not be queried: $($FailedTarget -join ', ')"
+            $lblDetail.ForeColor = [System.Drawing.Color]::Firebrick
+        }
+        $top.Controls.Add($lblDetail)
+
+        $lblFilter = New-Object System.Windows.Forms.Label
+        $lblFilter.Text = 'Filter:'
+        $lblFilter.Location = New-Object System.Drawing.Point(10, 58)
+        $lblFilter.AutoSize = $true
+        $top.Controls.Add($lblFilter)
+
+        $txtFilter = New-Object System.Windows.Forms.TextBox
+        $txtFilter.Location = New-Object System.Drawing.Point(56, 55)
+        $txtFilter.Size = New-Object System.Drawing.Size(300, 24)
+        $top.Controls.Add($txtFilter)
+
+        $lblCount = New-Object System.Windows.Forms.Label
+        $lblCount.Location = New-Object System.Drawing.Point(366, 58)
+        $lblCount.AutoSize = $true
+        $lblCount.Text = "Showing $total of $total. Click a column header to sort; Ctrl+C copies selected rows."
+        $top.Controls.Add($lblCount)
+
+        $txtFilter.Add_TextChanged({
+                $table.DefaultView.RowFilter = Get-ReportRowFilter -Text $txtFilter.Text -Column $textColumns
+                $lblCount.Text = "Showing $($table.DefaultView.Count) of $total. Click a column header to sort; Ctrl+C copies selected rows."
+            })
+
+        $bottom = New-Object System.Windows.Forms.FlowLayoutPanel
+        $bottom.Dock = [System.Windows.Forms.DockStyle]::Bottom
+        $bottom.Height = 44
+        $bottom.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+        $bottom.Padding = New-Object System.Windows.Forms.Padding(6)
+        $form.Controls.Add($bottom)
+
+        $btnClose = New-Object System.Windows.Forms.Button
+        $btnClose.Text = 'Close'
+        $btnClose.Size = New-Object System.Drawing.Size(100, 28)
+        $btnClose.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $bottom.Controls.Add($btnClose)
+
+        $btnSaveAs = New-Object System.Windows.Forms.Button
+        $btnSaveAs.Text = 'Save copy as...'
+        $btnSaveAs.Size = New-Object System.Drawing.Size(120, 28)
+        $btnSaveAs.Enabled = ([System.Threading.Thread]::CurrentThread.GetApartmentState() -eq [System.Threading.ApartmentState]::STA)
+        $btnSaveAs.Add_Click({
+                $dialog = New-Object System.Windows.Forms.SaveFileDialog
+                try {
+                    $dialog.Filter = 'CSV files (*.csv)|*.csv|All files (*.*)|*.*'
+                    $dialog.DefaultExt = 'csv'
+                    $dialog.FileName = [System.IO.Path]::GetFileName($CsvPath)
+                    if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
+                        Copy-Item -LiteralPath $CsvPath -Destination $dialog.FileName -Force
+                    }
+                }
+                catch {
+                    [void][System.Windows.Forms.MessageBox]::Show($form, "Could not save the copy: $($_.Exception.Message)", $form.Text,
+                        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                }
+                finally {
+                    $dialog.Dispose()
+                }
+            })
+        $bottom.Controls.Add($btnSaveAs)
+
+        $btnOpen = New-Object System.Windows.Forms.Button
+        $btnOpen.Text = 'Open CSV'
+        $btnOpen.Size = New-Object System.Drawing.Size(100, 28)
+        $btnOpen.Add_Click({
+                try { Invoke-Item -LiteralPath $CsvPath }
+                catch {
+                    [void][System.Windows.Forms.MessageBox]::Show($form, "Could not open the CSV: $($_.Exception.Message)", $form.Text,
+                        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                }
+            })
+        $bottom.Controls.Add($btnOpen)
+
+        $lblCsv = New-Object System.Windows.Forms.Label
+        $lblCsv.AutoSize = $true
+        $lblCsv.Margin = New-Object System.Windows.Forms.Padding(3, 9, 12, 3)
+        $lblCsv.Text = "CSV saved to: $CsvPath"
+        $bottom.Controls.Add($lblCsv)
+
+        $form.CancelButton = $btnClose
+        $form.ActiveControl = $txtFilter
+        [void]$form.ShowDialog()
+    }
+    finally {
+        $form.Dispose()
+        $table.Dispose()
+    }
+}
+
 function Show-MessageBox {
     <#
     .SYNOPSIS
-        Shows a message box and returns the button pressed. Used only when the window was shown.
+        Shows a message box. Used only when the window was shown.
 
     .PARAMETER Text
         Message body.
-
-    .PARAMETER Buttons
-        MessageBoxButtons name, e.g. 'OK' or 'YesNo'.
 
     .PARAMETER Icon
         MessageBoxIcon name, e.g. 'Information', 'Warning', 'Error'.
 
     .EXAMPLE
-        Show-MessageBox -Text 'Done' -Buttons OK -Icon Information
+        Show-MessageBox -Text 'Failed' -Icon Error
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
         [string]$Text,
 
-        [ValidateSet('OK', 'YesNo')]
-        [string]$Buttons = 'OK',
-
         [ValidateSet('Information', 'Warning', 'Error')]
         [string]$Icon = 'Information'
     )
 
-    return [System.Windows.Forms.MessageBox]::Show($Text, 'Windows VMs - no CPU / no IP report',
-        [System.Windows.Forms.MessageBoxButtons]$Buttons, [System.Windows.Forms.MessageBoxIcon]$Icon)
+    [void][System.Windows.Forms.MessageBox]::Show($Text, 'Windows VMs - no CPU / no IP report',
+        [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]$Icon)
 }
 
 #endregion Helpers
 
-Import-RequiredModules -Module ([ordered]@{
-        'Richo.Common' = (Join-Path -Path $repoRoot -ChildPath 'modules/Richo.Common/Richo.Common.psd1')
-    })
+if ($standalone) {
+    #region Standalone fallbacks - used only when this file runs outside the repo.
+    # Same behaviour as the Richo.Common functions of the same names, cut down to what this
+    # script uses. Inside the repo the module's versions are loaded instead.
+
+    function Write-RichoLog {
+        <#
+        .SYNOPSIS
+            Writes a timestamped, levelled log line (standalone copy of the Richo.Common function).
+
+        .PARAMETER Message
+            The text to log.
+
+        .PARAMETER Level
+            DEBUG, INFO, WARN or ERROR.
+
+        .PARAMETER Path
+            Optional log file to append to. Defaults to $env:RICHO_LOG_FILE when set.
+
+        .EXAMPLE
+            Write-RichoLog 'Connecting' -Level INFO
+        #>
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory, Position = 0, ValueFromPipeline)]
+            [AllowEmptyString()]
+            [string]$Message,
+
+            [Parameter(Position = 1)]
+            [ValidateSet('DEBUG', 'INFO', 'WARN', 'ERROR')]
+            [string]$Level = 'INFO',
+
+            [string]$Path = $env:RICHO_LOG_FILE
+        )
+
+        process {
+            $stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ssZ')
+            $line = '{0} [{1,-5}] {2}' -f $stamp, $Level, $Message
+            switch ($Level) {
+                'DEBUG' { Write-Verbose $line }
+                'INFO' { Write-Information $line -InformationAction Continue }
+                'WARN' { Write-Warning $line }
+                'ERROR' { Write-Error $line }
+            }
+            if ($Path) {
+                $dir = Split-Path -Path $Path -Parent
+                if ($dir -and (-not (Test-Path $dir))) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
+                Add-Content -Path $Path -Value $line -Encoding UTF8
+            }
+        }
+    }
+
+    function Get-RichoCredential {
+        <#
+        .SYNOPSIS
+            Resolves a credential without hardcoding secrets (standalone copy of the Richo.Common function).
+
+        .DESCRIPTION
+            SecretManagement (Get-Secret -Name), then RICHO_<NAME>_USER / RICHO_<NAME>_PASSWORD
+            environment variables, then an interactive prompt.
+
+        .PARAMETER Name
+            Credential name - a site's credentialName, or the vCenter name for a typed vCenter.
+
+        .EXAMPLE
+            $cred = Get-RichoCredential -Name 'vcenter01.example.com'
+        #>
+        [CmdletBinding()]
+        [OutputType([pscredential])]
+        param(
+            [Parameter(Mandatory, Position = 0)]
+            [ValidateNotNullOrEmpty()]
+            [string]$Name
+        )
+
+        if (Get-Command -Name 'Get-Secret' -ErrorAction SilentlyContinue) {
+            $secret = Get-Secret -Name $Name -ErrorAction SilentlyContinue
+            if ($secret -is [pscredential]) { return $secret }
+        }
+
+        $slug = ($Name -replace '[^A-Za-z0-9]', '_').ToUpperInvariant()
+        $user = [Environment]::GetEnvironmentVariable("RICHO_${slug}_USER")
+        $pass = [Environment]::GetEnvironmentVariable("RICHO_${slug}_PASSWORD")
+        if ($user -and $pass) {
+            return [pscredential]::new($user, (ConvertTo-SecureString $pass -AsPlainText -Force))
+        }
+
+        Get-Credential -Message "Credentials for '$Name'"
+    }
+
+    function Start-RichoTranscript {
+        <#
+        .SYNOPSIS
+            Starts a transcript in logs/ next to this script and returns its path (standalone version).
+
+        .EXAMPLE
+            $transcript = Start-RichoTranscript
+        #>
+        [CmdletBinding()]
+        [OutputType([string])]
+        param()
+
+        $logDir = Join-Path -Path $baseDir -ChildPath 'logs'
+        if (-not (Test-Path -LiteralPath $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
+        $stem = 'Export-WindowsVmNoCpuNoIpReport_{0}' -f (Get-Date).ToUniversalTime().ToString('yyyyMMdd_HHmmss')
+        $path = Join-Path -Path $logDir -ChildPath "$stem.transcript"
+        $env:RICHO_LOG_FILE = Join-Path -Path $logDir -ChildPath "$stem.log"
+        Start-Transcript -Path $path | Out-Null
+        return $path
+    }
+
+    #endregion Standalone fallbacks
+}
+else {
+    Import-RequiredModules -Module ([ordered]@{ 'Richo.Common' = $richoCommonPath })
+}
 
 if (-not $ConfigPath) {
-    $ConfigPath = if ($env:RICHO_CONFIG) { $env:RICHO_CONFIG } else { Join-Path -Path $repoRoot -ChildPath 'config/environments.json' }
+    $ConfigPath = if ($env:RICHO_CONFIG) {
+        $env:RICHO_CONFIG
+    }
+    elseif ($standalone) {
+        Join-Path -Path $baseDir -ChildPath 'environments.json'
+    }
+    else {
+        Join-Path -Path $baseDir -ChildPath 'config/environments.json'
+    }
 }
-$defaultOutputPath = Join-Path -Path $repoRoot -ChildPath ('output/WindowsVmNoCpuNoIp_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
+$defaultOutputPath = Join-Path -Path $baseDir -ChildPath ('output/WindowsVmNoCpuNoIp_{0}.csv' -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
 
-$interactive = -not $PSBoundParameters.ContainsKey('Site')
+$interactive = -not ($PSBoundParameters.ContainsKey('Site') -or $PSBoundParameters.ContainsKey('VCenter'))
 $transcriptPath = $null
 $connected = New-Object System.Collections.Generic.List[object]
 
 try {
-    # ---- Choose sites -------------------------------------------------------
+    # ---- Choose vCenters ------------------------------------------------------
+    # The config file is optional: a typed vCenter needs no entry in it.
+    $siteList = @(Get-SiteList -Path $ConfigPath -AllowMissing)
+
     if ($interactive) {
         if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
-            throw 'The site picker needs Windows. Pass -Site to run without it.'
+            throw 'The window needs Windows. Pass -VCenter or -Site to run without it.'
         }
-        $siteList = @(Get-SiteList -Path $ConfigPath)
-        if ($siteList.Count -eq 0) { throw "No environment in '$ConfigPath' has a vcenter.server entry." }
 
         $formArgs = @{
             SiteList          = $siteList
@@ -898,70 +1466,81 @@ try {
         }
         $choice = Show-SiteSelectionForm @formArgs
         if ($null -eq $choice) {
-            Write-RichoLog 'Cancelled at the site picker. Nothing was queried.'
+            Write-RichoLog 'Cancelled. Nothing was queried.'
             return
         }
 
-        $selectedSites = @($choice.Sites | ForEach-Object { $_.Name })
+        $siteNames = @($choice.Sites | ForEach-Object { $_.Name })
+        $vcNames = @($choice.VCenters)
         $outputFile = $choice.OutputPath
         $includeOff = [bool]$choice.IncludePoweredOff
         $threshold = [int]$choice.CpuThresholdMhz
     }
     else {
-        # 'pwsh -File' / 'powershell.exe -File' (e.g. a scheduled task) passes "-Site a,b" as one
-        # string, so split on commas as well as accepting a real array.
-        $selectedSites = @($Site | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        if ($selectedSites.Count -eq 0) { throw '-Site was given but names no environment.' }
+        $siteNames = @(ConvertTo-NameList -Value $Site)
+        $vcNames = @(ConvertTo-NameList -Value $VCenter)
+        if (($siteNames.Count -eq 0) -and ($vcNames.Count -eq 0)) { throw '-Site / -VCenter was given but names nothing to query.' }
         $outputFile = if ($OutputPath) { $OutputPath } else { $defaultOutputPath }
         $includeOff = $IncludePoweredOff.IsPresent
         $threshold = $CpuThresholdMhz
     }
 
+    $targets = @(Resolve-ReportTarget -SiteList $siteList -SiteName $siteNames -VCenter $vcNames)
     $outputFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($outputFile)
 
     if ($Transcript) { $transcriptPath = Start-RichoTranscript }
 
     $offText = if ($includeOff) { 'included' } else { 'excluded' }
-    Write-RichoLog ('Export-WindowsVmNoCpuNoIpReport {0}: sites {1}; CPU <= {2} MHz; powered-off VMs {3}.' -f $ScriptVersion, ($selectedSites -join ', '), $threshold, $offText)
+    $settingsText = 'CPU <= {0} MHz; powered-off VMs {1}' -f $threshold, $offText
+    $targetText = (@($targets | ForEach-Object { if ($_.Server -and ($_.Label -ne $_.Server)) { '{0} ({1})' -f $_.Label, $_.Server } else { $_.Label } }) -join ', ')
+    Write-RichoLog ('Export-WindowsVmNoCpuNoIpReport {0}: {1}; {2}.' -f $ScriptVersion, $targetText, $settingsText)
 
-    # Loaded after the window so the picker opens straight away; PowerCLI is slow to load.
+    # Loaded after the window so it opens straight away; PowerCLI is slow to load.
     Import-RequiredModules -Module ([ordered]@{ 'VMware.VimAutomation.Core' = 'VMware.VimAutomation.Core' })
 
-    # ---- Query each site ----------------------------------------------------
+    # ---- Query each vCenter ---------------------------------------------------
     $report = New-Object System.Collections.Generic.List[object]
-    $failedSites = New-Object System.Collections.Generic.List[string]
+    $failedTargets = New-Object System.Collections.Generic.List[string]
     $credentialCache = @{}
 
-    foreach ($siteName in $selectedSites) {
+    foreach ($target in $targets) {
+        if ($target.Problem) {
+            $failedTargets.Add($target.Label)
+            Write-RichoLog "[$($target.Label)] Skipped: $($target.Problem)" -Level WARN
+            continue
+        }
         try {
-            $siteConfig = Get-RichoConfig -Name $siteName -Path $ConfigPath
-            $vcServer = [string]$siteConfig.vcenter.server
-            $credentialName = [string]$siteConfig.vcenter.credentialName
-
-            # Sites that share a credential name are only asked for it once.
-            if (-not $credentialCache.ContainsKey($credentialName)) {
-                $credentialCache[$credentialName] = Get-RichoCredential -Name $credentialName
+            # vCenters that share a credential name are only asked for it once.
+            if (-not $credentialCache.ContainsKey($target.CredentialName)) {
+                $credentialCache[$target.CredentialName] = Get-RichoCredential -Name $target.CredentialName
             }
 
-            Write-RichoLog "[$siteName] Connecting to $vcServer."
-            $vc = Connect-VIServer -Server $vcServer -Credential $credentialCache[$credentialName] -ErrorAction Stop
+            Write-RichoLog "[$($target.Label)] Connecting to $($target.Server)."
+            $vc = Connect-VIServer -Server $target.Server -Credential $credentialCache[$target.CredentialName] -ErrorAction Stop
             $connected.Add($vc)
 
-            $rows = @(Get-WindowsVmNoCpuNoIp -Server $vc -SiteName $siteName -IncludePoweredOff:$includeOff -CpuThresholdMhz $threshold)
+            $rows = @(Get-WindowsVmNoCpuNoIp -Server $vc -SiteName $target.Label -IncludePoweredOff:$includeOff -CpuThresholdMhz $threshold)
             foreach ($row in $rows) { $report.Add($row) }
         }
         catch {
-            # One unreachable vCenter should not cost the other sites their results.
-            $failedSites.Add($siteName)
-            Write-RichoLog "[$siteName] Skipped: $($_.Exception.Message)" -Level WARN
+            # One unreachable vCenter should not cost the others their results.
+            $failedTargets.Add($target.Label)
+            Write-RichoLog "[$($target.Label)] Skipped: $($_.Exception.Message)" -Level WARN
         }
     }
 
-    if ($failedSites.Count -eq $selectedSites.Count) {
-        throw "No site could be queried ($($failedSites -join ', ')). No CSV was written."
+    # Everything needed is in memory now. Disconnect before the results window opens, so no
+    # vCenter session sits open for as long as someone keeps that window up.
+    foreach ($vc in $connected) {
+        Disconnect-VIServer -Server $vc -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    $connected.Clear()
+
+    if ($failedTargets.Count -eq $targets.Count) {
+        throw "No vCenter could be queried ($($failedTargets -join ', ')). No CSV was written."
     }
 
-    # ---- Export -------------------------------------------------------------
+    # ---- Export ---------------------------------------------------------------
     $outputDir = Split-Path -Path $outputFile -Parent
     if ($outputDir -and (-not (Test-Path -LiteralPath $outputDir))) {
         New-Item -Path $outputDir -ItemType Directory -Force | Out-Null
@@ -979,32 +1558,35 @@ try {
     }
 
     Write-RichoLog "$($sorted.Count) VM(s) written to $outputFile."
-    if ($failedSites.Count -gt 0) {
-        Write-RichoLog "Not included - could not be queried: $($failedSites -join ', ')." -Level WARN
+    if ($failedTargets.Count -gt 0) {
+        Write-RichoLog "Not included - could not be queried: $($failedTargets -join ', ')." -Level WARN
     }
 
+    # ---- Show -----------------------------------------------------------------
     if ($interactive) {
-        $message = "$($sorted.Count) Windows VM(s) with no CPU and no VMware Tools IP.`n`nSaved to:`n$outputFile"
-        if ($failedSites.Count -gt 0) { $message += "`n`nNOT included - could not be queried: $($failedSites -join ', ')" }
-        $message += "`n`nOpen the CSV now?"
-        $icon = if ($failedSites.Count -gt 0) { 'Warning' } else { 'Information' }
-        if ((Show-MessageBox -Text $message -Buttons YesNo -Icon $icon) -eq [System.Windows.Forms.DialogResult]::Yes) {
-            Invoke-Item -LiteralPath $outputFile
+        $resultArgs = @{
+            Row          = $sorted
+            Column       = $reportColumns
+            CsvPath      = $outputFile
+            Summary      = "vCenter: $targetText    |    $settingsText"
+            FailedTarget = $failedTargets.ToArray()
         }
+        Show-ResultsForm @resultArgs
     }
 
     if ($PassThru) { $sorted }
 }
 catch {
     if ($interactive) {
-        # Best effort: the window may never have loaded (e.g. failure before the picker opened).
-        try { [void](Show-MessageBox -Text "Failed: $($_.Exception.Message)" -Icon Error) } catch { Write-RichoLog "Could not show the error dialog: $($_.Exception.Message)" -Level DEBUG }
+        # Best effort: the window may never have loaded (e.g. failure before it opened).
+        try { Show-MessageBox -Text "Failed: $($_.Exception.Message)" -Icon Error } catch { Write-RichoLog "Could not show the error dialog: $($_.Exception.Message)" -Level DEBUG }
     }
     Write-RichoLog "Failed: $($_.Exception.Message)" -Level ERROR
     throw
 }
 finally {
-    # Only the sessions this run opened; anything else connected in this console is left alone.
+    # Safety net for an early exit: only the sessions this run opened, anything else connected in
+    # this console is left alone.
     foreach ($vc in $connected) {
         Disconnect-VIServer -Server $vc -Confirm:$false -ErrorAction SilentlyContinue
     }

@@ -5,8 +5,10 @@
 .DESCRIPTION
     Extracts the pure helpers from the script by AST and runs them against hand-built objects
     shaped like Get-View results: Windows detection from the configured guest OS when Tools is
-    silent, CPU threshold, Tools IP detection, power-state and template exclusion, and the VM
-    folder path (hidden 'vm' folder dropped, vApps included, broken chains marked).
+    silent, CPU threshold, Tools IP detection, power-state and template exclusion, the VM
+    folder path (hidden 'vm' folder dropped, vApps included, broken chains marked), how typed
+    vCenter names and configured sites become query targets, and the results grid's DataTable
+    and filter expression - applied to a real DataView, so a bad expression fails here.
 
     Standalone - no Pester, no vendor modules, no infrastructure.
 
@@ -21,7 +23,8 @@ $errors = $null; $tokens = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$errors)
 if ($errors) { throw "parse errors in $scriptPath" }
 
-$wanted = @('Get-SafeProperty', 'Get-MoRefKey', 'Test-WindowsGuest', 'Get-ToolsIpAddress', 'Get-VmEvaluation', 'Get-VmFolderPath')
+$wanted = @('Get-SafeProperty', 'Get-MoRefKey', 'Test-WindowsGuest', 'Get-ToolsIpAddress', 'Get-VmEvaluation', 'Get-VmFolderPath',
+    'ConvertTo-NameList', 'Resolve-ReportTarget', 'ConvertTo-RowFilterLiteral', 'Get-ReportRowFilter', 'ConvertTo-ReportDataTable')
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $wanted -contains $_.Name } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
@@ -116,6 +119,71 @@ Assert-Equal "VM at the root shows /"              '/'         (Get-VmFolderPath
 Assert-Equal "VM in a vApp"                        '/Prod/MyVApp' (Get-VmFolderPath -Lookup $lookup -StartRef $vapp).Path
 Assert-Equal "no parent at all"                    '(incomplete) /' (Get-VmFolderPath -Lookup $lookup -StartRef $null).Path
 Assert-Equal "unknown folder is marked"            '(incomplete) /' (Get-VmFolderPath -Lookup $lookup -StartRef (New-Ref 'Folder' 'group-v999')).Path
+
+Write-Host "`n=== Typed names ===" -ForegroundColor Cyan
+Assert-Equal "commas, semicolons, spaces"          'vc01|vc02|vc03' ((ConvertTo-NameList -Value 'vc01, vc02;vc03') -join '|')
+Assert-Equal "-File style single string"           'lab|dr'         ((ConvertTo-NameList -Value @('lab,dr')) -join '|')
+Assert-Equal "duplicates dropped, any case"        'vc01|vc02'      ((ConvertTo-NameList -Value @('vc01', 'VC01', 'vc02')) -join '|')
+Assert-Equal "null gives nothing"                  0                @(ConvertTo-NameList -Value $null).Count
+Assert-Equal "blank gives nothing"                 0                @(ConvertTo-NameList -Value '  , ;').Count
+
+Write-Host "`n=== Query targets ===" -ForegroundColor Cyan
+$sites = @(
+    [pscustomobject]@{ Name = 'prod'; Server = 'vc-prod.example.com'; CredentialName = 'vcenter-prod' }
+    [pscustomobject]@{ Name = 'dr'; Server = 'vc-dr.example.com'; CredentialName = 'vcenter-dr' }
+)
+$t = @(Resolve-ReportTarget -SiteList $sites -SiteName @('prod'))
+Assert-Equal "site brings its server"              'vc-prod.example.com' $t[0].Server
+Assert-Equal "site brings its credential"          'vcenter-prod'        $t[0].CredentialName
+$t = @(Resolve-ReportTarget -SiteList $sites -VCenter @('vc-test.example.com'))
+Assert-Equal "typed vCenter is its own label"      'vc-test.example.com' $t[0].Label
+Assert-Equal "typed vCenter is its own credential" 'vc-test.example.com' $t[0].CredentialName
+$t = @(Resolve-ReportTarget -SiteList $sites -VCenter @('vc-dr.example.com'))
+Assert-Equal "typed configured vCenter uses site"  'dr'                  $t[0].Label
+Assert-Equal "...and the site's credential"        'vcenter-dr'          $t[0].CredentialName
+$t = @(Resolve-ReportTarget -SiteList $sites -SiteName @('prod') -VCenter @('vc-prod.example.com'))
+Assert-Equal "same vCenter both ways is one"       1                     $t.Count
+$t = @(Resolve-ReportTarget -SiteList $sites -SiteName @('nosuch'))
+Assert-Equal "unknown site flagged, not dropped"   $true                 ($t[0].Problem -like "*'nosuch'*prod, dr*")
+$t = @(Resolve-ReportTarget -SiteList @() -VCenter @('vc01'))
+Assert-Equal "no config needed for typed vCenter"  'vc01'                $t[0].Server
+
+Write-Host "`n=== Results grid table and filter ===" -ForegroundColor Cyan
+Assert-Equal "quote doubled"                       "o''brien"            (ConvertTo-RowFilterLiteral -Value "o'brien")
+Assert-Equal "wildcards bracketed"                 'a[*]b[%]c[[]1[]]'    (ConvertTo-RowFilterLiteral -Value 'a*b%c[1]')
+Assert-Equal "empty filter clears"                 ''                    (Get-ReportRowFilter -Text '   ' -Column @('Server'))
+
+$columns = @('Site', 'Server', 'Datastore', 'vCPU', 'CpuUsageMhz')
+$rows = @(
+    [pscustomobject]@{ Site = 'lab'; Server = 'WIN-APP[1]'; Datastore = 'DS_GOLD_01'; vCPU = 4; CpuUsageMhz = 0 }
+    [pscustomobject]@{ Site = 'lab'; Server = "WIN-O'BRIEN"; Datastore = 'DS_SILVER'; vCPU = 2; CpuUsageMhz = 12 }
+    [pscustomobject]@{ Site = 'dr'; Server = 'WIN-100%'; Datastore = ''; vCPU = $null; CpuUsageMhz = 3 }
+)
+$table = ConvertTo-ReportDataTable -Row $rows -Column $columns
+$textColumns = @($columns | Where-Object { $table.Columns[$_].DataType -eq [string] })
+Assert-Equal "returned as one DataTable"           'DataTable'           $table.GetType().Name
+Assert-Equal "three rows"                          3                     $table.Rows.Count
+Assert-Equal "CPU column is numeric"               'Int32'               $table.Columns['CpuUsageMhz'].DataType.Name
+Assert-Equal "empty datastore is DBNull"           $true                 ($table.Rows[2]['Datastore'] -is [System.DBNull])
+Assert-Equal "missing vCPU is DBNull"              $true                 ($table.Rows[2]['vCPU'] -is [System.DBNull])
+Assert-Equal "text columns found"                  'Site|Server|Datastore' ($textColumns -join '|')
+Assert-Equal "empty table still has columns"       5                     (ConvertTo-ReportDataTable -Row @() -Column $columns).Columns.Count
+
+$view = $table.DefaultView
+$view.Sort = 'CpuUsageMhz DESC'
+Assert-Equal "numeric sort, not text sort"         "WIN-O'BRIEN"         $view[0]['Server']
+foreach ($case in @(
+        @{ Text = 'gold'; Count = 1; Why = 'case-insensitive match on datastore' }
+        @{ Text = 'app[1]'; Count = 1; Why = 'brackets are literal' }
+        @{ Text = "o'brien"; Count = 1; Why = 'quote does not break the expression' }
+        @{ Text = '100%'; Count = 1; Why = 'percent is literal' }
+        @{ Text = '*'; Count = 0; Why = 'star is literal, not match-all' }
+        @{ Text = 'lab'; Count = 2; Why = 'matches the site column' }
+        @{ Text = ''; Count = 3; Why = 'empty shows everything' }
+    )) {
+    $view.RowFilter = Get-ReportRowFilter -Text $case.Text -Column $textColumns
+    Assert-Equal "filter '$($case.Text)': $($case.Why)" $case.Count $view.Count
+}
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }

@@ -12,6 +12,22 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Export-WindowsVmNoCpuNoIpReport.ps1
 
+### [1.1.0] — 2026-11-11
+
+#### Changed
+
+- **Asks for the vCenter.** The first window now has a box to type one or more vCenter
+  names; configured sites are an optional shortcut underneath, and no config file is
+  needed. A typed vCenter's credential is looked up (or prompted for) under its own
+  name, or under the site's `credentialName` if it is a configured server. `-VCenter`
+  does the same without the window.
+- **Results open in a window** instead of a message box: sortable grid (CPU and vCPU
+  sort as numbers), live filter across the text columns, Open CSV and Save copy as.
+- **vCenter sessions are closed before the results window opens**, not when it closes.
+- **Single file.** Copied out of the repo on its own, the script uses built-in copies of
+  `Write-RichoLog`, `Get-RichoCredential` and `Start-RichoTranscript`, and keeps
+  `output/`, `logs/` and an optional `environments.json` next to itself.
+
 ### [1.0.0] — 2026-11-11
 
 #### Added
