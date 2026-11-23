@@ -10,6 +10,42 @@ versioning is [semantic](https://semver.org/) per script.
 
 ---
 
+## Invoke-VvfVCenterUpgrade.ps1
+
+### [3.0.0] — 2026-11-23
+
+#### Changed
+
+- **One script, no prompts.** `Start-VvfUpgradeGui.ps1` and
+  `Set-VvfUpgradeToolSignature.ps1` are retired; `scripts/vsphere/Invoke-VvfVCenterUpgrade.ps1`
+  is the whole tool, built to be uploaded into a script-runner / automation front end. The run
+  never waits for an answer -- every question is now a parameter (`-ConfirmVCenter`,
+  `-ProceedOverPreCheckErrors`, `-AllowHardPowerOff`, `-RemoveSnapshots`, `-Resume` /
+  `-StartFresh`, `-InstallerAnswers`); a failure stops the run (exit 1) and `-Resume` replaces
+  the interactive RETRY. Credentials come from the parameter, SecretManagement, or
+  `RICHO_VVF_*` environment variables (per host / per vCenter first, for differing passwords).
+- **The dry-run gate moved from the window into the script.** A real run (not a resume) needs a
+  passing dry run of the same CSV and ISO in the same `-LogFolder` within 24 hours
+  (`-SkipDryRunCheck` overrides, loudly).
+- `-LogFolder` defaults to `%ProgramData%\VvfVCenterUpgrade` instead of the current folder.
+- The CSV can be given as text (`-VCenterCsvText`).
+- Removed: `-Prompter`, `-OnEvent`, `-StopSignal` (GUI hooks). A `STOP` file still stops safely.
+
+#### Added
+
+- **SSH handled automatically end to end.** Turned on on every vCenter at the start (dry runs
+  included, so no check is skipped -- the dry run turns it back off), confirmed on after every
+  power-on and reboot, and turned off on every vCenter once the last vCenter is upgraded and the
+  ISO unmounted. A run that stops part way leaves it on for `-Resume` and records in the state
+  file where it turned it on, so the run that completes turns those off too.
+  `-SshFinalState Disable` turns it off on every vCenter, also those where it was on before.
+- A per-vCenter summary table and a result object at the end of every run.
+- `tests/Test-VvfVCenterUpgrade.ps1` (pure functions) and
+  `tests/Test-VvfVCenterUpgradeSimulation.ps1` (the whole script against stubbed ESXi,
+  appliance API and SSH).
+
+---
+
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
 ### [23.32.0] — 2026-08-21

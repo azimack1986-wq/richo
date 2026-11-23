@@ -1,10 +1,12 @@
 # =============================================================================
 #  Invoke-VvfVCenterUpgrade.ps1
 #
-#  VERSION : 2.5.2
-#  OUTPUT  : console progress, a transcript, a findings CSV and a resume state
-#            file -- offline snapshots and ISO-based upgrades of the vCenters
-#            listed in a CSV (an Enhanced Linked Mode group), one per round
+#  VERSION : 3.0.0
+#  OUTPUT  : progress text, a transcript, a findings CSV, a resume state file
+#            and a summary object -- offline snapshots and ISO-based upgrades of
+#            the vCenters listed in a CSV (an Enhanced Linked Mode group), one per
+#            round. One file, no prompts: built to be run by a job/automation
+#            front end (or at a console) with every input given as a parameter.
 #  Check VERSION above before running. If it is not what you expect, this is an
 #  old copy of the file. The run also prints the version as its first output
 #  line.
@@ -13,6 +15,42 @@
 #  HISTORY : every change to this file gets a new version, newest first. The
 #            top entry must match VERSION; tests/Test-ScriptVersion.ps1 enforces
 #            that, so a change without a bump fails the build.
+#    3.0.0  ONE SCRIPT, NO PROMPTS. Start-VvfUpgradeGui.ps1 and
+#           Set-VvfUpgradeToolSignature.ps1 are retired: this file is the whole
+#           tool, for uploading into a script-runner / automation front end. The
+#           run never waits for an answer -- a front end that cannot answer would
+#           hang on it -- so every question is now a parameter:
+#             confirm-start      -> -ConfirmVCenter <first vCenter's short name>
+#             proceed-over-errors-> -ProceedOverPreCheckErrors
+#             hard-poweroff      -> -AllowHardPowerOff
+#             remove-snapshots   -> -RemoveSnapshots
+#             resume             -> -Resume, or -StartFresh (moves the state aside)
+#             retry              -> gone: a failure stops the run (exit 1);
+#                                   fix it, then run again with -Resume
+#             vm-pick            -> set VmName in the CSV
+#             installer-question -> its default, or -InstallerAnswers
+#             credentials        -> parameters, else SecretManagement, else
+#                                   RICHO_* environment variables (per host or
+#                                   per vCenter first, for different passwords)
+#           -Prompter, -OnEvent and -StopSignal (GUI hooks) are removed; a STOP
+#           file in -LogFolder still stops the run safely. The CSV can be given
+#           as text (-VCenterCsvText) for a front end with a text box. The rule
+#           the window enforced is now the script's own: a real run (not a
+#           resume) needs a passing dry run of the same CSV and ISO in the same
+#           -LogFolder in the last 24 hours (-SkipDryRunCheck overrides, loudly).
+#           -LogFolder defaults to %ProgramData%\VvfVCenterUpgrade, not the
+#           current folder, which a front end may change from run to run.
+#           SSH, ALL AUTOMATIC: it is turned on on every vCenter at the start --
+#           now in a dry run too, so no check is skipped; the dry run turns it
+#           back off at its end -- confirmed on again after every power-on and
+#           reboot, and turned off on every vCenter once the LAST vCenter is
+#           upgraded and the ISO unmounted (the guest-side unmount needs it).
+#           Which vCenters the run turned it on for is kept in the state file, so
+#           a stopped run that is resumed still turns them off at its end. A run
+#           that stops part way leaves SSH on (the resume, and whoever looks at
+#           the failure, need it) and says so. -SshFinalState Disable turns it off
+#           at the end on every vCenter, also those where it was on before.
+#           Ends with a per-vCenter summary table and a result object.
 #    2.5.2  plink sends each command as an SSH exec request (-m <file>), the way
 #           Posh-SSH always has, instead of over a login shell's input. Seen live:
 #           on a production vCenter the service read over plink returned no
@@ -175,105 +213,159 @@
 
 <#
 .SYNOPSIS
-    Upgrades (patches) one VMware vSphere Foundation (VVF) vCenter Server appliance from an
-    ISO mounted to the appliance, taking an offline snapshot first and checking health,
-    services and Enhanced Linked Mode replication before and after.
+    Upgrades (patches) every vCenter Server appliance of a VMware vSphere Foundation (VVF)
+    Enhanced Linked Mode group from a patch ISO on a datastore, one vCenter per round, with an
+    offline snapshot of the whole group before each round and health, service and replication
+    checks before and after. One self-contained script that never prompts.
 
 .DESCRIPTION
+    Built to be uploaded into a script-runner / automation front end (or run at a console):
+    every input is a parameter and the run never waits for an answer. Anything it would have
+    asked is either a parameter (below) or a stop with the reason (exit code 1).
+
     The run, in order:
 
-      1. Asks for a CSV of the vCenters to upgrade, one row each, in upgrade order:
-         VCenter,EsxiHost[,VmName] -- the vCenter's FQDN, the ESXi host its VM runs on, and
-         (optionally) the VM's inventory name. Lines starting with # are comments.
-      2. Asks for ESXi root credentials (once, or per host), appliance root credentials
-         (once, or per vCenter) and the SSO administrator; connects to every ESXi host
-         directly (vCenter is about to be shut down), finds each vCenter's VM, and opens an
-         API session and SSH to each appliance. Root drives the upgrade (appliance API on
-         port 5480) and the service checks (SSH). SSO is needed by vdcrepadmin, by the
-         installer when it asks for the vmdir password, and for the API on port 443 when
-         root is not authorized there.
+      1. Reads the vCenter list -- -VCenterCsv (a file) or -VCenterCsvText (its contents) --
+         one row per vCenter in upgrade order: VCenter,EsxiHost[,VmName]. Lines starting with
+         # are comments. A real run (not -Resume) is refused unless a dry run of the same CSV
+         and ISO passed in the same -LogFolder in the last 24 hours, and unless
+         -ConfirmVCenter names the first vCenter. Both are checked before anything is touched.
+      2. Resolves the credentials (see CREDENTIALS), connects to every ESXi host directly
+         (vCenter is about to be shut down), finds each vCenter's VM, opens an appliance API
+         session and TURNS SSH ON on every vCenter where it is off (see SSH).
       3. Checks the CSV against the SSO domain's own list of vCenters: every member must be
          in the CSV (each round snapshots all of them together), and nothing else may be.
-      4. Asks for the datastore path of the patch ISO, pre-positioned on a datastore every
-         ESXi host in the CSV can reach (e.g. [SoftwareRepo] ISO/VMware-vCenter-Server-
-         Appliance-8.0.3.01000-24305161-patch-FP.iso), and checks every host sees the file.
-         Then mounts it on every vCenter still to be upgraded -- connected, and connected at
-         power on -- and has each appliance confirm it sees a newer update on it.
+      4. Checks every ESXi host sees the ISO (-IsoPath), mounts it on every vCenter still to be
+         upgraded -- connected, and connected at power on -- and has each appliance confirm it
+         sees a newer update on it.
       5. Pre-upgrade checks on every vCenter, recorded as findings: every automatic service
          started, appliance health, disk usage, root password and Machine SSL certificate
          expiry, any earlier failed update, vCenter HA, the installer's own precheck, and
          replication from every vCenter in the group. Errors stop the run before any vCenter
-         is shut down.
+         is shut down (-ProceedOverPreCheckErrors overrides those that can be overridden).
       6. One ROUND per vCenter, in CSV order:
            a. Offline snapshot of the WHOLE group at once: every vCenter shut down
-              together, a pause, polled until all are off, a settle pause, a snapshot of
-              each (no memory, no quiesce) while all are off, all powered on together.
-           b. Waits until every vCenter has every service started (checked every 60
-              seconds) and replication is healthy from all of them.
+              together, polled until all are off, a snapshot of each (no memory, no quiesce)
+              while all are off, all powered on together.
+           b. Waits until every vCenter answers, has SSH on, has every service started
+              (checked every 60 seconds) and replication is healthy from all of them.
            c. Upgrades that round's vCenter: ISO re-checked, validate, stage-and-install,
               progress every 60 seconds through the installer's service restarts.
-           d. Reboots it (unless the installer did), then waits again until every vCenter
-              has every service started and replication is healthy.
+           d. Reboots it (unless the installer did), then waits again as in b.
            e. Post-upgrade checks on it, and what is new since its pre-upgrade checks.
-         Nothing moves on until the whole group is confirmed up after every snapshot and
-         every reboot.
-      7. Unmounts the ISO from every vCenter. Each appliance releases it first (a CD-ROM the
-         guest still has mounted is locked, and ejecting it would leave the VM waiting on a
-         question); when the ISO cannot be unmounted the run says why -- the processes still
-         using it, a question pending on the VM, or the ESXi host's error. Then offers to
-         remove the snapshots this run took: default NO, as Aria Operations normally removes
-         snapshots older than 7 days. SSH is put back the way it was found, and the findings
-         CSV written.
+      7. Wrap-up, once the LAST vCenter is upgraded: unmounts the ISO from every vCenter
+         (released inside the appliance first, over SSH), then turns SSH OFF on every vCenter,
+         removes the snapshots only with -RemoveSnapshots (default: kept -- Aria Operations
+         normally removes snapshots older than 7 days), and writes the findings CSV.
 
-    FAILURES. Any failure in a round -- a VM that will not shut down, a failed install, a
-    service that does not start, unhealthy replication, a post-upgrade error -- stops the
-    progression: no further vCenter is upgraded. The power state of every vCenter VM is
-    shown, and you are asked to fix the problem and type RETRY, which carries on with the
-    failed vCenter from the stage it reached: before its install, a fresh snapshot of the
-    whole group is taken first (unless you decline); after its install, the run goes on
-    with the reboot or the checks. Anything else stops the run; its progress is in
-    upgrade-state-<vcenter>.json in -LogFolder, and running again with -Resume continues
-    from the failed vCenter -- the ones already done are not touched again (their live
-    version is checked against the state file).
+    SSH. Turned on through the appliance API on every vCenter where it is off, at the start
+    of every run -- dry runs included, so no check is skipped. It is confirmed on again after
+    every power-on and reboot. It is turned off on every vCenter only once the whole run has
+    completed: after the last vCenter's upgrade and the ISO unmount. A dry run turns it off
+    again at its end. A real run that stops part way (failure or STOP file) leaves it on --
+    -Resume and the person looking at the failure need it -- and records in the state file
+    which vCenters it turned it on for, so the run that completes the upgrade turns those off
+    too. A run refused before anything was changed (e.g. a failed check before the start)
+    puts SSH back as it found it. By default only the vCenters where the run turned SSH on are
+    turned off; -SshFinalState Disable turns it off on all of them.
 
-    -DryRun runs steps 1 to 5 and stops with a verdict instead of the confirmation. It
-    changes nothing at all -- in particular it does not mount the ISO -- see the parameter.
+    CREDENTIALS. Never prompted for. Each is taken from, in order: the parameter; a
+    SecretManagement secret (Get-Secret, a PSCredential) when that module is loaded; the
+    environment variables RICHO_<NAME>_USER and RICHO_<NAME>_PASSWORD (the repo-wide
+    convention). Names, most specific first:
+        ESXi root          vvf-esxi-<host>        then vvf-esxi
+        appliance root     vvf-vcenter-<vcenter>  then vvf-vcenter
+        SSO administrator  vvf-sso
+    e.g. RICHO_VVF_ESXI_USER / RICHO_VVF_ESXI_PASSWORD, or for one host with a different
+    password RICHO_VVF_ESXI_ESX01_CORP_LOCAL_USER / ..._PASSWORD (non-alphanumerics become _).
+    A parameter applies to every host / vCenter that has no more specific secret.
 
-    Nothing is changed before the typed confirmation, apart from mounting the ISO on the
-    vCenter VMs (and setting them to connect it at power on) and enabling SSH on the
-    appliances when it is off.
-    Every finding lands in the CSV with its phase (Pre / Snapshot / Post / Upgrade), node,
-    severity and detail.
+    FAILURES. Any failure in a round stops the run (exit code 1): no further vCenter is
+    upgraded, the power state of every vCenter VM is shown, and the progress is saved in
+    upgrade-state-<vcenter>.json in -LogFolder. Fix the problem and run again with -Resume:
+    the failed vCenter carries on from the stage it reached (a fresh group snapshot first if
+    its install had not started), and those already done are checked and skipped.
+
+    STOPPING. Create a file named STOP in -LogFolder; the run stops at the next safe point
+    (before the ISO is mounted, before the start, or between rounds -- never mid snapshot or
+    mid install), exit code 2. -Resume carries on.
+
+    -DryRun runs steps 1 to 5 and stops with a verdict. It mounts nothing and shuts nothing
+    down; the only change it makes is SSH, turned on for the checks and off again at the end.
 
     ENHANCED LINKED MODE AND SNAPSHOTS. Every round's snapshots are taken with ALL vCenters
     in the group powered off together -- Broadcom's guidance for a consistent ELM rollback
     point -- so the SSO domain is down for the length of each round's snapshot. To roll
-    back, revert EVERY vCenter to the SAME round's snapshot, never one alone. Each round adds
-    a snapshot to every vCenter (with N vCenters to upgrade, each ends up with N more);
-    remove them all together once the whole group is validated.
+    back, revert EVERY vCenter to the SAME round's snapshot, never one alone.
+
+    EXIT CODES. 0 all upgraded (dry run: a real run would proceed), 1 stopped on a failure or
+    refused (dry run: would stop), 2 stopped safely by a STOP file. The last thing written to
+    the output stream is a summary object (ExitCode, Result, Nodes, log paths).
 
 .PARAMETER VCenterCsv
-    CSV of the vCenters to upgrade, one row each, in upgrade order, with the columns
-    VCenter (FQDN), EsxiHost (the ESXi host its VM runs on) and optionally VmName (the VM's
-    inventory name, when it is not the vCenter name). Lines starting with # are comments.
-    Prompted for when omitted. Sample: docs/vcenter-upgrade.sample.csv.
+    Path of the CSV of the vCenters to upgrade, one row each, in upgrade order, with the
+    columns VCenter (FQDN), EsxiHost (the ESXi host its VM runs on) and optionally VmName (the
+    VM's inventory name, when it is not the vCenter name). Lines starting with # are comments.
+    Give this or -VCenterCsvText. Sample: docs/vcenter-upgrade.sample.csv.
+
+.PARAMETER VCenterCsvText
+    The same CSV as text (header line first), for a front end that offers a text box rather
+    than a file. The dry-run check compares the contents, so a file and the same text pasted
+    match.
 
 .PARAMETER IsoPath
     Datastore path of the patch ISO, e.g. "[SoftwareRepo] ISO/VMware-vCenter-Server-
-    Appliance-8.0.3.01000-24305161-patch-FP.iso". Upload it beforehand to a datastore every
-    ESXi host in the CSV can reach. Prompted for when omitted.
+    Appliance-8.0.3.01000-24305161-patch-FP.iso", on a datastore every ESXi host in the CSV
+    can reach. Required, except with -Resume, which reuses the stopped run's.
 
 .PARAMETER EsxiCredential
-    Root credentials for the ESXi hosts. Given here, it is used for every host; prompted for
-    otherwise, with the option of a different one per host. A host in lockdown mode refuses
-    a direct root login -- take it out of lockdown first.
+    ESXi root. See CREDENTIALS. A host in lockdown mode refuses a direct root login.
 
 .PARAMETER VCenterRootCredential
-    Appliance root credentials. Given here, they are used for every vCenter; prompted for
-    otherwise, with the option of different ones per vCenter.
+    Appliance root. See CREDENTIALS.
 
 .PARAMETER SsoCredential
-    SSO administrator, e.g. administrator@vsphere.local. Prompted for when omitted.
+    SSO administrator, e.g. administrator@vsphere.local. See CREDENTIALS.
+
+.PARAMETER ConfirmVCenter
+    Required for a real run (and a resume): the short name of the FIRST vCenter in the CSV,
+    e.g. vcenter1. The stand-in for typing it at the old confirmation: a run whose form was
+    filled in for another group does not start. Not needed for -DryRun.
+
+.PARAMETER ProceedOverPreCheckErrors
+    Carry on although the pre-upgrade checks found errors (not recommended). Installer
+    precheck errors and errors with the CSV, the VMs or vCenter access still stop the run.
+
+.PARAMETER AllowHardPowerOff
+    When a vCenter has not shut down by itself within -ShutdownTimeoutMinutes, power it off
+    hard. Without it the round fails there instead (and -Resume carries on later).
+
+.PARAMETER RemoveSnapshots
+    At the end, remove the snapshots this run took. Default: kept (Aria Operations normally
+    removes snapshots older than 7 days; they are the rollback point until then).
+
+.PARAMETER Resume
+    Continue a run that stopped (failure or STOP file), from the vCenter it stopped at, using
+    the state file in -LogFolder. Use the same CSV.
+
+.PARAMETER StartFresh
+    A previous run left an unfinished state file and you do NOT want to resume it: it is
+    renamed aside (.abandoned-<time>) and this run starts from the beginning. Without -Resume
+    or -StartFresh an unfinished state file stops a real run.
+
+.PARAMETER SkipDryRunCheck
+    Allow a real run without a matching passing dry run in the last 24 hours. Logged loudly.
+
+.PARAMETER InstallerAnswers
+    Answers to the installer's questions, by data item (e.g. @{ 'some.item' = 'value' }).
+    Questions not listed take the installer's default; one with no default stops the run
+    before anything is shut down, naming the item. The vmdir/SSO password is answered from
+    the SSO credential.
+
+.PARAMETER SshFinalState
+    Restore (default): at the end, turn SSH off on every vCenter where this run (or the
+    stopped run it resumes) turned it on. Disable: turn it off on every vCenter in the CSV.
+    Applies when the whole upgrade completes; a dry run always restores.
 
 .PARAMETER ShutdownPauseSeconds
     Pause after the guest shutdown is requested, before the power state is polled. Default 60.
@@ -297,88 +389,68 @@
     How long the upgrade may run before the script gives up watching. Default 240.
 
 .PARAMETER LogFolder
-    Folder for the transcript, findings CSV and log excerpts. Created when missing.
+    Folder for the transcript, findings CSV, log excerpts, the dry-run record and the resume
+    state. Default %ProgramData%\VvfVCenterUpgrade. The dry run, the real run and any resume
+    must use the same folder.
 
 .PARAMETER DryRun
-    Run every read-only step -- the CSV, host and VM lookup, the CSV against the SSO domain,
-    the ISO on the datastore from every host, the pre-upgrade checks, ELM replication, and
-    (where the ISO is already mounted) the installer's precheck and validate -- then report
-    whether a real run would proceed, and stop. The ISO is not mounted. Nothing is changed: no shutdown, snapshot or install, the
-    CD-ROM settings are reported rather than set, and SSH is not turned on. When SSH is off
-    the checks that need it (services, disk, password and certificate expiry, ELM) are
-    skipped and listed as skipped. Exit code 0 = a real run would proceed, 1 = it would stop,
-    or an ISO could not be checked so it cannot be told. Every vCenter in the group is
-    checked: its VM, its ISO, its health and the installer's precheck and validate.
-
-.PARAMETER Resume
-    Continue a run that stopped on a failure, from the vCenter that failed, using the state
-    file it left in -LogFolder. vCenters it recorded as done are checked (their live
-    version) and skipped. Use the same CSV; credentials are asked for again and the ISO path
-    from the stopped run is offered. Without -Resume, an unfinished state file is offered for
-    resuming.
-
-.PARAMETER Prompter
-    For a front end: a script block that answers the run's questions instead of the console.
-    It is given one request -- Id (a fixed name per question, e.g. confirm-start, retry,
-    remove-snapshots, esxi-credential), Kind (Text, Typed, YesNo or Credential), Text, Default,
-    Expected (the word a Typed question needs) and Context -- and returns a string for Text and
-    Typed, $true / $false / $null (the default) for YesNo, a PSCredential for Credential.
-
-.PARAMETER OnEvent
-    For a front end: a script block given every event of the run as an object with Time and
-    Kind -- Phase, Log (Level, Message), Findings, Prompt, Plan (Nodes with Name, VmName,
-    EsxiHost, CurrentVersion, TargetVersion, Stage), Round (Index, Count, Node), Node (Node,
-    Stage, Detail, Percent) and Result (ExitCode, DryRun, Stopped, Transcript, FindingsCsv,
-    StateFile). Errors thrown by it are ignored.
+    Every read-only step, then a verdict on whether a real run would proceed. Nothing is
+    mounted, shut down, snapshotted or installed; SSH is turned on for the checks and off again
+    at the end. Exit code 0 = a real run would proceed, 1 = it would stop. A passing dry run
+    writes dryrun-<vcenter>.json in -LogFolder, which a real run requires.
 
 .PARAMETER SshClient
     How the run reaches the appliances over SSH. Auto (default): Posh-SSH when it loads,
-    otherwise PuTTY's plink.exe. PoshSSH or Plink: that one only. Use Plink where Posh-SSH is
-    blocked (e.g. by antivirus) and PuTTY 0.77 or later is installed.
+    otherwise PuTTY's plink.exe. PoshSSH or Plink: that one only.
 
 .PARAMETER PlinkPath
     The plink.exe to use. Default: plink on the PATH, else Program Files\PuTTY\plink.exe.
-
-.PARAMETER StopSignal
-    For a front end: a script block that returns $true once the operator has asked the run to
-    stop. It is checked at the safe points -- before the ISO is mounted, before the start is
-    confirmed, and between rounds -- and the run stops there, exit code 2. From the console,
-    create a file named STOP in -LogFolder to do the same.
 
 .PARAMETER StrictCertificates
     Validate the ESXi and appliance TLS certificates. By default both are accepted
     unvalidated for this session only, because a jumpbox rarely trusts the VMCA root.
 
 .EXAMPLE
-    .\Invoke-VvfVCenterUpgrade.ps1
+    .\Invoke-VvfVCenterUpgrade.ps1 -VCenterCsv D:\Upgrades\vcenters.csv -IsoPath '[SoftwareRepo] ISO/VMware-vCenter-Server-Appliance-8.0.3.01000-24305161-patch-FP.iso' -DryRun
 
-    Prompts for the CSV, the credentials and the ISO path, in the order described above.
-
-.EXAMPLE
-    .\Invoke-VvfVCenterUpgrade.ps1 -VCenterCsv .\vcenters.csv -IsoPath '[SoftwareRepo] ISO/VMware-vCenter-Server-Appliance-8.0.3.01000-24305161-patch-FP.iso' -DryRun
-
-    Every check, then a verdict. Nothing is mounted, shut down, snapshotted or changed.
+    Every check, then a verdict. Credentials from SecretManagement or RICHO_VVF_* variables.
 
 .EXAMPLE
-    .\Invoke-VvfVCenterUpgrade.ps1 -VCenterCsv .\vcenters.csv -Resume
+    $esx = Get-Credential root; $vc = Get-Credential root; $sso = Get-Credential administrator@vsphere.local
+    .\Invoke-VvfVCenterUpgrade.ps1 -VCenterCsv D:\Upgrades\vcenters.csv -IsoPath '[SoftwareRepo] ISO/VMware-vCenter-Server-Appliance-8.0.3.01000-24305161-patch-FP.iso' -EsxiCredential $esx -VCenterRootCredential $vc -SsoCredential $sso -ConfirmVCenter vcenter1
 
-    Continues a run that stopped on a failure, from the vCenter that failed.
+    The real run, after a passing dry run of the same CSV and ISO.
+
+.EXAMPLE
+    .\Invoke-VvfVCenterUpgrade.ps1 -VCenterCsv D:\Upgrades\vcenters.csv -Resume -ConfirmVCenter vcenter1
+
+    Continues a run that stopped, from the vCenter it stopped at, with the same ISO.
 
 .NOTES
     Requires VMware PowerCLI (VMware.PowerCLI, VCF.PowerCLI, or VMware.VimAutomation.Core)
-    and an SSH client: Posh-SSH (Install-Module Posh-SSH -Scope CurrentUser), or PuTTY's
-    plink.exe 0.77 or later where Posh-SSH cannot be used (-SshClient). Written for Windows
-    PowerShell 5.1 and PowerShell 7. The appliance must answer SSH; the script enables it
-    through the appliance API when it is off and disables it again at the end.
-    Tested offline against a stubbed host and appliance (tests/Test-VvfVCenterUpgrade.ps1).
+    and an SSH client: Posh-SSH 4 or later, or PuTTY's plink.exe 0.77 or later where Posh-SSH
+    cannot be used (-SshClient). Modules must be visible to the account the front end runs
+    the script as (install them -Scope AllUsers, or as that account). Written for Windows
+    PowerShell 5.1 and PowerShell 7. Progress is written with Write-Host (the information
+    stream in PowerShell 5+) and to the transcript in -LogFolder.
 #>
 [CmdletBinding()]
 param(
     [string]$VCenterCsv,
+    [string]$VCenterCsvText,
     [string]$IsoPath,
     [System.Management.Automation.PSCredential]$EsxiCredential,
     [System.Management.Automation.PSCredential]$VCenterRootCredential,
     [System.Management.Automation.PSCredential]$SsoCredential,
+    [string]$ConfirmVCenter,
+    [switch]$ProceedOverPreCheckErrors,
+    [switch]$AllowHardPowerOff,
+    [switch]$RemoveSnapshots,
+    [switch]$Resume,
+    [switch]$StartFresh,
+    [switch]$SkipDryRunCheck,
+    [hashtable]$InstallerAnswers = @{},
+    [ValidateSet('Restore', 'Disable')] [string]$SshFinalState = 'Restore',
     [ValidateRange(0, 3600)] [int]$ShutdownPauseSeconds = 60,
     [ValidateRange(1, 240)]  [int]$ShutdownTimeoutMinutes = 20,
     [ValidateRange(0, 3600)] [int]$PowerOnPauseSeconds = 180,
@@ -386,13 +458,9 @@ param(
     [ValidateRange(1, 480)]  [int]$ServiceTimeoutMinutes = 60,
     [ValidateRange(5, 3600)] [int]$UpgradePollSeconds = 60,
     [ValidateRange(10, 1440)][int]$UpgradeTimeoutMinutes = 240,
-    [string]$LogFolder = (Join-Path (Get-Location).Path 'vcenter-upgrade-logs'),
+    [string]$LogFolder = $(if ($env:ProgramData) { Join-Path $env:ProgramData 'VvfVCenterUpgrade' } else { Join-Path (Get-Location).Path 'vcenter-upgrade-logs' }),
     [switch]$StrictCertificates,
     [switch]$DryRun,
-    [switch]$Resume,
-    [scriptblock]$Prompter,
-    [scriptblock]$OnEvent,
-    [scriptblock]$StopSignal,
     [ValidateSet('Auto', 'PoshSSH', 'Plink')] [string]$SshClient = 'Auto',
     [string]$PlinkPath
 )
@@ -400,42 +468,30 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '2.5.2'
+$ScriptVersion = '3.0.0'
 
 # ---------------------------------------------------------------------------- helpers --
 
-# ------------------------------------------------------------------- events, prompts --
-# A front end (the GUI) passes -OnEvent to be told what is happening, as objects rather than
-# console text, and -Prompter to answer the questions a run asks. Without them the run prints
-# and asks at the console, exactly as it always has.
-
-function Send-UpgradeEvent {
-    # One event to the -OnEvent listener: Kind plus the given fields, and the time. A listener
-    # that throws is ignored -- a broken display must never stop an upgrade half way.
-    param([string]$Kind, [hashtable]$Data = @{})
-    $sink = Get-Variable -Name UpgradeEventSink -Scope Script -ValueOnly -ErrorAction SilentlyContinue
-    if (-not $sink) { return }
-    $e = [ordered]@{ Time = Get-Date; Kind = $Kind }
-    foreach ($k in $Data.Keys) { $e[$k] = $Data[$k] }
-    try { $null = & $sink ([pscustomobject]$e) } catch { }
-}
+# ---------------------------------------------------------------------- output, inputs --
+# No front-end hooks and no prompts: progress goes to the host (and the transcript), and every
+# input comes from a parameter, a SecretManagement secret or an environment variable. A run
+# never waits for an answer -- a job runner that cannot give one would hang on it.
 
 function Set-NodeStage {
-    # Where one vCenter has got to, for a progress board: Stage is a fixed word (ShuttingDown,
-    # Snapshotted, Installing, Rebooting, Upgraded, Failed, ...), Detail free text.
+    # Where one vCenter has got to (ShuttingDown, Snapshotted, Installing, Rebooting, Upgraded,
+    # Failed, ...), kept on the node for the summary table at the end.
     param($Node, [string]$Stage, [string]$Detail = '', $Percent = $null)
-    Send-UpgradeEvent 'Node' @{ Node = $Node.Name; Stage = $Stage; Detail = $Detail; Percent = $Percent }
+    $Node.Board = [pscustomobject]@{ Stage = $Stage; Detail = $Detail; Percent = $Percent; Time = Get-Date }
 }
 
-function Write-Step { param([string]$Message) Write-Host "  $Message" -ForegroundColor Cyan; Send-UpgradeEvent 'Log' @{ Level = 'Step'; Message = $Message } }
-function Write-Note { param([string]$Message) Write-Host "  $Message" -ForegroundColor DarkGray; Send-UpgradeEvent 'Log' @{ Level = 'Note'; Message = $Message } }
-function Write-Warn { param([string]$Message) Write-Host "  $Message" -ForegroundColor Yellow; Send-UpgradeEvent 'Log' @{ Level = 'Warning'; Message = $Message } }
-function Write-Bad  { param([string]$Message) Write-Host "  $Message" -ForegroundColor Red; Send-UpgradeEvent 'Log' @{ Level = 'Error'; Message = $Message } }
-function Write-Good { param([string]$Message) Write-Host "  $Message" -ForegroundColor Green; Send-UpgradeEvent 'Log' @{ Level = 'Good'; Message = $Message } }
+function Write-Step { param([string]$Message) Write-Host "  $Message" -ForegroundColor Cyan }
+function Write-Note { param([string]$Message) Write-Host "  $Message" -ForegroundColor DarkGray }
+function Write-Warn { param([string]$Message) Write-Host "  WARNING: $Message" -ForegroundColor Yellow }
+function Write-Bad  { param([string]$Message) Write-Host "  ERROR: $Message" -ForegroundColor Red }
+function Write-Good { param([string]$Message) Write-Host "  $Message" -ForegroundColor Green }
 
 function Write-Phase {
     param([string]$Title)
-    Send-UpgradeEvent 'Phase' @{ Title = $Title }
     Write-Host ''
     Write-Host ('=' * 78) -ForegroundColor White
     Write-Host " $Title" -ForegroundColor White
@@ -499,65 +555,73 @@ function Test-TypedConfirmation {
     return ([string]$Typed).Trim() -ieq $Expected
 }
 
-function Invoke-Prompt {
-    # Every question a run asks goes through here. Id is a fixed name for the question (a front
-    # end can give each its own dialog); Kind is Text, Typed (an exact word to type -- $Expected),
-    # YesNo or Credential. With -Prompter the request goes to it; otherwise to the console.
-    # Returns what was answered: a string for Text and Typed ('' for just Enter), $true / $false
-    # / $null (= the default) for YesNo, a PSCredential or $null for Credential.
-    param([string]$Id, [string]$Text, [string]$Kind = 'Text', $Default = $null, [string]$Expected = '', [hashtable]$Context = @{})
-    $prompter = Get-Variable -Name UpgradePrompter -Scope Script -ValueOnly -ErrorAction SilentlyContinue
-    Send-UpgradeEvent 'Prompt' @{ Id = $Id; PromptKind = $Kind; Text = $Text }
-    if ($prompter) {
-        return (& $prompter ([pscustomobject]@{ Id = $Id; Kind = $Kind; Text = $Text; Default = $Default; Expected = $Expected; Context = $Context }))
-    }
+function ConvertTo-SecretSlug {
+    # A credential name -> the part of its environment variable names: 'vvf-esxi-esx01.corp'
+    # -> 'VVF_ESXI_ESX01_CORP' (RICHO_<slug>_USER / RICHO_<slug>_PASSWORD), the repo convention.
+    param([string]$Name)
+    return (($Name -replace '[^A-Za-z0-9]', '_').ToUpperInvariant())
+}
+
+function Get-CredentialNames {
+    # The secret names to look for, most specific first: per host / per vCenter, then shared.
+    param([ValidateSet('Esxi', 'VCenter', 'Sso')][string]$Kind, [string]$Target = '')
+    $t = ([string]$Target).Trim().ToLowerInvariant()
     switch ($Kind) {
-        'YesNo' {
-            $answer = Read-Host "$Text $(if ($Default) { '[Y/n]' } else { '[y/N]' })"
-            if ([string]::IsNullOrWhiteSpace($answer)) { return $null }
-            return ($answer.Trim() -match '^(y|yes)$')
+        'Esxi'    { return @($(if ($t) { "vvf-esxi-$t" }), 'vvf-esxi' | Where-Object { $_ }) }
+        'VCenter' { return @($(if ($t) { "vvf-vcenter-$t" }), 'vvf-vcenter' | Where-Object { $_ }) }
+        default   { return @('vvf-sso') }
+    }
+}
+
+function Resolve-VvfCredential {
+    # A credential without a prompt. For each name, most specific first: a SecretManagement
+    # secret (when Get-Secret is available), then RICHO_<NAME>_USER / _PASSWORD. The parameter
+    # value ($Given) is used after any per-target secret but before the shared one, so a
+    # front end's credential field applies to every host that has no secret of its own.
+    # Throws, naming every place it looked, when there is none. Returns Credential and Source.
+    param([string[]]$Names, [System.Management.Automation.PSCredential]$Given, [string]$ParameterName,
+          [scriptblock]$GetSecret = $null, [scriptblock]$GetEnv = { param($n) [Environment]::GetEnvironmentVariable($n) })
+    if (-not $GetSecret -and (Get-Command -Name 'Get-Secret' -ErrorAction SilentlyContinue)) { $GetSecret = { param($n) Get-Secret -Name $n -ErrorAction SilentlyContinue } }
+    $looked = [System.Collections.Generic.List[string]]::new()
+    $names = @($Names)
+    for ($i = 0; $i -lt $names.Count; $i++) {
+        $name = $names[$i]
+        # The parameter outranks only the shared (last) name; a per-target secret outranks it.
+        if ($Given -and $i -eq $names.Count - 1) { return [pscustomobject]@{ Credential = $Given; Source = "-$ParameterName" } }
+        if ($GetSecret) {
+            $s = $null
+            try { $s = & $GetSecret $name } catch { }
+            if ($s -is [System.Management.Automation.PSCredential]) { return [pscustomobject]@{ Credential = $s; Source = "secret '$name'" } }
+            $looked.Add("secret '$name'")
         }
-        'Credential' { return (Get-Credential -UserName ([string]$Default) -Message $Text) }
-        default { return (Read-Host $Text) }
+        $slug = ConvertTo-SecretSlug $name
+        $u = & $GetEnv "RICHO_${slug}_USER"
+        $p = & $GetEnv "RICHO_${slug}_PASSWORD"
+        if ($u -and $p) {
+            return [pscustomobject]@{ Credential = [System.Management.Automation.PSCredential]::new($u, (ConvertTo-SecureString $p -AsPlainText -Force)); Source = "RICHO_${slug}_USER/_PASSWORD" }
+        }
+        $looked.Add("RICHO_${slug}_USER/_PASSWORD")
     }
+    throw "No credential given: pass -$ParameterName, or set one of: $($looked -join ', ')."
 }
 
-function Read-YesNo {
-    param([string]$Prompt, [bool]$Default = $false, [string]$Id = 'yes-no')
-    $answer = Invoke-Prompt -Id $Id -Text $Prompt -Kind 'YesNo' -Default $Default
-    if ($null -eq $answer) { return $Default }
-    if ($answer -is [bool]) { return $answer }
-    if ([string]::IsNullOrWhiteSpace([string]$answer)) { return $Default }
-    return ([string]$answer).Trim() -match '^(y|yes|true)$'
-}
-
-function Read-NonEmpty {
-    param([string]$Prompt, [string]$Id = 'text')
-    $value = ''
-    for ($n = 1; [string]::IsNullOrWhiteSpace($value); $n++) {
-        if ($n -gt 1 -and (Get-Variable -Name UpgradePrompter -Scope Script -ValueOnly -ErrorAction SilentlyContinue)) { throw "No answer given to: $Prompt" }
-        $value = [string](Invoke-Prompt -Id $Id -Text $Prompt)
-    }
-    return $value.Trim().Trim('"').Trim("'")
-}
-
-function Read-Credential {
-    param([string]$Message, [string]$UserName, [string]$Id = 'credential')
-    $cred = Invoke-Prompt -Id $Id -Text $Message -Kind 'Credential' -Default $UserName
-    if ($null -eq $cred) { throw "No credentials supplied ($Message)." }
-    return $cred
+function Get-InstallerAnswer {
+    # The answer to one installer question, without asking: -InstallerAnswers by data item, else
+    # the installer's default. Returns Answer and Source; throws when there is neither.
+    param([string]$DataItem, [string]$Text, $Default, [hashtable]$Answers = @{})
+    if ($Answers -and $Answers.ContainsKey($DataItem)) { return [pscustomobject]@{ Answer = [string]$Answers[$DataItem]; Source = '-InstallerAnswers' } }
+    if ($null -ne $Default -and [string]$Default -ne '') { return [pscustomobject]@{ Answer = [string]$Default; Source = 'the installer default' } }
+    throw "the installer asks '$Text' (data item '$DataItem') and offers no default -- run again with -InstallerAnswers @{ '$DataItem' = '<answer>' }"
 }
 
 # ------------------------------------------------------------------------- stopping --
-# A stop is asked for with -StopSignal or a STOP file in -LogFolder, and acted on only at the
-# safe points (Assert-NotStopped): never in the middle of a group shutdown, snapshot and
-# power-on, or of an install and its reboot.
+# A stop is asked for with a file named STOP in -LogFolder, and acted on only at the safe
+# points (Assert-NotStopped): never in the middle of a group shutdown, snapshot and power-on,
+# or of an install and its reboot.
 
 function Test-StopRequested {
-    # Whether a stop has been asked for, and how: 'signal', 'file' or ''. A signal that throws
-    # does not count -- a broken front end must not stop an upgrade.
-    param([scriptblock]$Signal, [string]$StopFile)
-    if ($Signal) { try { if (& $Signal) { return 'signal' } } catch { } }
+    # Whether a stop has been asked for: 'file' or ''.
+    param([string]$StopFile)
     if ($StopFile -and (Test-Path -LiteralPath $StopFile)) { return 'file' }
     return ''
 }
@@ -565,7 +629,7 @@ function Test-StopRequested {
 function Assert-NotStopped {
     # At a safe point: stops the run here when a stop has been asked for.
     param([string]$Where)
-    $how = Test-StopRequested (Get-Variable -Name UpgradeStopSignal -Scope Script -ValueOnly -ErrorAction SilentlyContinue) (Get-Variable -Name StopFile -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
+    $how = Test-StopRequested (Get-Variable -Name StopFile -Scope Script -ValueOnly -ErrorAction SilentlyContinue)
     if (-not $how) { return }
     if ($how -eq 'file') { try { Remove-Item -LiteralPath $script:StopFile -Force -ErrorAction Stop } catch { } }
     # Its own error id: a real timeout can surface as an OperationCanceledException too, and must
@@ -605,7 +669,6 @@ function Add-Finding {
 function Write-Findings {
     param($Findings, [string]$Title)
     $list = @($Findings)
-    Send-UpgradeEvent 'Findings' @{ Title = $Title; Findings = $list }
     $errors = @($list | Where-Object { $_.Severity -eq 'Error' }).Count
     $warns  = @($list | Where-Object { $_.Severity -eq 'Warning' }).Count
     Write-Host ''
@@ -1129,10 +1192,11 @@ function New-Node {
         Name = $Name; Credential = $Credential; SsoCredential = $SsoCredential
         ApiBase = $null; Token = $null; ApiLabel = $null
         Vm = $null; Esxi = $null; EsxiHost = $null
-        CurrentVersion = $null; CurrentBuild = $null; TargetVersion = $null; IsoPath = $null; UserData = @{}
+        CurrentVersion = $null; FromVersion = $null; CurrentBuild = $null; TargetVersion = $null; IsoPath = $null; UserData = @{}
         Stage = 'Pending'; InstallMark = $null; LastError = $null; PreFindings = @(); Attempts = 0; IsoPending = $false
         Ssh = $null; ShellMode = $null; Stream = $null; Seq = 0
-        SshEnabledByScript = $false; SshOff = $false; LastReady = $null; HostKey = ''; StatusOneByOne = $false
+        SshEnabledByScript = $false; SshOff = $false; SshWasOn = $null; SshFinal = ''
+        LastReady = $null; HostKey = ''; StatusOneByOne = $false; Board = $null
     }
 }
 
@@ -1465,7 +1529,7 @@ function Get-SshFailureText {
     if ($m -match '(?i)aborted by the server|forcibly closed|connection was closed|connection lost|reset by peer|unexpectedly closed') {
         $hint = "The appliance dropped the login. Usual causes: the root password has expired (log in to https://${Name}:5480 as root to see), root is locked after failed logins (it unlocks after a while), or the appliance only offers SSH algorithms this Posh-SSH does not support (use Posh-SSH 4 or later). Check with PuTTY as $User."
     } elseif ($m -match '(?i)permission denied|access denied|authentication|auth fail|password') {
-        $hint = "The password for $User was refused. If the vCenters do not all share one root password, answer No to 'Do all ... vCenters share that root password?' (in the window: tick 'different root passwords')."
+        $hint = "The password for $User was refused. If the vCenters do not all share one root password, give that host or vCenter its own credential (secret vvf-vcenter-<name> / vvf-esxi-<name>, or RICHO_VVF_VCENTER_<NAME>_USER/_PASSWORD) -- see CREDENTIALS in the help."
     } elseif ($m -match '(?i)timed? ?out|refused|no such host|not known|unreachable|could not resolve|does not exist') {
         $hint = "Nothing answered SSH on port 22. Check SSH is enabled in the VAMI (Access), the name resolves, and no firewall blocks port 22 from this machine."
     }
@@ -1512,7 +1576,7 @@ function Start-NodeShell {
     # the result. Starting the same command on several appliances before collecting any is
     # what lets the group checks run on all of them at the same time.
     param($Node, [string]$Command, [int]$TimeoutSec = 300)
-    if ($Node.SshOff) { throw "SSH is off on $($Node.Name) and a dry run does not turn it on." }
+    if ($Node.SshOff) { throw "SSH is off on $($Node.Name) (it could not be turned on)." }
     Open-NodeSsh $Node
     $h = [pscustomobject]@{
         Node = $Node; TimeoutSec = $TimeoutSec; Clock = [Diagnostics.Stopwatch]::StartNew()
@@ -1580,7 +1644,7 @@ function Get-NodeShellError {
 function Invoke-NodeShell {
     # Runs one bash command on the appliance; reconnects once if the session has gone.
     param($Node, [string]$Command, [int]$TimeoutSec = 300)
-    if ($Node.SshOff) { throw "SSH is off on $($Node.Name) and a dry run does not turn it on." }
+    if ($Node.SshOff) { throw "SSH is off on $($Node.Name) (it could not be turned on)." }
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         try {
             return (Receive-NodeShell (Start-NodeShell $Node $Command $TimeoutSec))
@@ -1600,7 +1664,7 @@ function Invoke-GroupShell {
     $handles = [ordered]@{}
     $again = [System.Collections.Generic.List[object]]::new()
     foreach ($n in @($Nodes)) {
-        if ($n.SshOff) { $out[$n.Name] = [pscustomobject]@{ Result = $null; Error = "SSH is off on $($n.Name) and a dry run does not turn it on." }; continue }
+        if ($n.SshOff) { $out[$n.Name] = [pscustomobject]@{ Result = $null; Error = "SSH is off on $($n.Name) (it could not be turned on)." }; continue }
         try { $handles[$n.Name] = Start-NodeShell $n $Command $TimeoutSec } catch { Close-NodeSsh $n; $again.Add($n) }
     }
     foreach ($n in @($Nodes)) {
@@ -1615,33 +1679,93 @@ function Invoke-GroupShell {
     return $out
 }
 
+function Get-SshEndAction {
+    # What to do with SSH on one vCenter when a run ends. Disable or Leave.
+    #   $EnabledByRun   this run, or the stopped run it resumes, turned SSH on there
+    #   $Completed      the whole upgrade completed (every vCenter done, ISO unmounted)
+    #   $Unfinished     a real run left an unfinished state file (it will be resumed)
+    #   $FinalState     -SshFinalState: Restore or Disable
+    # A run part way through leaves SSH on: the resume and the person looking need it. A
+    # completed upgrade (or a dry run, or a run refused before it started) turns it off where
+    # the run turned it on -- and with Disable, after a completed upgrade, everywhere.
+    param([bool]$EnabledByRun, [bool]$Completed, [bool]$Unfinished, [bool]$DryRun, [string]$FinalState = 'Restore')
+    if (-not $DryRun -and $Unfinished) { return 'Leave' }
+    if ($EnabledByRun) { return 'Disable' }
+    if ($Completed -and -not $DryRun -and $FinalState -eq 'Disable') { return 'Disable' }
+    return 'Leave'
+}
+
 function Enable-NodeSsh {
-    # SSH is needed for the service and replication checks. Turned on through the API when
-    # it is off, and remembered so it is turned off again at the end. A dry run leaves it
-    # off and marks the node, so the checks that need SSH are skipped rather than failed.
+    # SSH is needed for the service, disk, expiry and replication checks and for releasing the
+    # ISO inside the appliance. Turned on through the API when it is off -- in a dry run too,
+    # which turns it off again at its end -- and remembered so it is turned off again once the
+    # whole upgrade has completed. When it cannot be turned on in a dry run, the node is marked
+    # and the checks that need SSH are skipped and listed; in a real run that is an error.
     param($Node, [bool]$DryRun = $false)
     $enabled = $true
-    try { $enabled = [bool](Invoke-NodeApi $Node 'Get' '/appliance/access/ssh') } catch { Write-Warn "Could not read the SSH setting on $($Node.Name): $($_.Exception.Message)"; return }
-    if ($enabled) { return }
-    if ($DryRun) {
-        Write-Warn "SSH is off on $($Node.Name). A dry run does not turn it on, so the checks that need it are skipped (a real run turns it on for the run)."
+    try { $enabled = [bool](Invoke-NodeApi $Node 'Get' '/appliance/access/ssh') }
+    catch { Write-Warn "Could not read the SSH setting on $($Node.Name): $($_.Exception.Message)"; return }
+    if ($null -eq $Node.SshWasOn) { $Node.SshWasOn = $enabled }
+    if ($enabled) { Write-Note "$($Node.Name): SSH is already on."; return }
+    Write-Step "$($Node.Name): turning SSH on for the run$(if ($DryRun) { ' (the dry run turns it off again at its end)' }) ..."
+    try { Invoke-NodeApi $Node 'Put' '/appliance/access/ssh' @{ enabled = $true } | Out-Null }
+    catch {
+        if (-not $DryRun) { throw "could not turn SSH on on $($Node.Name): $($_.Exception.Message)" }
+        Write-Warn "Could not turn SSH on on $($Node.Name) ($($_.Exception.Message)): the checks that need it are skipped."
         $Node.SshOff = $true
         return
     }
-    Write-Step "Enabling SSH on $($Node.Name) for the duration of the run ..."
-    Invoke-NodeApi $Node 'Put' '/appliance/access/ssh' @{ enabled = $true } | Out-Null
     $Node.SshEnabledByScript = $true
 }
 
-function Restore-NodeSsh {
+function Wait-NodeSshReady {
+    # Opens SSH to a vCenter, retrying for a while: sshd takes a few seconds to start after it
+    # is turned on, and longer while the appliance boots.
+    param($Node, [int]$Tries = 6, [int]$PauseSeconds = 10)
+    for ($t = 1; ; $t++) {
+        try { Open-NodeSsh $Node; return }
+        catch {
+            if ($t -ge $Tries) { throw }
+            Write-Note "$($Node.Name): SSH not answering yet ($(($_.Exception.Message -split "`n")[0])) -- trying again in ${PauseSeconds}s ($t/$Tries)."
+            Close-NodeSsh $Node
+            Start-Sleep -Seconds $PauseSeconds
+        }
+    }
+}
+
+function Confirm-NodeSshEnabled {
+    # After a power-on or reboot: SSH must still be on (the checks that follow need it). Turned
+    # on again when it is off -- and then counted as turned on by this run, so it is turned off
+    # at the end. Returns '' or why it could not be confirmed.
     param($Node)
-    if (-not $Node.SshEnabledByScript) { return }
+    $on = $null
+    try { $on = [bool](Invoke-NodeApi $Node 'Get' '/appliance/access/ssh') } catch { return "could not read the SSH setting: $($_.Exception.Message)" }
+    if ($on) { return '' }
+    Write-Warn "$($Node.Name): SSH was off after the power cycle -- turning it on again."
+    try { Invoke-NodeApi $Node 'Put' '/appliance/access/ssh' @{ enabled = $true } | Out-Null }
+    catch { return "could not turn SSH on again: $($_.Exception.Message)" }
+    $Node.SshEnabledByScript = $true
+    Close-NodeSsh $Node
+    Save-UpgradeState
+    return ''
+}
+
+function Disable-NodeSsh {
+    # Turns SSH off on one vCenter through the appliance API. Never throws: returns '' or why
+    # not, and records the result on the node for the summary.
+    param($Node, [string]$Why = '')
     Close-NodeSsh $Node
     try {
         Invoke-NodeApi $Node 'Put' '/appliance/access/ssh' @{ enabled = $false } | Out-Null
         $Node.SshEnabledByScript = $false
-        Write-Note "SSH disabled again on $($Node.Name)."
-    } catch { Write-Warn "Could not disable SSH on $($Node.Name) again -- do it from the VAMI: $($_.Exception.Message)" }
+        $Node.SshFinal = 'Off'
+        Write-Note "$($Node.Name): SSH turned off$(if ($Why) { " ($Why)" })."
+        return ''
+    } catch {
+        $Node.SshFinal = 'STILL ON (could not turn off)'
+        Write-Warn "Could not turn SSH off on $($Node.Name) -- do it in the VAMI (https://$($Node.Name):5480, Access): $($_.Exception.Message)"
+        return $_.Exception.Message
+    }
 }
 
 # =============================================================== checks over a node ==
@@ -1731,13 +1855,20 @@ function Wait-GroupServices {
     $pending = [System.Collections.Generic.List[object]]::new()
     foreach ($node in @($Nodes)) { $pending.Add($node) }
     $n = 0
+    # SSH is confirmed on once per vCenter per wait, as soon as its API answers: these waits
+    # follow a power-on or a reboot, and the service checks need SSH.
+    $sshConfirmed = @{}
     while ($true) {
         $n++
         $stamp = (Get-Date).ToString('HH:mm:ss')
         $check = [Diagnostics.Stopwatch]::StartNew()
         $apiDown = @{}
         foreach ($node in $pending) {
-            try { Reset-NodeApi $node; Connect-NodeApi $node } catch { $apiDown[$node.Name] = $_.Exception.Message }
+            try { Reset-NodeApi $node; Connect-NodeApi $node } catch { $apiDown[$node.Name] = $_.Exception.Message; continue }
+            if (-not $sshConfirmed.ContainsKey($node.Name)) {
+                $why = Confirm-NodeSshEnabled $node
+                if ($why) { $apiDown[$node.Name] = "SSH: $why" } else { $sshConfirmed[$node.Name] = $true }
+            }
         }
         $asked = @($pending | Where-Object { -not $apiDown.ContainsKey($_.Name) })
         $res = $(if ($asked.Count) { Get-GroupServiceReadiness $asked } else { @{} })
@@ -1897,13 +2028,9 @@ function Find-ApplianceVm {
     })
     if ($hit.Count -eq 1) { return $hit[0] }
 
-    Write-Warn "Could not identify the appliance VM for $VCenterName by name or guest host name."
-    $i = 0
-    foreach ($vm in $vms) { $i++; Write-Host ('    {0,3}. {1}  [{2}]' -f $i, $vm.Name, $vm.PowerState) }
-    $answer = Invoke-Prompt -Id 'vm-pick' -Text 'Number of the vCenter appliance VM (blank to abort)' -Context @{ VCenter = $VCenterName; Vms = @($vms | ForEach-Object { $_.Name }) }
-    $k = 0
-    if ([int]::TryParse([string]$answer, [ref]$k) -and $k -ge 1 -and $k -le $vms.Count) { return $vms[$k - 1] }
-    throw 'No vCenter appliance VM chosen.'
+    # No prompt: the VM's inventory name goes in the CSV's VmName column.
+    $names = @($vms | ForEach-Object { "$($_.Name) [$($_.PowerState)]" })
+    throw "could not tell which VM is the vCenter by name or guest host name -- put its inventory name in the CSV's VmName column. VMs on this host: $(if ($names.Count) { $names -join ', ' } else { 'none' })"
 }
 
 function Get-IsoDrive {
@@ -1974,6 +2101,7 @@ function ConvertTo-UpgradeStateJson {
             Stage = $n.Stage; TargetVersion = [string]$n.TargetVersion
             InstallMark = $(if ($n.InstallMark) { ([datetime]$n.InstallMark).ToUniversalTime().ToString('o') } else { '' })
             LastError = [string]$n.LastError
+            SshEnabledByRun = [bool]$n.SshEnabledByScript
         }
     }
     $doc = [ordered]@{ Script = 'Invoke-VvfVCenterUpgrade'; StateVersion = 1; Primary = $Primary; IsoPath = $IsoPath; Updated = (Get-Date).ToUniversalTime().ToString('o'); Nodes = @($rows) }
@@ -1994,9 +2122,37 @@ function ConvertFrom-UpgradeStateJson {
         [pscustomobject]@{
             Name = [string](Get-Prop $n 'Name'); EsxiHost = [string](Get-Prop $n 'EsxiHost' ''); VmName = [string](Get-Prop $n 'VmName' '')
             Stage = $stage; TargetVersion = [string](Get-Prop $n 'TargetVersion' ''); InstallMark = $mark; LastError = [string](Get-Prop $n 'LastError' '')
+            # Added in 3.0.0; a state file from 2.x has none, which reads as "not turned on by us".
+            SshEnabledByRun = [bool](Get-Prop $n 'SshEnabledByRun' $false)
         }
     }
     return [pscustomobject]@{ Primary = [string](Get-Prop $doc 'Primary'); IsoPath = [string](Get-Prop $doc 'IsoPath' ''); Nodes = @($nodes) }
+}
+
+function Merge-StateSshFlags {
+    # Adds "this run turned SSH on here" to the vCenters of an existing state file, without
+    # touching anything else in it -- for a run that ends before it has loaded the file's stages
+    # (so saving its own view would overwrite the progress). A flag already set stays set.
+    param([string]$Json, [hashtable]$EnabledByRun)
+    $doc = $Json | ConvertFrom-Json
+    foreach ($n in @(Get-Prop $doc 'Nodes' @())) {
+        $name = [string](Get-Prop $n 'Name' '')
+        $was = [bool](Get-Prop $n 'SshEnabledByRun' $false)
+        $now = ($was -or ($EnabledByRun.ContainsKey($name) -and [bool]$EnabledByRun[$name]))
+        if ($n.PSObject.Properties['SshEnabledByRun']) { $n.SshEnabledByRun = $now } else { $n | Add-Member -NotePropertyName SshEnabledByRun -NotePropertyValue $now }
+    }
+    return ($doc | ConvertTo-Json -Depth 5)
+}
+
+function Get-TextSha256 {
+    # SHA-256 of a CSV's text, line endings and trailing blank space evened out, so the same CSV
+    # given as a file or pasted as text (-VCenterCsvText) matches its dry-run record.
+    param([string]$Text)
+    $norm = (([string]$Text -replace "`r`n", "`n" -replace "`r", "`n") -split "`n" | ForEach-Object { $_.TrimEnd() }) -join "`n"
+    $norm = $norm.Trim("`n")
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $bytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($norm)) } finally { $sha.Dispose() }
+    return (($bytes | ForEach-Object { $_.ToString('X2') }) -join '')
 }
 
 function Get-RoundPlan {
@@ -2081,10 +2237,9 @@ function Invoke-NodePrecheck {
             if (-not $item) { continue }
             if ($item -match '(?i)vmdir\.password|sso.*password') { $Node.UserData[$item] = $Node.SsoCredential.GetNetworkCredential().Password; continue }
             $text = Get-MessageText (Get-Prop $q 'text')
-            $default = Get-Prop $q 'default_answer'
-            $answer = [string](Invoke-Prompt -Id 'installer-question' -Text "$($Node.Name) installer asks: $text$(if ($default) { " [$default]" })" -Default $default -Context @{ Node = $Node.Name; DataItem = $item })
-            if ([string]::IsNullOrWhiteSpace($answer) -and $default) { $answer = [string]$default }
-            $Node.UserData[$item] = $answer
+            $a = Get-InstallerAnswer $item $text (Get-Prop $q 'default_answer') $InstallerAnswers
+            Write-Note "$($Node.Name): the installer asks '$text' ($item) -- answered '$($a.Answer)' from $($a.Source)."
+            $Node.UserData[$item] = $a.Answer
         }
     } catch {
         $out.Add((New-Finding 'Pre' $Node.Name 'Error' 'Installer precheck' $_.Exception.Message)); $ok = $false
@@ -2152,9 +2307,10 @@ function Invoke-GroupSnapshot {
     }
     if ($stillOn.Count) {
         Write-Bad "Still not powered off after $ShutdownTimeoutMinutes minute(s): $(($stillOn | ForEach-Object { $_.Vm.Name }) -join ', ')"
-        if (-not (Test-TypedConfirmation (Invoke-Prompt -Id 'hard-poweroff' -Kind 'Typed' -Expected 'POWEROFF' -Text 'Type POWEROFF to hard power them off (anything else aborts)' -Context @{ Vms = @($stillOn | ForEach-Object { $_.Vm.Name }) }) 'POWEROFF')) {
-            throw "Stopped waiting for the shutdown. Still shutting down: $(($stillOn | ForEach-Object { $_.Vm.Name }) -join ', ') -- check their consoles."
+        if (-not $AllowHardPowerOff) {
+            throw "Stopped waiting for the shutdown. Still shutting down: $(($stillOn | ForEach-Object { $_.Vm.Name }) -join ', ') -- check their consoles. (-AllowHardPowerOff would have powered them off hard.)"
         }
+        Write-Warn "-AllowHardPowerOff: powering off $(($stillOn | ForEach-Object { $_.Vm.Name }) -join ', ') hard."
         foreach ($n in $stillOn) { Stop-VM -VM $n.Vm -Confirm:$false -ErrorAction Stop | Out-Null }
         foreach ($n in $stillOn) {
             $v = Get-VM -Id $n.Vm.Id -Server $n.Esxi -ErrorAction Stop
@@ -2231,7 +2387,7 @@ function Invoke-NodeInstall {
         try { $nowVersion = [string](Get-Prop (Invoke-NodeApi $Node 'Get' '/appliance/system/version') 'version' '') } catch { }
         if ($summary.State -match 'IN_PROGRESS$' -or $summary.TaskStatus -eq 'RUNNING') { $seenActivity = $true }
         $line = '{0,-22} {1,4}  {2}' -f $summary.State, $(if ($null -ne $summary.Percent) { "$($summary.Percent)%" } else { '' }), $summary.Message
-        if ($line -ne $lastLine) { Write-Host "  [$stamp] $elapsed  $line"; Send-UpgradeEvent 'Log' @{ Level = 'Progress'; Message = "[$stamp] $elapsed  $line" } } else { Write-Note "[$stamp] $elapsed  (no change)" }
+        if ($line -ne $lastLine) { Write-Host "  [$stamp] $elapsed  $line" } else { Write-Note "[$stamp] $elapsed  (no change)" }
         Set-NodeStage $Node 'Installing' ("{0} {1}" -f $summary.State, $summary.Message).Trim() $summary.Percent
         $lastLine = $line
         $verdict = Get-UpgradeVerdict $summary $nowVersion $target $seenActivity
@@ -2606,9 +2762,10 @@ function Write-GroupPowerState {
 
 # ======================================================================== main body ==
 # Everything above is functions (the offline test loads the pure ones by AST). Everything
-# below talks to the ESXi host and the appliance. Nothing changes state before the typed
-# confirmation, apart from connecting the ISO and setting it to connect at power on, and
-# enabling SSH on the appliances when it is off -- and with -DryRun, not even those.
+# below talks to the ESXi hosts and the appliances. Nothing is asked: every input is a
+# parameter, a secret or an environment variable. Nothing changes state before the start is
+# confirmed (-ConfirmVCenter), apart from turning SSH on and mounting the ISO -- and with
+# -DryRun, nothing but SSH, which the dry run turns off again at its end.
 
 $runStamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
 if (-not (Test-Path -LiteralPath $LogFolder)) { New-Item -ItemType Directory -Path $LogFolder -Force | Out-Null }
@@ -2617,20 +2774,21 @@ $transcriptOn = $false
 try { Start-Transcript -Path $transcript -Force | Out-Null; $transcriptOn = $true } catch { }
 
 Write-Host ''
-Write-Host "Invoke-VvfVCenterUpgrade.ps1  v$ScriptVersion$(if ($DryRun) { '  (DRY RUN -- nothing will be changed)' })" -ForegroundColor White
+Write-Host "Invoke-VvfVCenterUpgrade.ps1  v$ScriptVersion$(if ($DryRun) { '  (DRY RUN -- nothing is changed apart from SSH, which is turned back off at the end)' })" -ForegroundColor White
+Write-Host "  Log folder: $LogFolder"
 Write-Host ''
 
 $exitCode = 1
-$script:UpgradeEventSink = $OnEvent
-$script:UpgradePrompter = $Prompter
-$script:UpgradeStopSignal = $StopSignal
 $script:StopFile = Join-Path $LogFolder 'STOP'
 if (Test-Path -LiteralPath $script:StopFile) {
     try { Remove-Item -LiteralPath $script:StopFile -Force -ErrorAction Stop; Write-Note "A STOP file left from an earlier run was removed: $($script:StopFile)" } catch { }
 }
 $stopped = $false
+$confirmed = $false          # the start was confirmed: from here on vCenters are shut down
+$completed = $false          # every vCenter upgraded, the ISO unmounted and SSH turned off
 $script:Esxi = $null
 $primary = $null
+$VCenter = $null
 $groupNodes = @()
 $script:StatePath = $null
 $script:Iso = $null
@@ -2639,13 +2797,95 @@ $script:EsxiServers = [ordered]@{}
 $script:SshClientInUse = ''
 $script:PlinkExe = ''
 $script:PlinkPasswordFiles = [System.Collections.Generic.List[string]]::new()
+$carrySsh = @{}              # vCenters an abandoned run (-StartFresh) had turned SSH on for
+$moveStateAside = $false
 $vm = $null
 $findingsCsv = $null
 
 try {
+    # --- 1. the vCenter list, and whether this run may go ahead -----------------------
+    # Everything that can refuse the run is checked here, before anything is connected to.
+    Write-Phase '1. vCenters, and whether this run may go ahead'
+    if ($Resume -and $StartFresh) { throw 'Give -Resume (carry on) or -StartFresh (start again), not both.' }
+    if (-not [string]::IsNullOrWhiteSpace($VCenterCsvText) -and -not [string]::IsNullOrWhiteSpace($VCenterCsv)) { throw 'Give -VCenterCsv (a file) or -VCenterCsvText (its contents), not both.' }
+    if (-not [string]::IsNullOrWhiteSpace($VCenterCsvText)) { $csvText = $VCenterCsvText; $csvLabel = '-VCenterCsvText' }
+    elseif (-not [string]::IsNullOrWhiteSpace($VCenterCsv)) {
+        if (-not (Test-Path -LiteralPath $VCenterCsv -PathType Leaf)) { throw "There is no CSV at '$VCenterCsv' (as the account running this script sees it). It needs the columns VCenter,EsxiHost (and optionally VmName), one row per vCenter in the order to upgrade them -- see docs/vcenter-upgrade.sample.csv." }
+        $csvText = [string](Get-Content -LiteralPath $VCenterCsv -Raw)
+        $csvLabel = $VCenterCsv
+    } else { throw 'No vCenter list: pass -VCenterCsv (a file) or -VCenterCsvText (its contents) -- columns VCenter,EsxiHost[,VmName], one row per vCenter, in upgrade order.' }
+    try { $rows = @(ConvertFrom-VCenterCsv (([string]$csvText) -split "`r?`n")) }
+    catch { throw "$csvLabel`: $($_.Exception.Message)" }
+    $csvSha = Get-TextSha256 $csvText
+    $VCenter = $rows[0].VCenter
+    $short = Get-ShortName $VCenter
+    $k = 0
+    foreach ($r in $rows) { $k++; Write-Note ("{0}. {1}  on ESXi host {2}{3}" -f $k, $r.VCenter, $r.EsxiHost, $(if ($r.VmName) { "  (VM $($r.VmName))" })) }
+    $esxiHosts = @($rows | ForEach-Object { $_.EsxiHost } | Select-Object -Unique)
+
+    # A previous run that stopped part way left a state file: -Resume carries on from it,
+    # -StartFresh moves it aside. With neither, a real run stops rather than guess.
+    $script:StatePath = Join-Path $LogFolder "upgrade-state-$short.json"
+    $state = $null
+    if (Test-Path -LiteralPath $script:StatePath) {
+        $stateError = ''
+        try { $state = ConvertFrom-UpgradeStateJson (Get-Content -LiteralPath $script:StatePath -Raw) } catch { $stateError = $_.Exception.Message }
+        if ($state -and $state.Primary -ne $VCenter) { $stateError = "it is for $($state.Primary), not $VCenter"; $state = $null }
+        $unfinished = @($(if ($state) { $state.Nodes | Where-Object { $_.Stage -ne 'Done' } }))
+        if ($StartFresh) {
+            if ($DryRun) { Write-Note "-StartFresh: the dry run ignores the state file $($script:StatePath) (a real run with -StartFresh moves it aside)." }
+            else {
+                # Moved aside once the run is allowed to go ahead (below), not before: a run
+                # refused here must leave the file -- and where it says SSH was turned on -- as is.
+                if ($state) { foreach ($sn in $state.Nodes) { if ($sn.SshEnabledByRun) { $carrySsh[$sn.Name] = $true } } }
+                $moveStateAside = $true
+            }
+            $state = $null
+        }
+        elseif ($stateError) { throw "The state file $($script:StatePath) cannot be used ($stateError). Run with -StartFresh to move it aside and start from the beginning." }
+        elseif ($unfinished.Count -and -not $Resume) {
+            $why = "A previous run stopped at $($unfinished[0].Name) ($($unfinished[0].Stage)$(if ($unfinished[0].LastError) { ": $($unfinished[0].LastError)" }))"
+            if (-not $DryRun) { throw "$why. Run again with -Resume to carry on from there, or with -StartFresh to start from the beginning. Nothing has been changed." }
+            Write-Warn "$why. This dry run checks from the beginning (add -Resume to check the resume)."
+        }
+        if ($state -and $Resume) {
+            $was = @($state.Nodes | ForEach-Object { $_.Name }) -join ','
+            $now = @($rows | ForEach-Object { $_.VCenter }) -join ','
+            if ($was -ne $now) { throw "The CSV lists $now, but the stopped run was for $was. Use the same CSV to resume, or -StartFresh to start from the beginning." }
+            Write-Note "Resuming: $((@($state.Nodes) | ForEach-Object { "$($_.Name)=$($_.Stage)" }) -join ', ')"
+        } else { $state = $null }
+    } elseif ($Resume) {
+        throw "-Resume: there is no state file for $VCenter in $LogFolder (use the same -LogFolder as the run that stopped)."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($IsoPath) -and $state -and $state.IsoPath) { $IsoPath = $state.IsoPath; Write-Note "ISO: the stopped run's, $IsoPath" }
+    if ([string]::IsNullOrWhiteSpace($IsoPath)) { throw 'No ISO: pass -IsoPath, the datastore path of the patch ISO, e.g. [SoftwareRepo] ISO/VMware-vCenter-Server-Appliance-8.0.3.01000-24305161-patch-FP.iso' }
+    try { $script:Iso = ConvertFrom-DatastorePath $IsoPath } catch { throw $_.Exception.Message }
+
+    if (-not $DryRun) {
+        # The two things a person did in the old window before a real run: typed the first
+        # vCenter's name, and ran a dry run of this CSV and ISO that passed.
+        if (-not (Test-TypedConfirmation $ConfirmVCenter $short)) {
+            throw "A real run needs -ConfirmVCenter $short (the short name of the first vCenter in the CSV)$(if ($ConfirmVCenter) { " -- '$ConfirmVCenter' was given" }). Nothing has been changed."
+        }
+        if (-not $Resume) {
+            $record = Join-Path $LogFolder "dryrun-$short.json"
+            $json = $(if (Test-Path -LiteralPath $record) { Get-Content -LiteralPath $record -Raw } else { '' })
+            $verdict = Test-DryRunRecord -Json $json -CsvSha256 $csvSha -IsoPath $script:Iso.Full -Now (Get-Date)
+            if ($verdict.Valid) { Write-Good "A dry run of this CSV and ISO passed at $($verdict.Time.ToLocalTime().ToString('yyyy-MM-dd HH:mm')): the real run may go ahead." }
+            elseif ($SkipDryRunCheck) { Write-Warn "-SkipDryRunCheck: going ahead WITHOUT a matching passing dry run ($($verdict.Reason))." }
+            else { throw "The real run is locked: $($verdict.Reason). Run with -DryRun first (same CSV, same -IsoPath, same -LogFolder $LogFolder), then again without it. Nothing has been changed." }
+        }
+        if ($moveStateAside) {
+            $aside = "$($script:StatePath).abandoned-$runStamp"
+            Move-Item -LiteralPath $script:StatePath -Destination $aside -Force
+            Write-Warn "-StartFresh: the previous run's state file was moved aside to $aside; this run starts from the beginning."
+        }
+    }
+
     if (-not (Get-Command Connect-VIServer -ErrorAction SilentlyContinue)) {
         try { Import-Module VMware.VimAutomation.Core -ErrorAction Stop | Out-Null }
-        catch { throw 'VMware.VimAutomation.Core is not installed. Install-Module VMware.PowerCLI -Scope CurrentUser' }
+        catch { throw 'VMware.VimAutomation.Core is not installed for the account running this script. Install-Module VMware.PowerCLI -Scope AllUsers (or as that account).' }
     }
     $ssh = Resolve-SshClient $SshClient $PlinkPath
     $script:SshClientInUse = $ssh.Client
@@ -2657,30 +2897,29 @@ try {
         try { Set-PowerCLIConfiguration -Scope Session -InvalidCertificateAction Ignore -Confirm:$false | Out-Null } catch { }
     }
 
-    # --- 1. the vCenter list ---------------------------------------------------------
-    Write-Phase '1. vCenters and their ESXi hosts'
-    if ([string]::IsNullOrWhiteSpace($VCenterCsv)) { $VCenterCsv = Read-NonEmpty -Id 'csv-path' 'Path to the CSV of vCenters and the ESXi hosts they run on (columns VCenter,EsxiHost[,VmName], in upgrade order)' }
-    if (-not (Test-Path -LiteralPath $VCenterCsv)) { throw "There is no CSV at '$VCenterCsv'. It needs the columns VCenter,EsxiHost (and optionally VmName), one row per vCenter in the order to upgrade them -- see docs/vcenter-upgrade.sample.csv." }
-    try { $rows = @(ConvertFrom-VCenterCsv (Get-Content -LiteralPath $VCenterCsv)) }
-    catch { throw "$VCenterCsv`: $($_.Exception.Message)" }
-    $VCenter = $rows[0].VCenter
-    $k = 0
-    foreach ($r in $rows) { $k++; Write-Note ("{0}. {1}  on ESXi host {2}{3}" -f $k, $r.VCenter, $r.EsxiHost, $(if ($r.VmName) { "  (VM $($r.VmName))" })) }
-    $esxiHosts = @($rows | ForEach-Object { $_.EsxiHost } | Select-Object -Unique)
-
     # --- 2. credentials and connections --------------------------------------------
+    # Every credential is found before anything is connected to, so a missing one changes
+    # nothing. Most specific first: per host / per vCenter, then the parameter, then shared.
     Write-Phase '2. Credentials and connections'
-    $esxiGiven = [bool]$EsxiCredential
-    if (-not $esxiGiven) { $EsxiCredential = Read-Credential -Id 'esxi-credential' "Root credentials for ESXi host $($esxiHosts[0])" 'root' }
-    $sameEsxi = ($esxiGiven -or $esxiHosts.Count -eq 1 -or (Read-YesNo -Id 'same-esxi-password' "Do all $($esxiHosts.Count) ESXi hosts share that root password?" $true))
-    $vcGiven = [bool]$VCenterRootCredential
-    if (-not $vcGiven) { $VCenterRootCredential = Read-Credential -Id 'vcenter-credential' "Root credentials for vCenter appliance $VCenter" 'root' }
-    $sameVc = ($vcGiven -or $rows.Count -eq 1 -or (Read-YesNo -Id 'same-vcenter-password' "Do all $($rows.Count) vCenters share that root password?" $true))
-    if (-not $SsoCredential) { $SsoCredential = Read-Credential -Id 'sso-credential' 'SSO administrator (for replication checks, the installer, and the API where root is not authorized)' 'administrator@vsphere.local' }
+    $c = Resolve-VvfCredential (Get-CredentialNames 'Sso') $SsoCredential 'SsoCredential'
+    $SsoCredential = $c.Credential
+    Write-Note "SSO administrator: $($SsoCredential.UserName) (from $($c.Source))"
+    $esxiCred = @{}
+    foreach ($h in $esxiHosts) {
+        $c = Resolve-VvfCredential (Get-CredentialNames 'Esxi' $h) $EsxiCredential 'EsxiCredential'
+        $esxiCred[$h.ToLowerInvariant()] = $c.Credential
+        Write-Note "ESXi host $h`: $($c.Credential.UserName) (from $($c.Source))"
+    }
+    $vcCred = @{}
+    foreach ($r in $rows) {
+        $c = Resolve-VvfCredential (Get-CredentialNames 'VCenter' $r.VCenter) $VCenterRootCredential 'VCenterRootCredential'
+        $vcCred[$r.VCenter] = $c.Credential
+        Write-Note "vCenter $($r.VCenter): $($c.Credential.UserName) (from $($c.Source))"
+    }
 
     $pre = @()
     foreach ($h in $esxiHosts) {
-        $cred = $(if ($sameEsxi -or $h -eq $esxiHosts[0]) { $EsxiCredential } else { Read-Credential -Id 'esxi-credential' "Root credentials for ESXi host $h" 'root' })
+        $cred = $esxiCred[$h.ToLowerInvariant()]
         Write-Step "Connecting to ESXi host $h ..."
         try {
             $srv = Connect-VIServer -Server $h -Credential $cred -ErrorAction Stop
@@ -2694,10 +2933,10 @@ try {
 
     $groupNodes = @()
     foreach ($r in $rows) {
-        $cred = $(if ($sameVc -or $r.VCenter -eq $VCenter) { $VCenterRootCredential } else { Read-Credential -Id 'vcenter-credential' "Root credentials for vCenter appliance $($r.VCenter)" 'root' })
-        $node = New-Node $r.VCenter $cred $SsoCredential
+        $node = New-Node $r.VCenter $vcCred[$r.VCenter] $SsoCredential
         $node.EsxiHost = $r.EsxiHost
         $node.Esxi = $script:EsxiServers[$r.EsxiHost.ToLowerInvariant()]
+        if ($carrySsh.ContainsKey($node.Name)) { $node.SshEnabledByScript = $true }
         $groupNodes += $node
         try {
             $vmFound = Find-ApplianceVm $node.Esxi $r.VCenter $r.VmName
@@ -2716,11 +2955,14 @@ try {
             if ($node.ApiLabel -match 'NOT authorized') { Write-Warn "$($r.VCenter) appliance API: $($node.ApiLabel) -- expect the API checks to fail." }
             else { Write-Note "$($r.VCenter) appliance API: logged in as $($node.ApiLabel)" }
             Update-NodeVersion $node | Out-Null
+            $node.FromVersion = $node.CurrentVersion
             Write-Note "$($r.VCenter) runs vCenter Server $($node.CurrentVersion) build $($node.CurrentBuild)"
+            $wasOff = ($null -ne $node.SshWasOn -and -not $node.SshWasOn)
             Enable-NodeSsh $node ([bool]$DryRun)
             if (-not $node.SshOff) {
-                Open-NodeSsh $node
-                Write-Note "$($r.VCenter) SSH ready (root shell: $(if ($node.ShellMode -eq 'Exec') { 'bash' } else { 'appliance shell, switched to bash' }))"
+                # sshd needs a few seconds after it is turned on.
+                Wait-NodeSshReady $node $(if ($node.SshEnabledByScript -or $wasOff) { 6 } else { 1 })
+                Write-Note "$($r.VCenter) SSH ready (root shell: $(switch ($node.ShellMode) { 'Exec' { 'bash' } 'Plink' { 'bash, through plink' } default { 'appliance shell, switched to bash' } }))"
             }
         } catch {
             $pre += @(New-Finding 'Pre' $r.VCenter 'Error' 'vCenter access' $_.Exception.Message)
@@ -2728,30 +2970,9 @@ try {
     }
     $primary = $groupNodes[0]
     $many = ($groupNodes.Count -gt 1)
+    $sshOnNow = @($groupNodes | Where-Object { $_.SshEnabledByScript } | ForEach-Object { $_.Name })
+    if ($sshOnNow.Count) { Write-Note "SSH turned on by this run on: $($sshOnNow -join ', ') -- turned off again $(if ($DryRun) { 'at the end of the dry run' } else { 'once every vCenter is upgraded' })." }
 
-    # --- previous run ---------------------------------------------------------------
-    # A run that stopped on a failure left a state file; -Resume carries on from the vCenter
-    # that failed. Without -Resume, an unfinished state file is offered for resuming.
-    $script:StatePath = Join-Path $LogFolder "upgrade-state-$(Get-ShortName $VCenter).json"
-    $state = $null
-    if (Test-Path -LiteralPath $script:StatePath) {
-        try { $state = ConvertFrom-UpgradeStateJson (Get-Content -LiteralPath $script:StatePath -Raw) }
-        catch { throw "The state file $($script:StatePath) cannot be read ($($_.Exception.Message)). Move it aside to start afresh." }
-        if ($state.Primary -ne $VCenter) { throw "The state file $($script:StatePath) is for $($state.Primary), not $VCenter." }
-        $unfinished = @($state.Nodes | Where-Object { $_.Stage -ne 'Done' })
-        if (-not $Resume -and $unfinished.Count) {
-            Write-Warn "A previous run stopped at $($unfinished[0].Name) ($($unfinished[0].Stage)$(if ($unfinished[0].LastError) { ": $($unfinished[0].LastError)" }))."
-            if (-not $DryRun) { $Resume = [switch](Read-YesNo -Id 'resume' 'Resume from there? (No starts from the beginning)' $true) }
-        }
-        if ($Resume) {
-            $was = @($state.Nodes | ForEach-Object { $_.Name }) -join ','
-            $now = @($groupNodes | ForEach-Object { $_.Name }) -join ','
-            if ($was -ne $now) { throw "The CSV lists $now, but the stopped run was for $was. Use the same CSV to resume, or move $($script:StatePath) aside to start afresh." }
-            Write-Note "Resuming: $((@($state.Nodes) | ForEach-Object { "$($_.Name)=$($_.Stage)" }) -join ', ')"
-        } else { $state = $null }
-    } elseif ($Resume) {
-        throw "-Resume: there is no state file for $VCenter in $LogFolder."
-    }
     $stateOf = @{}
     if ($state) { foreach ($sn in $state.Nodes) { $stateOf[$sn.Name] = $sn } }
 
@@ -2777,10 +2998,12 @@ try {
     } }
 
     # Stages from the state file. A vCenter recorded Done must still run the version it was
-    # upgraded to; one that does not is upgraded again rather than trusted.
+    # upgraded to; one that does not is upgraded again rather than trusted. Where the stopped
+    # run turned SSH on, this run counts it as its own, so it is turned off at the end.
     foreach ($n in $groupNodes) {
         if (-not $stateOf.ContainsKey($n.Name)) { continue }
         $sn = $stateOf[$n.Name]
+        if ($sn.SshEnabledByRun) { $n.SshEnabledByScript = $true }
         $n.Stage = $sn.Stage; $n.TargetVersion = $sn.TargetVersion; $n.InstallMark = $sn.InstallMark; $n.LastError = $sn.LastError
         if ($n.Stage -ne 'Pending' -and $n.CurrentVersion -and $sn.TargetVersion -and $n.CurrentVersion -ne $sn.TargetVersion) {
             Write-Warn "$($n.Name) was recorded $($n.Stage) at $($sn.TargetVersion) but runs $($n.CurrentVersion) -- it will be upgraded again."
@@ -2788,7 +3011,7 @@ try {
         }
     }
     $todo = @($groupNodes | Where-Object { $_.Stage -ne 'Done' })
-    if ($todo.Count -eq 0) { throw 'Every vCenter in the state file is already upgraded. Nothing to do -- remove the state file to start afresh.' }
+    if ($todo.Count -eq 0) { throw 'Every vCenter in the state file is already upgraded. Nothing to do -- run with -StartFresh to start afresh.' }
 
     # The CSV, the VMs and the appliances have to be right before anything is mounted.
     $early = @($pre | Where-Object { $_.Severity -eq 'Error' -and $_.Check -in @('Appliance VM', 'vCenter access', 'ELM group') })
@@ -2803,14 +3026,8 @@ try {
     # host, mounted on every vCenter still to be upgraded, and only then validated by each
     # appliance (it must see a newer update on it). A dry run mounts nothing: it validates only
     # where the ISO is already mounted.
-    Assert-NotStopped 'before the ISO was mounted. Nothing has been changed'
+    Assert-NotStopped 'before the ISO was mounted. Nothing has been changed apart from SSH'
     Write-Phase '4. Upgrade ISO'
-    if ([string]::IsNullOrWhiteSpace($IsoPath) -and $state -and $state.IsoPath) {
-        $answer = [string](Invoke-Prompt -Id 'iso-path' -Text "Datastore path of the patch ISO [Enter = $($state.IsoPath)]" -Default $state.IsoPath)
-        $IsoPath = $(if ([string]::IsNullOrWhiteSpace($answer)) { $state.IsoPath } else { $answer })
-    }
-    if ([string]::IsNullOrWhiteSpace($IsoPath)) { $IsoPath = Read-NonEmpty -Id 'iso-path' 'Datastore path of the patch ISO, e.g. [SoftwareRepo] ISO/VMware-vCenter-Server-Appliance-8.0.3.01000-24305161-patch-FP.iso' }
-    try { $script:Iso = ConvertFrom-DatastorePath $IsoPath } catch { throw $_.Exception.Message }
     Write-Note "ISO: $($script:Iso.Full)"
     $isoName = Get-IsoNameFinding $script:Iso.Full 'Pre' $VCenter
     if ($isoName) { $pre += @($isoName) }
@@ -2883,8 +3100,8 @@ try {
         if ($precheckErrors.Count) { throw 'The installer precheck reported errors; the upgrade would fail. No vCenter has been shut down or changed apart from the ISO.' }
         if ($structural.Count) { throw "$($structural.Count) error(s) with the vCenters in the CSV or their VMs (see above) -- these cannot be overridden. No vCenter has been shut down or changed apart from the ISO." }
         if ($preErrors.Count) {
-            Write-Bad "$($preErrors.Count) pre-upgrade error(s). Upgrading over them is not recommended."
-            if (-not (Test-TypedConfirmation (Invoke-Prompt -Id 'proceed-over-errors' -Kind 'Typed' -Expected 'PROCEED' -Text 'Type PROCEED to continue anyway (anything else aborts)' -Context @{ Errors = $preErrors.Count }) 'PROCEED')) { throw 'Stopped at the pre-upgrade checks. Nothing has been changed.' }
+            if (-not $ProceedOverPreCheckErrors) { throw "$($preErrors.Count) pre-upgrade error(s) (see above). Fix them and run again -- or, only with a senior engineer's agreement, add -ProceedOverPreCheckErrors. No vCenter has been shut down or changed apart from the ISO." }
+            Write-Bad "-ProceedOverPreCheckErrors: carrying on over $($preErrors.Count) pre-upgrade error(s)."
         }
     }
 
@@ -2901,20 +3118,18 @@ try {
     }
     if ($many) {
         Write-Host "    Each round    : shut down ALL $($groupNodes.Count) vCenters together -> snapshot all of them while all are off ->"
-        Write-Host "                    power all on -> wait until every vCenter has every service started and replication is healthy ->"
+        Write-Host "                    power all on -> wait until every vCenter has SSH on, every service started and replication healthy ->"
         Write-Host "                    upgrade that round's vCenter -> reboot -> wait again for every vCenter and replication -> post checks"
         Write-Warn "The SSO domain is DOWN during each round's snapshot (all vCenters powered off together)."
         Write-Warn "Each round adds a snapshot to every vCenter: after $($todo.Count) round(s) each one has $($todo.Count) more. They are kept"
-        Write-Warn 'until you remove them -- remove all of them together once the whole group is validated.'
+        Write-Warn 'until removed -- remove all of them together once the whole group is validated (or -RemoveSnapshots).'
     } else {
         Write-Host "    Plan          : guest shutdown -> offline snapshot -> power on -> wait for services -> stage and install -> reboot -> post checks"
     }
-    Send-UpgradeEvent 'Plan' @{
-        DryRun = [bool]$DryRun; Resume = [bool]$Resume; IsoPath = $(if ($script:Iso) { $script:Iso.Full } else { '' })
-        Nodes = @($groupNodes | ForEach-Object { [pscustomobject]@{ Name = $_.Name; VmName = $(if ($_.Vm) { [string]$_.Vm.Name } else { '' }); EsxiHost = $_.EsxiHost; CurrentVersion = $_.CurrentVersion; TargetVersion = $_.TargetVersion; Stage = $_.Stage; IsoPending = [bool]$_.IsoPending } })
-    }
-    Write-Host "    On a failure  : no further vCenter is upgraded. You are offered a retry of the failed vCenter once"
-    Write-Host "                    the problem is fixed, or run again later with -Resume to continue from it."
+    $sshOffAtEnd = @($groupNodes | Where-Object { $_.SshEnabledByScript -or ($SshFinalState -eq 'Disable') } | ForEach-Object { $_.Name })
+    Write-Host "    SSH           : on for the run; turned off at the end on $(if ($sshOffAtEnd.Count) { $sshOffAtEnd -join ', ' } else { 'none (it was on before the run on every vCenter; -SshFinalState Disable turns it off)' })"
+    Write-Host "    On a failure  : no further vCenter is upgraded and the run stops (exit 1), SSH left on. Fix the problem,"
+    Write-Host "                    then run again with -Resume to carry on from the vCenter that failed."
     if ($DryRun) {
         $skipped = @($pre | Where-Object { $_.Check -match 'skipped|not run' -or $_.Detail -match '^not (checked|run)' })
         $noTarget = @($todo | Where-Object { $_.Stage -eq 'Pending' -and -not $_.TargetVersion -and -not $_.IsoPending })
@@ -2928,52 +3143,47 @@ try {
         } else {
             Write-Good "A real run would proceed: mount the ISO, validate it, then upgrade $($todo.Count) vCenter(s) as planned above."
             if ($toMount.Count) { Write-Warn "The ISO is not mounted yet on $(($toMount | ForEach-Object { $_.Name }) -join ', '): a real run mounts it, and each appliance must see the update on it and pass the installer precheck before anything else changes -- it stops there if not." }
+            Write-Note "For the real run: the same CSV, -IsoPath and -LogFolder, without -DryRun, with -ConfirmVCenter $short, within 24 hours."
             $exitCode = 0
         }
         if ($skipped.Count) { Write-Warn "$($skipped.Count) check(s) were skipped in this dry run -- see the findings above." }
-        Write-Note 'Dry run: nothing was changed.'
-        # The record a front end checks before allowing a real run: written on a pass, removed
-        # on a fail so an older pass cannot stand in for it.
-        $record = Join-Path $LogFolder "dryrun-$(Get-ShortName $VCenter).json"
+        # The record a real run checks before it goes ahead: written on a pass, removed on a
+        # fail so an older pass cannot stand in for it.
+        $record = Join-Path $LogFolder "dryrun-$short.json"
         try {
             if ($exitCode -eq 0) {
-                $sha = (Get-FileHash -LiteralPath $VCenterCsv -Algorithm SHA256).Hash
-                ConvertTo-DryRunRecordJson $sha $script:Iso.Full @($groupNodes | ForEach-Object { $_.Name }) (Get-Date) $ScriptVersion | Set-Content -LiteralPath $record -Encoding UTF8
+                ConvertTo-DryRunRecordJson $csvSha $script:Iso.Full @($groupNodes | ForEach-Object { $_.Name }) (Get-Date) $ScriptVersion | Set-Content -LiteralPath $record -Encoding UTF8
             } elseif (Test-Path -LiteralPath $record) { Remove-Item -LiteralPath $record -Force }
         } catch { Write-Warn "Could not write the dry-run record ${record}: $($_.Exception.Message)" }
         return
     }
-    Assert-NotStopped 'before the start was confirmed. No vCenter has been shut down or changed apart from the ISO'
-    $confirmWhat = $(if ($many) { "upgrade the $($todo.Count) vCenter(s) above, shutting down all $($groupNodes.Count) together for a snapshot before each" } else { 'shut it down, snapshot it and upgrade it' })
-    if (-not (Test-TypedConfirmation (Invoke-Prompt -Id 'confirm-start' -Kind 'Typed' -Expected (Get-ShortName $VCenter) -Text "Type the vCenter name ($(Get-ShortName $VCenter)) to $confirmWhat") (Get-ShortName $VCenter))) {
-        throw 'Not confirmed. Nothing has been changed.'
-    }
+    Assert-NotStopped 'before the start. No vCenter has been shut down or changed apart from the ISO and SSH'
+    Write-Good "Start confirmed by -ConfirmVCenter $ConfirmVCenter. From here on the vCenters are shut down for each round's snapshot."
+    $confirmed = $true
     Save-UpgradeState
 
     # --- rounds ------------------------------------------------------------------------
     # One round per vCenter: (group snapshot) -> install -> reboot -> group ready -> post
-    # checks. A failure stops the progression; the operator fixes it and retries the same
-    # vCenter (from the stage it reached), or stops and resumes later with -Resume.
+    # checks. A failure stops the run: the operator fixes it and runs again with -Resume,
+    # which carries on with the same vCenter from the stage it reached.
     $i = 0
-    $fresh = $true
     while ($i -lt $groupNodes.Count) {
         $n = $groupNodes[$i]
         if ($n.Stage -eq 'Done') { $i++; continue }
         Assert-NotStopped "before round $($i + 1) of $($groupNodes.Count) ($($n.Name))"
-        $plan = Get-RoundPlan $n.Stage $fresh
-        Send-UpgradeEvent 'Round' @{ Index = $i + 1; Count = $groupNodes.Count; Node = $n.Name; Stage = $n.Stage; FreshSnapshot = [bool]$plan.Snapshot }
+        $plan = Get-RoundPlan $n.Stage $true
         Write-Phase "7.$($i + 1) Round $($i + 1) of $($groupNodes.Count): $($n.Name)$(if ($n.TargetVersion) { " -> $($n.TargetVersion)" })$(if ($n.Stage -ne 'Pending') { " (resuming at $($n.Stage))" })"
         try {
             $n.Attempts++
             if ($plan.Snapshot) {
-                # Unique per round and per attempt: a retry's snapshot must never share a name
-                # with an earlier one, or the check that it was taken (and its removal) could
-                # pick the wrong one.
+                # Unique per round and per run: a resumed round's snapshot must never share a
+                # name with an earlier one, or the check that it was taken (and its removal)
+                # could pick the wrong one.
                 $stamp = (Get-Date).ToString('yyyyMMdd-HHmmss')
-                $snapName = "Pre-upgrade $(Get-ShortName $n.Name) $($n.TargetVersion) $stamp$(if ($n.Attempts -gt 1) { " attempt $($n.Attempts)" })"
+                $snapName = "Pre-upgrade $(Get-ShortName $n.Name) $($n.TargetVersion) $stamp"
                 $existing = @($groupNodes | ForEach-Object { try { @(Get-Snapshot -VM $_.Vm -ErrorAction Stop | ForEach-Object { $_.Name }) } catch { } })
                 $k2 = 1
-                while ($existing -contains $snapName) { $k2++; $snapName = "Pre-upgrade $(Get-ShortName $n.Name) $($n.TargetVersion) $stamp attempt $($n.Attempts)-$k2" }
+                while ($existing -contains $snapName) { $k2++; $snapName = "Pre-upgrade $(Get-ShortName $n.Name) $($n.TargetVersion) $stamp-$k2" }
                 $desc = "Offline snapshot before upgrading $($n.Name) to $($n.TargetVersion) ($stamp)"
                 if ($many) { $desc += " -- taken with ALL $($groupNodes.Count) vCenters of the ELM group powered off together ($(($groupNodes | ForEach-Object { $_.Name }) -join ', ')); revert all of them together, never one alone" }
                 Invoke-GroupSnapshot $groupNodes $snapName $desc
@@ -2996,8 +3206,8 @@ try {
             Set-NodeStage $n 'Upgraded' $n.TargetVersion 100
             Write-Good "Round $($i + 1) complete: $($n.Name) is upgraded to $($n.TargetVersion)."
             $i++
-            $fresh = $true
         } catch {
+            if ($_.FullyQualifiedErrorId -like 'VvfStopRequested*') { throw }
             $err = $_.Exception.Message
             $n.LastError = $err
             Save-UpgradeState
@@ -3009,21 +3219,13 @@ try {
             Write-GroupPowerState $groupNodes
             $remaining = @($groupNodes | Where-Object { $_.Stage -ne 'Done' } | ForEach-Object { $_.Name })
             Write-Note "Still to do: $($remaining -join ', ')"
-            $answer = Invoke-Prompt -Id 'retry' -Kind 'Typed' -Expected 'RETRY' -Text "Fix the problem, then type RETRY to carry on with $($n.Name) from where it stopped (Enter stops here; run again with -Resume later)" -Context @{ Node = $n.Name; Stage = $n.Stage; Error = $err }
-            if (-not (Test-TypedConfirmation $answer 'RETRY')) {
-                throw "Stopped at $($n.Name): $err Run again with -Resume to continue from $($n.Name)."
-            }
-            foreach ($g in $groupNodes) { Reset-NodeApi $g; Close-NodeSsh $g }
-            if ($n.Stage -eq 'Pending') {
-                $fresh = Read-YesNo -Id 'fresh-snapshot' "Take a fresh offline snapshot of $(if ($many) { "all $($groupNodes.Count) vCenters" } else { $n.Name }) before retrying?" $true
-            } else {
-                Write-Note "$($n.Name) is $($n.Stage) -- retrying from there (no new snapshot)."
-                $fresh = $false
-            }
+            throw "Stopped at $($n.Name): $err Fix the problem, then run again with -Resume to carry on from $($n.Name)$(if ($n.Stage -eq 'Pending') { ' (a fresh group snapshot is taken first)' } else { " (from $($n.Stage))" })."
         }
     }
 
     # --- wrap up ---------------------------------------------------------------------
+    # Every vCenter is upgraded: the ISO comes off (released inside each appliance over SSH
+    # first), and only then is SSH turned off -- the end of the whole upgrade.
     Write-Phase '8. Wrap-up'
     Write-Step "Unmounting the upgrade ISO from $(if ($many) { "all $($groupNodes.Count) vCenters" } else { $VCenter }) ..."
     $unmountFailed = @()
@@ -3042,20 +3244,38 @@ try {
     }
     if ($unmountFailed.Count) { Write-Warn "Disconnect the ISO from $(($unmountFailed | ForEach-Object { $_.Node }) -join ', ') by hand once the cause above is dealt with. The upgrades themselves are complete." }
 
+    Write-Step "Turning SSH off -- every vCenter is upgraded and the ISO is off$(if ($SshFinalState -eq 'Disable') { ' (-SshFinalState Disable: on every vCenter)' }) ..."
+    $sshFailed = @()
+    foreach ($n in $groupNodes) {
+        $act = Get-SshEndAction ([bool]$n.SshEnabledByScript) $true $false $false $SshFinalState
+        if ($act -eq 'Disable') {
+            if (Disable-NodeSsh $n $(if ($n.SshEnabledByScript) { 'the run had turned it on' } else { '-SshFinalState Disable' })) { $sshFailed += $n.Name }
+        } else {
+            Close-NodeSsh $n
+            $n.SshFinal = 'On (was on before the run)'
+            Write-Note "$($n.Name): SSH left on -- it was on before the run (-SshFinalState Disable turns it off)."
+        }
+    }
+    if ($sshFailed.Count) { Add-Finding 'Post' ($sshFailed -join ', ') 'Warning' 'SSH' 'could not be turned off -- turn it off in the VAMI (Access)' | Out-Null }
+
     $snapCount = $script:SnapshotsTaken.Count
     if ($snapCount) {
-        Write-Note "$snapCount pre-upgrade snapshot(s) were taken by this run. Aria Operations normally removes snapshots older than 7 days, so by default they are left for that."
-        if ($many) { Write-Note 'If you remove them yourself, remove them all together: a rollback needs the same round''s snapshot on every vCenter.' }
-        if (Read-YesNo -Id 'remove-snapshots' "Remove all $snapCount pre-upgrade snapshot(s) now instead?" $false) {
+        if ($RemoveSnapshots) {
+            Write-Step "-RemoveSnapshots: removing the $snapCount pre-upgrade snapshot(s) this run took ..."
             foreach ($t in $script:SnapshotsTaken) {
                 try {
                     $s = @(Get-Snapshot -VM $t.Node.Vm -ErrorAction Stop | Where-Object { $_.Name -eq $t.Name })
                     if ($s.Count -eq 1) { Remove-Snapshot -Snapshot $s[0] -Confirm:$false -ErrorAction Stop | Out-Null; Write-Note "Snapshot '$($t.Name)' removed from $($t.VmName)." }
                 } catch { Write-Warn "Could not remove '$($t.Name)' from $($t.VmName): $($_.Exception.Message)" }
             }
-        } else { Write-Note 'Snapshots kept.' }
+        } else {
+            Write-Note "$snapCount pre-upgrade snapshot(s) taken by this run are kept: Aria Operations normally removes snapshots older than 7 days, and they are the rollback point until then."
+            if ($many) { Write-Note 'If you remove them yourself, remove them all together: a rollback needs the same round''s snapshot on every vCenter.' }
+            foreach ($t in $script:SnapshotsTaken) { Write-Note "  '$($t.Name)' on $($t.VmName) ($($t.EsxiHost))" }
+        }
     }
     try { Remove-Item -LiteralPath $script:StatePath -Force -ErrorAction Stop } catch { }
+    $completed = $true
     Write-Good "All $($groupNodes.Count) vCenter(s) upgraded: $(($groupNodes | ForEach-Object { "$($_.Name) $($_.TargetVersion)" }) -join ', ')."
     $exitCode = 0
 }
@@ -3084,20 +3304,46 @@ catch {
         Write-Warn "Offline snapshot(s) taken by this run$(if (@($groupNodes).Count -gt 1) { ' (in ELM revert ALL vCenters to the same round''s snapshot, never one alone)' }):"
         foreach ($t in $script:SnapshotsTaken) { Write-Warn "  '$($t.Name)' on $($t.VmName) ($($t.Node.Name)) on $($t.EsxiHost)" }
     }
-    if ($script:StatePath -and (Test-Path -LiteralPath $script:StatePath)) { Write-Note "Progress saved to $($script:StatePath) -- run again with -Resume to continue. The ISO is left mounted for that." }
+    if ($script:StatePath -and (Test-Path -LiteralPath $script:StatePath) -and -not $DryRun) { Write-Note "Progress saved to $($script:StatePath) -- run again with -Resume to continue. The ISO is left mounted for that." }
     $exitCode = 1
   }
 }
 finally {
+    # --- SSH at the end of the run ---
+    # Completed: the wrap-up has already turned it off. Otherwise: a real run that is part way
+    # through (it will be resumed) leaves it on and records where it turned it on; a dry run,
+    # or a real run refused before it started, puts it back as it found it.
+    $unfinished = $false
+    if (-not $DryRun -and -not $completed) {
+        if ($confirmed) { $unfinished = $true }
+        elseif ($script:StatePath -and (Test-Path -LiteralPath $script:StatePath)) {
+            try { $unfinished = [bool]@((ConvertFrom-UpgradeStateJson (Get-Content -LiteralPath $script:StatePath -Raw)).Nodes | Where-Object { $_.Stage -ne 'Done' }).Count } catch { $unfinished = $true }
+        }
+    }
     $nodesToRestore = @($groupNodes)
     if ($primary -and $nodesToRestore -notcontains $primary) { $nodesToRestore += $primary }
+    $leftOn = @()
     foreach ($n in $nodesToRestore) {
-        # Leave SSH on when an upgrade is in an unknown state: it is the way in to look.
-        if ($exitCode -ne 0 -and $n.Stage -in @('Installed', 'Rebooted')) { Close-NodeSsh $n; continue }
-        if ($exitCode -ne 0 -and $n.Stage -eq 'Pending' -and $n.InstallMark) { Close-NodeSsh $n; continue }
-        try { Restore-NodeSsh $n } catch { }
+        if ($completed) { Close-NodeSsh $n; continue }
+        $act = Get-SshEndAction ([bool]$n.SshEnabledByScript) $false $unfinished ([bool]$DryRun) $SshFinalState
+        if ($act -eq 'Disable') {
+            $null = Disable-NodeSsh $n $(if ($DryRun) { 'the dry run had turned it on' } else { 'the run had turned it on, and ended before any vCenter was shut down' })
+            continue
+        }
         Close-NodeSsh $n
+        if ($n.SshEnabledByScript) { $leftOn += $n.Name; $n.SshFinal = 'On (left on for -Resume)' }
+        elseif (-not $n.SshFinal) { $n.SshFinal = $(if ($n.SshOff) { 'Off (could not be turned on)' } elseif ($n.SshWasOn) { 'On (was on before the run)' } else { 'unchanged' }) }
     }
+    if ($leftOn.Count) {
+        Write-Warn "SSH is left ON on $($leftOn -join ', '): the upgrade is not finished. The run that finishes it (-Resume) turns it off at its end; if the upgrade is abandoned, turn it off in each VAMI (Access)."
+        if ($script:StatePath -and (Test-Path -LiteralPath $script:StatePath)) {
+            $flags = @{}
+            foreach ($n in $groupNodes) { $flags[$n.Name] = [bool]$n.SshEnabledByScript }
+            try { Merge-StateSshFlags (Get-Content -LiteralPath $script:StatePath -Raw) $flags | Set-Content -LiteralPath $script:StatePath -Encoding UTF8 }
+            catch { Write-Warn "Could not record in $($script:StatePath) where SSH was turned on: $($_.Exception.Message)" }
+        }
+    }
+
     if ($script:Findings.Count) {
         $findingsCsv = Join-Path $LogFolder "findings-$(if ($VCenter) { Get-ShortName $VCenter } else { 'vcenter' })-$runStamp.csv"
         try { $script:Findings | Export-Csv -LiteralPath $findingsCsv -NoTypeInformation -Encoding UTF8; Write-Note "Findings: $findingsCsv" } catch { }
@@ -3105,10 +3351,39 @@ finally {
     foreach ($srv in @($script:EsxiServers.Values)) { try { Disconnect-VIServer -Server $srv -Confirm:$false | Out-Null } catch { } }
     # A plink password file whose command was never collected (a stop, a failure) goes too.
     foreach ($f in $script:PlinkPasswordFiles) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
-    if ($transcriptOn) { try { Stop-Transcript | Out-Null; Write-Note "Transcript: $transcript" } catch { } }
-    Send-UpgradeEvent 'Result' @{
-        ExitCode = $exitCode; DryRun = [bool]$DryRun; Stopped = [bool]$stopped; Transcript = $(if ($transcriptOn) { $transcript } else { '' })
-        FindingsCsv = [string]$findingsCsv; StateFile = $(if ($script:StatePath -and (Test-Path -LiteralPath $script:StatePath)) { $script:StatePath } else { '' })
+
+    # --- summary ---
+    $resultText = $(if ($DryRun) { $(if ($exitCode -eq 0) { 'DryRunPassed' } else { 'DryRunFailed' }) }
+                    elseif ($exitCode -eq 0) { 'Upgraded' } elseif ($stopped) { 'StoppedSafely' } else { 'Failed' })
+    $summaryRows = @($groupNodes | ForEach-Object {
+        [pscustomobject]@{
+            VCenter   = $_.Name
+            Stage     = $_.Stage
+            LastStep  = $(if ($_.Board) { (("{0} {1}" -f $_.Board.Stage, $_.Board.Detail).Trim()) } else { '' })
+            From      = [string]$_.FromVersion
+            Target    = [string]$_.TargetVersion
+            Now       = [string]$_.CurrentVersion
+            Ssh       = [string]$_.SshFinal
+            LastError = [string]$_.LastError
+        }
+    })
+    Write-Host ''
+    Write-Host "RESULT: $resultText (exit code $exitCode)" -ForegroundColor $(if ($exitCode -eq 0) { 'Green' } elseif ($stopped) { 'Yellow' } else { 'Red' })
+    if ($summaryRows.Count) { Write-Host (($summaryRows | Format-Table VCenter, Stage, LastStep, From, Target, Now, Ssh -AutoSize | Out-String -Width 250).TrimEnd()) }
+    $stateLeft = $(if (-not $DryRun -and $script:StatePath -and (Test-Path -LiteralPath $script:StatePath)) { $script:StatePath } else { '' })
+    if ($transcriptOn) { try { Stop-Transcript | Out-Null; Write-Host "  Transcript: $transcript" -ForegroundColor DarkGray } catch { } }
+    # The result object, last on the output stream, for a front end to read.
+    [pscustomobject]@{
+        Script      = 'Invoke-VvfVCenterUpgrade'
+        Version     = $ScriptVersion
+        Result      = $resultText
+        ExitCode    = $exitCode
+        DryRun      = [bool]$DryRun
+        Nodes       = $summaryRows
+        Transcript  = $(if ($transcriptOn) { $transcript } else { '' })
+        FindingsCsv = [string]$findingsCsv
+        StateFile   = $stateLeft
+        LogFolder   = $LogFolder
     }
     # Here rather than after the block: the dry run returns from inside it.
     exit $exitCode
