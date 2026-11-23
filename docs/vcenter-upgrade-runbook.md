@@ -6,9 +6,10 @@ script, run from your script-runner / automation front end (or a PowerShell cons
 it top to bottom and tick each box as you go. If anything does not match what this guide
 says, **stop and ask a senior engineer** before going on.
 
-Written for: `Invoke-VvfVCenterUpgrade.ps1` **3.0.0** or later
+Written for: `Invoke-VvfVCenterUpgrade.ps1` **3.0.1** or later
 (`scripts/vsphere/Invoke-VvfVCenterUpgrade.ps1`). The window (`Start-VvfUpgradeGui.ps1`) and
-the signing helper (`Set-VvfUpgradeToolSignature.ps1`) are retired; nothing else is needed.
+the signing helper (`Set-VvfUpgradeToolSignature.ps1`) are retired. **This one file is the whole
+process** -- no other scripts, modules from this repo, or sample files are needed.
 The full reference is the script's own help: `Get-Help .\Invoke-VvfVCenterUpgrade.ps1 -Full`.
 
 ---
@@ -88,8 +89,8 @@ You do not need to touch SSH in the VAMI at any point.
 
 - [ ] Find **every** vCenter in the SSO domain and, for each, the **ESXi host its VM runs on
       now** (vSphere Client -> the vCenter VM -> Summary -> Host).
-- [ ] Write the list, **in the order you want them upgraded** (start from
-      [`vcenter-upgrade.sample.csv`](vcenter-upgrade.sample.csv)):
+- [ ] Write the list, **in the order you want them upgraded** (in Notepad, or straight into the
+      front end's text field; the same template is in the script's help):
 
       ```csv
       VCenter,EsxiHost,VmName
@@ -154,7 +155,7 @@ Check **before** the window:
       ```
 
       Where antivirus blocks Posh-SSH, install PuTTY 0.77+ and set `SshClient` to `Plink`.
-- [ ] Upload **`Invoke-VvfVCenterUpgrade.ps1`** (3.0.0 or later) to the front end. It is the
+- [ ] Upload **`Invoke-VvfVCenterUpgrade.ps1`** (3.0.1 or later) to the front end. It is the
       only file. Its first output line shows the version -- check it on the first run.
 - [ ] **Execution policy.** If the runner enforces `AllSigned`, the file must be signed once
       after every change (a senior engineer, at a PowerShell prompt):

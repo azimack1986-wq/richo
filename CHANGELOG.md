@@ -12,6 +12,17 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## Invoke-VvfVCenterUpgrade.ps1
 
+### [3.0.1] — 2026-11-23
+
+#### Removed
+
+- **Everything but the script.** The process is `scripts/vsphere/Invoke-VvfVCenterUpgrade.ps1`
+  alone: `tests/Test-VvfVCenterUpgrade.ps1`, `tests/Test-VvfVCenterUpgradeSimulation.ps1` and
+  `docs/vcenter-upgrade.sample.csv` are gone. The CSV template is in the script's help
+  (`Get-Help .\Invoke-VvfVCenterUpgrade.ps1 -Parameter VCenterCsv`). Both test suites passed
+  against this version (54 and 50 assertions) before removal; they remain in git history at
+  b9a9157. No change to what a run does.
+
 ### [3.0.0] — 2026-11-23
 
 #### Changed

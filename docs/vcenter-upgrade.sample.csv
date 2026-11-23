@@ -1,7 +1,0 @@
-# vCenters to upgrade, one row each, IN UPGRADE ORDER. Every vCenter in the SSO domain
-# (Enhanced Linked Mode group) must be listed. Lines starting with # are ignored.
-# VmName is optional: the VM's inventory name when it is not the vCenter's name.
-VCenter,EsxiHost,VmName
-vcenter1.corp.local,esx01.corp.local,vcenter1
-vcenter2.corp.local,esx02.corp.local,vcenter2
-vcenter3.corp.local,esx03.corp.local,

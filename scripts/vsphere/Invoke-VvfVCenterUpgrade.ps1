@@ -1,7 +1,7 @@
 # =============================================================================
 #  Invoke-VvfVCenterUpgrade.ps1
 #
-#  VERSION : 3.0.0
+#  VERSION : 3.0.1
 #  OUTPUT  : progress text, a transcript, a findings CSV, a resume state file
 #            and a summary object -- offline snapshots and ISO-based upgrades of
 #            the vCenters listed in a CSV (an Enhanced Linked Mode group), one per
@@ -13,8 +13,10 @@
 # =============================================================================
 #
 #  HISTORY : every change to this file gets a new version, newest first. The
-#            top entry must match VERSION; tests/Test-ScriptVersion.ps1 enforces
-#            that, so a change without a bump fails the build.
+#            top entry must match VERSION and $ScriptVersion below.
+#    3.0.1  The whole process is this one file: no companion scripts, test
+#           harnesses or sample files are needed. The CSV template is in the
+#           help (.PARAMETER VCenterCsv). No change to what a run does.
 #    3.0.0  ONE SCRIPT, NO PROMPTS. Start-VvfUpgradeGui.ps1 and
 #           Set-VvfUpgradeToolSignature.ps1 are retired: this file is the whole
 #           tool, for uploading into a script-runner / automation front end. The
@@ -306,7 +308,12 @@
     Path of the CSV of the vCenters to upgrade, one row each, in upgrade order, with the
     columns VCenter (FQDN), EsxiHost (the ESXi host its VM runs on) and optionally VmName (the
     VM's inventory name, when it is not the vCenter name). Lines starting with # are comments.
-    Give this or -VCenterCsvText. Sample: docs/vcenter-upgrade.sample.csv.
+    Give this or -VCenterCsvText. Every vCenter in the SSO domain must be listed. Template:
+
+        VCenter,EsxiHost,VmName
+        vcenter1.corp.local,esx01.corp.local,vcenter1
+        vcenter2.corp.local,esx02.corp.local,
+        vcenter3.corp.local,esx03.corp.local,
 
 .PARAMETER VCenterCsvText
     The same CSV as text (header line first), for a front end that offers a text box rather
@@ -468,7 +475,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '3.0.0'
+$ScriptVersion = '3.0.1'
 
 # ---------------------------------------------------------------------------- helpers --
 
@@ -698,7 +705,7 @@ function Compare-Findings {
 }
 
 # ------------------------------------------------------------------ output parsers --
-# Pure functions over command output. The offline test loads these by AST.
+# Pure functions over command output: no calls to the hosts or appliances.
 
 function ConvertFrom-ServiceStatusOutput {
     # The output of Get-ServiceStatusCommand: a service-control --status --all section
@@ -2761,7 +2768,7 @@ function Write-GroupPowerState {
 }
 
 # ======================================================================== main body ==
-# Everything above is functions (the offline test loads the pure ones by AST). Everything
+# Everything above is functions. Everything
 # below talks to the ESXi hosts and the appliances. Nothing is asked: every input is a
 # parameter, a secret or an environment variable. Nothing changes state before the start is
 # confirmed (-ConfirmVCenter), apart from turning SSH on and mounting the ISO -- and with
@@ -2810,7 +2817,7 @@ try {
     if (-not [string]::IsNullOrWhiteSpace($VCenterCsvText) -and -not [string]::IsNullOrWhiteSpace($VCenterCsv)) { throw 'Give -VCenterCsv (a file) or -VCenterCsvText (its contents), not both.' }
     if (-not [string]::IsNullOrWhiteSpace($VCenterCsvText)) { $csvText = $VCenterCsvText; $csvLabel = '-VCenterCsvText' }
     elseif (-not [string]::IsNullOrWhiteSpace($VCenterCsv)) {
-        if (-not (Test-Path -LiteralPath $VCenterCsv -PathType Leaf)) { throw "There is no CSV at '$VCenterCsv' (as the account running this script sees it). It needs the columns VCenter,EsxiHost (and optionally VmName), one row per vCenter in the order to upgrade them -- see docs/vcenter-upgrade.sample.csv." }
+        if (-not (Test-Path -LiteralPath $VCenterCsv -PathType Leaf)) { throw "There is no CSV at '$VCenterCsv' (as the account running this script sees it). It needs the columns VCenter,EsxiHost (and optionally VmName), one row per vCenter in the order to upgrade them -- see Get-Help -Parameter VCenterCsv for a template." }
         $csvText = [string](Get-Content -LiteralPath $VCenterCsv -Raw)
         $csvLabel = $VCenterCsv
     } else { throw 'No vCenter list: pass -VCenterCsv (a file) or -VCenterCsvText (its contents) -- columns VCenter,EsxiHost[,VmName], one row per vCenter, in upgrade order.' }
