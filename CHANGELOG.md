@@ -10,6 +10,32 @@ versioning is [semantic](https://semver.org/) per script.
 
 ---
 
+## New-AutoDeployVendorImageProfile.ps1
+
+### [1.0.0] — 2026-11-25
+
+#### Added
+
+- **Builds a vendor image profile for Auto Deploy.** Clones an image profile from
+  the VMware ESXi offline bundle, chosen by name or from a menu that marks the
+  profiles Auto Deploy rules already use, and swaps the inbox VIBs for the newer
+  VIBs in one or more vendor depots (Cisco, NetApp and others).
+- Every vendor VIB is compared by version with the base profile's VIB of the same
+  name: newer replaces (old VIB removed, vendor VIB added), equal is kept, older is
+  never applied, and a VIB with no counterpart is added unless `-ReplaceOnly` is
+  set. `-RemoveVib` strips inbox VIBs the vendor ships under a different name.
+  VMware-signed VIBs found in a vendor depot are ignored unless named in
+  `-VendorVibName`.
+- The plan is logged before any change, and the finished profile is read back and
+  checked against it; a mismatch fails the run before anything is exported or
+  staged.
+- Outputs: offline bundle ZIP (`-ExportBundlePath`), ISO (`-ExportIsoPath`), and an
+  inactive deploy rule with a pattern that matches no host
+  (`-StageInAutoDeploy`), which uploads the profile to Auto Deploy without any host
+  booting from it. `-WhatIf` stops after the plan.
+
+---
+
 ## Invoke-AutoDeployFirmwareBatchControl.ps1
 
 ### [23.32.0] — 2026-08-21
