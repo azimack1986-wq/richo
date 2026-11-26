@@ -69,10 +69,10 @@
     entry.
 
 .PARAMETER BaseDepot
-    Path to the VMware ESXi offline bundle ZIP, or an online depot URL.
+    Path to the VMware ESXi offline bundle ZIP.
 
 .PARAMETER VendorDepot
-    One or more paths (or URLs) to vendor add-on or driver depot ZIPs.
+    One or more paths to vendor add-on or driver depot ZIPs.
 
 .PARAMETER BaseImageProfile
     Name of the ESXi image profile to clone, for example
@@ -149,10 +149,12 @@ param(
 
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
+    [ValidateScript({ (Test-Path -LiteralPath $_ -PathType Leaf) -and ([IO.Path]::GetExtension($_) -eq '.zip') })]
     [string]$BaseDepot,
 
     [Parameter(Mandatory)]
     [ValidateNotNullOrEmpty()]
+    [ValidateScript({ (Test-Path -LiteralPath $_ -PathType Leaf) -and ([IO.Path]::GetExtension($_) -eq '.zip') })]
     [string[]]$VendorDepot,
 
     [string]$BaseImageProfile,
@@ -183,7 +185,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.3.0'
+$ScriptVersion = '1.3.1'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -825,7 +827,7 @@ function Add-DepotToSession {
         correct here: an identical VIB is never a change.
 
     .PARAMETER Depot
-        Path or URL of the depot.
+        Path to the depot ZIP.
 
     .EXAMPLE
         $vibs = Add-DepotToSession -Depot 'D:\Depots\Cisco-addon.zip'
@@ -833,16 +835,13 @@ function Add-DepotToSession {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Depot)
 
-    $isUrl = $Depot -match '^(?i)https?://'
-    if (-not $isUrl -and -not (Test-Path -LiteralPath $Depot -PathType Leaf)) {
-        throw "Depot file not found: $Depot"
-    }
+    if (-not (Test-Path -LiteralPath $Depot -PathType Leaf)) { throw "Depot ZIP not found: $Depot" }
+    if ([IO.Path]::GetExtension($Depot) -ne '.zip') { throw "Depot must be a ZIP file: $Depot" }
 
     $before = @{}
     foreach ($vib in @(Get-EsxSoftwarePackage -ErrorAction SilentlyContinue)) { $before[(Get-SessionVibKey -Package $vib)] = $true }
 
-    $source = $Depot
-    if (-not $isUrl) { $source = (Resolve-Path -LiteralPath $Depot).ProviderPath }
+    $source = (Resolve-Path -LiteralPath $Depot).ProviderPath
 
     try {
         Add-EsxSoftwareDepot -DepotUrl $source -ErrorAction Stop | Out-Null

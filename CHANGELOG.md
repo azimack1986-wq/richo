@@ -12,6 +12,14 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## New-AutoDeployVendorImageProfile.ps1
 
+### [1.3.1] — 2026-11-26
+
+#### Changed
+
+- **Depots are ZIP files only.** Online depot URLs are no longer accepted.
+  `-BaseDepot` and every `-VendorDepot` must be an existing `.zip` file, checked
+  when the parameters are bound, before vCenter is contacted.
+
 ### [1.3.0] — 2026-11-26
 
 #### Removed
