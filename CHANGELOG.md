@@ -12,6 +12,17 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## New-AutoDeployVendorImageProfile.ps1
 
+### [1.5.0] — 2026-11-26
+
+#### Removed
+
+- **Everything to do with Auto Deploy rules and vCenter.** The script no longer
+  connects to vCenter, reads deploy rules or rule sets, or marks which ESXi
+  images rules use. It is image building only: Image Builder in the PowerShell
+  session, from ZIPs to a checked export ZIP. Removed with it: the window's
+  Connect step and "Used by Auto Deploy rule" column, `-Environment`, and the
+  VMware.VimAutomation.Core and VMware.DeployAutomation loads.
+
 ### [1.4.0] — 2026-11-26
 
 #### Added

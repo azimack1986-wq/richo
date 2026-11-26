@@ -9,22 +9,19 @@
 
     Run with no depot parameters and a window opens:
 
-      1. Connect. Pick the environment and connect to vCenter. The Auto Deploy rules are
-         read, and only read, to mark which ESXi images are already in use.
-
-      2. Depot ZIPs. Choose the VMware ESXi bundle ZIP and one or more vendor add-on or
+      1. Depot ZIPs. Choose the VMware ESXi bundle ZIP and one or more vendor add-on or
          driver ZIPs (Cisco, NetApp and so on), then load them. If a vendor download is
          a ZIP that contains the depot ZIP, use the inner one.
 
-      3. ESXi image. The image profiles inside the ESXi bundle ZIP are listed, with any
-         Auto Deploy rule that uses each one. Select the one to clone.
+      2. ESXi image. The image profiles inside the ESXi bundle ZIP are listed. Select the
+         one to clone.
 
-      4. Clone settings. The image name is filled in from the ESXi image and can be
+      3. Clone settings. The image name is filled in from the ESXi image and can be
          changed. The acceptance level defaults to VMwareAccepted. "Also remove" takes
          ESXi package names the vendor ships under a different name. The export ZIP
          defaults to output\<image name>.zip in this repository.
 
-      5. Packages. Show packages lists every vendor package against the ESXi package of
+      4. Packages. Show packages lists every vendor package against the ESXi package of
          the same name:
 
            Replace  Vendor version is newer. The ESXi package is removed and the vendor
@@ -50,8 +47,9 @@
 
     WHAT IT CHANGES
 
-      Nothing in vCenter. Auto Deploy rules, rule sets and depots are never created,
-      changed or activated. The only output is the export ZIP (and an ISO when
+      Nothing in vCenter. The script does not connect to vCenter and does not read or
+      change Auto Deploy rules; it only builds the image with Image Builder in this
+      PowerShell session. The only output is the export ZIP (and an ISO when
       -ExportIsoPath is given). To place the image in the vCenter "Software" depot,
       import the ZIP under Auto Deploy > Software Depots, then clone the image into
       "Software" with no package changes; no documented PowerCLI or API method writes
@@ -65,13 +63,9 @@
 
       - Windows PowerShell 5.1 for the window (single-threaded apartment, which is the
         default for powershell.exe). The command line also runs on PowerShell 7.
-      - VMware PowerCLI 13.x with VMware.ImageBuilder and VMware.DeployAutomation.
+      - VMware PowerCLI 13.x with VMware.ImageBuilder.
       - Python 3.7 or later configured for PowerCLI (Set-PowerCLIConfiguration
         -PythonPath). Image Builder in PowerCLI 13 does not run without it.
-
-.PARAMETER Environment
-    Environment key from config/environments.json. Defaults to the file's "default"
-    entry. In the window it is the environment selected when the window opens.
 
 .PARAMETER BaseDepot
     Command line: path to the VMware ESXi bundle ZIP.
@@ -123,13 +117,13 @@
     Opens the window.
 
 .EXAMPLE
-    .\New-AutoDeployVendorImageProfile.ps1 -Environment lab -WhatIf
+    .\New-AutoDeployVendorImageProfile.ps1 -WhatIf
 
-    Opens the window on the lab environment. Build image runs every step up to the
-    clone and then stops, so the whole flow can be tested without building anything.
+    Opens the window. Build image runs every check up to the clone and then stops, so
+    the whole flow can be tested without building anything.
 
 .EXAMPLE
-    .\New-AutoDeployVendorImageProfile.ps1 -Environment prod `
+    .\New-AutoDeployVendorImageProfile.ps1 `
         -BaseDepot 'D:\Depots\VMware-ESXi-8.0U3e-24677879-depot.zip' `
         -VendorDepot 'D:\Depots\Cisco-addon-ESXi-8.0U3.zip', 'D:\Depots\NetAppNasPlugin.zip' `
         -BaseImageProfile 'ESXi-8.0U3e-24677879-standard' `
@@ -141,8 +135,6 @@
 #Requires -Version 5.1
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High', DefaultParameterSetName = 'Gui')]
 param(
-    [string]$Environment,
-
     [Parameter(Mandatory, ParameterSetName = 'Cli')]
     [ValidateScript({ (Test-Path -LiteralPath $_ -PathType Leaf) -and ([IO.Path]::GetExtension($_) -eq '.zip') })]
     [string]$BaseDepot,
@@ -188,12 +180,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.4.0'
+$ScriptVersion = '1.5.0'
 
 # Set while the window is open, so log lines also reach its log box.
 $script:LogSink = $null
-# The vCenter this run connected to, disconnected at the end.
-$script:ConnectedServer = $null
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -202,7 +192,7 @@ $script:ConnectedServer = $null
 function Import-RequiredModules {
     <#
     .SYNOPSIS
-        Loads Richo.Common and the PowerCLI modules this script uses, where not already loaded.
+        Loads Richo.Common and VMware.ImageBuilder, where not already loaded.
 
     .DESCRIPTION
         Each load is guarded by Get-Module, so a module already in the session (including a
@@ -216,9 +206,7 @@ function Import-RequiredModules {
 
     $wanted = @(
         [pscustomobject]@{ Name = 'Richo.Common'; Source = (Join-Path $PSScriptRoot '..\..\modules\Richo.Common\Richo.Common.psd1') }
-        [pscustomobject]@{ Name = 'VMware.VimAutomation.Core'; Source = 'VMware.VimAutomation.Core' }
         [pscustomobject]@{ Name = 'VMware.ImageBuilder'; Source = 'VMware.ImageBuilder' }
-        [pscustomobject]@{ Name = 'VMware.DeployAutomation'; Source = 'VMware.DeployAutomation' }
     )
 
     foreach ($module in $wanted) {
@@ -658,88 +646,6 @@ function Get-DefaultProfileName {
     return "$BaseName-$suffix"
 }
 
-function Get-RuleImageProfileName {
-    <#
-    .SYNOPSIS
-        The image profile name in one deploy rule item, or an empty string when the item is
-        a host profile, cluster, folder or script bundle.
-
-    .DESCRIPTION
-        An image profile is identified by type first, then by carrying a VIB list, which no
-        other rule item has. A plain string item counts only when it has the shape of an
-        ESXi image profile name.
-
-    .PARAMETER Item
-        One entry from a deploy rule's ItemList.
-
-    .EXAMPLE
-        Get-RuleImageProfileName -Item $rule.ItemList[0]
-    #>
-    [CmdletBinding()]
-    [OutputType([string])]
-    param([AllowNull()]$Item)
-
-    if ($null -eq $Item) { return '' }
-    if ($Item -is [string]) {
-        if ($Item -match '(?i)^ESXi-.*\d{6,}') { return [string]$Item }
-        return ''
-    }
-    $typeName = ''
-    try { $typeName = [string]$Item.GetType().FullName } catch { $typeName = '' }
-    if ($typeName -match '(?i)ImageProfile') { return [string]$Item.Name }
-    if ($Item.PSObject.Properties.Name -contains 'VibList') { return [string]$Item.Name }
-    return ''
-}
-
-function Get-AutoDeployProfileUsage {
-    <#
-    .SYNOPSIS
-        Maps each image profile name used by an Auto Deploy rule to the rules that use it.
-
-    .DESCRIPTION
-        Rules in the active rule set are marked "(active)". When the active rule set cannot
-        be read, rules are listed without the marker. Returns an empty map when Auto Deploy
-        cannot be queried, after logging why.
-
-    .EXAMPLE
-        $usage = Get-AutoDeployProfileUsage
-    #>
-    [CmdletBinding()]
-    [OutputType([hashtable])]
-    param()
-
-    $usage = @{}
-    $rules = @()
-    try {
-        $rules = @(Get-DeployRule -ErrorAction Stop)
-    }
-    catch {
-        Write-BuildLog "Auto Deploy rules could not be read: $($_.Exception.Message). Profiles will not be marked as in use." -Level WARN
-        return $usage
-    }
-
-    $activeNames = @()
-    try {
-        $activeNames = @(Get-DeployRuleSet -ErrorAction Stop | ForEach-Object { [string]$_.Name })
-    }
-    catch {
-        Write-BuildLog "The active rule set could not be read: $($_.Exception.Message)." -Level DEBUG
-    }
-
-    foreach ($rule in $rules) {
-        foreach ($item in @($rule.ItemList)) {
-            $name = Get-RuleImageProfileName -Item $item
-            if ([string]::IsNullOrWhiteSpace($name)) { continue }
-            $label = [string]$rule.Name
-            if ($activeNames -contains $label) { $label = "$label (active)" }
-            if (-not $usage.ContainsKey($name)) { $usage[$name] = New-Object System.Collections.Generic.List[string] }
-            [void]$usage[$name].Add($label)
-        }
-    }
-    Write-BuildLog "Read $($rules.Count) Auto Deploy rule(s); $($usage.Count) image profile(s) in use." -Level INFO
-    return $usage
-}
-
 function Select-BaseImageProfile {
     <#
     .SYNOPSIS
@@ -751,11 +657,8 @@ function Select-BaseImageProfile {
     .PARAMETER Name
         Profile name given on the command line. When set, no menu is shown.
 
-    .PARAMETER Usage
-        Map of profile name to the Auto Deploy rules that use it.
-
     .EXAMPLE
-        $base = Select-BaseImageProfile -ImageProfile $profiles -Usage $usage
+        $base = Select-BaseImageProfile -ImageProfile $profiles
     #>
     [CmdletBinding()]
     param(
@@ -763,9 +666,7 @@ function Select-BaseImageProfile {
         [AllowEmptyCollection()]
         [object[]]$ImageProfile,
 
-        [string]$Name,
-
-        [hashtable]$Usage = @{}
+        [string]$Name
     )
 
     if ($ImageProfile.Count -eq 0) {
@@ -788,11 +689,7 @@ function Select-BaseImageProfile {
     $sorted = @($ImageProfile | Sort-Object -Property Name)
     Write-BuildLog 'Image profiles in the base depot:' -Level INFO
     for ($i = 0; $i -lt $sorted.Count; $i++) {
-        $line = '  {0,2}. {1}' -f ($i + 1), $sorted[$i].Name
-        if ($Usage.ContainsKey([string]$sorted[$i].Name)) {
-            $line += '   [Auto Deploy: ' + (($Usage[[string]$sorted[$i].Name]) -join ', ') + ']'
-        }
-        Write-BuildLog $line -Level INFO
+        Write-BuildLog ('  {0,2}. {1}' -f ($i + 1), $sorted[$i].Name) -Level INFO
     }
 
     while ($true) {
@@ -1176,70 +1073,6 @@ function Get-DefaultDescription {
     return "Clone of $BaseName with vendor VIBs from: $sources. Built $((Get-Date).ToString('yyyy-MM-dd'))."
 }
 
-function Get-RichoEnvironmentList {
-    <#
-    .SYNOPSIS
-        The environment names in config/environments.json, and the default one.
-
-    .DESCRIPTION
-        Fills the window's environment list. Returns an empty list when the file cannot be
-        read; connecting then reports the problem through Get-RichoConfig.
-
-    .EXAMPLE
-        $envs = Get-RichoEnvironmentList
-    #>
-    [CmdletBinding()]
-    param()
-
-    $path = $env:RICHO_CONFIG
-    if (-not $path) { $path = Join-Path ([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))) 'config\environments.json' }
-
-    $names = @()
-    $default = ''
-    try {
-        $json = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json
-        $names = @($json.environments.PSObject.Properties | ForEach-Object { $_.Name })
-        if ($json.PSObject.Properties.Name -contains 'default') { $default = [string]$json.default }
-    }
-    catch {
-        Write-BuildLog "Environment list not read from ${path}: $($_.Exception.Message)" -Level WARN
-    }
-    return [pscustomobject]@{ Names = $names; Default = $default }
-}
-
-function Connect-AutoDeployVCenter {
-    <#
-    .SYNOPSIS
-        Connects to an environment's vCenter and reads which image profiles Auto Deploy
-        rules use.
-
-    .DESCRIPTION
-        A connection already made by this script is closed first. The rules are only read.
-
-    .PARAMETER Environment
-        Environment key from config/environments.json; empty for the default.
-
-    .EXAMPLE
-        $conn = Connect-AutoDeployVCenter -Environment lab
-    #>
-    [CmdletBinding()]
-    param([AllowEmptyString()][string]$Environment)
-
-    if ($script:ConnectedServer) {
-        Disconnect-VIServer -Server $script:ConnectedServer -Confirm:$false -ErrorAction SilentlyContinue
-        $script:ConnectedServer = $null
-    }
-
-    $config = Get-RichoConfig -Name $Environment
-    $cred = Get-RichoCredential -Name $config.vcenter.credentialName
-    Connect-VIServer -Server $config.vcenter.server -Credential $cred -ErrorAction Stop | Out-Null
-    $script:ConnectedServer = $config.vcenter.server
-    Write-BuildLog "Connected to vCenter $($config.vcenter.server) (environment '$($config.Name)')." -Level INFO
-
-    $usage = Get-AutoDeployProfileUsage
-    return [pscustomobject]@{ Server = $config.vcenter.server; Environment = $config.Name; Usage = $usage }
-}
-
 function Import-BuildDepot {
     <#
     .SYNOPSIS
@@ -1349,8 +1182,8 @@ function Invoke-ImageBuild {
 
     .DESCRIPTION
         Checks before anything is built: at least one change, every package at or above the
-        acceptance level, the name not already used in this session or by an Auto Deploy
-        rule, and the export files not already present.
+        acceptance level, the name not already used in this session, and the export files
+        not already present.
 
         After the build every plan row is checked against the new image. After the export
         the session is cleared and the ZIP is loaded on its own; its image must carry
@@ -1384,9 +1217,6 @@ function Invoke-ImageBuild {
     .PARAMETER ExportIsoPath
         Absolute path of the ISO to write, or empty.
 
-    .PARAMETER Usage
-        Map of image profile name to the Auto Deploy rules that use it.
-
     .EXAMPLE
         $result = Invoke-ImageBuild -BaseProfile $base -Plan $plan -NewProfileName $name `
             -AcceptanceLevel VMwareAccepted -ProfileVendor Custom -Description $text `
@@ -1405,8 +1235,7 @@ function Invoke-ImageBuild {
         [Parameter(Mandatory)][string]$ProfileVendor,
         [Parameter(Mandatory)][string]$Description,
         [Parameter(Mandatory)][string]$ExportBundlePath,
-        [string]$ExportIsoPath,
-        [hashtable]$Usage = @{}
+        [string]$ExportIsoPath
     )
 
     $result = [pscustomobject]@{ Built = $false; Exported = $false; ExportBundlePath = $ExportBundlePath; VibCount = 0 }
@@ -1425,9 +1254,6 @@ function Invoke-ImageBuild {
 
     if (@(Get-EsxImageProfile | Where-Object { $_.Name -eq $NewProfileName }).Count -gt 0) {
         throw "An image profile named '$NewProfileName' is already loaded. Choose another name."
-    }
-    if ($Usage.ContainsKey($NewProfileName)) {
-        throw "Auto Deploy already has an image profile named '$NewProfileName' (rule: $(($Usage[$NewProfileName]) -join ', ')). Choose another name."
     }
     Assert-OutputPath -Path $ExportBundlePath
     if ($ExportIsoPath) { Assert-OutputPath -Path $ExportIsoPath }
@@ -1582,9 +1408,6 @@ function Show-BuilderForm {
     .SYNOPSIS
         Opens the image builder window and returns when it is closed.
 
-    .PARAMETER Environment
-        Environment selected when the window opens.
-
     .PARAMETER AcceptanceLevel
         Acceptance level selected when the window opens.
 
@@ -1592,11 +1415,10 @@ function Show-BuilderForm {
         Vendor field written into images built from the window.
 
     .EXAMPLE
-        Show-BuilderForm -Environment lab
+        Show-BuilderForm
     #>
     [CmdletBinding()]
     param(
-        [string]$Environment,
         [string]$AcceptanceLevel = 'VMwareAccepted',
         [string]$ProfileVendor = 'Custom'
     )
@@ -1610,7 +1432,6 @@ function Show-BuilderForm {
     [System.Windows.Forms.Application]::EnableVisualStyles()
 
     $state = @{
-        Usage      = @{}
         Profiles   = @()
         Vendor     = @()
         VendorZips = @()
@@ -1629,25 +1450,13 @@ function Show-BuilderForm {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "Auto Deploy vendor image builder $ScriptVersion"
-    $form.ClientSize = New-Object System.Drawing.Size(1105, 860)
+    $form.ClientSize = New-Object System.Drawing.Size(1105, 800)
     $form.MinimumSize = New-Object System.Drawing.Size(900, 700)
     $form.StartPosition = 'CenterScreen'
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
 
-    # ---- 1. Connect ------------------------------------------------------------
-    $grpConnect = New-Object System.Windows.Forms.GroupBox -Property @{ Text = '1. Connect to vCenter Auto Deploy'; Location = [System.Drawing.Point]::new(10, 10); Size = [System.Drawing.Size]::new(1085, 55); Anchor = $stretch }
-    $lblEnv = New-Object System.Windows.Forms.Label -Property @{ Text = 'Environment:'; Location = [System.Drawing.Point]::new(12, 25); Size = [System.Drawing.Size]::new(85, 20) }
-    $cmbEnv = New-Object System.Windows.Forms.ComboBox -Property @{ Location = [System.Drawing.Point]::new(100, 21); Size = [System.Drawing.Size]::new(160, 24); DropDownStyle = 'DropDown' }
-    $btnConnect = New-Object System.Windows.Forms.Button -Property @{ Text = 'Connect'; Location = [System.Drawing.Point]::new(270, 20); Size = [System.Drawing.Size]::new(100, 26) }
-    $lblConn = New-Object System.Windows.Forms.Label -Property @{ Text = 'Not connected.'; Location = [System.Drawing.Point]::new(380, 25); Size = [System.Drawing.Size]::new(690, 20); Anchor = $stretch }
-    $grpConnect.Controls.AddRange(@($lblEnv, $cmbEnv, $btnConnect, $lblConn))
-
-    $envList = Get-RichoEnvironmentList
-    foreach ($name in $envList.Names) { [void]$cmbEnv.Items.Add($name) }
-    if ($Environment) { $cmbEnv.Text = $Environment } elseif ($envList.Default) { $cmbEnv.Text = $envList.Default }
-
-    # ---- 2. Depot ZIPs ---------------------------------------------------------
-    $grpZip = New-Object System.Windows.Forms.GroupBox -Property @{ Text = '2. Depot ZIPs'; Location = [System.Drawing.Point]::new(10, 70); Size = [System.Drawing.Size]::new(1085, 135); Anchor = $stretch }
+    # ---- 1. Depot ZIPs ---------------------------------------------------------
+    $grpZip = New-Object System.Windows.Forms.GroupBox -Property @{ Text = '1. Depot ZIPs'; Location = [System.Drawing.Point]::new(10, 10); Size = [System.Drawing.Size]::new(1085, 135); Anchor = $stretch }
     $lblBase = New-Object System.Windows.Forms.Label -Property @{ Text = 'ESXi bundle ZIP:'; Location = [System.Drawing.Point]::new(12, 26); Size = [System.Drawing.Size]::new(110, 20) }
     $txtBase = New-Object System.Windows.Forms.TextBox -Property @{ Location = [System.Drawing.Point]::new(125, 22); Size = [System.Drawing.Size]::new(840, 24); ReadOnly = $true; Anchor = $stretch }
     $btnBase = New-Object System.Windows.Forms.Button -Property @{ Text = 'Browse...'; Location = [System.Drawing.Point]::new(975, 21); Size = [System.Drawing.Size]::new(95, 26); Anchor = $pinRight }
@@ -1658,8 +1467,8 @@ function Show-BuilderForm {
     $btnLoad = New-Object System.Windows.Forms.Button -Property @{ Text = 'Load ZIPs'; Location = [System.Drawing.Point]::new(975, 105); Size = [System.Drawing.Size]::new(95, 26); Anchor = $pinRight }
     $grpZip.Controls.AddRange(@($lblBase, $txtBase, $btnBase, $lblVendor, $lstVendor, $btnVendorAdd, $btnVendorRemove, $btnLoad))
 
-    # ---- 3. ESXi image ---------------------------------------------------------
-    $grpImage = New-Object System.Windows.Forms.GroupBox -Property @{ Text = '3. ESXi image to clone (from the ESXi bundle ZIP)'; Location = [System.Drawing.Point]::new(10, 210); Size = [System.Drawing.Size]::new(1085, 180); Anchor = $stretch }
+    # ---- 2. ESXi image ---------------------------------------------------------
+    $grpImage = New-Object System.Windows.Forms.GroupBox -Property @{ Text = '2. ESXi image to clone (from the ESXi bundle ZIP)'; Location = [System.Drawing.Point]::new(10, 150); Size = [System.Drawing.Size]::new(1085, 180); Anchor = $stretch }
     $gridImage = New-Object System.Windows.Forms.DataGridView -Property @{
         Location = [System.Drawing.Point]::new(12, 22); Size = [System.Drawing.Size]::new(1060, 148); Anchor = $stretch; ReadOnly = $true
         AllowUserToAddRows = $false; AllowUserToDeleteRows = $false; RowHeadersVisible = $false
@@ -1669,16 +1478,14 @@ function Show-BuilderForm {
     [void]$gridImage.Columns.Add('Vendor', 'Vendor')
     [void]$gridImage.Columns.Add('Acceptance', 'Acceptance level')
     [void]$gridImage.Columns.Add('Vibs', 'Packages')
-    [void]$gridImage.Columns.Add('Rules', 'Used by Auto Deploy rule')
-    $gridImage.Columns['Name'].FillWeight = 35
-    $gridImage.Columns['Vendor'].FillWeight = 15
-    $gridImage.Columns['Acceptance'].FillWeight = 15
-    $gridImage.Columns['Vibs'].FillWeight = 8
-    $gridImage.Columns['Rules'].FillWeight = 27
+    $gridImage.Columns['Name'].FillWeight = 50
+    $gridImage.Columns['Vendor'].FillWeight = 20
+    $gridImage.Columns['Acceptance'].FillWeight = 20
+    $gridImage.Columns['Vibs'].FillWeight = 10
     $grpImage.Controls.Add($gridImage)
 
-    # ---- 4. Clone settings -----------------------------------------------------
-    $grpClone = New-Object System.Windows.Forms.GroupBox -Property @{ Text = '4. Clone settings'; Location = [System.Drawing.Point]::new(10, 395); Size = [System.Drawing.Size]::new(1085, 90); Anchor = $stretch }
+    # ---- 3. Clone settings -----------------------------------------------------
+    $grpClone = New-Object System.Windows.Forms.GroupBox -Property @{ Text = '3. Clone settings'; Location = [System.Drawing.Point]::new(10, 335); Size = [System.Drawing.Size]::new(1085, 90); Anchor = $stretch }
     $lblName = New-Object System.Windows.Forms.Label -Property @{ Text = 'Image name:'; Location = [System.Drawing.Point]::new(12, 27); Size = [System.Drawing.Size]::new(80, 20) }
     $txtName = New-Object System.Windows.Forms.TextBox -Property @{ Location = [System.Drawing.Point]::new(95, 23); Size = [System.Drawing.Size]::new(420, 24) }
     $lblAcc = New-Object System.Windows.Forms.Label -Property @{ Text = 'Acceptance level:'; Location = [System.Drawing.Point]::new(530, 27); Size = [System.Drawing.Size]::new(105, 20) }
@@ -1694,8 +1501,8 @@ function Show-BuilderForm {
     $btnPlan = New-Object System.Windows.Forms.Button -Property @{ Text = 'Show packages'; Location = [System.Drawing.Point]::new(960, 54); Size = [System.Drawing.Size]::new(110, 26); Anchor = $pinRight }
     $grpClone.Controls.AddRange(@($lblName, $txtName, $lblAcc, $cmbAcc, $chkReplaceOnly, $lblRemove, $txtRemove, $lblExport, $txtExport, $btnExport, $btnPlan))
 
-    # ---- 5. Packages -----------------------------------------------------------
-    $grpPlan = New-Object System.Windows.Forms.GroupBox -Property @{ Text = '5. Packages - untick a row to leave the ESXi image as it is for that package'; Location = [System.Drawing.Point]::new(10, 490); Size = [System.Drawing.Size]::new(1085, 230); Anchor = $stretch }
+    # ---- 4. Packages -----------------------------------------------------------
+    $grpPlan = New-Object System.Windows.Forms.GroupBox -Property @{ Text = '4. Packages - untick a row to leave the ESXi image as it is for that package'; Location = [System.Drawing.Point]::new(10, 430); Size = [System.Drawing.Size]::new(1085, 230); Anchor = $stretch }
     $gridPlan = New-Object System.Windows.Forms.DataGridView -Property @{
         Location = [System.Drawing.Point]::new(12, 22); Size = [System.Drawing.Size]::new(1060, 165); Anchor = $stretch
         AllowUserToAddRows = $false; AllowUserToDeleteRows = $false; RowHeadersVisible = $false
@@ -1716,11 +1523,11 @@ function Show-BuilderForm {
 
     # ---- Log -------------------------------------------------------------------
     $txtLog = New-Object System.Windows.Forms.TextBox -Property @{
-        Location = [System.Drawing.Point]::new(10, 725); Size = [System.Drawing.Size]::new(1085, 125); Multiline = $true; ReadOnly = $true; ScrollBars = 'Vertical'
+        Location = [System.Drawing.Point]::new(10, 665); Size = [System.Drawing.Size]::new(1085, 125); Multiline = $true; ReadOnly = $true; ScrollBars = 'Vertical'
         Anchor = ($top -bor $bottom -bor $left -bor $right); Font = (New-Object System.Drawing.Font('Consolas', 8.5))
     }
 
-    $form.Controls.AddRange(@($grpConnect, $grpZip, $grpImage, $grpClone, $grpPlan, $txtLog))
+    $form.Controls.AddRange(@($grpZip, $grpImage, $grpClone, $grpPlan, $txtLog))
 
     $script:LogSink = {
         param($Line)
@@ -1747,9 +1554,7 @@ function Show-BuilderForm {
     $fillImages = {
         $gridImage.Rows.Clear()
         foreach ($imageProfile in $state.Profiles) {
-            $rules = ''
-            if ($state.Usage.ContainsKey([string]$imageProfile.Name)) { $rules = ($state.Usage[[string]$imageProfile.Name]) -join ', ' }
-            $index = $gridImage.Rows.Add([string]$imageProfile.Name, [string]$imageProfile.Vendor, [string]$imageProfile.AcceptanceLevel, @($imageProfile.VibList).Count, $rules)
+            $index = $gridImage.Rows.Add([string]$imageProfile.Name, [string]$imageProfile.Vendor, [string]$imageProfile.AcceptanceLevel, @($imageProfile.VibList).Count)
             $gridImage.Rows[$index].Tag = $imageProfile
         }
         $gridImage.ClearSelection()
@@ -1758,15 +1563,6 @@ function Show-BuilderForm {
     }
 
     # ---- Events ----------------------------------------------------------------
-    $btnConnect.Add_Click({
-            Invoke-GuiAction -GuiForm $form -Body {
-                $conn = Connect-AutoDeployVCenter -Environment $cmbEnv.Text.Trim()
-                $state.Usage = $conn.Usage
-                $lblConn.Text = "Connected to $($conn.Server) ($($conn.Environment)). $($conn.Usage.Count) image profile(s) in use by Auto Deploy rules."
-                if ($state.Profiles.Count -gt 0) { & $fillImages }
-            }
-        })
-
     $btnBase.Add_Click({
             $dialog = New-Object System.Windows.Forms.OpenFileDialog -Property @{ Filter = 'ZIP files (*.zip)|*.zip'; Title = 'VMware ESXi bundle ZIP' }
             if ($dialog.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
@@ -1794,7 +1590,6 @@ function Show-BuilderForm {
             Invoke-GuiAction -GuiForm $form -Body {
                 if ([string]::IsNullOrWhiteSpace($txtBase.Text)) { throw 'Choose the ESXi bundle ZIP.' }
                 if ($lstVendor.Items.Count -eq 0) { throw 'Add at least one vendor ZIP.' }
-                if (-not $script:ConnectedServer) { Write-BuildLog 'Not connected: the ESXi images will not show which Auto Deploy rules use them.' -Level WARN }
 
                 & $clearImages
                 $zips = @($lstVendor.Items | ForEach-Object { [string]$_ })
@@ -1907,7 +1702,7 @@ function Show-BuilderForm {
                 $counts = ($changes | Group-Object -Property Action | ForEach-Object { "$($_.Count) to $($_.Name.ToLower())" }) -join ', '
                 if ($excluded.Count -gt 0) { Write-BuildLog "Unticked, ESXi image left as it is: $($excluded -join ', ')." -Level INFO }
 
-                $question = "Build image '$name' from '$($state.Base.Name)'?`r`n`r`n$counts`r`nAcceptance level: $level`r`nExport ZIP: $zipPath`r`n`r`nNothing in vCenter or Auto Deploy is changed."
+                $question = "Build image '$name' from '$($state.Base.Name)'?`r`n`r`n$counts`r`nAcceptance level: $level`r`nExport ZIP: $zipPath`r`n`r`nNothing in vCenter is changed."
                 $answer = [System.Windows.Forms.MessageBox]::Show($question, 'Build image', 'YesNo', 'Question')
                 if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) {
                     Write-BuildLog 'Build cancelled.' -Level INFO
@@ -1918,7 +1713,7 @@ function Show-BuilderForm {
                 try {
                     $result = Invoke-ImageBuild -BaseProfile $state.Base -Plan $plan -NewProfileName $name -AcceptanceLevel $level `
                         -ProfileVendor $ProfileVendor -Description (Get-DefaultDescription -BaseName ([string]$state.Base.Name) -VendorDepot $state.VendorZips) `
-                        -ExportBundlePath $zipPath -Usage $state.Usage -Confirm:$false
+                        -ExportBundlePath $zipPath -Confirm:$false
                 }
                 finally {
                     # Once the clone exists the session's depots have changed and the loaded lists
@@ -1964,19 +1759,15 @@ try {
 
     # ---- Window -----------------------------------------------------------
     if ($PSCmdlet.ParameterSetName -eq 'Gui') {
-        Show-BuilderForm -Environment $Environment -AcceptanceLevel $AcceptanceLevel -ProfileVendor $ProfileVendor
+        Show-BuilderForm -AcceptanceLevel $AcceptanceLevel -ProfileVendor $ProfileVendor
         return
     }
 
     # ---- Command line -----------------------------------------------------
-    $conn = Connect-AutoDeployVCenter -Environment $Environment
     $loaded = Import-BuildDepot -BaseDepot $BaseDepot -VendorDepot $VendorDepot -VendorVibName $VendorVibName
 
-    $base = Select-BaseImageProfile -ImageProfile $loaded.Profiles -Name $BaseImageProfile -Usage $conn.Usage
+    $base = Select-BaseImageProfile -ImageProfile $loaded.Profiles -Name $BaseImageProfile
     Write-BuildLog "ESXi image: '$($base.Name)' ($(@($base.VibList).Count) packages, acceptance level $($base.AcceptanceLevel))." -Level INFO
-    if ($conn.Usage.ContainsKey([string]$base.Name)) {
-        Write-BuildLog "Used by Auto Deploy rule(s): $(($conn.Usage[[string]$base.Name]) -join ', ')." -Level INFO
-    }
 
     $plan = Get-VibSwapPlan -BaseVib @($base.VibList) -VendorVib $loaded.Vendor -RemoveVib $RemoveVib -ReplaceOnly:$ReplaceOnly
     Write-BuildLog "Packages for '$($base.Name)':" -Level INFO
@@ -1994,7 +1785,7 @@ try {
     if (-not $Description) { $Description = Get-DefaultDescription -BaseName $base.Name -VendorDepot $VendorDepot }
 
     $result = Invoke-ImageBuild -BaseProfile $base -Plan $plan -NewProfileName $NewProfileName -AcceptanceLevel $AcceptanceLevel `
-        -ProfileVendor $ProfileVendor -Description $Description -ExportBundlePath $zipPath -ExportIsoPath $isoPath -Usage $conn.Usage
+        -ProfileVendor $ProfileVendor -Description $Description -ExportBundlePath $zipPath -ExportIsoPath $isoPath
 
     if ($result.Exported) { Write-BuildLog 'Completed successfully.' -Level INFO }
 }
@@ -2003,8 +1794,5 @@ catch {
     throw
 }
 finally {
-    if ($script:ConnectedServer) {
-        Disconnect-VIServer -Server $script:ConnectedServer -Confirm:$false -ErrorAction SilentlyContinue
-    }
     if ($transcriptPath) { Stop-Transcript | Out-Null }
 }

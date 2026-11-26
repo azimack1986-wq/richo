@@ -31,7 +31,7 @@ if ($errors) { throw "parse errors in ${scriptPath}: $($errors | ForEach-Object 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in @('ConvertTo-VibVersionSegment', 'Compare-VibVersionText', 'Compare-VibVersion',
             'Select-NewestVib', 'Get-VibSwapPlan', 'Get-DefaultProfileName', 'Find-ProfileVib',
-            'Test-ProfileMatchesPlan', 'Get-RuleImageProfileName', 'Get-OptionalProperty',
+            'Test-ProfileMatchesPlan', 'Get-OptionalProperty',
             'Get-AcceptanceRank', 'Get-AcceptanceShortfall', 'Read-ProfileName', 'Compare-VibSet', 'Set-PlanExclusion') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
@@ -201,13 +201,6 @@ $date = [datetime]'2026-11-25'
 Assert-Equal 'standard suffix replaced' 'ESXi-8.0U3e-24677879-custom-20261125' (Get-DefaultProfileName -BaseName 'ESXi-8.0U3e-24677879-standard' -Date $date)
 Assert-Equal 'no-tools suffix replaced' 'ESXi-8.0U3e-24677879-custom-20261125' (Get-DefaultProfileName -BaseName 'ESXi-8.0U3e-24677879-no-tools' -Date $date)
 Assert-Equal 'other names get the suffix appended' 'MyProfile-custom-20261125' (Get-DefaultProfileName -BaseName 'MyProfile' -Date $date)
-
-Write-Host "`n=== Get-RuleImageProfileName ===" -ForegroundColor Cyan
-Assert-Equal 'string shaped like a profile name' 'ESXi-8.0U3e-24677879-standard' (Get-RuleImageProfileName -Item 'ESXi-8.0U3e-24677879-standard')
-Assert-Equal 'host profile name string ignored' '' (Get-RuleImageProfileName -Item 'HP-Cluster01')
-Assert-Equal 'object with a VIB list counts' 'Custom-1' (Get-RuleImageProfileName -Item ([pscustomobject]@{ Name = 'Custom-1'; VibList = @() }))
-Assert-Equal 'object without a VIB list ignored' '' (Get-RuleImageProfileName -Item ([pscustomobject]@{ Name = 'Cluster01' }))
-Assert-Equal 'null ignored' '' (Get-RuleImageProfileName -Item $null)
 
 Write-Host "`n--- $script:pass passed, $script:fail failed ---" -ForegroundColor $(if ($script:fail -eq 0) { 'Green' } else { 'Red' })
 if ($script:fail -gt 0) { exit 1 }
