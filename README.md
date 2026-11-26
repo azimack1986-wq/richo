@@ -153,4 +153,4 @@ They are independent, so any one can be run on its own:
 | `Test-IntersightDeployState.ps1` | Which `ConfigState` values mean a deploy is needed |
 | `Test-IntersightFailureKind.ps1` | Auth failure vs. a response the client cannot parse |
 | `Test-ModuleEnumerationCache.ps1` | Module enumeration happens once, not per lookup |
-| `Test-VendorImageProfilePlan.ps1` | VIB version comparison and the vendor VIB swap plan for Auto Deploy images |
+| `Test-VendorImageProfilePlan.ps1` | VIB version comparison, the vendor package swap plan, unticked rows and the export check |

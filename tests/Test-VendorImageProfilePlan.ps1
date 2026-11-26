@@ -14,7 +14,8 @@
       - -RemoveVib removes, and cannot name a VIB that is also being applied;
       - when several versions are offered, the newest is chosen and the others are reported;
       - the finished-profile check catches a VIB left at the old version;
-      - a package below the clone's acceptance level is found before the clone is made.
+      - a package below the clone's acceptance level is found before the clone is made;
+      - an unticked row changes nothing, and the check expects the ESXi image as it was.
 
     Standalone - no Pester, no vendor modules, no infrastructure.
 
@@ -31,7 +32,7 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
     Where-Object { $_.Name -in @('ConvertTo-VibVersionSegment', 'Compare-VibVersionText', 'Compare-VibVersion',
             'Select-NewestVib', 'Get-VibSwapPlan', 'Get-DefaultProfileName', 'Find-ProfileVib',
             'Test-ProfileMatchesPlan', 'Get-RuleImageProfileName', 'Get-OptionalProperty',
-            'Get-AcceptanceRank', 'Get-AcceptanceShortfall', 'Read-ProfileName', 'Compare-VibSet') } |
+            'Get-AcceptanceRank', 'Get-AcceptanceShortfall', 'Read-ProfileName', 'Compare-VibSet', 'Set-PlanExclusion') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0
@@ -158,6 +159,27 @@ Assert-Equal 'nothing below PartnerSupported' 0 @($partner.Below).Count
 
 Write-Host "`n=== Read-ProfileName ===" -ForegroundColor Cyan
 Assert-Equal 'given name is used and trimmed' 'ESXi-Cisco' (Read-ProfileName -Name '  ESXi-Cisco ' -Default 'ESXi-default')
+
+Write-Host "`n=== Set-PlanExclusion (unticked rows) ===" -ForegroundColor Cyan
+$excludedPlan = Set-PlanExclusion -Plan $plan -Name 'nenic', 'NetAppNasPlugin', 'nmlx4-en', 'nfnic'
+Assert-Equal 'unticked Replace becomes Excluded' 'Excluded' (Get-Row $excludedPlan 'nenic').Action
+Assert-Equal 'unticked Add becomes Excluded' 'Excluded' (Get-Row $excludedPlan 'NetAppNasPlugin').Action
+Assert-Equal 'unticked Remove becomes Excluded' 'Excluded' (Get-Row $excludedPlan 'nmlx4-en').Action
+Assert-Equal 'Keep row is not changed by unticking' 'Keep' (Get-Row $excludedPlan 'nfnic').Action
+Assert-Equal 'the plan passed in is not changed' 'Replace' (Get-Row $plan 'nenic').Action
+Assert-Equal 'nothing unticked leaves the plan as it is' 'Replace' (Get-Row (Set-PlanExclusion -Plan $plan -Name @()) 'nenic').Action
+
+$untouched = [pscustomobject]@{ VibList = @(
+        [pscustomobject]@{ Name = 'esx-base'; Version = '8.0.3-0.55.24677879' }
+        [pscustomobject]@{ Name = 'nenic'; Version = '1.0.45.0-1vmw.800.1.0.20513097' }
+        [pscustomobject]@{ Name = 'nfnic'; Version = '5.0.0.43-1vmw.800.1.0.20513097' }
+        [pscustomobject]@{ Name = 'lsi-mr3'; Version = '7.727.02.00-1vmw.800.1.0.20513097' }
+        [pscustomobject]@{ Name = 'nmlx4-en'; Version = '3.19.70.1-1vmw.800.1.0.20513097' }
+    ) }
+Assert-Equal 'image left as ESXi had it matches an all-unticked plan' 0 (Test-ProfileMatchesPlan -ImageProfile $untouched -Plan $excludedPlan).Count
+$swappedAnyway = Test-ProfileMatchesPlan -ImageProfile $good -Plan $excludedPlan
+Assert-Equal 'unticked package swapped anyway is caught' $true (@($swappedAnyway | Where-Object { $_ -like 'nenic: unticked*' }).Count -eq 1)
+Assert-Equal 'unticked package added anyway is caught' $true (@($swappedAnyway | Where-Object { $_ -like 'NetAppNasPlugin: unticked*' }).Count -eq 1)
 
 Write-Host "`n=== Compare-VibSet ===" -ForegroundColor Cyan
 $expected = @('nenic|2.0.15.0-1OEM', 'esx-base|8.0.3-0.55')

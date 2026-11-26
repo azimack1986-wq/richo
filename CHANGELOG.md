@@ -12,6 +12,31 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## New-AutoDeployVendorImageProfile.ps1
 
+### [1.4.0] — 2026-11-26
+
+#### Added
+
+- **A window.** Run the script with no depot parameters and it opens a window
+  that follows the vSphere Client steps: connect to vCenter, choose the ESXi
+  bundle ZIP and vendor ZIPs, pick the ESXi image from a list of the image
+  profiles inside the ESXi ZIP (with the Auto Deploy rules that use each one),
+  set the name, acceptance level and export ZIP, then review the packages.
+  Every Replace, Add and Remove row is ticked; untick one to leave the ESXi
+  image as it is for that package. Packages below the acceptance level are
+  shown in red. Build image asks for confirmation, then builds, checks,
+  exports and checks the exported ZIP.
+- Running with `-WhatIf` lets the window be tested end to end: Build image runs
+  every check and stops before the clone.
+
+#### Changed
+
+- The build is one function (`Invoke-ImageBuild`) used by both the window and
+  the command line, so both run the same checks. Loading the ZIPs also clears
+  any image profile left in the session by an earlier build.
+- Command-line parameters other than `-Environment`, `-AcceptanceLevel`,
+  `-ProfileVendor` and `-Transcript` belong to the command-line parameter set;
+  passing `-BaseDepot` and `-VendorDepot` selects it.
+
 ### [1.3.1] — 2026-11-26
 
 #### Changed
