@@ -31,7 +31,7 @@ $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionD
     Where-Object { $_.Name -in @('ConvertTo-VibVersionSegment', 'Compare-VibVersionText', 'Compare-VibVersion',
             'Select-NewestVib', 'Get-VibSwapPlan', 'Get-DefaultProfileName', 'Find-ProfileVib',
             'Test-ProfileMatchesPlan', 'Get-RuleImageProfileName', 'Get-OptionalProperty',
-            'Get-AcceptanceRank', 'Get-AcceptanceShortfall', 'Read-ProfileName') } |
+            'Get-AcceptanceRank', 'Get-AcceptanceShortfall', 'Read-ProfileName', 'Compare-VibSet') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0
@@ -158,6 +158,21 @@ Assert-Equal 'nothing below PartnerSupported' 0 @($partner.Below).Count
 
 Write-Host "`n=== Read-ProfileName ===" -ForegroundColor Cyan
 Assert-Equal 'given name is used and trimmed' 'ESXi-Cisco' (Read-ProfileName -Name '  ESXi-Cisco ' -Default 'ESXi-default')
+
+Write-Host "`n=== Compare-VibSet ===" -ForegroundColor Cyan
+$expected = @('nenic|2.0.15.0-1OEM', 'esx-base|8.0.3-0.55')
+$same = [pscustomobject]@{ VibList = @(
+        [pscustomobject]@{ Name = 'esx-base'; Version = '8.0.3-0.55' }
+        [pscustomobject]@{ Name = 'nenic'; Version = '2.0.15.0-1OEM' }
+    ) }
+Assert-Equal 'identical VIB lists match, order ignored' 0 (Compare-VibSet -Expected $expected -ImageProfile $same).Count
+$drift = [pscustomobject]@{ VibList = @(
+        [pscustomobject]@{ Name = 'esx-base'; Version = '8.0.3-0.55' }
+        [pscustomobject]@{ Name = 'nenic'; Version = '1.0.45.0-1vmw' }
+    ) }
+$diff = Compare-VibSet -Expected $expected -ImageProfile $drift
+Assert-Equal 'removed VIB back in the bundle is reported' $true (@($diff | Where-Object { $_ -eq 'unexpected nenic 1.0.45.0-1vmw' }).Count -eq 1)
+Assert-Equal 'vendor VIB missing from the bundle is reported' $true (@($diff | Where-Object { $_ -eq 'missing nenic 2.0.15.0-1OEM' }).Count -eq 1)
 
 Write-Host "`n=== Get-DefaultProfileName ===" -ForegroundColor Cyan
 $date = [datetime]'2026-11-25'

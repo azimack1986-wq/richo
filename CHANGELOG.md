@@ -12,6 +12,19 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## New-AutoDeployVendorImageProfile.ps1
 
+### [1.2.0] — 2026-11-26
+
+#### Changed
+
+- **The exported bundle is checked, not assumed.** After export, the session's
+  depots are unloaded and the ZIP is loaded on its own; its image profile must
+  carry exactly the VIBs of the verified profile and match the swap plan. A
+  mismatch stops the run before Auto Deploy is touched. The Auto Deploy upload
+  and the ISO now come from this checked ZIP.
+- The last log line states the steps that place the image in the vCenter
+  "Software" custom depot: import the ZIP on the Software Depots page, then
+  clone the profile into "Software" with no package changes.
+
 ### [1.1.0] — 2026-11-26
 
 #### Changed

@@ -43,16 +43,20 @@
          a mismatch stops the run before anything is written. The profile is then:
 
            - exported as an offline bundle ZIP, to -ExportBundlePath or by default to
-             output\<profile name>.zip in this repository;
-           - uploaded to Auto Deploy through a new deploy rule, unless -SkipAutoDeploy
-             is set. The rule is created with a pattern that matches no host and is not
+             output\<profile name>.zip in this repository. The ZIP is then reloaded on its
+             own and its VIB list must match the verified profile exactly; a mismatch
+             stops the run before anything goes to Auto Deploy;
+           - uploaded to Auto Deploy from the checked ZIP through a new deploy rule,
+             unless -SkipAutoDeploy is set. The rule is created with a pattern that matches no host and is not
              added to the active or working rule set, so no host boots from it until the
              pattern is set and the rule is activated;
            - exported as an ISO when -ExportIsoPath is given.
 
-    PowerCLI cannot write into the custom depots shown on the vSphere Client Software
-    Depots page; the clone is built in this PowerShell session. To see the image on that
-    page, import the exported offline bundle ZIP there.
+    The image is not written into a vCenter custom depot such as "Software". No
+    documented PowerCLI or API method writes into those depots, so the clone is built
+    in this PowerShell session. To place it in "Software", import the exported ZIP under
+    Auto Deploy > Software Depots, then clone the profile from it into "Software" with
+    no package changes. The last log line gives the file and profile name.
 
     PREREQUISITES
 
@@ -197,7 +201,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.1.0'
+$ScriptVersion = '1.2.0'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1001,6 +1005,40 @@ function Test-ProfileMatchesPlan {
     return , $problems.ToArray()
 }
 
+function Compare-VibSet {
+    <#
+    .SYNOPSIS
+        Lists the differences between an expected VIB list and an image profile's VIB list.
+
+    .PARAMETER Expected
+        Expected VIBs as "Name|Version" strings.
+
+    .PARAMETER ImageProfile
+        The image profile to check.
+
+    .EXAMPLE
+        $problems = Compare-VibSet -Expected $expectedVibs -ImageProfile $reloaded
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [string[]]$Expected,
+
+        [Parameter(Mandatory)]$ImageProfile
+    )
+
+    $actual = @($ImageProfile.VibList | ForEach-Object { "$($_.Name)|$($_.Version)" })
+    $problems = New-Object System.Collections.Generic.List[string]
+    foreach ($key in ($Expected | Sort-Object -Unique)) {
+        if ($actual -notcontains $key) { $problems.Add("missing $($key -replace '\|', ' ')") }
+    }
+    foreach ($key in ($actual | Sort-Object -Unique)) {
+        if ($Expected -notcontains $key) { $problems.Add("unexpected $($key -replace '\|', ' ')") }
+    }
+    return , $problems.ToArray()
+}
+
 function Assert-OutputPath {
     <#
     .SYNOPSIS
@@ -1136,8 +1174,14 @@ try {
     if (-not $ExportBundlePath) {
         $ExportBundlePath = Join-Path (Join-Path $PSScriptRoot '..\..\output') "$NewProfileName.zip"
     }
+    # Image Builder resolves a relative path against the process directory, not the PowerShell
+    # location, so both paths are made absolute here.
+    $ExportBundlePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ExportBundlePath)
     Assert-OutputPath -Path $ExportBundlePath
-    if ($ExportIsoPath) { Assert-OutputPath -Path $ExportIsoPath }
+    if ($ExportIsoPath) {
+        $ExportIsoPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ExportIsoPath)
+        Assert-OutputPath -Path $ExportIsoPath
+    }
 
     if (@(Get-EsxImageProfile | Where-Object { $_.Name -eq $NewProfileName }).Count -gt 0) {
         throw "An image profile named '$NewProfileName' is already loaded. Choose another -NewProfileName."
@@ -1226,13 +1270,41 @@ try {
     $dropped = @($baseKeys.Keys | Where-Object { -not $newKeys.ContainsKey($_) }).Count
     Write-RichoLog "Verified '$NewProfileName': $(@($newProfile.VibList).Count) VIBs; $added VIB version(s) not in the base, $dropped base VIB version(s) gone. Matches the plan." -Level INFO
 
-    # ---- Export -----------------------------------------------------------
-    if ($PSCmdlet.ShouldProcess($ExportBundlePath, "Export '$NewProfileName' as an offline bundle")) {
-        $folder = Split-Path -Path $ExportBundlePath -Parent
-        if ($folder -and -not (Test-Path -LiteralPath $folder -PathType Container)) { New-Item -Path $folder -ItemType Directory -Force | Out-Null }
-        Export-EsxImageProfile -ImageProfile $newProfile -ExportToBundle -FilePath $ExportBundlePath -ErrorAction Stop
-        Write-RichoLog "Exported offline bundle to $ExportBundlePath." -Level INFO
+    # ---- Export, then reload the bundle and check it -------------------------
+    # The bundle is what goes into vCenter (imported on the Software Depots page) and what is
+    # uploaded to Auto Deploy below, so it is checked on its own rather than trusted to match
+    # the session copy. Its VIB list must be identical to the verified profile's.
+    if (-not $PSCmdlet.ShouldProcess($ExportBundlePath, "Export '$NewProfileName' as an offline bundle")) {
+        Write-RichoLog 'Bundle not exported. Nothing uploaded to Auto Deploy.' -Level INFO
+        return
     }
+
+    $expectedVibs = @($newProfile.VibList | ForEach-Object { "$($_.Name)|$($_.Version)" })
+
+    $folder = Split-Path -Path $ExportBundlePath -Parent
+    if ($folder -and -not (Test-Path -LiteralPath $folder -PathType Container)) { New-Item -Path $folder -ItemType Directory -Force | Out-Null }
+    Export-EsxImageProfile -ImageProfile $newProfile -ExportToBundle -FilePath $ExportBundlePath -ErrorAction Stop
+    Write-RichoLog "Exported offline bundle to $ExportBundlePath." -Level INFO
+
+    # The session copy must be gone before the reload, or the check could read it instead of
+    # the profile that came out of the ZIP.
+    Get-EsxSoftwareDepot | Remove-EsxSoftwareDepot -ErrorAction Stop
+    foreach ($leftover in @(Get-EsxImageProfile -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $NewProfileName })) {
+        Remove-EsxImageProfile -ImageProfile $leftover -ErrorAction Stop
+    }
+    [void](Add-DepotToSession -Depot $ExportBundlePath)
+    $reloaded = @(Get-EsxImageProfile | Where-Object { $_.Name -eq $NewProfileName })
+    if ($reloaded.Count -ne 1) {
+        throw "Expected one image profile named '$NewProfileName' in $ExportBundlePath, found $($reloaded.Count). Do not import the bundle. Nothing uploaded to Auto Deploy."
+    }
+    $newProfile = $reloaded[0]
+
+    $bundleProblems = @(Compare-VibSet -Expected $expectedVibs -ImageProfile $newProfile) + @(Test-ProfileMatchesPlan -ImageProfile $newProfile -Plan $plan)
+    if ($bundleProblems.Count -gt 0) {
+        foreach ($problem in ($bundleProblems | Sort-Object -Unique)) { Write-RichoLog "Bundle check: $problem" -Level WARN }
+        throw "The exported bundle does not match the verified profile. Do not import $ExportBundlePath. Nothing uploaded to Auto Deploy."
+    }
+    Write-RichoLog "Reloaded $($ExportBundlePath): '$NewProfileName' has the same $($expectedVibs.Count) VIBs as the verified profile." -Level INFO
 
     if ($ExportIsoPath -and $PSCmdlet.ShouldProcess($ExportIsoPath, "Export '$NewProfileName' as an ISO")) {
         $folder = Split-Path -Path $ExportIsoPath -Parent
@@ -1241,7 +1313,7 @@ try {
         Write-RichoLog "Exported ISO to $ExportIsoPath." -Level INFO
     }
 
-    # ---- Upload to Auto Deploy ---------------------------------------------
+    # ---- Upload to Auto Deploy, from the checked bundle ------------------------
     if (-not $SkipAutoDeploy) {
         $patternText = $DeployRulePattern -join ', '
         if ($PSCmdlet.ShouldProcess($config.vcenter.server, "Create inactive deploy rule '$DeployRuleName' holding '$NewProfileName' (pattern: $patternText); uploads the VIBs to Auto Deploy")) {
@@ -1250,6 +1322,8 @@ try {
             Write-RichoLog "Deploy rule '$DeployRuleName' created with pattern '$patternText'. It is not in the active or working rule set; no host boots from it until the pattern is set and the rule is activated." -Level INFO
         }
     }
+
+    Write-RichoLog "To place the image in the vCenter 'Software' depot: import $ExportBundlePath under Auto Deploy > Software Depots, then clone '$NewProfileName' into 'Software' with no package changes." -Level INFO
 
     Write-RichoLog 'Completed successfully.' -Level INFO
 }
