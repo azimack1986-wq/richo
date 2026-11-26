@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds a vendor ESXi image profile for Auto Deploy in one run: loads the ESXi bundle
+    Builds a vendor ESXi image in one run: loads the ESXi bundle
     and vendor add-ons, clones the ESXi image, sets the acceptance level, swaps each ESXi
     package for the newer vendor version, and creates the image.
 
@@ -45,12 +45,11 @@
            - exported as an offline bundle ZIP, to -ExportBundlePath or by default to
              output\<profile name>.zip in this repository. The ZIP is then reloaded on its
              own and its VIB list must match the verified profile exactly; a mismatch
-             stops the run before anything goes to Auto Deploy;
-           - uploaded to Auto Deploy from the checked ZIP through a new deploy rule,
-             unless -SkipAutoDeploy is set. The rule is created with a pattern that matches no host and is not
-             added to the active or working rule set, so no host boots from it until the
-             pattern is set and the rule is activated;
-           - exported as an ISO when -ExportIsoPath is given.
+             fails the run and the ZIP must not be imported;
+           - exported as an ISO, from the checked ZIP, when -ExportIsoPath is given.
+
+    Auto Deploy rules and rule sets are never created, changed or activated. The rules
+    are only read, to mark which ESXi images are already in use in the menu.
 
     The image is not written into a vCenter custom depot such as "Software". No
     documented PowerCLI or API method writes into those depots, so the clone is built
@@ -112,16 +111,6 @@
 .PARAMETER ExportIsoPath
     ISO to write. The file must not exist.
 
-.PARAMETER SkipAutoDeploy
-    Do not upload the image to Auto Deploy. Only the export files are written.
-
-.PARAMETER DeployRuleName
-    Name of the deploy rule that carries the upload. Defaults to
-    "Staged-<profile name>".
-
-.PARAMETER DeployRulePattern
-    Pattern for that deploy rule. Defaults to a vendor pattern that matches no host.
-
 .PARAMETER Transcript
     Writes a transcript to logs/.
 
@@ -132,7 +121,7 @@
         -WhatIf
 
     Shows the ESXi image menu and the name prompt, then logs every package swap.
-    Nothing is cloned, written or uploaded.
+    Nothing is cloned or written.
 
 .EXAMPLE
     .\New-AutoDeployVendorImageProfile.ps1 -Environment prod `
@@ -142,17 +131,16 @@
         -NewProfileName 'ESXi-8.0U3e-24677879-Cisco-NetApp'
 
     The full build with no prompts other than the confirmations: clone at
-    VMwareAccepted, swap every newer vendor package, export to
-    output\ESXi-8.0U3e-24677879-Cisco-NetApp.zip and upload to Auto Deploy in an
-    inactive rule.
+    VMwareAccepted, swap every newer vendor package, and export to
+    output\ESXi-8.0U3e-24677879-Cisco-NetApp.zip.
 
 .EXAMPLE
     .\New-AutoDeployVendorImageProfile.ps1 -Environment lab `
         -BaseDepot 'D:\Depots\VMware-ESXi-8.0U3e-24677879-depot.zip' `
         -VendorDepot 'D:\Depots\Cisco-addon-ESXi-8.0U3.zip' `
-        -VendorVibName nenic, nfnic -ReplaceOnly -SkipAutoDeploy
+        -VendorVibName nenic, nfnic -ReplaceOnly
 
-    Swaps only nenic and nfnic, and only writes the offline bundle.
+    Swaps only nenic and nfnic, and only where the ESXi image already has them.
 #>
 #Requires -Version 5.1
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
@@ -189,19 +177,13 @@ param(
 
     [string]$ExportIsoPath,
 
-    [switch]$SkipAutoDeploy,
-
-    [string]$DeployRuleName,
-
-    [string[]]$DeployRulePattern = @('vendor=RICHO-STAGED-NO-MATCH'),
-
     [switch]$Transcript
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.2.0'
+$ScriptVersion = '1.3.0'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1189,12 +1171,6 @@ try {
     if ($usage.ContainsKey($NewProfileName)) {
         throw "Auto Deploy already has an image profile named '$NewProfileName' (rule: $(($usage[$NewProfileName]) -join ', ')). Choose another -NewProfileName."
     }
-    if (-not $SkipAutoDeploy) {
-        if (-not $DeployRuleName) { $DeployRuleName = "Staged-$NewProfileName" }
-        if (@(Get-DeployRule -ErrorAction Stop | Where-Object { $_.Name -eq $DeployRuleName }).Count -gt 0) {
-            throw "A deploy rule named '$DeployRuleName' already exists. Choose another -DeployRuleName."
-        }
-    }
 
     if (-not $Description) {
         $sources = ($VendorDepot | ForEach-Object { Split-Path -Path $_ -Leaf }) -join ', '
@@ -1206,7 +1182,7 @@ try {
 
     # ---- Build the profile ------------------------------------------------
     if (-not $PSCmdlet.ShouldProcess($NewProfileName, "Clone image profile '$($base.Name)' and apply $counts")) {
-        Write-RichoLog 'Profile not built. No export or Auto Deploy change made.' -Level INFO
+        Write-RichoLog 'Profile not built. Nothing exported.' -Level INFO
         return
     }
 
@@ -1271,11 +1247,11 @@ try {
     Write-RichoLog "Verified '$NewProfileName': $(@($newProfile.VibList).Count) VIBs; $added VIB version(s) not in the base, $dropped base VIB version(s) gone. Matches the plan." -Level INFO
 
     # ---- Export, then reload the bundle and check it -------------------------
-    # The bundle is what goes into vCenter (imported on the Software Depots page) and what is
-    # uploaded to Auto Deploy below, so it is checked on its own rather than trusted to match
-    # the session copy. Its VIB list must be identical to the verified profile's.
+    # The bundle is what goes into vCenter (imported on the Software Depots page), so it is
+    # checked on its own rather than trusted to match the session copy. Its VIB list must be
+    # identical to the verified profile's.
     if (-not $PSCmdlet.ShouldProcess($ExportBundlePath, "Export '$NewProfileName' as an offline bundle")) {
-        Write-RichoLog 'Bundle not exported. Nothing uploaded to Auto Deploy.' -Level INFO
+        Write-RichoLog 'Bundle not exported.' -Level INFO
         return
     }
 
@@ -1295,14 +1271,14 @@ try {
     [void](Add-DepotToSession -Depot $ExportBundlePath)
     $reloaded = @(Get-EsxImageProfile | Where-Object { $_.Name -eq $NewProfileName })
     if ($reloaded.Count -ne 1) {
-        throw "Expected one image profile named '$NewProfileName' in $ExportBundlePath, found $($reloaded.Count). Do not import the bundle. Nothing uploaded to Auto Deploy."
+        throw "Expected one image profile named '$NewProfileName' in $ExportBundlePath, found $($reloaded.Count). Do not import the bundle."
     }
     $newProfile = $reloaded[0]
 
     $bundleProblems = @(Compare-VibSet -Expected $expectedVibs -ImageProfile $newProfile) + @(Test-ProfileMatchesPlan -ImageProfile $newProfile -Plan $plan)
     if ($bundleProblems.Count -gt 0) {
         foreach ($problem in ($bundleProblems | Sort-Object -Unique)) { Write-RichoLog "Bundle check: $problem" -Level WARN }
-        throw "The exported bundle does not match the verified profile. Do not import $ExportBundlePath. Nothing uploaded to Auto Deploy."
+        throw "The exported bundle does not match the verified profile. Do not import $ExportBundlePath."
     }
     Write-RichoLog "Reloaded $($ExportBundlePath): '$NewProfileName' has the same $($expectedVibs.Count) VIBs as the verified profile." -Level INFO
 
@@ -1311,16 +1287,6 @@ try {
         if ($folder -and -not (Test-Path -LiteralPath $folder -PathType Container)) { New-Item -Path $folder -ItemType Directory -Force | Out-Null }
         Export-EsxImageProfile -ImageProfile $newProfile -ExportToIso -FilePath $ExportIsoPath -ErrorAction Stop
         Write-RichoLog "Exported ISO to $ExportIsoPath." -Level INFO
-    }
-
-    # ---- Upload to Auto Deploy, from the checked bundle ------------------------
-    if (-not $SkipAutoDeploy) {
-        $patternText = $DeployRulePattern -join ', '
-        if ($PSCmdlet.ShouldProcess($config.vcenter.server, "Create inactive deploy rule '$DeployRuleName' holding '$NewProfileName' (pattern: $patternText); uploads the VIBs to Auto Deploy")) {
-            Write-RichoLog "Creating deploy rule '$DeployRuleName'. Uploading the image profile can take several minutes." -Level INFO
-            New-DeployRule -Name $DeployRuleName -Item $newProfile -Pattern $DeployRulePattern -ErrorAction Stop | Out-Null
-            Write-RichoLog "Deploy rule '$DeployRuleName' created with pattern '$patternText'. It is not in the active or working rule set; no host boots from it until the pattern is set and the rule is activated." -Level INFO
-        }
     }
 
     Write-RichoLog "To place the image in the vCenter 'Software' depot: import $ExportBundlePath under Auto Deploy > Software Depots, then clone '$NewProfileName' into 'Software' with no package changes." -Level INFO

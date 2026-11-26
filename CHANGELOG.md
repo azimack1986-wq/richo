@@ -12,6 +12,16 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## New-AutoDeployVendorImageProfile.ps1
 
+### [1.3.0] — 2026-11-26
+
+#### Removed
+
+- **No Auto Deploy rule is created or changed.** The upload through an inactive
+  deploy rule is gone, with `-SkipAutoDeploy`, `-DeployRuleName` and
+  `-DeployRulePattern`. The script creates the image and exports it, and
+  nothing else. Deploy rules are only read, to mark the ESXi images already in
+  use in the selection menu.
+
 ### [1.2.0] — 2026-11-26
 
 #### Changed
