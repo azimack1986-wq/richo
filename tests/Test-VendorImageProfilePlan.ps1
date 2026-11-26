@@ -13,7 +13,8 @@
       - a vendor VIB with no counterpart is added, or skipped under -ReplaceOnly;
       - -RemoveVib removes, and cannot name a VIB that is also being applied;
       - when several versions are offered, the newest is chosen and the others are reported;
-      - the finished-profile check catches a VIB left at the old version.
+      - the finished-profile check catches a VIB left at the old version;
+      - a package below the clone's acceptance level is found before the clone is made.
 
     Standalone - no Pester, no vendor modules, no infrastructure.
 
@@ -29,7 +30,8 @@ if ($errors) { throw "parse errors in ${scriptPath}: $($errors | ForEach-Object 
 $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
     Where-Object { $_.Name -in @('ConvertTo-VibVersionSegment', 'Compare-VibVersionText', 'Compare-VibVersion',
             'Select-NewestVib', 'Get-VibSwapPlan', 'Get-DefaultProfileName', 'Find-ProfileVib',
-            'Test-ProfileMatchesPlan', 'Get-RuleImageProfileName') } |
+            'Test-ProfileMatchesPlan', 'Get-RuleImageProfileName', 'Get-OptionalProperty',
+            'Get-AcceptanceRank', 'Get-AcceptanceShortfall', 'Read-ProfileName') } |
     ForEach-Object { Invoke-Expression $_.Extent.Text }
 
 $script:pass = 0; $script:fail = 0
@@ -126,6 +128,36 @@ $problems = Test-ProfileMatchesPlan -ImageProfile $stale -Plan $plan
 Assert-Equal 'old nenic left in place is caught' $true (@($problems | Where-Object { $_ -like 'nenic:*found 1.0.45.0*' }).Count -eq 1)
 Assert-Equal 'missing added VIB is caught' $true (@($problems | Where-Object { $_ -like 'NetAppNasPlugin:*not present' }).Count -eq 1)
 Assert-Equal 'VIB that should be removed is caught' $true (@($problems | Where-Object { $_ -like 'nmlx4-en:*expected removed*' }).Count -eq 1)
+
+Write-Host "`n=== Acceptance level ===" -ForegroundColor Cyan
+Assert-Equal 'VMwareAccepted ranks 3' 3 (Get-AcceptanceRank 'VMwareAccepted')
+Assert-Equal 'short metadata name ranks the same' 3 (Get-AcceptanceRank 'accepted')
+Assert-Equal 'PartnerSupported ranks 2' 2 (Get-AcceptanceRank 'PartnerSupported')
+Assert-Equal 'CommunitySupported ranks 1' 1 (Get-AcceptanceRank 'CommunitySupported')
+Assert-Equal 'certified outranks accepted' 4 (Get-AcceptanceRank 'VMwareCertified')
+Assert-Equal 'unknown ranks 0' 0 (Get-AcceptanceRank '')
+
+$accBase = @(
+    [pscustomobject]@{ Name = 'esx-base'; Version = '8.0.3-0.55'; AcceptanceLevel = 'VMwareCertified' }
+    [pscustomobject]@{ Name = 'nenic'; Version = '1.0.45.0-1vmw'; AcceptanceLevel = 'PartnerSupported' }
+)
+$accPlan = @(
+    [pscustomobject]@{ Action = 'Replace'; Name = 'nenic'; VendorVersion = '2.0.15.0-1OEM'; Acceptance = 'VMwareAccepted' }
+    [pscustomobject]@{ Action = 'Add'; Name = 'NetAppNasPlugin'; VendorVersion = '2.0.1-16'; Acceptance = 'PartnerSupported' }
+    [pscustomobject]@{ Action = 'Add'; Name = 'mystery'; VendorVersion = '1.0'; Acceptance = '' }
+    [pscustomobject]@{ Action = 'Older'; Name = 'lsi-mr3'; VendorVersion = '7.0'; Acceptance = 'CommunitySupported' }
+)
+$short = Get-AcceptanceShortfall -BaseVib $accBase -Plan $accPlan -Level 'VMwareAccepted'
+Assert-Equal 'partner vendor package is below VMwareAccepted' $true (@($short.Below | Where-Object { $_ -like 'NetAppNasPlugin*' }).Count -eq 1)
+Assert-Equal 'replaced ESXi package is not checked' 0 @($short.Below | Where-Object { $_ -like 'nenic*ESXi*' }).Count
+Assert-Equal 'vendor package that is not applied is not checked' 0 @($short.Below | Where-Object { $_ -like 'lsi-mr3*' }).Count
+Assert-Equal 'only one package is below' 1 @($short.Below).Count
+Assert-Equal 'unreadable level is reported, not passed' $true (@($short.Unknown | Where-Object { $_ -like 'mystery*' }).Count -eq 1)
+$partner = Get-AcceptanceShortfall -BaseVib $accBase -Plan $accPlan -Level 'PartnerSupported'
+Assert-Equal 'nothing below PartnerSupported' 0 @($partner.Below).Count
+
+Write-Host "`n=== Read-ProfileName ===" -ForegroundColor Cyan
+Assert-Equal 'given name is used and trimmed' 'ESXi-Cisco' (Read-ProfileName -Name '  ESXi-Cisco ' -Default 'ESXi-default')
 
 Write-Host "`n=== Get-DefaultProfileName ===" -ForegroundColor Cyan
 $date = [datetime]'2026-11-25'

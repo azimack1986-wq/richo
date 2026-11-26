@@ -12,6 +12,24 @@ versioning is [semantic](https://semver.org/) per script.
 
 ## New-AutoDeployVendorImageProfile.ps1
 
+### [1.1.0] — 2026-11-26
+
+#### Changed
+
+- **One run, start to finish, in the same order as the vSphere Client workflow:**
+  load the ESXi bundle and vendor add-ons, select the ESXi image, clone it, set
+  the acceptance level, name it, swap each ESXi package for the newer vendor
+  version, and create the image.
+- The clone is set to `VMwareAccepted` by default (`-AcceptanceLevel`). Every
+  package the finished image would carry is checked against that level before
+  the clone is made, and the run stops if one is below it.
+- The clone's name is prompted for when `-NewProfileName` is not given, with a
+  default offered.
+- The offline bundle is always written, by default to
+  `output\<profile name>.zip`, and the image is uploaded to Auto Deploy in an
+  inactive no-match rule by default. `-StageInAutoDeploy` is replaced by
+  `-SkipAutoDeploy`.
+
 ### [1.0.0] — 2026-11-25
 
 #### Added

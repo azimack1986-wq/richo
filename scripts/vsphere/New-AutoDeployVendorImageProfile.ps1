@@ -1,63 +1,58 @@
 <#
 .SYNOPSIS
-    Clones a VMware ESXi image profile and swaps the inbox VIBs for newer vendor VIBs
-    (Cisco, NetApp and others), ready for Auto Deploy.
+    Builds a vendor ESXi image profile for Auto Deploy in one run: loads the ESXi bundle
+    and vendor add-ons, clones the ESXi image, sets the acceptance level, swaps each ESXi
+    package for the newer vendor version, and creates the image.
 
 .DESCRIPTION
-    Builds a vendor image profile for Auto Deploy from two inputs:
+    Follows the same steps as building the image in the vSphere Client under Auto Deploy
+    > Software Depots.
 
-      1. The VMware ESXi offline bundle (the base depot). The image profile to clone is
-         chosen from the profiles in this depot, either by -BaseImageProfile or from a
-         numbered menu. Profiles that an Auto Deploy rule in vCenter already uses are
-         marked in the menu with the rule name.
-      2. One or more vendor depots (Cisco UCS add-on, Cisco nenic/nfnic driver bundles,
-         NetApp NFS plug-in and so on).
+      1. Load the binaries. -BaseDepot is the VMware ESXi offline bundle ZIP and
+         -VendorDepot is one or more vendor add-on or driver ZIPs (Cisco, NetApp and so
+         on). Extract a vendor download first if it is a ZIP wrapped around the depot ZIP.
 
-    For every VIB in the vendor depots, the script compares it with the VIB of the same
-    name in the base profile:
+      2. Select the ESXi image. The image profiles in the ESXi bundle are listed by
+         number, and profiles that an Auto Deploy rule already uses are marked with the
+         rule name. -BaseImageProfile selects one without the menu.
 
-      Replace  The base profile has an older version. The old VIB is removed and the
-               vendor VIB is added.
-      Add      The base profile has no VIB of that name. The vendor VIB is added, unless
-               -ReplaceOnly is set.
-      Keep     The base profile already has the same version. Nothing changes.
-      Older    The vendor VIB is older than the one in the base profile. The base VIB is
-               kept and a warning is logged.
+      3. Clone. The clone is named from -NewProfileName, or from a prompt that offers a
+         default, and its acceptance level is set to -AcceptanceLevel (VMwareAccepted by
+         default). Every vendor package is checked against that level before anything
+         is cloned, and the run stops if one is below it.
 
-    When a vendor depot carries several versions of one VIB, the newest is used.
-    VMware-signed VIBs found in a vendor depot (a vendor custom image carries a full
-    ESXi build) are ignored unless named in -VendorVibName.
+      4. Swap the packages. For each package in the vendor depots, the vendor version is
+         compared with the ESXi package of the same name:
 
-    VIB names listed in -RemoveVib are removed from the clone whether or not a vendor
-    VIB replaces them. Use this for an inbox driver that the vendor ships under a
-    different name.
+           Replace  Vendor version is newer. The ESXi package is removed and the vendor
+                    package is added.
+           Keep     Same version. Nothing changes.
+           Older    Vendor version is older. The ESXi package is kept and a warning is
+                    logged.
+           Add      No ESXi package of that name. The vendor package is added, unless
+                    -ReplaceOnly is set.
 
-    The full plan is logged before anything is changed. After the changes, the new
-    profile is read back and every planned change is verified; the run fails if any
-    VIB is not at the expected version.
+         When a vendor depot carries several versions of one package, the newest is
+         used. VMware-signed packages in a vendor depot (a vendor custom image carries a
+         full ESXi build) are ignored unless named in -VendorVibName. -RemoveVib removes
+         ESXi packages that the vendor ships under a different name.
 
-    WHAT IT CHANGES
+         The full list of swaps is logged and confirmed before the clone is made.
 
-      - The cloned image profile exists only in this PowerShell session until it is
-        exported or staged.
-      - -ExportBundlePath writes an offline bundle ZIP. Import it in the vSphere Client
-        under Auto Deploy > Software Depots.
-      - -ExportIsoPath writes an installer ISO.
-      - -StageInAutoDeploy creates a new deploy rule that holds the profile, which
-        uploads the profile and its VIBs to the Auto Deploy server. The rule is created
-        with a pattern that matches no host and is NOT added to the active or working
-        rule set, so no host boots from it. Edit the pattern and activate the rule
-        when the change is approved.
+      5. Create the image. The finished profile is read back and every swap is checked;
+         a mismatch stops the run before anything is written. The profile is then:
 
-    WHAT IT READS
+           - exported as an offline bundle ZIP, to -ExportBundlePath or by default to
+             output\<profile name>.zip in this repository;
+           - uploaded to Auto Deploy through a new deploy rule, unless -SkipAutoDeploy
+             is set. The rule is created with a pattern that matches no host and is not
+             added to the active or working rule set, so no host boots from it until the
+             pattern is set and the rule is activated;
+           - exported as an ISO when -ExportIsoPath is given.
 
-      - Auto Deploy rules in vCenter, to mark which profiles are in use.
-      - The base and vendor depots, loaded into this session only. Any depots already
-        loaded in the session are unloaded first so the vendor VIB list is exact.
-
-    Image profiles and depots imported into the vCenter Auto Deploy Software Depots
-    page are not exposed to PowerCLI as a depot URL. Point -BaseDepot at the same ESXi
-    offline bundle ZIP that was imported there, or at a ZIP exported from it.
+    PowerCLI cannot write into the custom depots shown on the vSphere Client Software
+    Depots page; the clone is built in this PowerShell session. To see the image on that
+    page, import the exported offline bundle ZIP there.
 
     PREREQUISITES
 
@@ -65,8 +60,6 @@
       - Python 3.7 or later configured for PowerCLI (Set-PowerCLIConfiguration
         -PythonPath). Image Builder in PowerCLI 13 does not run without it.
       - vCenter with the Auto Deploy and Image Builder services running.
-      - Vendor driver downloads are often a ZIP that contains the real depot ZIP plus
-        release notes. Extract it and pass the inner ZIP.
 
 .PARAMETER Environment
     Environment key from config/environments.json. Defaults to the file's "default"
@@ -76,56 +69,54 @@
     Path to the VMware ESXi offline bundle ZIP, or an online depot URL.
 
 .PARAMETER VendorDepot
-    One or more paths (or URLs) to vendor depot ZIPs.
+    One or more paths (or URLs) to vendor add-on or driver depot ZIPs.
 
 .PARAMETER BaseImageProfile
-    Name of the image profile in the base depot to clone, for example
+    Name of the ESXi image profile to clone, for example
     ESXi-8.0U3e-24677879-standard. When omitted, a numbered menu is shown.
 
 .PARAMETER NewProfileName
-    Name for the new image profile. Defaults to the base name with "-standard" or
-    "-no-tools" replaced by "-custom-<yyyyMMdd>".
-
-.PARAMETER ProfileVendor
-    Vendor field written into the new image profile. Defaults to "Custom".
-
-.PARAMETER Description
-    Description written into the new image profile. Defaults to a generated line that
-    names the base profile and the vendor depots.
-
-.PARAMETER VendorVibName
-    Restricts the vendor VIBs that are applied to these names. Every name given must
-    exist in a vendor depot. When omitted, every VIB in the vendor depots is
-    considered.
-
-.PARAMETER RemoveVib
-    VIB names to remove from the clone. A name here must not also be a vendor VIB that
-    is being applied.
-
-.PARAMETER ReplaceOnly
-    Only replace VIBs that already exist in the base profile. Vendor VIBs with no
-    counterpart in the base profile are skipped.
+    Name for the cloned image profile. When omitted, the operator is prompted, with
+    the base name ending "-custom-<yyyyMMdd>" offered as the default.
 
 .PARAMETER AcceptanceLevel
-    Sets the acceptance level of the new profile. Only needed when a vendor VIB is at a
-    lower level than the base profile, for example CommunitySupported.
+    Acceptance level of the clone. Defaults to VMwareAccepted.
+
+.PARAMETER ProfileVendor
+    Vendor field written into the clone. Defaults to "Custom".
+
+.PARAMETER Description
+    Description written into the clone. Defaults to a line naming the ESXi image and
+    the vendor depots.
+
+.PARAMETER VendorVibName
+    Restricts the vendor packages applied to these names. Every name given must exist
+    in a vendor depot. When omitted, every vendor package is considered.
+
+.PARAMETER RemoveVib
+    ESXi package names to remove from the clone. A name here must not also be a vendor
+    package being applied.
+
+.PARAMETER ReplaceOnly
+    Only swap packages the ESXi image already has. Vendor packages with no ESXi
+    equivalent are not added.
 
 .PARAMETER ExportBundlePath
-    Writes the new profile to this offline bundle ZIP. The file must not exist.
+    Offline bundle ZIP to write. Defaults to output\<profile name>.zip in this
+    repository. The file must not exist.
 
 .PARAMETER ExportIsoPath
-    Writes the new profile to this ISO. The file must not exist.
+    ISO to write. The file must not exist.
 
-.PARAMETER StageInAutoDeploy
-    Creates an inactive deploy rule holding the new profile, which uploads it to Auto
-    Deploy. The rule is not activated.
+.PARAMETER SkipAutoDeploy
+    Do not upload the image to Auto Deploy. Only the export files are written.
 
 .PARAMETER DeployRuleName
-    Name of the staging deploy rule. Defaults to "Staged-<NewProfileName>".
+    Name of the deploy rule that carries the upload. Defaults to
+    "Staged-<profile name>".
 
 .PARAMETER DeployRulePattern
-    Pattern for the staging deploy rule. Defaults to a vendor pattern that matches no
-    host.
+    Pattern for that deploy rule. Defaults to a vendor pattern that matches no host.
 
 .PARAMETER Transcript
     Writes a transcript to logs/.
@@ -133,33 +124,31 @@
 .EXAMPLE
     .\New-AutoDeployVendorImageProfile.ps1 -Environment lab `
         -BaseDepot 'D:\Depots\VMware-ESXi-8.0U3e-24677879-depot.zip' `
-        -VendorDepot 'D:\Depots\Cisco-addon-ESXi-8.0U3.zip', 'D:\Depots\NetAppNasPlugin.v23.zip' `
+        -VendorDepot 'D:\Depots\Cisco-addon-ESXi-8.0U3.zip', 'D:\Depots\NetAppNasPlugin.zip' `
         -WhatIf
 
-    Shows the menu of base profiles, then logs the swap plan. Nothing is cloned,
-    exported or staged.
+    Shows the ESXi image menu and the name prompt, then logs every package swap.
+    Nothing is cloned, written or uploaded.
 
 .EXAMPLE
     .\New-AutoDeployVendorImageProfile.ps1 -Environment prod `
         -BaseDepot 'D:\Depots\VMware-ESXi-8.0U3e-24677879-depot.zip' `
-        -VendorDepot 'D:\Depots\Cisco-nenic-2.0.15.0.zip', 'D:\Depots\Cisco-nfnic-5.0.0.43.zip' `
+        -VendorDepot 'D:\Depots\Cisco-addon-ESXi-8.0U3.zip', 'D:\Depots\NetAppNasPlugin.zip' `
         -BaseImageProfile 'ESXi-8.0U3e-24677879-standard' `
-        -NewProfileName 'ESXi-8.0U3e-24677879-Cisco-NetApp' `
-        -ExportBundlePath 'D:\Depots\ESXi-8.0U3e-24677879-Cisco-NetApp.zip' `
-        -StageInAutoDeploy
+        -NewProfileName 'ESXi-8.0U3e-24677879-Cisco-NetApp'
 
-    Clones the standard profile, swaps in the Cisco drivers, exports an offline bundle
-    and uploads the profile to Auto Deploy in an inactive rule.
+    The full build with no prompts other than the confirmations: clone at
+    VMwareAccepted, swap every newer vendor package, export to
+    output\ESXi-8.0U3e-24677879-Cisco-NetApp.zip and upload to Auto Deploy in an
+    inactive rule.
 
 .EXAMPLE
     .\New-AutoDeployVendorImageProfile.ps1 -Environment lab `
         -BaseDepot 'D:\Depots\VMware-ESXi-8.0U3e-24677879-depot.zip' `
         -VendorDepot 'D:\Depots\Cisco-addon-ESXi-8.0U3.zip' `
-        -VendorVibName nenic, nfnic -ReplaceOnly `
-        -ExportBundlePath 'D:\Depots\ESXi-8.0U3e-nenic-nfnic.zip'
+        -VendorVibName nenic, nfnic -ReplaceOnly -SkipAutoDeploy
 
-    Applies only the nenic and nfnic VIBs from the Cisco add-on, and only where the
-    base profile already carries them.
+    Swaps only nenic and nfnic, and only writes the offline bundle.
 #>
 #Requires -Version 5.1
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'High')]
@@ -178,6 +167,9 @@ param(
 
     [string]$NewProfileName,
 
+    [ValidateSet('VMwareCertified', 'VMwareAccepted', 'PartnerSupported', 'CommunitySupported')]
+    [string]$AcceptanceLevel = 'VMwareAccepted',
+
     [ValidateNotNullOrEmpty()]
     [string]$ProfileVendor = 'Custom',
 
@@ -189,14 +181,11 @@ param(
 
     [switch]$ReplaceOnly,
 
-    [ValidateSet('VMwareCertified', 'VMwareAccepted', 'PartnerSupported', 'CommunitySupported')]
-    [string]$AcceptanceLevel,
-
     [string]$ExportBundlePath,
 
     [string]$ExportIsoPath,
 
-    [switch]$StageInAutoDeploy,
+    [switch]$SkipAutoDeploy,
 
     [string]$DeployRuleName,
 
@@ -208,7 +197,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.1.0'
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -359,6 +348,138 @@ function Compare-VibVersion {
     return 0
 }
 
+function Get-OptionalProperty {
+    <#
+    .SYNOPSIS
+        A property's value as a string, or an empty string when the object lacks it.
+
+    .PARAMETER InputObject
+        The object to read.
+
+    .PARAMETER Name
+        Property name.
+
+    .EXAMPLE
+        Get-OptionalProperty -InputObject $vib -Name 'Acceptance'
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([AllowNull()]$InputObject, [Parameter(Mandatory)][string]$Name)
+
+    if ($null -eq $InputObject) { return '' }
+    if ($InputObject.PSObject.Properties.Name -notcontains $Name) { return '' }
+    return [string]$InputObject.$Name
+}
+
+function Get-AcceptanceRank {
+    <#
+    .SYNOPSIS
+        Ranks an acceptance level: 4 certified, 3 accepted, 2 partner, 1 community, 0 unknown.
+
+    .DESCRIPTION
+        Accepts both the PowerCLI names (VMwareAccepted, PartnerSupported) and the short
+        names used in VIB metadata (accepted, partner).
+
+    .PARAMETER Level
+        The acceptance level text.
+
+    .EXAMPLE
+        Get-AcceptanceRank -Level 'VMwareAccepted'
+    #>
+    [CmdletBinding()]
+    [OutputType([int])]
+    param([AllowEmptyString()][string]$Level)
+
+    if ($Level -match '(?i)certified') { return 4 }
+    if ($Level -match '(?i)accepted') { return 3 }
+    if ($Level -match '(?i)partner') { return 2 }
+    if ($Level -match '(?i)community') { return 1 }
+    return 0
+}
+
+function Get-AcceptanceShortfall {
+    <#
+    .SYNOPSIS
+        Lists the packages that would be below the clone's acceptance level.
+
+    .DESCRIPTION
+        Checks every package the finished image would carry: the ESXi packages that stay,
+        and the vendor packages being added. Image Builder refuses a package below the
+        image's acceptance level, so finding them here stops the run before the clone is
+        made rather than partway through the swaps. A package whose level cannot be read
+        is reported separately rather than assumed to pass.
+
+    .PARAMETER BaseVib
+        The ESXi image's packages (Name, Version, AcceptanceLevel).
+
+    .PARAMETER Plan
+        Rows from Get-VibSwapPlan.
+
+    .PARAMETER Level
+        The clone's acceptance level.
+
+    .EXAMPLE
+        $shortfall = Get-AcceptanceShortfall -BaseVib $base.VibList -Plan $plan -Level VMwareAccepted
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$BaseVib,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Plan,
+
+        [Parameter(Mandatory)][string]$Level
+    )
+
+    $required = Get-AcceptanceRank -Level $Level
+    $leaving = @($Plan | Where-Object { $_.Action -in @('Replace', 'Remove') } | ForEach-Object { $_.Name })
+
+    $kept = @($BaseVib | Where-Object { $leaving -notcontains $_.Name } | ForEach-Object {
+            [pscustomobject]@{ Name = [string]$_.Name; Version = [string]$_.Version; Acceptance = (Get-OptionalProperty -InputObject $_ -Name 'AcceptanceLevel'); From = 'ESXi' }
+        })
+    $added = @($Plan | Where-Object { $_.Action -in @('Replace', 'Add') } | ForEach-Object {
+            [pscustomobject]@{ Name = $_.Name; Version = $_.VendorVersion; Acceptance = [string]$_.Acceptance; From = 'vendor' }
+        })
+
+    $below = New-Object System.Collections.Generic.List[string]
+    $unknown = New-Object System.Collections.Generic.List[string]
+    foreach ($vib in ($kept + $added)) {
+        $rank = Get-AcceptanceRank -Level $vib.Acceptance
+        if ($rank -eq 0) { $unknown.Add("$($vib.Name) $($vib.Version) ($($vib.From))"); continue }
+        if ($rank -lt $required) { $below.Add("$($vib.Name) $($vib.Version) ($($vib.From), $($vib.Acceptance))") }
+    }
+    return [pscustomobject]@{ Below = $below.ToArray(); Unknown = $unknown.ToArray() }
+}
+
+function Read-ProfileName {
+    <#
+    .SYNOPSIS
+        Returns the clone's name: the one given, or one typed at a prompt that offers a default.
+
+    .PARAMETER Name
+        The name from -NewProfileName, if any.
+
+    .PARAMETER Default
+        The name offered at the prompt, and used when the session is not interactive.
+
+    .EXAMPLE
+        $NewProfileName = Read-ProfileName -Name $NewProfileName -Default 'ESXi-8.0U3e-custom'
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([string]$Name, [Parameter(Mandatory)][string]$Default)
+
+    if (-not [string]::IsNullOrWhiteSpace($Name)) { return $Name.Trim() }
+    if (-not [Environment]::UserInteractive) { return $Default }
+
+    $typed = Read-Host "Name for the cloned image profile [$Default]"
+    if ([string]::IsNullOrWhiteSpace($typed)) { return $Default }
+    return $typed.Trim()
+}
+
 function Select-NewestVib {
     <#
     .SYNOPSIS
@@ -395,6 +516,7 @@ function Select-NewestVib {
                 Version    = $best.Version
                 Source     = $best.Source
                 Package    = $best.Package
+                Acceptance = (Get-OptionalProperty -InputObject $best -Name 'Acceptance')
                 Superseded = ($others -join '; ')
             })
     }
@@ -485,6 +607,7 @@ function Get-VibSwapPlan {
                 VendorVersion = [string]$vib.Version
                 Source        = [string]$vib.Source
                 Superseded    = [string]$vib.Superseded
+                Acceptance    = (Get-OptionalProperty -InputObject $vib -Name 'Acceptance')
                 Package       = $vib.Package
             })
     }
@@ -503,6 +626,7 @@ function Get-VibSwapPlan {
                 VendorVersion = ''
                 Source        = '-RemoveVib'
                 Superseded    = ''
+                Acceptance    = ''
                 Package       = $null
             })
     }
@@ -880,7 +1004,7 @@ function Test-ProfileMatchesPlan {
 function Assert-OutputPath {
     <#
     .SYNOPSIS
-        Fails when an export path already exists or its folder does not.
+        Fails when an export file already exists. The folder is created at export time.
 
     .PARAMETER Path
         The output file path.
@@ -892,10 +1016,6 @@ function Assert-OutputPath {
     param([Parameter(Mandatory)][string]$Path)
 
     if (Test-Path -LiteralPath $Path) { throw "Output file already exists: $Path" }
-    $folder = Split-Path -Path $Path -Parent
-    if ($folder -and -not (Test-Path -LiteralPath $folder -PathType Container)) {
-        throw "Output folder does not exist: $folder"
-    }
 }
 
 # ---------------------------------------------------------------------------
@@ -912,10 +1032,6 @@ $connected = $false
 try {
     $config = Get-RichoConfig -Name $Environment
     Write-RichoLog "New-AutoDeployVendorImageProfile $ScriptVersion targeting environment '$($config.Name)'." -Level INFO
-
-    # ---- Pre-flight on outputs, before any slow work ----------------------
-    if ($ExportBundlePath) { Assert-OutputPath -Path $ExportBundlePath }
-    if ($ExportIsoPath) { Assert-OutputPath -Path $ExportIsoPath }
 
     # ---- Connect ----------------------------------------------------------
     $cred = Get-RichoCredential -Name $config.vcenter.credentialName
@@ -954,8 +1070,9 @@ try {
             $candidates.Add([pscustomobject]@{
                     Name    = [string]$vib.Name
                     Version = [string]$vib.Version
-                    Vendor  = [string]$vib.Vendor
-                    Source  = $depot
+                    Vendor     = [string]$vib.Vendor
+                    Acceptance = [string]$vib.AcceptanceLevel
+                    Source     = $depot
                     Package = $vib
                 })
         }
@@ -1004,14 +1121,31 @@ try {
         return
     }
 
-    if (-not $NewProfileName) { $NewProfileName = Get-DefaultProfileName -BaseName $base.Name }
+    # ---- Clone settings: acceptance level and name -------------------------
+    $shortfall = Get-AcceptanceShortfall -BaseVib @($base.VibList) -Plan $plan -Level $AcceptanceLevel
+    if ($shortfall.Unknown.Count -gt 0) {
+        Write-RichoLog "Acceptance level could not be read for: $($shortfall.Unknown -join ', '). Image Builder checks these when they are added." -Level WARN
+    }
+    if ($shortfall.Below.Count -gt 0) {
+        foreach ($line in $shortfall.Below) { Write-RichoLog "Below $AcceptanceLevel`: $line" -Level WARN }
+        throw "$($shortfall.Below.Count) package(s) are below $AcceptanceLevel and would be refused. Leave them out with -VendorVibName, or lower -AcceptanceLevel."
+    }
+    Write-RichoLog "Every package in the finished image meets $AcceptanceLevel." -Level INFO
+
+    $NewProfileName = Read-ProfileName -Name $NewProfileName -Default (Get-DefaultProfileName -BaseName $base.Name)
+    if (-not $ExportBundlePath) {
+        $ExportBundlePath = Join-Path (Join-Path $PSScriptRoot '..\..\output') "$NewProfileName.zip"
+    }
+    Assert-OutputPath -Path $ExportBundlePath
+    if ($ExportIsoPath) { Assert-OutputPath -Path $ExportIsoPath }
+
     if (@(Get-EsxImageProfile | Where-Object { $_.Name -eq $NewProfileName }).Count -gt 0) {
         throw "An image profile named '$NewProfileName' is already loaded. Choose another -NewProfileName."
     }
     if ($usage.ContainsKey($NewProfileName)) {
         throw "Auto Deploy already has an image profile named '$NewProfileName' (rule: $(($usage[$NewProfileName]) -join ', ')). Choose another -NewProfileName."
     }
-    if ($StageInAutoDeploy) {
+    if (-not $SkipAutoDeploy) {
         if (-not $DeployRuleName) { $DeployRuleName = "Staged-$NewProfileName" }
         if (@(Get-DeployRule -ErrorAction Stop | Where-Object { $_.Name -eq $DeployRuleName }).Count -gt 0) {
             throw "A deploy rule named '$DeployRuleName' already exists. Choose another -DeployRuleName."
@@ -1036,7 +1170,7 @@ try {
     $newProfile = Get-SessionImageProfile -Name $NewProfileName
     Write-RichoLog "Cloned '$($base.Name)' to '$NewProfileName'." -Level INFO
 
-    if ($AcceptanceLevel) {
+    if ([string]$newProfile.AcceptanceLevel -ne $AcceptanceLevel) {
         Set-EsxImageProfile -ImageProfile $newProfile -AcceptanceLevel $AcceptanceLevel -ErrorAction Stop | Out-Null
         $newProfile = Get-SessionImageProfile -Name $NewProfileName
         Write-RichoLog "Acceptance level set to $AcceptanceLevel." -Level INFO
@@ -1093,18 +1227,22 @@ try {
     Write-RichoLog "Verified '$NewProfileName': $(@($newProfile.VibList).Count) VIBs; $added VIB version(s) not in the base, $dropped base VIB version(s) gone. Matches the plan." -Level INFO
 
     # ---- Export -----------------------------------------------------------
-    if ($ExportBundlePath -and $PSCmdlet.ShouldProcess($ExportBundlePath, "Export '$NewProfileName' as an offline bundle")) {
+    if ($PSCmdlet.ShouldProcess($ExportBundlePath, "Export '$NewProfileName' as an offline bundle")) {
+        $folder = Split-Path -Path $ExportBundlePath -Parent
+        if ($folder -and -not (Test-Path -LiteralPath $folder -PathType Container)) { New-Item -Path $folder -ItemType Directory -Force | Out-Null }
         Export-EsxImageProfile -ImageProfile $newProfile -ExportToBundle -FilePath $ExportBundlePath -ErrorAction Stop
         Write-RichoLog "Exported offline bundle to $ExportBundlePath." -Level INFO
     }
 
     if ($ExportIsoPath -and $PSCmdlet.ShouldProcess($ExportIsoPath, "Export '$NewProfileName' as an ISO")) {
+        $folder = Split-Path -Path $ExportIsoPath -Parent
+        if ($folder -and -not (Test-Path -LiteralPath $folder -PathType Container)) { New-Item -Path $folder -ItemType Directory -Force | Out-Null }
         Export-EsxImageProfile -ImageProfile $newProfile -ExportToIso -FilePath $ExportIsoPath -ErrorAction Stop
         Write-RichoLog "Exported ISO to $ExportIsoPath." -Level INFO
     }
 
-    # ---- Stage in Auto Deploy ---------------------------------------------
-    if ($StageInAutoDeploy) {
+    # ---- Upload to Auto Deploy ---------------------------------------------
+    if (-not $SkipAutoDeploy) {
         $patternText = $DeployRulePattern -join ', '
         if ($PSCmdlet.ShouldProcess($config.vcenter.server, "Create inactive deploy rule '$DeployRuleName' holding '$NewProfileName' (pattern: $patternText); uploads the VIBs to Auto Deploy")) {
             Write-RichoLog "Creating deploy rule '$DeployRuleName'. Uploading the image profile can take several minutes." -Level INFO
